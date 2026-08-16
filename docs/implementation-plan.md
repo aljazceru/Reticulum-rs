@@ -1176,3 +1176,28 @@ with M9 for team-load leveling.
 > Python sources (`markqvist/lxmf`, `markqvist/LXST`) are not in this
 > workspace. Step 10.A.1 (clone + audit) must precede any Phase 10 wire-format
 > work.
+
+---
+
+## Progress log (updated by implementation work)
+
+| Item | Status |
+|---|---|
+| 0.4 error/packet polish | ✅ `RnsError::ResourceMsg/Resource/Storage/Request/Iface/Unsupported`, protocol constants corrected (HEADER_MAXSIZE=35 → MDU 464, LINK_MDU 431) |
+| 2.8 Link MTU discovery | ✅ `Link::signalling_bytes`, MTU parsed from link requests/proofs, `link.mtu()/mdu()/sdu()` |
+| 3.1 Resource advertisement format | ✅ byte-exact vs Python (`tests/fixtures_msgpack.json` golden vectors) |
+| 3.2 Outbound resource | ✅ windowed part serving, hashmap updates, retries, progress |
+| 3.3 Inbound resource | ✅ accept/reject, EIFR/window management, assembly, proof, cancel |
+| 3.4 Compression | ✅ bzip2 behind default `bz2` feature, decompression guards |
+| 3.5 Metadata + encrypted flags | ✅ 3-byte size prefix, metadata extraction on assembly |
+| 3.6 Watchdog/timers | ✅ transport resource watchdog task with retry table |
+| 3.7 Integration | ✅ `Transport::send_resource(_with_options)`, resource events |
+| 2.7 Requests & responses | ✅ packet + resource-backed both directions, handler registry, `await_request_response` |
+| Python interop (resources/requests) | ✅ `tests/python_resources.rs`: Rust→Py and Py→Rust resource transfer (60–80 KB) and request/response incl. resource-backed responses |
+| Python test-suite parity | ✅ `tests/parity.rs`: SHA-256 vectors, fixed identity hashes, known signature, valid/invalid announce, fixed destination hash |
+| LXMF crate | ✅ new `lxmf/` crate (byte-exact message format, stamps, peers, router) |
+| LXST crate | ✅ new `lxst/` crate (audio codecs, wire protocol, pipelines, calls) |
+
+Remaining phases (identity persistence, ratchets, plain/group destinations,
+interfaces, tunnels/blackholes/discovery, daemon/RPC, `rn*` utilities,
+buffer streams) are still open; see the phase descriptions above.

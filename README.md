@@ -9,51 +9,48 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
 
 - 📡 Cryptographic mesh networking
 - 🔐 Trustless routing via identity-based keys
-- 📁 Lightweight and modular design
-- 🧱 Support for multiple transport layers (TCP, serial, Kaonic)
+- 📦 Resource transfers: arbitrary-size payloads over links with windowing,
+  compression (bzip2), retries and automatic segmentation — wire-compatible
+  with Python `RNS.Resource`
+- 🔄 Requests & responses over links, including resource-backed transfers of
+  large responses (Python `Link.request` compatible)
+- 🧱 Support for multiple transport layers (TCP, UDP, serial)
 - 🔌 Easily embeddable in embedded devices and tactical radios
+- ✅ Python interop test-suite: resources, requests, links, announces
 - 🧪 Example clients for testnets and real deployments
+- 📨 `lxmf` crate: the LXMF messaging layer (byte-exact Python LXMF format)
+- 🎙 `lxst` crate: LXST audio streaming, codecs and calls
 
 ## Structure
-
 
 ```
 Reticulum-rs/
 ├── src/                 # Core Reticulum protocol implementation
-│   ├── buffer.rs
-│   ├── crypt.rs
-│   ├── destination.rs
-│   ├── error.rs
-│   ├── hash.rs
-│   ├── identity.rs
-│   ├── iface.rs
-│   ├── lib.rs
-│   ├── transport.rs
-│   └── packet.rs
-├── proto/               # Protocol definitions (e.g. for Kaonic)
-│   └── kaonic/
-│       └── kaonic.proto
+│   ├── transport.rs     #   transport instance, routing, path requests
+│   ├── resource/        #   resource transfers (outbound/inbound/manager)
+│   ├── channel.rs       #   reliable channel streams over links
+│   ├── iface/           #   interfaces (tcp client/server, udp, hdlc)
+│   └── buffer.rs
+├── reticulum-core/      # no_std protocol core (crypto, identity, packet)
+├── reticulum-daemon/    # RNS daemon + config conversion
+├── lxmf/                # LXMF message format, stamps, peers, router
+├── lxst/                # LXST audio streaming, codecs, calls
+├── tests/               # unit, interop and parity tests
+│   ├── resource_transfer.rs
+│   ├── parity.rs        #   ports of the Python tests/ suite vectors
+│   ├── python_resources.rs  # Python interop: resources + requests
+│   └── python.rs        # Python interop: announce/link/identify
 ├── examples/            # Example clients and servers
-│   ├── kaonic_client.rs
-│   ├── link_client.rs
-│   ├── tcp_client.rs
-│   ├── tcp_server.rs
-│   └── testnet_client.rs
-├── reticulum-daemon/           # RNS Daemon
-│   ├── Cargo.toml
-│   └── src/
-│       ├── config.rs
-│       └── main.rs
-├── Cargo.toml           # Crate configuration
-├── LICENSE              # License (MIT/Apache)
-└── build.rs             
-````
+├── docs/                # implementation plan and notes
+├── Cargo.toml           # Workspace configuration
+└── LICENSE
+```
+
 ## Getting Started
 
 ### Prerequisites
 
 * Rust (edition 2021+)
-* `protoc` for compiling `.proto` files (if using gRPC/Kaonic modules)
 
 ### Build
 
@@ -89,25 +86,48 @@ The daemon searches for either `config` (legacy filename) or `config.toml` in th
 ### Run Examples
 
 ```bash
-# TCP client example
+# TCP client/server examples
 cargo run --example tcp_client
+cargo run --example tcp_server
 
-# Kaonic mesh test client
-cargo run --example kaonic_client
+# Channel examples
+cargo run --example channel_server
+cargo run --example channel_client
+
+# Multi-hop transport example
+cargo run --example multihop
+```
+
+### Resource transfers and requests
+
+```rust,ignore
+use reticulum::resource::{ResourceOptions, ResourceStrategy, ResourceStatus};
+
+// Accept incoming resources on a link
+transport.set_resource_strategy(link_id, ResourceStrategy::All).await;
+
+// Send an arbitrary-size payload as a resource
+transport.send_resource(&link, data).await?;
+
+// Send a request and await the response (resource-backed when large)
+let rid = transport.request(&link, "my.path", b"payload").await?;
+let response = transport.await_request_response(rid, Duration::from_secs(30)).await;
 ```
 
 ### Python integration tests
 
-Integration tests against the Python implementation can be run with the `python-tests` feature and
-setting the `RETICULUM_TEST_PYTHON_DIR` environment variable to the location of the checked out
-Python Reticulum source tree. Example:
+Integration tests against the Python implementation (announces, links,
+identify, resource transfers and requests) can be run with the `python-tests`
+feature and setting `RETICULUM_TEST_PYTHON_DIR` (and `PYTHONPATH`) to the
+location of the checked out Python Reticulum source tree. Example:
 ```
-RETICULUM_TEST_PYTHON_DIR=../Reticulum cargo test python --features="python-tests"
+RETICULUM_TEST_PYTHON_DIR=../Reticulum PYTHONPATH=../Reticulum \
+    cargo test python --features="python-tests"
 ```
 
 ## Use Cases
 
-* 🛰 Tactical radio mesh with Kaonic
+* 🛰 Tactical radio mesh over LoRa/serial transceivers
 * 🕵️‍♂️ Covert communication using serial or sub-GHz transceivers
 * 🚁 UAV-to-ground resilient C2 and telemetry
 * 🧱 Decentralized infrastructure-free messaging

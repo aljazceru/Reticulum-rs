@@ -63,3 +63,5 @@ jobs:
         run: |
           cargo test --workspace --all-targets --features="python-tests" -- --no-capture
           cargo test -p reticulum-core --all-targets --no-default-features --features="embassy-time"
+          # bzip2 compression matrix for resources
+          cargo test -p reticulum --features bz2 --test resource_transfer

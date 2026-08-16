@@ -3,9 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lxmf::router::{
-    AnnounceInfo, DeliveryConfig, LxmEvent, LxmRouter, RouterConfig, SendFailure,
-};
+use lxmf::router::{AnnounceInfo, DeliveryConfig, LxmEvent, LxmRouter, RouterConfig};
 use lxmf::{delivery_destination_hash, LXMessage, DIRECT, OPPORTUNISTIC};
 use rand_core::OsRng;
 use reticulum::identity::PrivateIdentity;
@@ -214,24 +212,16 @@ async fn send_to_unknown_destination_queues_and_fails_gracefully() {
     assert!(router.send(&mut propagated, &bob_identity).await.is_err());
     assert_eq!(propagated.state, lxmf::FAILED);
 
-    // Messages too large for a single packet report the resource TODO via
-    // a failure event
+    // Messages too large for a single packet are queued for resource-backed
+    // delivery once a path becomes known (mirroring the packet path).
     let mut large = LXMessage::new(unknown, bob_delivery, b"t", "z".repeat(1000).as_bytes());
     large.pack(&bob_identity).expect("pack");
     assert_eq!(large.representation, lxmf::RESOURCE);
     router.send(&mut large, &bob_identity).await.expect("send");
 
-    let failed = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("failure event")
-        .expect("event");
-    assert!(matches!(
-        failed,
-        LxmEvent::SendFailed {
-            reason: SendFailure::ResourceUnsupported,
-            ..
-        }
-    ));
+    // No failure is emitted: the message is queued awaiting a path.
+    let event = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
+    assert!(event.is_err(), "large message queued without failure event");
 }
 
 #[tokio::test]

@@ -34,6 +34,7 @@ use reticulum::packet::{
     DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer,
     PacketType, PropagationType,
 };
+use reticulum::resource::{ResourceStatus, ResourceStrategy};
 use reticulum::transport::{AnnounceEvent, ReceivedData, Transport};
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{timeout, Duration};
@@ -184,6 +185,10 @@ pub enum SendFailure {
     DeliveryTimeout,
     /// The message requires resource transfer, which is not implemented yet.
     ResourceUnsupported,
+    /// A resource-backed delivery was attempted but the transfer failed.
+    ResourceFailed,
+    /// No identity is known for the destination (path unknown).
+    NoPath,
     /// No outbound propagation node has been configured.
     NoPropagationNode,
     /// The message was malformed or could not be packed.
@@ -260,6 +265,14 @@ pub struct RouterConfig {
     pub delivery_timeout: Duration,
     /// How long to wait for link activation.
     pub link_timeout: Duration,
+}
+
+impl RouterConfig {
+    /// Timeout for resource-backed deliveries: delivery timeout plus a
+    /// generous transfer allowance.
+    pub fn resource_timeout(&self) -> u64 {
+        self.delivery_timeout.as_secs().max(30) * 3
+    }
 }
 
 impl Default for RouterConfig {
@@ -474,6 +487,11 @@ impl LxmRouter {
         let router = self.clone();
         tokio::spawn(async move {
             router.link_event_watcher().await;
+        });
+
+        let router = self.clone();
+        tokio::spawn(async move {
+            router.resource_event_watcher().await;
         });
     }
 
@@ -870,6 +888,153 @@ impl LxmRouter {
         Ok(())
     }
 
+    /// Deliver a large message as a resource transfer over an established
+    /// link (Python `LXMessage.__as_resource`).
+    async fn deliver_as_resource(
+        self: &Arc<Self>,
+        destination_hash: &AddressHash,
+        message: &Arc<Mutex<LXMessage>>,
+        source: &PrivateIdentity,
+    ) -> Result<(), SendFailure> {
+        let _ = source;
+
+        let identity = {
+            let state = self.state.lock().await;
+            state.known_identities.get(destination_hash).copied()
+        };
+        let Some(identity) = identity else {
+            // No path yet: request and queue like the packet path.
+            self.transport
+                .request_path(destination_hash, None, None)
+                .await;
+            let mut state = self.state.lock().await;
+            state.pending_outbound.push(OutboundEntry {
+                destination_hash: *destination_hash,
+                message: message.clone(),
+                source: source.clone(),
+            });
+            return Ok(());
+        };
+
+        let packed = {
+            let m = message.lock().await;
+            m.packed.clone()
+        };
+        let Some(packed) = packed else {
+            return Err(SendFailure::Invalid("message not packed".into()));
+        };
+
+        {
+            let mut m = message.lock().await;
+            m.state = SENDING;
+            m.progress = 0.5;
+        }
+
+        let desc = DestinationDesc {
+            identity,
+            address_hash: *destination_hash,
+            name: delivery_name(),
+        };
+
+        let router = self.clone();
+        let payload = packed;
+        let destination = *destination_hash;
+        let message = Arc::clone(message);
+        tokio::spawn(async move {
+            router
+                .deliver_resource_over_link(desc, destination, message, payload)
+                .await;
+        });
+
+        Ok(())
+    }
+
+    /// Establish the link and transfer the packed message as a resource.
+    async fn deliver_resource_over_link(
+        self: &Arc<Self>,
+        desc: DestinationDesc,
+        destination_hash: AddressHash,
+        message: Arc<Mutex<LXMessage>>,
+        payload: Vec<u8>,
+    ) {
+        let mut events = self.transport.out_link_events();
+
+        let link = self.transport.link(desc).await;
+        let link_id = *link.lock().await.id();
+
+        let mut active = link.lock().await.status() == LinkStatus::Active;
+        if !active {
+            let activated = timeout(self.config.link_timeout, async {
+                loop {
+                    match events.recv().await {
+                        Ok(LinkEventData { id, event, .. }) if id == link_id => match event {
+                            LinkEvent::Activated => return true,
+                            LinkEvent::Closed => return false,
+                            _ => {}
+                        },
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false);
+            active = activated;
+        }
+
+        if !active {
+            log::debug!("LXMF resource delivery: link to {destination_hash} failed");
+            self.fail(&message, SendFailure::LinkFailed).await;
+            return;
+        }
+
+        let mut resource_events = self.transport.resource_events().await;
+
+        let result = self.transport.send_resource(&link, payload).await;
+        let resource_hash = match result {
+            Ok(hash) => hash,
+            Err(err) => {
+                log::debug!("LXMF resource delivery failed to start: {err:?}");
+                self.fail(&message, SendFailure::ResourceFailed).await;
+                return;
+            }
+        };
+
+        let timeout_at = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(self.config.resource_timeout());
+
+        loop {
+            if tokio::time::Instant::now() > timeout_at {
+                self.fail(&message, SendFailure::ResourceFailed).await;
+                return;
+            }
+            match timeout(std::time::Duration::from_secs(1), resource_events.recv()).await {
+                Ok(Ok(event)) => {
+                    if event.hash.as_slice() == resource_hash.as_slice() {
+                        match event.status {
+                            ResourceStatus::Complete => {
+                                let mut m = message.lock().await;
+                                m.state = SENT;
+                                m.progress = 1.0;
+                                log::debug!("LXMF resource delivery to {destination_hash} sent");
+                                return;
+                            }
+                            ResourceStatus::Failed
+                            | ResourceStatus::Corrupt
+                            | ResourceStatus::Rejected => {
+                                self.fail(&message, SendFailure::ResourceFailed).await;
+                                return;
+                            }
+                            _ => continue,
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
     /// Attempt delivery of a single queued message
     /// (the per-message part of `LXMRouter.process_outbound`).
     async fn process_outbound(self: &Arc<Self>, entry: OutboundEntry) {
@@ -882,11 +1047,17 @@ impl LxmRouter {
         let method = message.lock().await.method;
         let representation = message.lock().await.representation;
 
-        // Messages larger than a single link packet require resource
-        // transfer.
-        // TODO(integration): resource-backed delivery of large messages
-        // once RNS resources are available on links in the Rust transport.
+        // Messages larger than a single link packet are delivered as a
+        // resource transfer over the link (Python `LXMessage.__as_resource`).
+        if representation == RESOURCE && method == DIRECT {
+            if let Err(err) = self.deliver_as_resource(&destination_hash, &message, &source).await {
+                log::debug!("resource delivery failed: {err:?}");
+                self.fail(&message, SendFailure::ResourceUnsupported).await;
+            }
+            return;
+        }
         if representation == RESOURCE {
+            // Resource delivery to propagation nodes is not supported yet.
             self.fail(&message, SendFailure::ResourceUnsupported).await;
             return;
         }
@@ -1736,6 +1907,41 @@ impl LxmRouter {
         }
     }
 
+    /// Watch for completed incoming resources on the delivery destination's
+    /// links and ingest them as LXMF messages.
+    async fn resource_event_watcher(self: Arc<Self>) {
+        let mut events = self.transport.resource_events().await;
+
+        loop {
+            let Ok(event) = events.recv().await else {
+                return;
+            };
+
+            if event.status != ResourceStatus::Complete {
+                continue;
+            }
+
+            let is_delivery_link = {
+                let delivery = self.delivery.lock().await;
+                delivery.as_ref().is_some()
+            };
+            if !is_delivery_link {
+                continue;
+            }
+
+            if let Some(data) = event.data {
+                log::debug!(
+                    "LXMF resource of {} bytes completed on link {}, ingesting",
+                    data.len(),
+                    event.link_id
+                );
+                self.lxmf_delivery(&data, Some(DIRECT), None, false, false)
+                    .await
+                    .ok();
+            }
+        }
+    }
+
     async fn link_event_watcher(self: Arc<Self>) {
         let mut events = self.transport.in_link_events();
 
@@ -1747,7 +1953,12 @@ impl LxmRouter {
             match event.event {
                 LinkEvent::Activated => {
                     // Make the responder side prove link data packets so
-                    // that senders receive delivery receipts.
+                    // that senders receive delivery receipts, and accept
+                    // resource transfers (large messages arrive as
+                    // resources, Python `LXMessage.__as_resource`).
+                    self.transport
+                        .set_resource_strategy(event.id, ResourceStrategy::All)
+                        .await;
                     if let Some(link) = self.transport.find_in_link(&event.id).await {
                         link.lock().await.prove_messages(true);
                     }
