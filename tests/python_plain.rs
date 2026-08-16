@@ -77,8 +77,10 @@ async fn rust_broadcast_received_by_python() {
     let partner = spawn_plain(None, 15.0).await;
     let mut lines = partner.lines.resubscribe();
 
-    // Wait for the Python broadcast destination to be up
+    // Wait for the Python broadcast destination to be up, plus a grace
+    // period for its shared-instance interfaces to bind.
     wait_line(&mut lines, "[PYI] destination", 15).await.expect("destination");
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let transport = TransportConfig::default().build();
     transport.iface_manager().lock().await.spawn(
@@ -87,10 +89,13 @@ async fn rust_broadcast_received_by_python() {
     );
 
     let name = DestinationName::new("example_utilities", "broadcast.public_information");
-    transport
-        .send_to_plain_destination(name, b"hello from rust broadcast")
-        .await
-        .expect("broadcast");
+    for _ in 0..3 {
+        transport
+            .send_to_plain_destination(name, b"hello from rust broadcast")
+            .await
+            .expect("broadcast");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     let received = wait_line(&mut lines, "[PYI] received hello from rust broadcast", 10)
         .await
