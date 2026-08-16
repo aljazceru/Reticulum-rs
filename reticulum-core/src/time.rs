@@ -66,7 +66,7 @@ mod no_std_only {
 }
 
 #[cfg(feature = "std")]
-pub (crate) use std_only::*;
+pub use std_only::*;
 
 #[cfg(not(feature = "std"))]
 pub (crate) use no_std_only::*;

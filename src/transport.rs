@@ -11,13 +11,21 @@ use tokio_util::sync::CancellationToken;
 use crate::channel::{self, Channel};
 use crate::destination::link::{Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket,
     LinkHandleResult, LinkId, LinkPayload, LinkPayloadSink, LinkStatus};
+use crate::resource::{
+    self, manager::{pack_request, pack_response, request_id as make_request_id,
+        RequestContext as RequestCtx, RequestEventData, RequestEvent,
+        ResourceManager, ResourceStrategy},
+    ResourceEvent, ResourceOptions,
+};
 use crate::destination::{DestinationAnnounce, DestinationDesc, DestinationHandleStatus,
     DestinationName, SingleInputDestination, SingleOutputDestination};
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 use crate::identity::PrivateIdentity;
 use crate::iface::{InterfaceManager, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType};
-use crate::packet::{DestinationType, Packet, PacketContext, PacketDataBuffer, PacketType};
+use crate::packet::{
+    DestinationType, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
+};
 
 mod announce_limits;
 mod announce_table;
@@ -62,6 +70,7 @@ pub struct TimerConfig {
     pub old_announces_retransmit: Duration,
     pub keep_packet_cached: Duration,
     pub packet_cache_cleanup: Duration,
+    pub resource_watchdog: Duration,
 }
 
 impl Default for TimerConfig {
@@ -80,6 +89,7 @@ impl Default for TimerConfig {
             old_announces_retransmit: Duration::from_secs(60),
             keep_packet_cached: Duration::from_secs(180),
             packet_cache_cleanup: Duration::from_secs(90),
+            resource_watchdog: Duration::from_secs(1),
         }
     }
 }
@@ -159,6 +169,8 @@ pub(crate) struct TransportHandler {
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
 
     packet_cache: Mutex<PacketCache>,
+
+    resources: ResourceManager,
 
     path_requests: PathRequests,
 
@@ -285,6 +297,7 @@ impl Transport {
             out_links: HashMap::new(),
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
+            resources: ResourceManager::new(),
             path_requests,
             announce_tx,
             link_in_event_tx: link_in_event_tx.clone().into(),
@@ -580,6 +593,190 @@ impl Transport {
         destination
     }
 
+    /// Subscribe to resource transfer events for all links.
+    pub async fn resource_events(&self) -> broadcast::Receiver<ResourceEvent> {
+        self.handler.lock().await.resources.events.subscribe()
+    }
+
+    /// Subscribe to request (request/response) events.
+    pub async fn request_events(&self) -> broadcast::Receiver<RequestEventData> {
+        self.handler.lock().await.resources.request_events.subscribe()
+    }
+
+    /// Set the resource acceptance strategy for a link
+    /// (Python `Link.set_resource_strategy`).
+    pub async fn set_resource_strategy(&self, link_id: LinkId, strategy: ResourceStrategy) {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .set_resource_strategy(link_id, strategy);
+    }
+
+    /// Register an application callback deciding whether an advertised
+    /// resource should be accepted (Python `Link.set_resource_callback`).
+    pub async fn set_resource_accept_callback(
+        &self,
+        link_id: LinkId,
+        callback: resource::manager::ResourceAcceptCallback,
+    ) {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .set_accept_callback(link_id, callback);
+    }
+
+    /// Register a handler for a request path on one of our inbound
+    /// destinations (Python `Destination.register_request_handler`).
+    pub async fn register_request_handler<F>(
+        &self,
+        destination: &AddressHash,
+        path: &str,
+        handler: F,
+    ) where
+        F: Fn(RequestCtx) -> Option<Vec<u8>> + Send + Sync + 'static,
+    {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .register_request_handler(*destination, path, Arc::new(handler));
+    }
+
+    /// Send an arbitrary-size payload as a resource over an established link.
+    pub async fn send_resource(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        data: Vec<u8>,
+    ) -> Result<AddressHash, RnsError> {
+        self.send_resource_with_options(link, data, ResourceOptions::default()).await
+    }
+
+    /// Send an arbitrary-size payload as a resource with options
+    /// (metadata, request id, response flag). Returns the resource hash.
+    pub async fn send_resource_with_options(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        data: Vec<u8>,
+        options: ResourceOptions,
+    ) -> Result<AddressHash, RnsError> {
+        let mut handler = self.handler.lock().await;
+        let link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
+        }
+
+        // reserve a slot and build the resource under the link lock
+        let mut resource = crate::resource::outbound::OutgoingResource::new(
+            data,
+            &link_guard,
+            options,
+        )?;
+
+        let mut tx = crate::resource::ResourceTx::default();
+        let active = handler
+            .resources
+            .out
+            .get(link_guard.id())
+            .map(|list| list.iter().any(|r| !r.status.is_concluded()))
+            .unwrap_or(false);
+
+        let hash = resource.truncated_hash;
+        if active {
+            resource.status = crate::resource::ResourceStatus::Queued;
+        } else {
+            resource.advertise(&link_guard, &mut tx)?;
+        }
+
+        for packet in tx.packets {
+            handler.send_packet(packet).await;
+        }
+
+        handler
+            .resources
+            .out
+            .entry(*link_guard.id())
+            .or_default()
+            .push(resource);
+
+        Ok(hash)
+    }
+
+    /// Send a request to the remote end of a link and await nothing (events
+    /// arrive on `request_events`). Returns the request id
+    /// (Python `Link.request`).
+    pub async fn request(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &str,
+        data: &[u8],
+    ) -> Result<AddressHash, RnsError> {
+        let mut handler = self.handler.lock().await;
+        let link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
+        }
+
+        let packed = pack_request(path, data);
+        let rid = make_request_id(&packed);
+
+        if packed.len() <= link_guard.mdu() {
+            let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
+            handler.send_packet(packet).await;
+        } else {
+            let opts = ResourceOptions {
+                request_id: Some(rid),
+                is_response: false,
+                ..Default::default()
+            };
+            // Build + advertise directly (single outstanding request is fine)
+            let mut resource = crate::resource::outbound::OutgoingResource::new(
+                packed, &link_guard, opts,
+            )?;
+            let mut tx = crate::resource::ResourceTx::default();
+            resource.advertise(&link_guard, &mut tx)?;
+            for p in tx.packets {
+                handler.send_packet(p).await;
+            }
+            handler
+                .resources
+                .out
+                .entry(*link_guard.id())
+                .or_default()
+                .push(resource);
+        }
+
+        handler.resources.pending_requests.insert(rid, *link_guard.id());
+        Ok(rid)
+    }
+
+    /// Await a response for a previously sent request.
+    pub async fn await_request_response(
+        &self,
+        request_id: AddressHash,
+        timeout: core::time::Duration,
+    ) -> Option<Vec<u8>> {
+        let mut rx = self.request_events().await;
+        let deadline = time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(event)) => match event.event {
+                    RequestEvent::Response { request_id: rid, data, .. } if rid == request_id => {
+                        return Some(data)
+                    }
+                    RequestEvent::Failed { request_id: rid } if rid == request_id => return None,
+                    _ => continue,
+                },
+                _ => return None,
+            }
+        }
+    }
+
     pub async fn get_in_destination(
         &self,
         address: &AddressHash,
@@ -741,6 +938,29 @@ async fn handle_proof<'a>(
         packet.destination
     );
 
+    // Resource proofs (receiver -> sender) are handled by the resource
+    // engine; they are never encrypted (Python Packet.pack rules).
+    if packet.context == PacketContext::ResourceProof {
+                // `out_links` is keyed by destination hash while `in_links` is keyed
+        // by link id, so scan for the link matching the packet destination.
+        let mut link = None;
+        for candidate in handler.out_links.values() {
+            let id = *candidate.lock().await.id();
+            if id == packet.destination {
+                link = Some(candidate.clone());
+                break;
+            }
+        }
+        let link = link.or_else(|| handler.in_links.get(&packet.destination).cloned());
+        if let Some(link) = link {
+            let link_guard = link.lock().await;
+            handler.resources.handle_proof(&link_guard, packet.data.as_slice());
+            drop(link_guard);
+            handler.resources.cleanup();
+        }
+        return;
+    }
+
     for link in handler.out_links.values() {
         let mut link = link.lock().await;
         let link_id = *link.id();
@@ -822,13 +1042,234 @@ async fn handle_keepalive_response<'a>(
     false
 }
 
-async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_resource_packet<'a>(
+    packet: &Packet,
+    link_arc: &Arc<Mutex<Link>>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
+) -> bool {
+    use crate::packet::PacketContext as Ctx;
+
+    let link = link_arc.lock().await;
+    let handled = match packet.context {
+        Ctx::ResourceAdvertisement => {
+            let mut buffer = [0u8; PACKET_MDU];
+            match link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                Ok(plaintext) => {
+                    let tx = handler
+                        .resources
+                        .handle_advertisement(&link, packet, plaintext);
+                    for p in tx.packets {
+                        handler.send_packet(p).await;
+                    }
+                    // an accepted request resource may need dispatch once done
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Ctx::ResourceRequest => {
+            let mut buffer = [0u8; PACKET_MDU];
+            match link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                Ok(plaintext) => {
+                    let tx = handler.resources.handle_request_data(&link, plaintext);
+                    for p in tx.packets {
+                        handler.send_packet(p).await;
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Ctx::ResourceHashUpdate => {
+            let mut buffer = [0u8; PACKET_MDU];
+            match link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                Ok(plaintext) => {
+                    let tx = handler.resources.handle_hashmap_update(&link, plaintext);
+                    for p in tx.packets {
+                        handler.send_packet(p).await;
+                    }
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        Ctx::Resource => {
+            let (part_tx, completed) = handler.resources.handle_part(&link, packet);
+            for p in part_tx.packets {
+                handler.send_packet(p).await;
+            }
+            if completed {
+                let mut tx = crate::resource::ResourceTx::default();
+                if let Some((_hash, data)) =
+                    handler.resources.assemble_completed(&link, &mut tx)
+                {
+                    for p in tx.packets {
+                        handler.send_packet(p).await;
+                    }
+                    // Dispatch an inbound request resource to handlers
+                    let request_data = data;
+                    if let Some((_time, path_hash, req_payload)) =
+                        crate::resource::manager::unpack_request(&request_data)
+                    {
+                        let rid = make_request_id(&request_data);
+                        let link_for_dispatch = link_arc.clone();
+                        drop(link);
+                        handle_incoming_request(
+                            &link_for_dispatch, rid, _time, path_hash, req_payload, handler,
+                        )
+                        .await;
+                    }
+                } else {
+                    for p in tx.packets {
+                        handler.send_packet(p).await;
+                    }
+                }
+            }
+            true
+        }
+        Ctx::ResourceProof => {
+            handler.resources.handle_proof(&link, packet.data.as_slice());
+            handler.resources.cleanup();
+            true
+        }
+        Ctx::ResourceInitiatorCancel => {
+            let mut buffer = [0u8; PACKET_MDU];
+            if let Ok(plaintext) = link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                handler.resources.handle_cancel(&link, plaintext);
+            }
+            true
+        }
+        Ctx::ResourceReceiverCancel => {
+            let mut buffer = [0u8; PACKET_MDU];
+            if let Ok(plaintext) = link.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                handler.resources.handle_reject(&link, plaintext);
+            }
+            true
+        }
+        _ => false,
+    };
+    handled
+}
+
+async fn handle_incoming_request<'a>(
+    link: &Arc<Mutex<Link>>,
+    rid: AddressHash,
+    requested_at: f64,
+    path_hash: AddressHash,
+    request_data: Vec<u8>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
+) {
+    let link = link.lock().await;
+    let destination = link.destination().address_hash;
+    let remote_identity = link.remote_identity();
+
+    let handler_fn = handler
+        .resources
+        .request_handlers
+        .get(&destination)
+        .and_then(|handlers| handlers.get(&path_hash).cloned());
+
+    let Some(handler_fn) = handler_fn else {
+        log::trace!("tp: no handler for request path {path_hash}");
+        return;
+    };
+
+    let response = handler_fn(RequestCtx {
+        path_hash,
+        data: request_data,
+        request_id: rid,
+        link_id: *link.id(),
+        remote_identity,
+        requested_at,
+    });
+
+    if let Some(response) = response {
+        let packed = pack_response(&rid, &response);
+        if packed.len() <= link.mdu() {
+            if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
+                handler.send_packet(packet).await;
+            }
+        } else {
+            let opts = ResourceOptions {
+                request_id: Some(rid),
+                is_response: true,
+                ..Default::default()
+            };
+            match handler.resources.send_resource(&link, packed, opts) {
+                Ok(tx) => {
+                    for p in tx.packets {
+                        handler.send_packet(p).await;
+                    }
+                }
+                Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
+            }
+        }
+    }
+}
+
+async fn handle_request_or_response_packet<'a>(
+    packet: &Packet,
+    link: &Arc<Mutex<Link>>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
+) -> bool {
+    let rid_from_plaintext = |plaintext: &[u8]| make_request_id(plaintext);
+
+    let link_guard = link.lock().await;
+    let mut buffer = [0u8; PACKET_MDU];
+    let Ok(plaintext) = link_guard.decrypt(packet.data.as_slice(), &mut buffer[..]) else {
+        return false;
+    };
+
+    match packet.context {
+        PacketContext::Request => {
+            let Some((time, path_hash, data)) = crate::resource::manager::unpack_request(plaintext)
+            else {
+                log::debug!("tp: could not unpack request payload");
+                return false;
+            };
+            let rid = rid_from_plaintext(plaintext);
+            drop(link_guard);
+            handle_incoming_request(link, rid, time, path_hash, data, handler).await;
+            true
+        }
+        PacketContext::Response => {
+            let Some((rid, response)) = crate::resource::manager::unpack_response(plaintext)
+            else {
+                return false;
+            };
+            handler
+                .resources
+                .request_events
+                .send(RequestEventData {
+                    link_id: packet.destination,
+                    event: RequestEvent::Response {
+                        request_id: rid,
+                        data: response,
+                        metadata: None,
+                    },
+                })
+                .ok();
+            handler.resources.pending_requests.remove(&rid);
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
     let mut data_handled = false;
 
     if packet.header.destination_type == DestinationType::Link {
         let mut local_out_link_handled = false;
 
         if let Some(link) = handler.in_links.get(&packet.destination).cloned() {
+            if handle_resource_packet(packet, &link, &mut handler).await {
+                return;
+            }
+            if handle_request_or_response_packet(packet, &link, &mut handler).await {
+                return;
+            }
+
             let mut link = link.lock().await;
             let channel_tx = handler.channel_table.get(link.id());
 
@@ -851,11 +1292,31 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
             }
         }
 
+        let mut out_links: Vec<Arc<Mutex<Link>>> = Vec::new();
         for link in handler.out_links.values() {
-            let mut link = link.lock().await;
-            let link_id = *link.id();
+            let id = *link.lock().await.id();
+            if id == packet.destination {
+                out_links.push(link.clone());
+            }
+        }
+
+        for link in out_links {
+            let link_id = *link.lock().await.id();
 
             if link_id == packet.destination {
+                if handle_resource_packet(packet, &link, &mut handler).await {
+                    local_out_link_handled = true;
+                    data_handled = true;
+                    continue;
+                }
+                if handle_request_or_response_packet(packet, &link, &mut handler).await {
+                    local_out_link_handled = true;
+                    data_handled = true;
+                    continue;
+                }
+
+                let mut link = link.lock().await;
+
                 let result = link.handle_packet(
                     &handler.link_out_event_tx,
                     handler.channel_table.get(&link_id),
@@ -1460,6 +1921,47 @@ async fn manage_transport(
                             .release(timer_config.keep_packet_cached);
 
                         handler.link_table.remove_stale();
+                    },
+                }
+            }
+        });
+    }
+
+    // Resource watchdog: retry/timeouts for active transfers, cleanup of
+    // concluded ones. Runs faster than the cache cleanup to keep transfer
+    // latency low (Python ticks every WATCHDOG_MAX_SLEEP = 1s).
+    {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+        let resource_tick = timer_config
+            .resource_watchdog
+            .min(crate::resource::WATCHDOG_MAX_SLEEP);
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(resource_tick) => {
+                        let mut handler = handler.lock().await;
+
+                        let all_links: HashMap<LinkId, Arc<Mutex<Link>>> = handler
+                            .in_links
+                            .iter()
+                            .chain(handler.out_links.iter())
+                            .map(|(id, link)| (*id, link.clone()))
+                            .collect();
+
+                        let tx = handler.resources.check(&all_links);
+                        for packet in tx.packets {
+                            handler.send_packet(packet).await;
+                        }
+                        handler.resources.cleanup();
                     },
                 }
             }

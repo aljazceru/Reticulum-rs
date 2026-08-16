@@ -9,6 +9,36 @@ use crate::hash::Hash;
 pub const PACKET_MDU: usize = 2048usize;
 pub const PACKET_IFAC_MAX_LENGTH: usize = 64usize;
 
+/// The MTU that Reticulum adheres to by default. Changing this breaks
+/// compatibility with all other RNS networks (see Python `RNS.Reticulum.MTU`).
+pub const PROTOCOL_MTU: usize = 500;
+
+/// Minimum on-wire header size: flags, hops and a truncated destination hash
+/// (Python `RNS.Reticulum.HEADER_MINSIZE` = 2+1+16).
+pub const HEADER_MINSIZE: usize = 2 + 1 + (TRUNCATED_HASHLENGTH_BYTES);
+/// Maximum on-wire header size: flags, hops, transport id and destination
+/// hash (Python `RNS.Reticulum.HEADER_MAXSIZE` = 2+1+16*2 = 35).
+pub const HEADER_MAXSIZE: usize = 2 + 1 + (TRUNCATED_HASHLENGTH_BYTES * 2);
+/// Minimum size reserved for an interface access code.
+pub const IFAC_MIN_SIZE: usize = 1;
+/// Fernet token overhead (IV + HMAC, no version/timestamp fields).
+pub const TOKEN_OVERHEAD: usize = 48;
+/// AES block size in bytes.
+pub const AES128_BLOCKSIZE: usize = 16;
+
+/// Maximum payload of an unencrypted packet (`RNS.Packet.MDU`).
+pub const PACKET_PROTOCOL_MDU: usize = PROTOCOL_MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE;
+/// Maximum plaintext payload of a link-encrypted packet (`RNS.Link.MDU`).
+pub const LINK_MDU: usize =
+    (PROTOCOL_MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES128_BLOCKSIZE
+        * AES128_BLOCKSIZE
+        - 1;
+
+/// Number of bytes in a truncated hash (an address or link id).
+pub const TRUNCATED_HASHLENGTH_BYTES: usize = 16;
+/// Full hash length in bytes.
+pub const HASHLENGTH_BYTES: usize = 32;
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum IfacFlag {
     Open = 0b0,
@@ -195,6 +225,22 @@ impl Header {
             packet_type: PacketType::from(meta /*>> 0*/),
             hops: 0,
         }
+    }
+
+    /// The high bit of the first header byte is multiplexed by Reticulum:
+    /// for announce packets it signals that the announce carries a ratchet
+    /// key (Python `Packet.context_flag`), and at the transport level it
+    /// signals the presence of an interface access code (IFAC).
+    pub fn context_flag(&self) -> bool {
+        self.ifac_flag == IfacFlag::Authenticated
+    }
+
+    pub fn set_context_flag(&mut self, flag: bool) {
+        self.ifac_flag = if flag {
+            IfacFlag::Authenticated
+        } else {
+            IfacFlag::Open
+        };
     }
 }
 

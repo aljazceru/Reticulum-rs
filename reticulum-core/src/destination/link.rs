@@ -154,9 +154,33 @@ pub struct Link {
     request_time: Duration,
     rtt: Duration,
     proves_messages: bool,
+    /// Maximum transfer unit negotiated (or defaulted) for this link.
+    mtu: usize,
+    /// Bytes spent on link establishment (request + proof), used for rate estimation.
+    establishment_cost: usize,
+    /// Current expected in-flight rate estimate in bytes per second.
+    expected_rate: Option<f64>,
+    /// Window size remembered from the last completed incoming resource.
+    last_resource_window: Option<usize>,
+    /// EIFR remembered from the last completed incoming resource.
+    last_resource_eifr: Option<f64>,
 }
 
+/// Enabled link cipher mode (Python only enables `MODE_AES256_CBC` today).
+pub const LINK_MODE_AES256_CBC: u8 = 0x01;
+
 impl Link {
+    /// Three bytes of MTU/mode signalling appended to link requests and
+    /// link request proofs: `(mtu & 0x1FFFFF) + ((mode << 5 & 0xE0) << 16)`
+    /// packed as the low three bytes of a big-endian u32
+    /// (Python `Link.signalling_bytes`).
+    pub fn signalling_bytes(mtu: usize) -> [u8; LINK_MTU_SIZE] {
+        let mode = LINK_MODE_AES256_CBC;
+        let value = (mtu & 0x1F_FFFF) + ((((mode << 5) & 0xE0) as usize) << 16);
+        let packed = (value as u32).to_be_bytes();
+        [packed[1], packed[2], packed[3]]
+    }
+
     pub fn new(destination: DestinationDesc) -> Self {
         Self {
             id: AddressHash::new_empty(),
@@ -169,6 +193,11 @@ impl Link {
             request_time: now(),
             rtt: Duration::from_secs(0),
             proves_messages: false,
+            mtu: crate::packet::PROTOCOL_MTU,
+            establishment_cost: 0,
+            expected_rate: None,
+            last_resource_window: None,
+            last_resource_eifr: None,
         }
     }
 
@@ -193,6 +222,17 @@ impl Link {
         let link_id = LinkId::from(packet);
         log::debug!("link: create from request {}", link_id);
 
+        // A link request may carry 3 bytes of MTU/mode signalling appended
+        // after the ephemeral keys (Python `Link.mtu_from_lr_packet`).
+        let mtu = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
+            let sig = &packet.data.as_slice()[PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
+            let value = ((sig[0] as usize) << 16) | ((sig[1] as usize) << 8) | (sig[2] as usize);
+            let mtu = value & 0x1F_FFFF;
+            if mtu == 0 { crate::packet::PROTOCOL_MTU } else { mtu }
+        } else {
+            crate::packet::PROTOCOL_MTU
+        };
+
         let mut link = Self {
             id: link_id,
             destination,
@@ -204,6 +244,11 @@ impl Link {
             request_time: now(),
             rtt: Duration::from_secs(0),
             proves_messages: false,
+            mtu,
+            establishment_cost: 0,
+            expected_rate: None,
+            last_resource_window: None,
+            last_resource_eifr: None,
         };
 
         link.handshake(peer_identity);
@@ -216,6 +261,8 @@ impl Link {
 
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
         packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        // MTU/mode signalling, mirroring `Link.signalling_bytes(mtu, mode)`.
+        let _ = packet_data.safe_write(&Self::signalling_bytes(self.mtu));
 
         let packet = Packet {
             header: Header {
@@ -337,6 +384,154 @@ impl Link {
             context: PacketContext::KeepAlive,
             data: packet_data,
         }
+    }
+
+    /// Create a link-encrypted data packet with a custom context, matching
+    /// Python `RNS.Packet(link, data, context=...)` for payloads that are
+    /// encrypted with the link token (resource advertisements, requests,
+    /// hashmap updates and cancel messages).
+    pub fn context_packet(&self, data: &[u8], context: PacketContext) -> Result<Packet, RnsError> {
+        match self.status {
+            LinkStatus::Pending | LinkStatus::Handshake => {
+                log::warn!("link: can't create data packet for pending link");
+                return Err(RnsError::LinkNotReady)
+            }
+            LinkStatus::Closed => {
+                log::warn!("link: can't create data packet for closed link");
+                return Err(RnsError::LinkClosed)
+            }
+            LinkStatus::Active | LinkStatus::Stale => {}
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+
+        let cipher_text_len = {
+            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            cipher_text.len()
+        };
+
+        packet_data.resize(cipher_text_len);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context,
+            data: packet_data,
+        })
+    }
+
+    /// Create an unencrypted link-addressed packet. Resource part packets
+    /// carry pre-encrypted chunks of the whole-resource token and resource
+    /// proofs are never encrypted (Python `Packet.pack` rules).
+    pub fn raw_packet(
+        &self,
+        data: &[u8],
+        packet_type: PacketType,
+        context: PacketContext,
+    ) -> Result<Packet, RnsError> {
+        match self.status {
+            LinkStatus::Pending | LinkStatus::Handshake => {
+                log::warn!("link: can't create data packet for pending link");
+                return Err(RnsError::LinkNotReady)
+            }
+            LinkStatus::Closed => {
+                log::warn!("link: can't create data packet for closed link");
+                return Err(RnsError::LinkClosed)
+            }
+            LinkStatus::Active | LinkStatus::Stale => {}
+        }
+
+        let mut packet_data = PacketDataBuffer::new();
+        let _ = packet_data.safe_write(data);
+
+        Ok(Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: self.id,
+            transport: None,
+            context,
+            data: packet_data,
+        })
+    }
+
+    /// Encrypt an arbitrary-length plaintext with the link token. Used by
+    /// the resource engine which encrypts the whole resource stream once
+    /// (Python `link.encrypt`). The Fernet token grows the data by
+    /// `TOKEN_OVERHEAD` bytes plus block padding.
+    pub fn encrypt_alloc(&self, text: &[u8], out_buf: &mut Vec<u8>) -> Result<usize, RnsError> {
+        let start = out_buf.len();
+        out_buf.resize(
+            start + text.len() + crate::packet::TOKEN_OVERHEAD + 64,
+            0,
+        );
+        let chunk = self.encrypt(text, &mut out_buf[start..])?;
+        let written = chunk.len();
+        out_buf.truncate(start + written);
+        Ok(out_buf.len())
+    }
+
+    pub fn mtu(&self) -> usize {
+        self.mtu
+    }
+
+    /// Set the negotiated link MTU (bounded by the protocol MTU floor rules).
+    pub fn set_mtu(&mut self, mtu: usize) {
+        self.mtu = mtu.max(crate::packet::HEADER_MAXSIZE + crate::packet::IFAC_MIN_SIZE + 1);
+    }
+
+    /// Maximum link-encrypted plaintext size (`RNS.Link.MDU`).
+    pub fn mdu(&self) -> usize {
+        let mdu = self.mtu - crate::packet::IFAC_MIN_SIZE - crate::packet::HEADER_MINSIZE
+            - crate::packet::TOKEN_OVERHEAD;
+        mdu / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE - 1
+    }
+
+    /// Maximum size of an unencrypted resource part chunk
+    /// (`link.mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE`, Python `Resource.sdu`).
+    pub fn sdu(&self) -> usize {
+        self.mtu - crate::packet::HEADER_MAXSIZE - crate::packet::IFAC_MIN_SIZE
+    }
+
+    pub fn establishment_cost(&self) -> usize {
+        self.establishment_cost
+    }
+
+    pub fn add_establishment_cost(&mut self, cost: usize) {
+        self.establishment_cost += cost;
+    }
+
+    pub fn expected_rate(&self) -> Option<f64> {
+        self.expected_rate
+    }
+
+    pub fn set_expected_rate(&mut self, rate: Option<f64>) {
+        self.expected_rate = rate;
+    }
+
+    pub fn last_resource_window(&self) -> Option<usize> {
+        self.last_resource_window
+    }
+
+    pub fn set_last_resource_window(&mut self, window: Option<usize>) {
+        self.last_resource_window = window;
+    }
+
+    pub fn last_resource_eifr(&self) -> Option<f64> {
+        self.last_resource_eifr
+    }
+
+    pub fn set_last_resource_eifr(&mut self, eifr: Option<f64>) {
+        self.last_resource_eifr = eifr;
     }
 
     pub fn message_proof(&self, hash: Hash) -> Packet {
@@ -684,12 +879,14 @@ impl <E: LinkEventSink> LinkExt<E> for Link {
         packet_data.safe_write(self.id.as_slice());
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
         packet_data.safe_write(self.priv_identity.as_identity().verifying_key.as_bytes());
+        let _ = packet_data.safe_write(&Self::signalling_bytes(self.mtu));
 
         let signature = self.priv_identity.sign(packet_data.as_slice());
 
         packet_data.reset();
         packet_data.safe_write(&signature.to_bytes()[..]);
         packet_data.safe_write(self.priv_identity.as_identity().public_key.as_bytes());
+        let _ = packet_data.safe_write(&Self::signalling_bytes(self.mtu));
 
         Packet {
             header: Header {

@@ -141,4 +141,5 @@ pub use reticulum_core::*;
 
 pub mod channel;
 pub mod iface;
+pub mod resource;
 pub mod transport;
