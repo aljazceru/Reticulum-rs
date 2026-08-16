@@ -18,13 +18,14 @@ use crate::resource::{
     ResourceEvent, ResourceOptions,
 };
 use crate::destination::{DestinationAnnounce, DestinationDesc, DestinationHandleStatus,
-    DestinationName, SingleInputDestination, SingleOutputDestination};
+    DestinationName, PlainInputDestination, SingleInputDestination, SingleOutputDestination};
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 use crate::identity::PrivateIdentity;
 use crate::iface::{InterfaceManager, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType};
 use crate::packet::{
-    DestinationType, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
+    DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
+    PACKET_MDU,
 };
 
 mod announce_limits;
@@ -162,6 +163,7 @@ pub(crate) struct TransportHandler {
     link_table: LinkTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
+    plain_in_destinations: HashMap<AddressHash, Arc<Mutex<PlainInputDestination>>>,
 
     announce_limits: AnnounceLimits,
 
@@ -293,6 +295,7 @@ impl Transport {
             path_table: PathTable::new(reroute_eager),
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
+            plain_in_destinations: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
@@ -775,6 +778,58 @@ impl Transport {
                 _ => return None,
             }
         }
+    }
+
+    /// Register a PLAIN (unencrypted broadcast) input destination
+    /// (Python `RNS.Destination(None, IN, PLAIN, app, *aspects)`).
+    pub async fn add_plain_destination(
+        &mut self,
+        name: DestinationName,
+    ) -> Arc<Mutex<PlainInputDestination>> {
+        let destination = PlainInputDestination::new(reticulum_core::identity::EmptyIdentity, name);
+        let address_hash = destination.desc.address_hash;
+
+        log::debug!("tp({}): add plain destination {}", self.name, address_hash);
+
+        let destination = Arc::new(Mutex::new(destination));
+
+        self.handler
+            .lock()
+            .await
+            .plain_in_destinations
+            .insert(address_hash, destination.clone());
+
+        destination
+    }
+
+    /// Send an unencrypted packet to a PLAIN destination
+    /// (Python `RNS.Packet(plain_destination, data).send()`).
+    pub async fn send_to_plain_destination(&self, name: DestinationName, data: &[u8]) -> Result<AddressHash, RnsError> {
+        let destination = PlainInputDestination::new(
+            reticulum_core::identity::EmptyIdentity,
+            name,
+        );
+        let address = destination.desc.address_hash;
+
+        let mut packet_data = PacketDataBuffer::new();
+        let _ = packet_data.safe_write(data);
+
+        let packet = Packet {
+            header: Header {
+                header_type: HeaderType::Type1,
+                destination_type: DestinationType::Plain,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: address,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        };
+
+        self.send_packet(packet).await;
+        Ok(address)
     }
 
     pub async fn get_in_destination(
@@ -1354,6 +1409,19 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                 );
             }
         }
+    }
+
+    if packet.header.destination_type == DestinationType::Plain {
+        if let Some(_destination) = handler.plain_in_destinations.get(&packet.destination) {
+            data_handled = true;
+
+            handler.received_data_tx.send(ReceivedData {
+                destination: packet.destination,
+                data: packet.data,
+            }).ok();
+        }
+        // Plain packets are never routed elsewhere: everyone on a shared
+        // interface receives them directly.
     }
 
     if packet.header.destination_type == DestinationType::Single {
