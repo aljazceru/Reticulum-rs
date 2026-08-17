@@ -186,7 +186,13 @@ impl From<u8> for PacketContext {
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub struct Header {
+    /// Transport-level flag signalling an interface access code (IFAC).
+    /// Python sets this bit on the wire in `Transport.transmit` with
+    /// `raw[0] | 0x80`; `Packet.get_packed_flags` never sets it.
     pub ifac_flag: IfacFlag,
+    /// Packet context flag (Python `Packet.context_flag`, header bit 5).
+    /// Set on announces that carry a ratchet key.
+    pub context_flag: bool,
     pub header_type: HeaderType,
     pub propagation_type: PropagationType,
     pub destination_type: DestinationType,
@@ -198,6 +204,7 @@ impl Default for Header {
     fn default() -> Self {
         Self {
             ifac_flag: IfacFlag::Open,
+            context_flag: false,
             header_type: HeaderType::Type1,
             propagation_type: PropagationType::Broadcast,
             destination_type: DestinationType::Single,
@@ -208,9 +215,14 @@ impl Default for Header {
 }
 
 impl Header {
+    /// Packed header flags byte, byte-compatible with Python
+    /// `Packet.get_packed_flags`:
+    /// `(header_type << 6) | (context_flag << 5) | (transport_type << 4)
+    /// | (destination_type << 2) | packet_type`.
     pub fn to_meta(&self) -> u8 {
         (self.ifac_flag as u8) << 7
             | (self.header_type as u8) << 6
+            | ((self.context_flag as u8) << 5)
             | (self.propagation_type as u8) << 4
             | (self.destination_type as u8) << 2
             | (self.packet_type as u8) //<< 0
@@ -219,6 +231,7 @@ impl Header {
     pub fn from_meta(meta: u8) -> Self {
         Self {
             ifac_flag: IfacFlag::from(meta >> 7),
+            context_flag: (meta & 0b0010_0000) != 0,
             header_type: HeaderType::from(meta >> 6),
             propagation_type: PropagationType::from(meta >> 4),
             destination_type: DestinationType::from(meta >> 2),
@@ -226,31 +239,16 @@ impl Header {
             hops: 0,
         }
     }
-
-    /// The high bit of the first header byte is multiplexed by Reticulum:
-    /// for announce packets it signals that the announce carries a ratchet
-    /// key (Python `Packet.context_flag`), and at the transport level it
-    /// signals the presence of an interface access code (IFAC).
-    pub fn context_flag(&self) -> bool {
-        self.ifac_flag == IfacFlag::Authenticated
-    }
-
-    pub fn set_context_flag(&mut self, flag: bool) {
-        self.ifac_flag = if flag {
-            IfacFlag::Authenticated
-        } else {
-            IfacFlag::Open
-        };
-    }
 }
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{:b}{:b}{:0>2b}{:0>2b}{:0>2b}.{}",
+            "{:b}{:b}{:b}{:0>2b}{:0>2b}{:0>2b}.{}",
             self.ifac_flag as u8,
             self.header_type as u8,
+            self.context_flag as u8,
             self.propagation_type as u8,
             self.destination_type as u8,
             self.packet_type as u8,

@@ -134,6 +134,7 @@ impl PathRequests {
         Packet {
             header: Header {
                 ifac_flag: IfacFlag::Open,
+                context_flag: false,
                 header_type: HeaderType::Type1,
                 propagation_type: PropagationType::Broadcast,
                 destination_type: DestinationType::Plain,

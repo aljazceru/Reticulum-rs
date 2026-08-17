@@ -563,8 +563,13 @@ impl Link {
     }
 
     pub fn decrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
-        self.priv_identity
-            .decrypt(OsRng, text, &self.derived_key, out_buf)
+        <PrivateIdentity as DecryptIdentity>::decrypt(
+            &self.priv_identity,
+            OsRng,
+            text,
+            &self.derived_key,
+            out_buf,
+        )
     }
 
     pub fn destination(&self) -> &DestinationDesc {

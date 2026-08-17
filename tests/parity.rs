@@ -115,7 +115,7 @@ fn identity_sign_validate() {
 fn valid_announce() {
     let identity =
         PrivateIdentity::new_from_hex_string(FIXED_KEYS[3].0).expect("valid key");
-    let destination =
+    let mut destination =
         SingleInputDestination::new(identity, DestinationName::new("test", "announce"));
 
     let announce = destination
@@ -132,7 +132,7 @@ fn valid_announce() {
 fn invalid_announce() {
     let identity =
         PrivateIdentity::new_from_hex_string(FIXED_KEYS[4].0).expect("valid key");
-    let destination =
+    let mut destination =
         SingleInputDestination::new(identity, DestinationName::new("test", "announce"));
 
     let mut announce = destination

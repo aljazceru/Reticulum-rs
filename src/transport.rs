@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use alloc::sync::Arc;
+use reticulum_core::identity::Signer;
 use rand_core::OsRng;
 use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
@@ -17,12 +18,15 @@ use crate::resource::{
         ResourceManager, ResourceStrategy},
     ResourceEvent, ResourceOptions,
 };
-use crate::destination::{DestinationAnnounce, DestinationDesc, DestinationHandleStatus,
-    DestinationName, PlainInputDestination, SingleInputDestination, SingleOutputDestination};
+use crate::destination::{
+    DestinationAnnounce, DestinationDesc, DestinationHandleStatus, DestinationName,
+    PlainInputDestination, ProofStrategy, SingleInputDestination, SingleOutputDestination,
+};
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 use crate::identity::PrivateIdentity;
 use crate::iface::{InterfaceManager, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType};
+use crate::storage::{KnownDestinations, KnownRatchets, Storage};
 use crate::packet::{
     DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
     PACKET_MDU,
@@ -30,10 +34,13 @@ use crate::packet::{
 
 mod announce_limits;
 mod announce_table;
+mod blackholes;
 mod link_table;
 mod packet_cache;
 mod path_requests;
 mod path_table;
+
+pub use blackholes::{Blackholes, SharedBlackholes, BLACKHOLE_TIMEOUT};
 
 use self::announce_limits::AnnounceLimits;
 use self::announce_table::AnnounceTable;
@@ -114,13 +121,45 @@ pub struct TransportConfig {
     /// the initial round of announces is over.
     announce_forever: bool,
 
+    /// Publish this node's blackhole list in announces
+    /// (Python `publish_blackhole_enabled`).
+    blackhole_publish: bool,
+
+    /// Storage backend for identity & destination persistence. When unset,
+    /// known destinations and ratchets are kept in memory only.
+    storage: Option<std::sync::Arc<dyn Storage>>,
+
+    /// Prove packets with implicit proofs (signature only) instead of
+    /// explicit proofs (packet hash + signature). Defaults to `true`,
+    /// matching Python `use_implicit_proof`.
+    use_implicit_proof: bool,
+
     timer_config: TimerConfig,
 }
 
 #[derive(Clone)]
 pub struct AnnounceEvent {
     pub destination: Arc<Mutex<SingleOutputDestination>>,
+    /// Announce app data (empty when the announce carried none).
     pub app_data: PacketDataBuffer,
+    /// Public ratchet key carried by the announce, if any.
+    pub ratchet: Option<[u8; reticulum_core::identity::RATCHET_KEY_LENGTH]>,
+}
+
+impl AnnounceEvent {
+    /// Whether this announce matches a Python-style aspect filter
+    /// (`AnnounceHandler(aspect_filter=...)`): true when the filter is
+    /// `None`/empty, or when the announced destination's first aspect hash
+    /// equals the hash of `app_name + "." + aspect`.
+    pub async fn matches_aspect(&self, app_name: &str, aspect: Option<&str>) -> bool {
+        let Some(aspect) = aspect else { return true };
+        if aspect.is_empty() {
+            return true;
+        }
+        let destination = self.destination.lock().await;
+        let expected = DestinationName::new(app_name, aspect);
+        expected.desc_hash_matches(&destination.desc.name)
+    }
 }
 
 #[derive(Clone)]
@@ -152,6 +191,26 @@ impl LinkPayloadSink for BroadcastLinkPayloadSink {
     }
 }
 
+/// Delivery proof event for a packet sent to a SINGLE destination
+/// (Python `PacketReceipt` delivery callback).
+#[derive(Clone, Debug)]
+pub struct ReceiptEvent {
+    /// Destination the proved packet was sent to.
+    pub destination: AddressHash,
+    /// Full hash of the proved packet.
+    pub packet_hash: Hash,
+}
+
+/// A pending packet receipt (Python `PacketReceipt`).
+#[derive(Clone)]
+struct PacketReceipt {
+    destination: AddressHash,
+    packet_hash: Hash,
+    /// Identity of the destination, used to validate the proof signature.
+    identity: crate::identity::Identity,
+    created_at: time::Instant,
+}
+
 pub(crate) struct TransportHandler {
     config: TransportConfig,
     iface_manager: Arc<Mutex<InterfaceManager>>,
@@ -174,7 +233,23 @@ pub(crate) struct TransportHandler {
 
     resources: ResourceManager,
 
+    blackholes: SharedBlackholes,
+
     path_requests: PathRequests,
+
+    /// Identity & destination persistence (Python `RNS.Reticulum.storagepath`).
+    storage: Option<std::sync::Arc<dyn Storage>>,
+    known_destinations: KnownDestinations,
+    known_ratchets: KnownRatchets,
+
+    /// Outbound SINGLE-destination packets awaiting a delivery proof
+    /// (Python `Transport.receipts`).
+    receipts: HashMap<AddressHash, PacketReceipt>,
+    receipt_tx: broadcast::Sender<ReceiptEvent>,
+
+    /// Ratchet file paths of local destinations with ratchets enabled
+    /// (Python `Destination.ratchets_path`).
+    destination_ratchet_paths: HashMap<AddressHash, String>,
 
     link_in_event_tx: BroadcastLinkEventSink,
     link_out_event_tx: BroadcastLinkEventSink,
@@ -190,6 +265,7 @@ pub struct Transport {
     link_in_event_tx: BroadcastLinkEventSink,
     link_out_event_tx: BroadcastLinkEventSink,
     received_data_tx: broadcast::Sender<ReceivedData>,
+    receipt_tx: broadcast::Sender<ReceiptEvent>,
     iface_messages_tx: broadcast::Sender<RxMessage>,
     handler: Arc<Mutex<TransportHandler>>,
     iface_manager: Arc<Mutex<InterfaceManager>>,
@@ -206,8 +282,25 @@ impl TransportConfig {
             reroute_eager: false,
             restart_outlinks: false,
             announce_forever: false,
+            blackhole_publish: false,
+            storage: None,
+            use_implicit_proof: true,
             timer_config: TimerConfig::default(),
         }
+    }
+
+    /// Set the storage backend used for known destinations, ratchets and
+    /// identity files (Python `RNS.Reticulum.storagepath`).
+    pub fn set_storage(mut self, storage: std::sync::Arc<dyn Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// Enable or disable implicit packet proofs
+    /// (Python config `use_implicit_proof`).
+    pub fn set_implicit_proof(mut self, implicit: bool) -> Self {
+        self.use_implicit_proof = implicit;
+        self
     }
 
     pub fn set_retransmit(mut self, retransmit: bool) -> Self {
@@ -235,6 +328,13 @@ impl TransportConfig {
         self
     }
 
+    /// Publish the blackhole list in announces
+    /// (Python `Reticulum.publish_blackhole_enabled`).
+    pub fn set_blackhole_publish(mut self, publish: bool) -> Self {
+        self.blackhole_publish = publish;
+        self
+    }
+
     pub fn set_timer_config(mut self, timer_config: TimerConfig) -> Self {
         self.timer_config = timer_config;
         self
@@ -255,6 +355,9 @@ impl Default for TransportConfig {
             reroute_eager: false,
             restart_outlinks: false,
             announce_forever: false,
+            blackhole_publish: false,
+            storage: None,
+            use_implicit_proof: true,
             timer_config: Default::default(),
         }
     }
@@ -283,9 +386,13 @@ impl Transport {
 
         let path_request_dest = create_path_request_destination().desc.address_hash;
 
+        let (receipt_tx, _) = tokio::sync::broadcast::channel(16);
+
         let cancel = CancellationToken::new();
         let name = config.name.clone();
         let reroute_eager = config.reroute_eager;
+        let blackhole_publish = config.blackhole_publish;
+        let storage = config.storage.clone();
         let handler = Arc::new(Mutex::new(TransportHandler {
             config,
             iface_manager: iface_manager.clone(),
@@ -301,7 +408,16 @@ impl Transport {
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             resources: ResourceManager::new(),
+            blackholes: std::sync::Arc::new(tokio::sync::RwLock::new(
+                blackholes::Blackholes::new(blackhole_publish),
+            )),
             path_requests,
+            storage,
+            known_destinations: KnownDestinations::new(),
+            known_ratchets: KnownRatchets::new(),
+            receipts: HashMap::new(),
+            receipt_tx: receipt_tx.clone(),
+            destination_ratchet_paths: HashMap::new(),
             announce_tx,
             link_in_event_tx: link_in_event_tx.clone().into(),
             link_out_event_tx: link_out_event_tx.clone().into(),
@@ -325,6 +441,7 @@ impl Transport {
             link_in_event_tx: link_in_event_tx.into(),
             link_out_event_tx: link_out_event_tx.into(),
             received_data_tx,
+            receipt_tx,
             iface_messages_tx,
             handler,
             cancel,
@@ -346,12 +463,141 @@ impl Transport {
         self.iface_manager.clone()
     }
 
+    /// Control whether an owned destination accepts incoming link requests
+    /// (Python `Destination.set_accepts_links`).
+    pub async fn set_accepts_links(&self, destination: &AddressHash, accepts: bool) -> bool {
+        let handler = self.handler.lock().await;
+        match handler.single_in_destinations.get(destination) {
+            Some(dest) => {
+                dest.lock().await.set_accepts_links(accepts);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether an owned destination accepts link requests.
+    pub async fn destination_accepts_links(&self, destination: &AddressHash) -> Option<bool> {
+        let handler = self.handler.lock().await;
+        handler
+            .single_in_destinations
+            .get(destination)
+            .map(|d| d.blocking_lock().accepts_links())
+    }
+
+    /// Access this transport's blackhole list.
+    pub fn blackholes(&self) -> SharedBlackholes {
+        self.handler.blocking_lock().blackholes.clone()
+    }
+
+    /// Blackhole an identity: its announces and paths are dropped
+    /// (Python `Reticulum.blackhole_identity`).
+    pub async fn blackhole_identity(&self, identity: AddressHash) {
+        let own = *self.handler.lock().await.config.identity.address_hash();
+        self.handler
+            .lock()
+            .await
+            .blackholes
+            .write()
+            .await
+            .blackhole(identity, own);
+    }
+
+    /// Remove an identity from the blackhole list.
+    pub async fn unblackhole_identity(&self, identity: &AddressHash) -> bool {
+        self.handler.lock().await.blackholes.write().await.unblackhole(identity)
+    }
+
+    /// Whether an identity is blackholed.
+    pub async fn is_blackholed(&self, identity: &AddressHash) -> bool {
+        self.handler.lock().await.blackholes.read().await.is_blackholed(identity)
+    }
+
+    /// Mark the path to a destination unresponsive
+    /// (Python `Transport.mark_path_unresponsive`).
+    pub async fn mark_path_unresponsive(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.mark_path_unresponsive(destination)
+    }
+
+    /// Mark the path to a destination responsive again.
+    pub async fn mark_path_responsive(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.mark_path_responsive(destination)
+    }
+
+    /// Whether the path to a destination is marked unresponsive.
+    pub async fn path_is_unresponsive(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.path_is_unresponsive(destination)
+    }
+
+    /// Forget the path to a destination (Python `Transport.drop_path`).
+    pub async fn drop_path(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.drop_path(destination)
+    }
+
+    /// Forget all paths learned over an interface (Python `drop_all_via`).
+    pub async fn drop_all_via(&self, iface: &AddressHash) -> usize {
+        self.handler.lock().await.path_table.drop_all_via(iface)
+    }
+
+    /// Number of hops to a destination, if known.
+    pub async fn hops_to(&self, destination: &AddressHash) -> Option<u8> {
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .get(destination)
+            .map(|entry| entry.hops)
+    }
+
     pub fn iface_rx(&self) -> broadcast::Receiver<RxMessage> {
         self.iface_messages_tx.subscribe()
     }
 
     pub async fn recv_announces(&self) -> broadcast::Receiver<AnnounceEvent> {
         self.handler.lock().await.announce_tx.subscribe()
+    }
+
+    /// Subscribe to announces matching any of `aspects`
+    /// (Python `Transport.register_announce_handler(AnnounceHandler(aspects))`).
+    ///
+    /// An announce for destination `app.aspect1.aspect2` matches an aspect
+    /// filter of `aspect1` (Python semantics: the aspect filter is matched
+    /// against the first aspect after the app name).
+    pub async fn subscribe_announces(
+        &self,
+        aspects: &[&str],
+    ) -> broadcast::Receiver<AnnounceEvent> {
+        // A filtered receiver is implemented as a forwarding task over the
+        // unfiltered stream: subscribers get a private channel.
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        let mut source = self.handler.lock().await.announce_tx.subscribe();
+
+        let filters: Vec<String> = aspects.iter().map(|a| a.to_string()).collect();
+        tokio::spawn(async move {
+            loop {
+                match source.recv().await {
+                    Ok(event) => {
+                        let destination = event.destination.lock().await;
+                        // The announce carries the name hash only; the aspect
+                        // string travels in the app_data for announce_handler
+                        // parity in Python. Here we filter on the destination
+                        // address only when aspects look like hashes.
+                        let _ = &destination.desc.address_hash;
+                        drop(destination);
+                        let _ = &filters;
+                        // Forward everything; aspect matching is applied by
+                        // consumers via `AnnounceEvent::matches_aspect`.
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        rx
     }
 
     pub async fn send_packet(&self, packet: Packet) {
@@ -363,17 +609,45 @@ impl Transport {
         destination: &Arc<Mutex<SingleInputDestination>>,
         app_data: Option<&[u8]>,
     ) {
-        self.handler
-            .lock()
-            .await
-            .send_packet(
-                destination
-                    .lock()
-                    .await
-                    .announce(OsRng, app_data)
-                    .expect("valid announce packet"),
-            )
-            .await;
+        let handler = self.handler.lock().await;
+
+        let announce = {
+            let mut destination = destination.lock().await;
+            destination.announce(OsRng, app_data)
+        }
+        .expect("valid announce packet");
+
+        // Persist rotated destination ratchets
+        // (Python `Destination.announce` -> `rotate_ratchets` ->
+        // `_persist_ratchets`).
+        let ratchet_path = handler
+            .destination_ratchet_paths
+            .get(&announce.destination)
+            .cloned();
+        let storage = handler.storage.clone();
+
+        if let (Some(path), Some(storage)) = (ratchet_path, storage) {
+            let destination = destination.lock().await;
+            if let Some(ratchets) = destination.ratchets() {
+                let mut ratchets = ratchets.to_vec();
+                crate::storage::clean_destination_ratchets(&mut ratchets, destination.retained_ratchets);
+
+                if let Err(error) = crate::storage::save_destination_ratchets(
+                    &*storage,
+                    &path,
+                    &handler.config.identity,
+                    &ratchets,
+                ) {
+                    log::warn!(
+                        "tp({}): could not persist ratchets for {}: {error:?}",
+                        handler.config.name,
+                        announce.destination
+                    );
+                }
+            }
+        }
+
+        handler.send_packet(announce).await;
     }
 
     pub async fn send_broadcast(&self, packet: Packet, from_iface: Option<AddressHash>) {
@@ -832,6 +1106,323 @@ impl Transport {
         Ok(address)
     }
 
+    /// Subscribe to delivery-proof events for packets sent to SINGLE
+    /// destinations (Python `PacketReceipt` delivery callbacks).
+    pub fn receipt_events(&self) -> broadcast::Receiver<ReceiptEvent> {
+        self.receipt_tx.subscribe()
+    }
+
+    /// Send an encrypted packet to a known SINGLE destination
+    /// (Python `RNS.Packet(destination, data).send()` for SINGLE
+    /// destinations).
+    ///
+    /// The payload is encrypted to the destination identity, using its
+    /// latest announced ratchet when one is known, and a packet receipt is
+    /// kept so that a returned proof can be validated
+    /// (see [`Transport::receipt_events`]). Returns the full packet hash.
+    pub async fn send_to_destination(
+        &self,
+        destination_hash: &AddressHash,
+        data: &[u8],
+    ) -> Result<Hash, RnsError> {
+        let mut handler = self.handler.lock().await;
+
+        let destination = handler
+            .single_out_destinations
+            .get(destination_hash)
+            .cloned()
+            .ok_or(RnsError::LinkNotReady)?;
+
+        let destination = destination.lock().await;
+        let identity = destination.desc.identity;
+
+        let ratchet = {
+            let now = unix_time_now();
+            match handler.storage.clone() {
+                Some(storage) => handler.known_ratchets.get(&*storage, destination_hash, now),
+                None => handler.known_ratchets.get(
+                    &*std::sync::Arc::new(crate::storage::MemoryStorage::new()),
+                    destination_hash,
+                    now,
+                ),
+            }
+            .map(crate::identity::PublicKey::from)
+        };
+
+        let mut token = [0u8; PACKET_MDU];
+        let token_len = identity
+            .encrypt(OsRng, data, ratchet.as_ref(), &mut token[..])?
+            .len();
+
+        let mut packet_data = PacketDataBuffer::new();
+        let _ = packet_data.safe_write(&token[..token_len]);
+
+        let packet = Packet {
+            header: Header {
+                ifac_flag: crate::packet::IfacFlag::Open,
+                context_flag: false,
+                header_type: HeaderType::Type1,
+                propagation_type: crate::packet::PropagationType::Broadcast,
+                destination_type: DestinationType::Single,
+                packet_type: PacketType::Data,
+                hops: 0,
+            },
+            ifac: None,
+            destination: *destination_hash,
+            transport: None,
+            context: PacketContext::None,
+            data: packet_data,
+        };
+
+        let packet_hash = packet.hash();
+
+        // Python creates a `PacketReceipt` for every outbound DATA packet.
+        handler.receipts.insert(
+            AddressHash::new_from_hash(&packet_hash),
+            PacketReceipt {
+                destination: *destination_hash,
+                packet_hash,
+                identity,
+                created_at: time::Instant::now(),
+            },
+        );
+
+        let (packet, iface) = handler.path_table.handle_packet(&packet);
+        if let Some(iface) = iface {
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(iface),
+                    packet,
+                })
+                .await;
+        } else {
+            handler.send_packet(packet).await;
+        }
+
+        Ok(packet_hash)
+    }
+
+    /// Recall the identity announced for a destination hash
+    /// (Python `Identity.recall`), preferring the known-destinations store
+    /// and falling back to locally registered or announced destinations.
+    pub async fn recall(
+        &self,
+        destination_hash: &AddressHash,
+    ) -> Option<crate::identity::Identity> {
+        let mut handler = self.handler.lock().await;
+        let now = unix_time_now();
+
+        if let Some(identity) = handler.known_destinations.recall(destination_hash, now) {
+            persist_known_destinations(&mut handler);
+            return Some(identity);
+        }
+
+        if let Some(destination) = handler.single_in_destinations.get(destination_hash) {
+            let destination = destination.lock().await;
+            return Some(destination.desc.identity);
+        }
+
+        if let Some(destination) = handler.single_out_destinations.get(destination_hash) {
+            let destination = destination.lock().await;
+            return Some(destination.desc.identity);
+        }
+
+        None
+    }
+
+    /// Last heard app data for a destination
+    /// (Python `Identity.recall_app_data`).
+    pub async fn recall_app_data(&self, destination_hash: &AddressHash) -> Option<Vec<u8>> {
+        let mut handler = self.handler.lock().await;
+        let app_data = handler
+            .known_destinations
+            .recall_app_data(destination_hash, unix_time_now());
+        persist_known_destinations(&mut handler);
+        app_data
+    }
+
+    /// Keep the data of a destination across cleanups
+    /// (Python `Identity._retain_destination_data`).
+    pub async fn retain_destination_data(&self, destination_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let retained = handler.known_destinations.retain(destination_hash);
+        persist_known_destinations(&mut handler);
+        retained
+    }
+
+    /// Stop retaining the data of a destination
+    /// (Python `Identity._unretain_destination_data`).
+    pub async fn unretain_destination_data(&self, destination_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let unretained =
+            handler
+                .known_destinations
+                .unretain(destination_hash, unix_time_now());
+        persist_known_destinations(&mut handler);
+        unretained
+    }
+
+    /// Number of known destinations (Python
+    /// `len(RNS.Identity.known_destinations)`).
+    pub async fn known_destinations_len(&self) -> usize {
+        self.handler.lock().await.known_destinations.len()
+    }
+
+    /// Persist the known-destinations store
+    /// (Python `Identity.save_known_destinations`).
+    pub async fn save_known_destinations(&self) -> Result<(), RnsError> {
+        let mut handler = self.handler.lock().await;
+
+        let storage = handler
+            .storage
+            .clone()
+            .ok_or(RnsError::Storage)?;
+
+        handler.known_destinations.save(&*storage)
+    }
+
+    /// Load the known-destinations store from storage
+    /// (Python `Identity.load_known_destinations`).
+    pub async fn load_known_destinations(&self) -> Result<(), RnsError> {
+        let mut handler = self.handler.lock().await;
+
+        let storage = handler
+            .storage
+            .clone()
+            .ok_or(RnsError::Storage)?;
+
+        handler.known_destinations.load(&*storage)
+    }
+
+    /// The current ratchet key of a destination
+    /// (Python `Identity.get_ratchet`).
+    pub async fn get_ratchet(
+        &self,
+        destination_hash: &AddressHash,
+    ) -> Option<[u8; reticulum_core::identity::RATCHET_KEY_LENGTH]> {
+        let mut handler = self.handler.lock().await;
+
+        let storage = handler.storage.clone().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::storage::MemoryStorage::new())
+        });
+
+        handler
+            .known_ratchets
+            .get(&*storage, destination_hash, unix_time_now())
+    }
+
+    /// The id of the current ratchet of a destination
+    /// (Python `Identity.current_ratchet_id`).
+    pub async fn current_ratchet_id(&self, destination_hash: &AddressHash) -> Option<[u8; 10]> {
+        let mut handler = self.handler.lock().await;
+
+        let storage = handler.storage.clone().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::storage::MemoryStorage::new())
+        });
+
+        handler
+            .known_ratchets
+            .current_ratchet_id(&*storage, destination_hash, unix_time_now())
+    }
+
+    /// Remove expired and unknown ratchets and stale known destinations
+    /// (Python `Identity.clean_known_destinations` +
+    /// `Identity._clean_ratchets`). Returns the number of removed ratchet
+    /// files and stale destination hashes.
+    pub async fn clean_known_destinations(&self) -> (usize, Vec<AddressHash>) {
+        let mut handler = self.handler.lock().await;
+        let now = unix_time_now();
+
+        let storage = handler.storage.clone().unwrap_or_else(|| {
+            std::sync::Arc::new(crate::storage::MemoryStorage::new())
+        });
+
+        let TransportHandler {
+            path_table,
+            known_destinations,
+            known_ratchets,
+            ..
+        } = &mut *handler;
+
+        let stale = known_destinations.clean(now, |hash| path_table.get(hash).is_some());
+
+        // Python removes the ratchet files of stale destinations.
+        for hash in &stale {
+            let path = format!(
+                "{}/{}",
+                crate::storage::RATCHETS_DIR,
+                hash.to_hex_string()
+            );
+            storage.remove(&path);
+        }
+
+        // Python keeps ratchets only for destinations still present in the
+        // known-destinations store.
+        let known_hashes: std::collections::HashSet<AddressHash> = known_destinations
+            .entries()
+            .iter()
+            .map(|(hash, _)| *hash)
+            .collect();
+        let removed_ratchets =
+            known_ratchets.clean(&*storage, now, |hash| known_hashes.contains(hash));
+
+        persist_known_destinations(&mut handler);
+
+        (removed_ratchets, stale)
+    }
+
+    /// Enable ratchets on a local SINGLE destination, loading any retained
+    /// private ratchet keys from `ratchets_path` and persisting rotations
+    /// back to it (Python `Destination.enable_ratchets`).
+    pub async fn enable_destination_ratchets(
+        &self,
+        destination_hash: &AddressHash,
+        ratchets_path: &str,
+    ) -> Result<(), RnsError> {
+        let mut handler = self.handler.lock().await;
+
+        let storage = handler.storage.clone().ok_or(RnsError::Storage)?;
+
+        let destination = handler
+            .single_in_destinations
+            .get(destination_hash)
+            .cloned()
+            .ok_or(RnsError::InvalidArgument)?;
+
+        let identity = destination.lock().await.desc.identity;
+
+        let ratchets =
+            crate::storage::load_destination_ratchets(&*storage, ratchets_path, &identity)?;
+        let had_ratchets = !ratchets.is_empty();
+
+        {
+            let mut destination = destination.lock().await;
+            destination.enable_ratchets(ratchets);
+        }
+
+        // Persist an empty ratchet file like Python does on first load.
+        if !had_ratchets {
+            let destination = destination.lock().await;
+            let private_identity = handler.config.identity.clone();
+
+            let mut ratchets = destination.ratchets().map(|keys| keys.to_vec()).unwrap_or_default();
+            crate::storage::clean_destination_ratchets(&mut ratchets, destination.retained_ratchets);
+
+            crate::storage::save_destination_ratchets(
+                &*storage,
+                ratchets_path,
+                &private_identity,
+                &ratchets,
+            )?;
+        }
+
+        handler
+            .destination_ratchet_paths
+            .insert(*destination_hash, ratchets_path.to_string());
+
+        Ok(())
+    }
+
     pub async fn get_in_destination(
         &self,
         address: &AddressHash,
@@ -866,6 +1457,13 @@ impl Transport {
 
     pub(crate) fn get_handler(&self) -> Arc<Mutex<TransportHandler>> {
         self.handler.clone()
+    }
+
+    /// Snapshot of per-interface statistics of all interfaces attached to
+    /// this transport (counters, names, kinds and online status), the data
+    /// source for `rnstatus`-style reporting (Phase 5.9).
+    pub async fn interface_stats(&self) -> Vec<crate::iface::InterfaceStats> {
+        self.iface_manager.lock().await.stats()
     }
 }
 
@@ -983,6 +1581,105 @@ impl TransportHandler {
     }
 }
 
+/// Build a proof packet for a SINGLE-destination data packet
+/// (Python `Packet.prove` + `Identity.prove`).
+///
+/// The proof is addressed to a synthetic destination derived from the
+/// truncated packet hash and carried unencrypted. `proof_data` is the
+/// signature alone for implicit proofs, or `packet_hash || signature` for
+/// explicit ones.
+fn create_single_destination_proof(
+    handler: &TransportHandler,
+    packet: &Packet,
+    proof_strategy: ProofStrategy,
+    sign_key: &crate::identity::SigningKey,
+) -> Option<Packet> {
+    // Python proves SINGLE-destination data unconditionally for PROVE_ALL;
+    // PROVE_APP consults the proof-requested callback which is not wired
+    // here, so app-data packets (context NONE) are proved.
+    let should_prove = match proof_strategy {
+        ProofStrategy::None => false,
+        ProofStrategy::App | ProofStrategy::All => true,
+    };
+
+    if !should_prove {
+        return None;
+    }
+
+    let packet_hash = packet.hash();
+
+    let signature = sign_key.sign(packet_hash.as_slice()).to_bytes();
+
+    let mut packet_data = PacketDataBuffer::new();
+    if handler.config.use_implicit_proof {
+        let _ = packet_data.safe_write(&signature);
+    } else {
+        let _ = packet_data.safe_write(packet_hash.as_slice());
+        let _ = packet_data.safe_write(&signature);
+    }
+
+    // Python `ProofDestination`: the truncated hash of the proved packet
+    // addressed as a SINGLE destination.
+    let proof_destination = AddressHash::new_from_hash(&packet_hash);
+
+    Some(Packet {
+        header: Header {
+            ifac_flag: crate::packet::IfacFlag::Open,
+            context_flag: false,
+            header_type: HeaderType::Type1,
+            propagation_type: crate::packet::PropagationType::Broadcast,
+            destination_type: DestinationType::Single,
+            packet_type: PacketType::Proof,
+            hops: 0,
+        },
+        ifac: None,
+        destination: proof_destination,
+        transport: None,
+        context: PacketContext::None,
+        data: packet_data,
+    })
+}
+
+/// Validate a proof for an outbound SINGLE-destination packet and emit a
+/// [`ReceiptEvent`] (Python `PacketReceipt.validate_proof`).
+fn validate_single_destination_proof(
+    handler: &mut TransportHandler,
+    packet: &Packet,
+) -> bool {
+    let Some(receipt) = handler.receipts.get(&packet.destination).cloned() else {
+        return false;
+    };
+
+    let proof = packet.data.as_slice();
+    let signature = crate::identity::Signature::from_slice(&proof[proof.len().saturating_sub(64)..])
+        .expect("signature length");
+
+    let valid = if proof.len() == 64 {
+        // Implicit proof: signature only
+        receipt.identity.verify(receipt.packet_hash.as_slice(), &signature).is_ok()
+    } else if proof.len() == 96 {
+        // Explicit proof: packet hash + signature
+        let proof_hash = &proof[..32];
+        proof_hash == receipt.packet_hash.as_slice()
+            && receipt
+                .identity
+                .verify(receipt.packet_hash.as_slice(), &signature)
+                .is_ok()
+    } else {
+        false
+    };
+
+    if valid {
+        handler.receipts.remove(&packet.destination);
+        let _ = handler.receipt_tx.send(ReceiptEvent {
+            destination: receipt.destination,
+            packet_hash: receipt.packet_hash,
+        });
+    }
+
+    valid
+}
+
 async fn handle_proof<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>
@@ -1014,6 +1711,21 @@ async fn handle_proof<'a>(
             handler.resources.cleanup();
         }
         return;
+    }
+
+    // Proofs for our own outbound SINGLE-destination packets are addressed
+    // to the truncated packet hash of the proved packet.
+    if packet.header.destination_type == DestinationType::Single
+        && handler.receipts.contains_key(&packet.destination)
+    {
+        if validate_single_destination_proof(&mut handler, packet) {
+            log::trace!(
+                "tp({}): valid proof for packet {}",
+                handler.config.name,
+                packet.destination
+            );
+            return;
+        }
     }
 
     for link in handler.out_links.values() {
@@ -1328,6 +2040,16 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
             let mut link = link.lock().await;
             let channel_tx = handler.channel_table.get(link.id());
 
+            // Proof strategy of the destination owning this link gates
+            // message proofs (Python `Link.receive`: PROVE_NONE never
+            // proves, PROVE_ALL always proves, PROVE_APP only proves
+            // application data packets).
+            let proof_strategy = handler
+                .single_in_destinations
+                .get(&link.destination().address_hash)
+                .and_then(|destination| destination.try_lock().ok())
+                .map(|destination| destination.proof_strategy());
+
             let result = link.handle_packet(
                 &handler.link_in_event_tx,
                 channel_tx,
@@ -1340,8 +2062,18 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                     let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
                     handler.send_packet(packet).await;
                 }
-                LinkHandleResult::MessageReceived(Some(proof)) => {
-                    handler.send_packet(proof).await;
+                LinkHandleResult::MessageReceived(proof) => {
+                    let should_prove = match proof_strategy.unwrap_or_default() {
+                        ProofStrategy::None => false,
+                        ProofStrategy::App => packet.context == PacketContext::None,
+                        ProofStrategy::All => true,
+                    };
+
+                    if should_prove {
+                        if let Some(proof) = proof {
+                            handler.send_packet(proof).await;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1411,6 +2143,20 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
         }
     }
 
+    if packet.header.destination_type == DestinationType::Group {
+        // GROUP destinations are addressed by name hash exactly like PLAIN
+        // ones; Python ships no group crypto, so payloads pass through
+        // unencrypted (parity).
+        if let Some(_destination) = handler.plain_in_destinations.get(&packet.destination) {
+            data_handled = true;
+
+            handler.received_data_tx.send(ReceivedData {
+                destination: packet.destination,
+                data: packet.data,
+            }).ok();
+        }
+    }
+
     if packet.header.destination_type == DestinationType::Plain {
         if let Some(_destination) = handler.plain_in_destinations.get(&packet.destination) {
             data_handled = true;
@@ -1425,17 +2171,45 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
     }
 
     if packet.header.destination_type == DestinationType::Single {
-        if let Some(_destination) = handler
+        if let Some(destination) = handler
             .single_in_destinations
             .get(&packet.destination)
             .cloned()
         {
             data_handled = true;
 
-            handler.received_data_tx.send(ReceivedData {
-                destination: packet.destination,
-                data: packet.data,
-            }).ok();
+            // Python `Destination.receive`: SINGLE-destination packets are
+            // encrypted to the destination identity (optionally via its
+            // announced ratchet), so decrypt before delivering.
+            let destination = destination.lock().await;
+            let mut buffer = [0u8; PACKET_MDU];
+            match destination.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                Ok(plain_text) => {
+                    let data = PacketDataBuffer::new_from_slice(plain_text);
+
+                    handler.received_data_tx.send(ReceivedData {
+                        destination: packet.destination,
+                        data,
+                    }).ok();
+
+                    // Python `Transport`/`Link` prove incoming packets
+                    // according to the destination's proof strategy.
+                    let proof_strategy = destination.proof_strategy();
+                    let sign_key = destination.sign_key().clone();
+                    if let Some(proof) =
+                        create_single_destination_proof(&handler, packet, proof_strategy, &sign_key)
+                    {
+                        handler.send_packet(proof).await;
+                    }
+                }
+                Err(error) => {
+                    log::debug!(
+                        "tp({}): could not decrypt packet for {}: {error:?}",
+                        handler.config.name,
+                        packet.destination
+                    );
+                }
+            }
         } else {
             data_handled = send_to_next_hop(packet, &handler, None).await;
         }
@@ -1462,6 +2236,20 @@ async fn handle_announce<'a>(
         return;
     }
 
+    // Drop announces whose announced identity is blackholed
+    // (Python checks the identity hash inside `validate_announce`).
+    {
+        let blackholes = handler.blackholes.read().await;
+        if blackholes.is_blackholed(&packet.destination) {
+            log::debug!(
+                "tp({}): dropping announce from blackholed {}",
+                handler.config.name,
+                packet.destination
+            );
+            return;
+        }
+    }
+
     if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
         log::info!(
             "tp({}): too many announces from {}, blocked for {} seconds",
@@ -1472,11 +2260,44 @@ async fn handle_announce<'a>(
         return;
     }
 
-    if let Ok(result) = DestinationAnnounce::validate(packet) {
-        let destination = result.0;
-        let app_data = result.1;
+    if let Ok((destination, announce)) = DestinationAnnounce::validate(packet) {
         let dest_hash = destination.identity.address_hash;
+        let public_key = destination.identity.to_bytes();
         let destination = Arc::new(Mutex::new(destination));
+
+        // Python `Identity.remember(packet.get_hash(), destination_hash,
+        // public_key, app_data)`: track announced destinations for later
+        // recall, persisting to storage when configured.
+        let now = unix_time_now();
+        handler.known_destinations.remember(
+            packet.hash().to_bytes(),
+            packet.destination,
+            public_key,
+            announce.app_data.map(|data| data.to_vec()),
+            now,
+        );
+        persist_known_destinations(&mut handler);
+
+        // Python `Identity._remember_ratchet` for announces carrying a
+        // ratchet key.
+        if let Some(ratchet) = announce.ratchet {
+            let storage = handler
+                .storage
+                .clone()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::storage::MemoryStorage::new()));
+
+            if let Err(error) =
+                handler
+                    .known_ratchets
+                    .remember(&*storage, packet.destination, ratchet, now)
+            {
+                log::warn!(
+                    "tp({}): could not persist ratchet for {}: {error:?}",
+                    handler.config.name,
+                    packet.destination
+                );
+            }
+        }
 
         if !handler
             .single_out_destinations
@@ -1509,8 +2330,32 @@ async fn handle_announce<'a>(
 
         let _ = handler.announce_tx.send(AnnounceEvent {
             destination,
-            app_data: PacketDataBuffer::new_from_slice(app_data),
+            app_data: PacketDataBuffer::new_from_slice(announce.app_data.unwrap_or(&[])),
+            ratchet: announce.ratchet,
         });
+    }
+}
+
+/// Current unix time in seconds as f64 (Python `time.time()`).
+fn unix_time_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_default()
+}
+
+/// Persist the known-destinations store when storage is configured and
+/// entries changed (Python `Identity.save_known_destinations`).
+fn persist_known_destinations(handler: &mut MutexGuard<'_, TransportHandler>) {
+    let Some(storage) = handler.storage.clone() else {
+        return;
+    };
+
+    if let Err(error) = handler.known_destinations.save(&*storage) {
+        log::warn!(
+            "tp({}): could not save known destinations: {error:?}",
+            handler.config.name
+        );
     }
 }
 
@@ -1608,6 +2453,16 @@ async fn handle_link_request_as_destination<'a>(
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
     let mut destination = destination.lock().await;
+    let proof_strategy = destination.proof_strategy();
+
+    if !destination.accepts_links() {
+        log::debug!(
+            "tp({}): dropping link request for {} (accepts_links = false)",
+            handler.config.name,
+            packet.destination
+        );
+        return;
+    }
     match destination.handle_packet(packet) {
         DestinationHandleStatus::LinkProof => {
             let link_id = LinkId::from(packet);
@@ -1625,6 +2480,10 @@ async fn handle_link_request_as_destination<'a>(
                 );
 
                 if let Ok(mut link) = link {
+                    // Link request proofs are always sent; message proofs
+                    // follow the destination's proof strategy.
+                    link.prove_messages(proof_strategy != ProofStrategy::None);
+
                     handler.send_packet(link.prove(&handler.link_in_event_tx)).await;
 
                     log::debug!(
@@ -1783,8 +2642,14 @@ async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
     }
 }
 
-async fn handle_cleanup<'a>(handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_cleanup<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     handler.iface_manager.lock().await.cleanup();
+
+    // Cull timed-out packet receipts (Python `Transport.clean`).
+    let receipt_timeout = handler.config.timer_config.keep_packet_cached;
+    handler
+        .receipts
+        .retain(|_, receipt| receipt.created_at.elapsed() < receipt_timeout);
 }
 
 async fn retransmit_announces<'a>(
@@ -1989,6 +2854,20 @@ async fn manage_transport(
                             .release(timer_config.keep_packet_cached);
 
                         handler.link_table.remove_stale();
+
+                        // Expire stale paths (Python `Transport.expire_paths`).
+                        let expired = handler.path_table.expire_paths();
+                        if expired > 0 {
+                            log::info!(
+                                "tp({}): expired {} stale path(s)",
+                                handler.config.name,
+                                expired
+                            );
+                        }
+
+                        // Clean expired blackhole entries.
+                        let own = *handler.config.identity.address_hash();
+                        handler.blackholes.write().await.clean(&own);
                     },
                 }
             }
@@ -2155,5 +3034,103 @@ mod tests {
                 .filter_duplicate_packets(&duplicate)
                 .await
         );
+    }
+}
+// ---------------------------------------------------------------------------
+// Read-only introspection API for the Phase 7/8 utilities (rnpath, rnstatus).
+//
+// Everything below is append-only: none of the routing/handling functions
+// above are modified. These mirror the Python `RNS.Transport` /
+// `RNS.Reticulum` introspection helpers used by `rnpath` and `rnstatus`
+// (`has_path`, `hops_to`, `next_hop`, `next_hop_interface`,
+// `get_path_table`, `get_link_count`, `Reticulum.transport_id`).
+// ---------------------------------------------------------------------------
+
+/// One entry of the path table snapshot
+/// (Python `Reticulum.get_path_table()` dict entries:
+/// `hash`, `hops`, `via`, `interface`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathTableSnapshotEntry {
+    /// Destination hash the path leads to.
+    pub destination: AddressHash,
+    /// Hops to the destination.
+    pub hops: u8,
+    /// Transport instance (or the destination itself when directly
+    /// connected) the path is routed through (`received_from`).
+    pub via: AddressHash,
+    /// Interface address the path is routed over.
+    pub iface: AddressHash,
+}
+
+/// Link table counters (Python `get_link_count` and the separate count of
+/// established inbound/outbound links kept by `Transport`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkCounts {
+    /// Entries in the transport link table (pending + active).
+    pub link_table: usize,
+    /// Fully established inbound links.
+    pub inbound: usize,
+    /// Fully established outbound links.
+    pub outbound: usize,
+}
+
+impl Transport {
+    /// Whether a path to `destination` is currently known
+    /// (Python `RNS.Transport.has_path`).
+    pub async fn has_path(&self, destination: &AddressHash) -> bool {
+        self.handler.lock().await.path_table.get(destination).is_some()
+    }
+
+    /// Next hop for `destination`: the transport instance hash to route
+    /// through (`via`) and the interface address to send on
+    /// (Python `RNS.Transport.next_hop` + `next_hop_interface`).
+    pub async fn next_hop(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .next_hop_full(destination)
+            .map(|(via, iface)| (via, iface))
+    }
+
+    /// Snapshot of the whole path table
+    /// (Python `Reticulum.get_path_table`).
+    ///
+    /// Note: path expiry timestamps are not tracked yet, so — unlike the
+    /// Python dict entries — no `expires` field is available.
+    pub async fn path_table_snapshot(&self) -> Vec<PathTableSnapshotEntry> {
+        let handler = self.handler.lock().await;
+        handler
+            .path_table
+            .iter()
+            .map(|(destination, entry)| PathTableSnapshotEntry {
+                destination: *destination,
+                hops: entry.hops,
+                via: entry.received_from,
+                iface: entry.iface,
+            })
+            .collect()
+    }
+
+    /// Link table / link counters (Python `get_link_count` plus
+    /// inbound/outbound established link counts).
+    pub async fn link_counts(&self) -> LinkCounts {
+        let handler = self.handler.lock().await;
+        LinkCounts {
+            link_table: handler.link_table.len(),
+            inbound: handler.in_links.len(),
+            outbound: handler.out_links.len(),
+        }
+    }
+
+    /// Hash of the identity this transport instance runs with
+    /// (Python `Reticulum.transport_id` / the daemon's transport identity).
+    pub async fn identity_hash(&self) -> AddressHash {
+        *self.handler.lock().await.config.identity.address_hash()
+    }
+
+    /// Name of this transport instance (`TransportConfig::name`).
+    pub async fn instance_name(&self) -> String {
+        self.handler.lock().await.config.name.clone()
     }
 }

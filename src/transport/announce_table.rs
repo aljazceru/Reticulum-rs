@@ -46,6 +46,9 @@ impl AnnounceEntry {
         let packet = Packet {
             header: Header {
                 ifac_flag: IfacFlag::Open,
+                // Retransmitted announces keep the original ratchet context
+                // flag (Python `context_flag = packet.context_flag`).
+                context_flag: self.packet.header.context_flag,
                 header_type: HeaderType::Type2,
                 propagation_type: PropagationType::Broadcast,
                 destination_type: DestinationType::Single,
