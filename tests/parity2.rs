@@ -9,7 +9,6 @@ use tokio::sync::Mutex;
 
 use reticulum::destination::link::{Link, LinkEvent};
 use reticulum::destination::{DestinationName, ProofStrategy};
-use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport, TransportConfig};

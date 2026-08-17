@@ -78,8 +78,8 @@ async fn buffer_round_trip() {
     }
 
     // B writes a stream to A; A writes a stream back
-    let mut stream_b = create_bidirectional_buffer(&channel_b, receiver_b, 1, 2);
-    let mut stream_a = create_bidirectional_buffer(&channel_a, receiver_a, 2, 1);
+    let stream_b = create_bidirectional_buffer(&channel_b, receiver_b, 1, 2);
+    let stream_a = create_bidirectional_buffer(&channel_a, receiver_a, 2, 1);
 
     let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
 
