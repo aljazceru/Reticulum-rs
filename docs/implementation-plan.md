@@ -1247,7 +1247,8 @@ buffer streams) are still open; see the phase descriptions above.
 | 6.4 Tunnels | ✅ `transport/tunnels.rs`: signed synthesize packets on fixed PLAIN dest `rnstransport.tunnel.synthesize` (176-byte wire format, remote transport identity signature validation), tunnel table with path association, void/restore on re-appearance (Python restore rules: unknown/expired/worse-path checks), `TUNNEL_TIMEOUT` expiry, `Transport::synthesize_tunnel`/`void_tunnel`/`tunnel_table_snapshot`, iface `tunnel_id`/`wants_tunnel` |
 | 6.5 Blackholes | ✅ `transport/blackholes.rs`, identity-hash announce filtering, pack/merge lists |
 | 7.2/7.4 Daemon config & lifecycle | ✅ config parity for new interfaces + shared-instance keys, identity persistence |
-| 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp |
+| 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp/rnprobe (`rn probe --loopback` measures proof RTTs) |
+| 9.3 Benchmarks | ✅ criterion `benches/hot_paths.rs`: announce validation, IFAC wrap/unwrap, packet serialize, announce emission timestamp, HDLC framing |
 | LXMF crate | ✅ byte-exact message format, stamps, peers, router + resource-backed delivery |
 | LXST crate | ✅ codecs, wire protocol, pipelines, calls |
 
@@ -1259,4 +1260,4 @@ buffer streams) are still open; see the phase descriptions above.
 * Blackhole discovery persistence to storage (in-memory table today)
 * 7.1 `reticulum::Reticulum` facade + 7.3 shared-instance RPC (pickle protocol) — the daemon serves
   local clients directly via `LocalServer` instead
-* 9.2 cargo-fuzz targets, 9.3 criterion benches
+* 9.2 cargo-fuzz targets

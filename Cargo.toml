@@ -67,6 +67,7 @@ tonic-build = "0.13.0"
 
 [dev-dependencies]
 serde_json = "1.0.150"
+criterion = "0.5"
 tokio = { version = "1.44.2", features = ["test-util"] }
 
 [workspace]
@@ -78,6 +79,10 @@ members = [
   "lxst",
   "reticulum-utils"
 ]
+
+[[bench]]
+name = "hot_paths"
+harness = false
 
 [[example]]
 name = "tcp_server"

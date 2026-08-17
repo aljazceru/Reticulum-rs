@@ -28,6 +28,8 @@ enum Command {
     Status(StatusArgs),
     /// Transfer files over Reticulum resources (rncp)
     Cp(CpArgs),
+    /// Probe transport instances (rnprobe)
+    Probe(ProbeArgs),
 }
 
 #[derive(Args)]
@@ -79,6 +81,33 @@ struct StatusArgs {
     /// Output in JSON format
     #[arg(short = 'j', long)]
     json: bool,
+    /// Increase verbosity
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
+#[derive(Args)]
+struct ProbeArgs {
+    /// Path to alternative Reticulum config directory
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Hexadecimal hash of the probe destination
+    destination: Option<String>,
+    /// Payload size in bytes
+    #[arg(short, long)]
+    size: Option<usize>,
+    /// Number of probes to send
+    #[arg(short, long, default_value_t = 1)]
+    probes: usize,
+    /// Timeout in seconds before giving up
+    #[arg(short = 'w', long)]
+    timeout: Option<f64>,
+    /// UDP loopback ports LISTEN:FORWARD instead of configured interfaces
+    #[arg(long)]
+    udp_loopback: Option<String>,
+    /// Run a local probe server and probe it once
+    #[arg(short, long)]
+    loopback: bool,
     /// Increase verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -182,6 +211,7 @@ async fn main() -> ExitCode {
         Command::Path(args) => exit_code(run_path(args).await),
         Command::Status(args) => exit_code(run_status(args).await),
         Command::Cp(args) => exit_code(run_cp(args).await),
+        Command::Probe(args) => exit_code(run_probe(args).await),
     }
 }
 
@@ -361,4 +391,52 @@ async fn run_cp(args: CpArgs) -> Result<(), String> {
 fn parse_udp_loopback(spec: &str) -> Option<(u16, u16)> {
     let (bind, forward) = spec.split_once(':')?;
     Some((bind.parse().ok()?, forward.parse().ok()?))
+}
+
+async fn run_probe(args: ProbeArgs) -> Result<(), String> {
+    init_logging(args.verbose);
+
+    if args.loopback {
+        let (destination, results) = reticulum_utils::rnprobe::run_loopback()
+            .await
+            .map_err(|err| format!("probe failed: {err:?}"))?;
+        print!(
+            "{}",
+            reticulum_utils::rnprobe::render_results(&destination, &results)
+        );
+        return Ok(());
+    }
+
+    let destination = args
+        .destination
+        .as_deref()
+        .map(parse_hash)
+        .transpose()
+        .map_err(|err| err.to_string())?
+        .ok_or("a destination hash is required (or use --loopback)")?;
+
+    let udp_loopback = args
+        .udp_loopback
+        .as_deref()
+        .and_then(parse_udp_pair);
+
+    let options = reticulum_utils::rnprobe::ProbeOptions {
+        config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+        size: args.size.unwrap_or(reticulum_utils::rnprobe::DEFAULT_PROBE_SIZE),
+        timeout: duration_arg(args.timeout, reticulum_utils::rnprobe::DEFAULT_TIMEOUT),
+        probes: args.probes,
+        udp_loopback,
+    };
+
+    let results = reticulum_utils::rnprobe::probe(&destination, &options)
+        .await
+        .map_err(|err| format!("probe failed: {err:?}"))?;
+
+    print!("{}", reticulum_utils::rnprobe::render_results(&destination, &results));
+    Ok(())
+}
+
+fn parse_udp_pair(spec: &str) -> Option<(u16, u16)> {
+    let (listen, forward) = spec.split_once(':')?;
+    Some((listen.parse().ok()?, forward.parse().ok()?))
 }

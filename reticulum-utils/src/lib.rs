@@ -6,6 +6,7 @@
 //! * [`rnid`] — identity generation/inspection (`Utilities/rnid.py`)
 //! * [`rnpath`] — path lookup / path table (`Utilities/rnpath.py`)
 //! * [`rnstatus`] — instance status (`Utilities/rnstatus.py`)
+//! * [`rnprobe`] — round-trip probes (`Utilities/rnprobe.py`)
 //! * [`rncp`] — file transfer over resources (`Utilities/rncp.py`)
 //!
 //! The tools are exposed both as a library (used by the integration tests
@@ -22,4 +23,5 @@ pub mod common;
 pub mod rncp;
 pub mod rnid;
 pub mod rnpath;
+pub mod rnprobe;
 pub mod rnstatus;
