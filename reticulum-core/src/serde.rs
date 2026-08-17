@@ -2,7 +2,7 @@ use crate::{
     buffer::{InputBuffer, OutputBuffer, StaticBuffer},
     error::RnsError,
     hash::AddressHash,
-    packet::{Header, HeaderType, Packet, PacketContext},
+    packet::{Header, HeaderType, Packet, PacketContext, PACKET_MDU},
 };
 
 pub trait Serialize {
@@ -89,7 +89,14 @@ impl Packet {
             data: StaticBuffer::new(),
         };
 
-        buffer.read(packet.data.accuire_buf(buffer.bytes_left()))?;
+        // Hostile inputs may claim more payload than the protocol MTU
+        // allows; reject instead of panicking on the capacity slice.
+        let remaining = buffer.bytes_left();
+        if remaining > PACKET_MDU {
+            return Err(RnsError::OutOfMemory);
+        }
+
+        buffer.read(packet.data.accuire_buf(remaining))?;
 
         Ok(packet)
     }

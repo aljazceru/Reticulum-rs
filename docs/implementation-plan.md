@@ -1248,6 +1248,7 @@ buffer streams) are still open; see the phase descriptions above.
 | 6.5 Blackholes | ✅ `transport/blackholes.rs`, identity-hash announce filtering, pack/merge lists |
 | 7.2/7.4 Daemon config & lifecycle | ✅ config parity for new interfaces + shared-instance keys, identity persistence |
 | 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp/rnprobe (`rn probe --loopback` measures proof RTTs) |
+| 9.2 Fuzz/property tests | ✅ `fuzz/` cargo-fuzz targets (packet deserialize, announce validation, tunnel synthesis, IFAC strip, HDLC decode — nightly/cargo-fuzz) + stable-runnable `tests/fuzz_properties.rs` driving the same decoders with deterministic pseudo-random corpora; found and fixed a real panic: `Packet::deserialize` sliced beyond the 2 KiB payload buffer for oversized hostile inputs (now `RnsError::OutOfMemory`) |
 | 9.3 Benchmarks | ✅ criterion `benches/hot_paths.rs`: announce validation, IFAC wrap/unwrap, packet serialize, announce emission timestamp, HDLC framing |
 | LXMF crate | ✅ byte-exact message format, stamps, peers, router + resource-backed delivery |
 | LXST crate | ✅ codecs, wire protocol, pipelines, calls |
@@ -1260,4 +1261,4 @@ buffer streams) are still open; see the phase descriptions above.
 * Blackhole discovery persistence to storage (in-memory table today)
 * 7.1 `reticulum::Reticulum` facade + 7.3 shared-instance RPC (pickle protocol) — the daemon serves
   local clients directly via `LocalServer` instead
-* 9.2 cargo-fuzz targets
+* (none — all tracked phases implemented; see remaining-open notes)

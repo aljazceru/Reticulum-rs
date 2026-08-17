@@ -58,6 +58,11 @@ use self::path_requests::{create_path_request_destination, PathRequests, TagByte
 use self::path_table::PathTable;
 use self::tunnels::{TunnelPath, Tunnels};
 
+pub use self::tunnels::{
+    decode_tunnel_synthesize as decode_tunnel_synthesis, TUNNEL_SYNTHESIZE_LENGTH,
+    TUNNEL_TIMEOUT,
+};
+
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
 pub const PATHFINDER_M: usize = 128; // Max hops
