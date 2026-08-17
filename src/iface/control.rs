@@ -15,7 +15,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::buffer::OutputBuffer;
 use crate::hash::AddressHash;
-use crate::packet::{PACKET_MDU, Packet, PacketType};
+use crate::packet::{Packet, PacketType, PACKET_MDU};
 use crate::serde::Serialize;
 
 /// Offset of the 10-byte random blob inside announce data
@@ -341,7 +341,11 @@ impl IfaceControlState {
             deque.pop_front();
         }
         let span = span.as_secs_f64();
-        if span <= 0.0 { 0.0 } else { n as f64 / span }
+        if span <= 0.0 {
+            0.0
+        } else {
+            n as f64 / span
+        }
     }
 
     /// Incoming announce frequency in Hz
@@ -673,11 +677,9 @@ mod tests {
         assert_eq!(state.held_announces_len(), 1);
 
         // Held announces are not released while the burst penalty is active.
-        assert!(
-            state
-                .release_held_announce(t0 + Duration::from_secs(2))
-                .is_none()
-        );
+        assert!(state
+            .release_held_announce(t0 + Duration::from_secs(2))
+            .is_none());
     }
 
     #[test]

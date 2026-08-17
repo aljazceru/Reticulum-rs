@@ -15,7 +15,7 @@ use reticulum::transport::{Transport, TransportConfig};
 
 async fn pair(ports: (u16, u16)) -> (Transport, Transport, Arc<Mutex<Link>>) {
     let server_identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut server = TransportConfig::new("srv", &server_identity, false).build();
+    let server = TransportConfig::new("srv", &server_identity, false).build();
     let client = TransportConfig::new("cli", &PrivateIdentity::new_from_rand(OsRng), false).build();
 
     server.iface_manager().lock().await.spawn(
@@ -128,7 +128,7 @@ async fn blackhole_blocks_announces() {
     let mut announces = client.recv_announces().await;
     let (other_identity, other) = {
         let id = PrivateIdentity::new_from_rand(OsRng);
-        let mut t = TransportConfig::new("other", &id, false).build();
+        let t = TransportConfig::new("other", &id, false).build();
         t.iface_manager().lock().await.spawn(
             UdpInterface::new("127.0.0.1:4633", Some("127.0.0.1:4632"), false),
             UdpInterface::spawn,

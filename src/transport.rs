@@ -4,7 +4,7 @@ use std::time::Duration;
 use alloc::sync::Arc;
 use rand_core::OsRng;
 use reticulum_core::identity::Signer;
-use tokio::sync::{Mutex, MutexGuard, broadcast};
+use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -25,15 +25,16 @@ use crate::iface::{
     InterfaceManager, InterfaceMode, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType,
 };
 use crate::packet::{
-    DestinationType, Header, HeaderType, PACKET_MDU, Packet, PacketContext, PacketDataBuffer,
-    PacketType,
+    DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
+    PACKET_MDU,
 };
 use crate::resource::{
-    self, ResourceEvent, ResourceOptions,
+    self,
     manager::{
-        RequestContext as RequestCtx, RequestEvent, RequestEventData, ResourceManager,
-        ResourceStrategy, pack_request, pack_response, request_id as make_request_id,
+        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
+        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
     },
+    ResourceEvent, ResourceOptions,
 };
 use crate::storage::{KnownDestinations, KnownRatchets, Storage};
 
@@ -41,18 +42,19 @@ mod announce_limits;
 mod announce_table;
 mod blackholes;
 mod link_table;
+mod management;
 mod packet_cache;
 mod path_requests;
 mod path_table;
 mod tunnels;
 
-pub use blackholes::{BLACKHOLE_TIMEOUT, Blackholes, SharedBlackholes};
+pub use blackholes::{Blackholes, SharedBlackholes, BLACKHOLE_TIMEOUT};
 
 use self::announce_limits::AnnounceLimits;
 use self::announce_table::AnnounceTable;
 use self::link_table::LinkTable;
 use self::packet_cache::PacketCache;
-use self::path_requests::{PathRequests, TagBytes, create_path_request_destination};
+use self::path_requests::{create_path_request_destination, PathRequests, TagBytes};
 use self::path_table::PathTable;
 use self::tunnels::{TunnelPath, Tunnels};
 
@@ -284,6 +286,10 @@ pub(crate) struct TransportHandler {
     /// Tunnel table (Python `Transport.tunnels`).
     tunnels: Tunnels,
 
+    /// Identities allowed to use the remote management destination
+    /// (Python `Transport.remote_management_allowed`).
+    remote_management_allowed: Arc<std::sync::RwLock<Vec<AddressHash>>>,
+
     cancel: CancellationToken,
 }
 
@@ -440,6 +446,7 @@ impl Transport {
             ))),
             path_requests,
             tunnels: Tunnels::new(),
+            remote_management_allowed: Arc::new(std::sync::RwLock::new(Vec::new())),
             fixed_dest_tunnel_synthesize: tunnels::create_tunnel_synthesize_destination()
                 .desc
                 .address_hash,
@@ -870,7 +877,7 @@ impl Transport {
     }
 
     #[allow(unused)] // mocked out in the test build, so the linter
-    // would complain about dead code
+                     // would complain about dead code
     pub(crate) async fn bind_link_to_channel(
         &self,
         id: LinkId,
@@ -956,7 +963,7 @@ impl Transport {
     }
 
     pub async fn add_destination(
-        &mut self,
+        &self,
         identity: PrivateIdentity,
         name: DestinationName,
     ) -> Arc<Mutex<SingleInputDestination>> {
@@ -3845,6 +3852,223 @@ impl Transport {
                 paths: entry.paths.len(),
             })
             .collect()
+    }
+
+    /// Enable the remote management destination
+    /// `rnstransport.remote.management` with `/status` and `/path`
+    /// request handlers (Python `Transport.remote_management_destination`).
+    ///
+    /// Requests are restricted to link-identified peers on the allow list
+    /// (Python `ALLOW_LIST`); add identities via
+    /// [`Transport::remote_management_allow`].
+    pub async fn enable_remote_management(&self) -> Arc<Mutex<SingleInputDestination>> {
+        let identity = self.handler.lock().await.config.identity.clone();
+
+        let snapshot = Arc::new(std::sync::RwLock::new(
+            management::ManagementSnapshot::default(),
+        ));
+        let allowed = self.handler.lock().await.remote_management_allowed.clone();
+        let destination = self
+            .add_destination(identity, management::remote_management_name())
+            .await;
+        let address = destination.lock().await.desc.address_hash;
+
+        // /status handler
+        {
+            let snapshot = snapshot.clone();
+            let allowed = allowed.clone();
+            self.register_request_handler(&address, "/status", move |ctx| {
+                if !management::identity_allowed(
+                    ctx.remote_identity.as_ref(),
+                    &allowed.read().unwrap(),
+                ) {
+                    return None;
+                }
+                let include_links = matches!(
+                    management::decode_management_request(&ctx.data),
+                    management::ManagementRequest::Status {
+                        include_links: true
+                    }
+                );
+                Some(management::status_response(
+                    &snapshot.read().unwrap(),
+                    include_links,
+                ))
+            })
+            .await;
+        }
+
+        // /path handler
+        {
+            let snapshot = snapshot.clone();
+            let allowed = allowed.clone();
+            self.register_request_handler(&address, "/path", move |ctx| {
+                if !management::identity_allowed(
+                    ctx.remote_identity.as_ref(),
+                    &allowed.read().unwrap(),
+                ) {
+                    return None;
+                }
+                match management::decode_management_request(&ctx.data) {
+                    management::ManagementRequest::PathTable {
+                        destination,
+                        max_hops,
+                    } => Some(management::path_table_response(
+                        &snapshot.read().unwrap(),
+                        destination.as_deref(),
+                        max_hops,
+                    )),
+                    management::ManagementRequest::Rates { destination } => {
+                        Some(management::rates_response(
+                            &snapshot.read().unwrap(),
+                            destination.as_deref(),
+                        ))
+                    }
+                    _ => None,
+                }
+            })
+            .await;
+        }
+
+        // Refresh the snapshot periodically.
+        let handler = self.handler.clone();
+        tokio::spawn(async move {
+            loop {
+                let handler = handler.lock().await;
+                let stats = handler.iface_manager.lock().await.stats();
+                let paths = handler
+                    .path_table
+                    .iter()
+                    .map(|(destination, entry)| PathTableSnapshotEntry {
+                        destination: *destination,
+                        hops: entry.hops,
+                        via: entry.received_from,
+                        iface: entry.iface,
+                        unresponsive: entry.unresponsive,
+                        age_secs: crate::time::now().saturating_sub(entry.timestamp).as_secs(),
+                        announce_hash: entry.packet_hash,
+                    })
+                    .collect();
+                let blackholes = handler
+                    .blackholes
+                    .read()
+                    .await
+                    .blackholed_identities()
+                    .iter()
+                    .map(|hash| hash.as_slice().to_vec())
+                    .collect();
+
+                *snapshot.write().unwrap() = management::ManagementSnapshot {
+                    stats,
+                    paths,
+                    link_counts: (
+                        handler.link_table.len(),
+                        handler.in_links.len(),
+                        handler.out_links.len(),
+                    ),
+                    blackholes,
+                };
+                drop(handler);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        log::info!(
+            "tp({}): enabled remote management on {}",
+            self.name,
+            address
+        );
+
+        destination
+    }
+
+    /// Add an identity to the remote-management allow list
+    /// (Python `Transport.remote_management_allowed`).
+    pub async fn remote_management_allow(&self, identity: AddressHash) {
+        self.handler
+            .lock()
+            .await
+            .remote_management_allowed
+            .write()
+            .unwrap()
+            .push(identity);
+    }
+
+    /// Enable the probe destination `rnstransport.probe`
+    /// (Python `Transport.probe_destination`: no links, PROVE_ALL —
+    /// `rnprobe` measures round-trip times against it).
+    pub async fn enable_probe_destination(&self) -> Arc<Mutex<SingleInputDestination>> {
+        let identity = self.handler.lock().await.config.identity.clone();
+
+        let destination = management::probe_destination(&identity);
+        let address = destination.desc.address_hash;
+        let destination = Arc::new(Mutex::new(destination));
+
+        self.handler
+            .lock()
+            .await
+            .single_in_destinations
+            .insert(address, destination.clone());
+
+        log::info!(
+            "tp({}): transport instance will respond to probe requests on {}",
+            self.name,
+            address
+        );
+
+        destination
+    }
+
+    /// Enable blackhole-list publishing on `rnstransport.info.blackhole`
+    /// with the `/list` request handler
+    /// (Python `Transport.blackhole_destination`).
+    pub async fn enable_blackhole_publishing(&self) -> Arc<Mutex<SingleInputDestination>> {
+        let identity = self.handler.lock().await.config.identity.clone();
+
+        let snapshot = Arc::new(std::sync::RwLock::new(
+            management::ManagementSnapshot::default(),
+        ));
+        let destination = self
+            .add_destination(identity, management::blackhole_info_name())
+            .await;
+        let address = destination.lock().await.desc.address_hash;
+
+        {
+            let snapshot = snapshot.clone();
+            self.register_request_handler(&address, "/list", move |_ctx| {
+                Some(management::encode_blackhole_list(
+                    &snapshot.read().unwrap().blackholes,
+                ))
+            })
+            .await;
+        }
+
+        // Refresh periodically alongside remote management.
+        let handler = self.handler.clone();
+        tokio::spawn(async move {
+            loop {
+                let handler = handler.lock().await;
+                let blackholes = handler
+                    .blackholes
+                    .read()
+                    .await
+                    .blackholed_identities()
+                    .iter()
+                    .map(|hash| hash.as_slice().to_vec())
+                    .collect();
+                snapshot.write().unwrap().blackholes = blackholes;
+                drop(handler);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        log::info!(
+            "tp({}): enabled blackhole list publishing on {}",
+            self.name,
+            address
+        );
+
+        destination
     }
 
     /// Hash of the identity this transport instance runs with

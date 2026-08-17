@@ -30,9 +30,8 @@ use reticulum_core::identity::Signer;
 /// Fixed HKDF salt for IFAC key derivation
 /// (Python `Reticulum.IFAC_SALT`).
 pub const IFAC_SALT: [u8; 32] = [
-    0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80, 0x77, 0x1e, 0xb4, 0x99, 0x5d, 0x70,
-    0x2d, 0x4a, 0x3e, 0x73, 0x33, 0x91, 0xb2, 0xa0, 0xf5, 0x3f, 0x41, 0x6d, 0x9f, 0x90,
-    0x7e, 0x55, 0xcf, 0xf8,
+    0xad, 0xf5, 0x4d, 0x88, 0x2c, 0x9a, 0x9b, 0x80, 0x77, 0x1e, 0xb4, 0x99, 0x5d, 0x70, 0x2d, 0x4a,
+    0x3e, 0x73, 0x33, 0x91, 0xb2, 0xa0, 0xf5, 0x3f, 0x41, 0x6d, 0x9f, 0x90, 0x7e, 0x55, 0xcf, 0xf8,
 ];
 
 /// Minimum IFAC size in bytes (Python `Reticulum.IFAC_MIN_SIZE`).
@@ -72,9 +71,7 @@ impl IfacKey {
         let mut origin = Vec::new();
 
         if let Some(netname) = netname {
-            origin.extend_from_slice(
-                Hash::new_from_slice(netname.as_bytes()).as_bytes(),
-            );
+            origin.extend_from_slice(Hash::new_from_slice(netname.as_bytes()).as_bytes());
         }
 
         if let Some(netkey) = netkey {
@@ -97,7 +94,7 @@ impl IfacKey {
             sign_key: SigningKey::from_bytes(&sign_seed),
             size: size.max(IFAC_MIN_SIZE),
         }
-}
+    }
 
     /// Truncated access-code signature: the last `size` bytes of the
     /// signature over `raw` (Python `identity.sign(raw)[-ifac_size:]`).

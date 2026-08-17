@@ -61,7 +61,7 @@ async fn build_transport(name: &str, bind_addr: &str, forward_addr: &str)
 async fn channel_send() {
     setup();
 
-    let (mut transport_a, id_a) = build_transport("a", "127.0.0.1:8081", "127.0.0.1:8082").await;
+    let (transport_a, id_a) = build_transport("a", "127.0.0.1:8081", "127.0.0.1:8082").await;
     let (transport_b, _) = build_transport("b", "127.0.0.1:8082", "127.0.0.1:8081").await;
 
     let mut in_link_events = transport_a.in_link_events();

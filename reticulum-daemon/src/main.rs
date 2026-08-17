@@ -25,10 +25,10 @@ use reticulum::iface::kiss::CsmaParams;
 use reticulum::iface::kiss::KissInterface;
 #[cfg(feature = "iface-serial")]
 use reticulum::iface::kiss::SerialPortConfig;
-#[cfg(feature = "iface-serial")]
-use reticulum::iface::serial::SerialInterface;
 #[cfg(feature = "iface-pipe")]
 use reticulum::iface::pipe::PipeInterface;
+#[cfg(feature = "iface-serial")]
+use reticulum::iface::serial::SerialInterface;
 
 use reticulum_daemon::config::{Config, InterfaceConfig};
 
@@ -43,7 +43,7 @@ const IDENTITY_FILE: &str = "identity";
 /// Reticulum-rs daemon
 #[derive(Parser)]
 #[clap(version)]
-#[clap(args_conflicts_with_subcommands=true)]
+#[clap(args_conflicts_with_subcommands = true)]
 pub struct Command {
     /// Reticulum config directory
     #[arg(short, long)]
@@ -57,8 +57,8 @@ pub enum Subcommand {
     /// Convert a Python Reticulum config file to TOML
     ConvertConfig {
         /// Path to the Python Reticulum config file
-        config_file: PathBuf
-    }
+        config_file: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -67,15 +67,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(subcommand) = cmd.convert_config {
         match subcommand {
             Subcommand::ConvertConfig { config_file } => {
-                return reticulum_daemon::config::migrate_config(&config_file)
+                return reticulum_daemon::config::migrate_config(&config_file);
             }
         }
     }
 
     let (config, config_path) = Config::load(cmd.config_dir.as_deref())?;
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(format!("{:?}", config.logging.loglevel))
-    ).init();
+        env_logger::Env::default().default_filter_or(format!("{:?}", config.logging.loglevel)),
+    )
+    .init();
 
     log::info!("Configuration loaded from: {}", config_path.display());
     log::info!("Reticulum daemon starting");
@@ -113,12 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "rns-daemon".to_string());
     log::info!("Instance name: {instance_name}");
 
-    let transport = TransportConfig::new(
-            &instance_name,
-            &identity,
-            config.reticulum.enable_transport)
-        .set_retransmit(config.reticulum.enable_transport)
-        .build();
+    let transport =
+        TransportConfig::new(&instance_name, &identity, config.reticulum.enable_transport)
+            .set_retransmit(config.reticulum.enable_transport)
+            .build();
 
     let iface_manager = transport.iface_manager();
 
@@ -133,7 +132,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        let address = if config.reticulum.shared_instance_type.eq_ignore_ascii_case("tcp") {
+        let address = if config
+            .reticulum
+            .shared_instance_type
+            .eq_ignore_ascii_case("tcp")
+        {
             SharedInstanceAddress::tcp(config.reticulum.shared_instance_port)
         } else if cfg!(unix) {
             SharedInstanceAddress::unix_abstract(instance_name)
@@ -170,35 +173,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         match &iface.config {
-            InterfaceConfig::TCPServerInterface { bind_host, bind_port, .. } => {
+            InterfaceConfig::TCPServerInterface {
+                bind_host,
+                bind_port,
+                ..
+            } => {
                 let addr = format!("{}:{}", bind_host.trim_end_matches(':'), bind_port);
-                log::info!("Enabling interface '{}': TCP Server on {}", iface.name, addr);
+                log::info!(
+                    "Enabling interface '{}': TCP Server on {}",
+                    iface.name,
+                    addr
+                );
                 let address = iface_manager.lock().await.spawn(
                     TcpServer::new(addr, iface_manager.clone()),
                     TcpServer::spawn,
                 );
                 configure_iface(&iface_manager, &address, &iface).await;
             }
-            InterfaceConfig::TCPClientInterface { target_host, target_port, .. } => {
+            InterfaceConfig::TCPClientInterface {
+                target_host,
+                target_port,
+                ..
+            } => {
                 let addr = format!("{}:{}", target_host.trim_end_matches(':'), target_port);
-                log::info!("Enabling interface '{}': TCP Client to {}", iface.name, addr);
-                let address = iface_manager.lock().await.spawn(
-                    TcpClient::new(addr),
-                    TcpClient::spawn,
+                log::info!(
+                    "Enabling interface '{}': TCP Client to {}",
+                    iface.name,
+                    addr
                 );
+                let address = iface_manager
+                    .lock()
+                    .await
+                    .spawn(TcpClient::new(addr), TcpClient::spawn);
                 configure_iface(&iface_manager, &address, &iface).await;
             }
-            InterfaceConfig::UDPInterface { listen_ip, listen_port, forward_ip, forward_port, .. } => {
+            InterfaceConfig::UDPInterface {
+                listen_ip,
+                listen_port,
+                forward_ip,
+                forward_port,
+                ..
+            } => {
                 let bind_addr = format!("{}:{}", listen_ip, listen_port);
                 let forward_addr = format!("{}:{}", forward_ip, forward_port);
-                log::info!("Enabling interface '{}': UDP {}→{}", iface.name, bind_addr, forward_addr);
+                log::info!(
+                    "Enabling interface '{}': UDP {}→{}",
+                    iface.name,
+                    bind_addr,
+                    forward_addr
+                );
                 let address = iface_manager.lock().await.spawn(
                     UdpInterface::new(bind_addr, Some(forward_addr), false),
                     UdpInterface::spawn,
                 );
                 configure_iface(&iface_manager, &address, &iface).await;
             }
-            InterfaceConfig::AutoInterface { group_id, discovery_port, data_port, discovery_scope, multicast_address_type, devices, ignored_devices, .. } => {
+            InterfaceConfig::AutoInterface {
+                group_id,
+                discovery_port,
+                data_port,
+                discovery_scope,
+                multicast_address_type,
+                devices,
+                ignored_devices,
+                ..
+            } => {
                 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
                 {
                     let mut auto_config = AutoInterfaceConfig {
@@ -212,7 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         auto_config.discovery_scope = DiscoveryScope::parse(&scope);
                     }
                     if let Some(address_type) = multicast_address_type {
-                        auto_config.multicast_address_type = MulticastAddressType::parse(&address_type);
+                        auto_config.multicast_address_type =
+                            MulticastAddressType::parse(&address_type);
                     }
                     if let Some(devices) = devices {
                         auto_config.devices = devices
@@ -247,7 +287,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(not(all(feature = "iface-auto", target_os = "linux")))]
                 {
-                    let _ = (group_id, discovery_port, data_port, discovery_scope, multicast_address_type, devices, ignored_devices);
+                    let _ = (
+                        group_id,
+                        discovery_port,
+                        data_port,
+                        discovery_scope,
+                        multicast_address_type,
+                        devices,
+                        ignored_devices,
+                    );
                     log::warn!(
                         "Interface '{}' type 'AutoInterface' requires building the daemon with --features iface-auto (Linux only)",
                         iface.name
@@ -255,19 +303,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             InterfaceConfig::I2PInterface { .. } => {
-                log::warn!("Interface '{}' type 'I2PInterface' is not yet supported", iface.name);
+                log::warn!(
+                    "Interface '{}' type 'I2PInterface' is not yet supported",
+                    iface.name
+                );
             }
             InterfaceConfig::RNodeInterface { .. } => {
-                log::warn!("Interface '{}' type 'RNodeInterface' is not yet supported", iface.name);
+                log::warn!(
+                    "Interface '{}' type 'RNodeInterface' is not yet supported",
+                    iface.name
+                );
             }
             InterfaceConfig::BLEInterface { .. } => {
-                log::warn!("Interface '{}' type 'BLEInterface' is not yet supported", iface.name);
+                log::warn!(
+                    "Interface '{}' type 'BLEInterface' is not yet supported",
+                    iface.name
+                );
             }
-            InterfaceConfig::KISSInterface { port, speed, databits, parity, stopbits, preamble, txtail, persistence, slottime, flow_control, .. } => {
+            InterfaceConfig::KISSInterface {
+                port,
+                speed,
+                databits,
+                parity,
+                stopbits,
+                preamble,
+                txtail,
+                persistence,
+                slottime,
+                flow_control,
+                ..
+            } => {
                 #[cfg(feature = "iface-serial")]
                 {
-                    let serial = SerialPortConfig::new(port.clone(), *speed)
-                        .with_format(*databits, parity.clone(), *stopbits);
+                    let serial = SerialPortConfig::new(port.clone(), *speed).with_format(
+                        *databits,
+                        parity.clone(),
+                        *stopbits,
+                    );
                     let csma = CsmaParams::new(*preamble, *txtail, *persistence, *slottime);
 
                     log::info!(
@@ -284,18 +356,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(not(feature = "iface-serial"))]
                 {
-                    let _ = (speed, databits, parity, stopbits, preamble, txtail, persistence, slottime, flow_control);
+                    let _ = (
+                        speed,
+                        databits,
+                        parity,
+                        stopbits,
+                        preamble,
+                        txtail,
+                        persistence,
+                        slottime,
+                        flow_control,
+                    );
                     log::warn!(
                         "Interface '{}' type 'KISSInterface' on port {port} requires building the daemon with --features iface-serial",
                         iface.name
                     );
                 }
             }
-            InterfaceConfig::SerialInterface { port, speed, databits, parity, stopbits, .. } => {
+            InterfaceConfig::SerialInterface {
+                port,
+                speed,
+                databits,
+                parity,
+                stopbits,
+                ..
+            } => {
                 #[cfg(feature = "iface-serial")]
                 {
-                    let serial = SerialPortConfig::new(port.clone(), *speed)
-                        .with_format(*databits, parity.clone(), *stopbits);
+                    let serial = SerialPortConfig::new(port.clone(), *speed).with_format(
+                        *databits,
+                        parity.clone(),
+                        *stopbits,
+                    );
 
                     log::info!(
                         "Enabling interface '{}': Serial (HDLC) on {port} at {speed} baud",
@@ -318,10 +410,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            InterfaceConfig::PipeInterface { command, respawn_delay, .. } => {
+            InterfaceConfig::PipeInterface {
+                command,
+                respawn_delay,
+                ..
+            } => {
                 #[cfg(feature = "iface-pipe")]
                 {
-                    let respawn_delay = std::time::Duration::from_secs_f64(respawn_delay.max(0.0) as f64);
+                    let respawn_delay =
+                        std::time::Duration::from_secs_f64(respawn_delay.max(0.0) as f64);
 
                     log::info!(
                         "Enabling interface '{}': Pipe command '{command}' (respawn delay {respawn_delay:?})",
@@ -344,7 +441,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            InterfaceConfig::LocalInterface { listen_ip, listen_port, .. } => {
+            InterfaceConfig::LocalInterface {
+                listen_ip,
+                listen_port,
+                ..
+            } => {
                 // A local shared-instance listener declared as an interface
                 // (Python handles this via [reticulum] share_instance; the
                 // daemon also accepts it explicitly here).
@@ -355,7 +456,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     iface_manager.lock().await.spawn_named(
                         &iface.name,
-                        LocalServer::new(SharedInstanceAddress::tcp(*listen_port), iface_manager.clone()),
+                        LocalServer::new(
+                            SharedInstanceAddress::tcp(*listen_port),
+                            iface_manager.clone(),
+                        ),
                         LocalServer::spawn,
                     );
                 } else {
@@ -365,14 +469,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            InterfaceConfig::AX25KISSInterface { callsign, ssid, port, speed, databits, parity, stopbits, preamble, txtail, persistence, slottime, flow_control, .. } => {
+            InterfaceConfig::AX25KISSInterface {
+                callsign,
+                ssid,
+                port,
+                speed,
+                databits,
+                parity,
+                stopbits,
+                preamble,
+                txtail,
+                persistence,
+                slottime,
+                flow_control,
+                ..
+            } => {
                 #[cfg(feature = "iface-serial")]
                 {
-                    let serial = SerialPortConfig::new(port.clone(), *speed)
-                        .with_format(*databits, parity.clone(), *stopbits);
+                    let serial = SerialPortConfig::new(port.clone(), *speed).with_format(
+                        *databits,
+                        parity.clone(),
+                        *stopbits,
+                    );
                     let csma = CsmaParams::new(*preamble, *txtail, *persistence, *slottime);
 
-                    match KissInterface::new_ax25(callsign.clone(), *ssid, serial, csma, *flow_control) {
+                    match KissInterface::new_ax25(
+                        callsign.clone(),
+                        *ssid,
+                        serial,
+                        csma,
+                        *flow_control,
+                    ) {
                         Ok(interface) => {
                             log::info!(
                                 "Enabling interface '{}': AX.25 KISS {callsign}-{ssid} on {port} at {speed} baud",
@@ -395,7 +522,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(not(feature = "iface-serial"))]
                 {
-                    let _ = (callsign, ssid, speed, databits, parity, stopbits, preamble, txtail, persistence, slottime, flow_control);
+                    let _ = (
+                        callsign,
+                        ssid,
+                        speed,
+                        databits,
+                        parity,
+                        stopbits,
+                        preamble,
+                        txtail,
+                        persistence,
+                        slottime,
+                        flow_control,
+                    );
                     log::warn!(
                         "Interface '{}' type 'AX25KISSInterface' on port {port} requires building the daemon with --features iface-serial",
                         iface.name
@@ -406,6 +545,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 log::warn!("Interface '{}' uses an unsupported type", iface.name);
             }
         }
+    }
+
+    // Management destinations (Python Transport.start: probe and remote
+    // management destinations when enabled in the configuration).
+    if config.reticulum.probe_destination {
+        transport.enable_probe_destination().await;
+    }
+
+    if config.reticulum.remote_management {
+        let destination = transport.enable_remote_management().await;
+        log::info!(
+            "Remote management enabled on {}",
+            destination.lock().await.desc.address_hash
+        );
     }
 
     log::info!("Reticulum instance running, interfaces initialized");
@@ -430,7 +583,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
 /// Apply per-interface common options after spawning
 /// (Python `Reticulum._add_interface`: mode, bitrate, IFAC derivation).
 async fn configure_iface(
@@ -440,7 +592,11 @@ async fn configure_iface(
 ) {
     let manager = iface_manager.lock().await;
 
-    if let Some(mode) = iface.mode.as_deref().and_then(reticulum::iface::InterfaceMode::from_name) {
+    if let Some(mode) = iface
+        .mode
+        .as_deref()
+        .and_then(reticulum::iface::InterfaceMode::from_name)
+    {
         manager.set_iface_mode(address, mode);
     } else if let Some(mode) = iface.mode.as_deref() {
         log::warn!(

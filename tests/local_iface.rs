@@ -67,7 +67,7 @@ async fn local_tcp_shared_instance_announce() {
 
     let address = SharedInstanceAddress::tcp(free_tcp_port());
     let shared = build_shared_instance("shared", address.clone()).await;
-    let mut client_a = build_local_client("client-a", address.clone()).await;
+    let client_a = build_local_client("client-a", address.clone()).await;
     let client_b = build_local_client("client-b", address.clone()).await;
 
     // let the shared instance come up and the clients connect
@@ -120,7 +120,7 @@ async fn local_unix_abstract_shared_instance_announce() {
     // abstract socket \0rns/<name> (LocalInterface.py address format)
     let address = SharedInstanceAddress::unix_abstract("rs-test-instance");
     let shared = build_shared_instance("shared-unix", address.clone()).await;
-    let mut client_a_unix = build_local_client("client-a-unix", address.clone()).await;
+    let client_a_unix = build_local_client("client-a-unix", address.clone()).await;
     let client_b_unix = build_local_client("client-b-unix", address.clone()).await;
 
     time::sleep(Duration::from_secs(2)).await;
@@ -153,7 +153,7 @@ async fn local_tcp_shared_instance_path_request() {
     let address = SharedInstanceAddress::tcp(free_tcp_port());
     let _shared = build_shared_instance("shared-pr", address.clone()).await;
     let client_a_pr = build_local_client("client-a-pr", address.clone()).await;
-    let mut client_b_pr = build_local_client("client-b-pr", address.clone()).await;
+    let client_b_pr = build_local_client("client-b-pr", address.clone()).await;
 
     time::sleep(Duration::from_secs(2)).await;
 

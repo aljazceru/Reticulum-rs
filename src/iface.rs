@@ -19,11 +19,11 @@ pub mod pipe;
 pub mod serial;
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 use tokio::task;

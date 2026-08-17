@@ -121,7 +121,7 @@ const NAME: (&str, &str) = ("example_utilities", "identity.transport");
 
 #[tokio::test]
 async fn single_destination_encrypted_exchange_with_ratchets() {
-    let Pair { mut server, client } = pair(45512).await;
+    let Pair { server, client } = pair(45512).await;
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let destination = server
@@ -216,7 +216,7 @@ async fn single_destination_encrypted_exchange_with_ratchets() {
 
 #[tokio::test]
 async fn proof_strategy_matrix() {
-    let Pair { mut server, client } = pair(45532).await;
+    let Pair { server, client } = pair(45532).await;
 
     let mut received = server.received_data_events();
     let mut announces = client.recv_announces().await;
@@ -284,7 +284,7 @@ async fn known_destinations_persist_across_restart() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let mut server = server;
+    let server = server;
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let destination = server

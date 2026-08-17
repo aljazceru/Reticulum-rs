@@ -386,7 +386,7 @@ impl LxmRouter {
     /// transport requires destinations to be registered at construction
     /// time, so this cannot be done later on an owned router.
     pub async fn new<T: AsRef<Path>, N: Into<String>>(
-        mut transport: Transport,
+        transport: Transport,
         identity: PrivateIdentity,
         storage_path: T,
         name: Option<N>,

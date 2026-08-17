@@ -57,7 +57,7 @@ async fn call_end_to_end_over_udp() {
     // --- callee ------------------------------------------------------------
     let callee_identity = PrivateIdentity::new_from_rand(OsRng);
     // register the call destination before wrapping the transport in an Arc
-    let mut callee_transport = Transport::new(
+    let callee_transport = Transport::new(
         reticulum::transport::TransportConfig::new("callee", &callee_identity, true),
     );
     let destination = callee_transport
@@ -198,7 +198,7 @@ async fn packetizer_to_link_source_loop() {
     use lxst::network::{LinkSource, Packetizer};
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = Transport::new(
+    let transport = Transport::new(
         reticulum::transport::TransportConfig::new("loop", &identity, true),
     );
     let _dest = transport

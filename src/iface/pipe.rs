@@ -348,18 +348,12 @@ mod tests {
 
         assert_eq!(
             split_command("tee /tmp/a\\ b.txt").unwrap(),
-            vec![
-                "tee".to_string(),
-                "/tmp/a b.txt".to_string(),
-            ]
+            vec!["tee".to_string(), "/tmp/a b.txt".to_string(),]
         );
 
         assert_eq!(
             split_command("script --opt=\"value with spaces\"").unwrap(),
-            vec![
-                "script".to_string(),
-                "--opt=value with spaces".to_string(),
-            ]
+            vec!["script".to_string(), "--opt=value with spaces".to_string(),]
         );
 
         assert_eq!(split_command("   ").unwrap(), Vec::<String>::new());

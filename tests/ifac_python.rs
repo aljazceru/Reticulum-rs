@@ -6,15 +6,15 @@
 
 #![cfg(feature = "python-tests")]
 
-use tokio::io::AsyncWriteExt;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 
 use rand_core::OsRng;
 use reticulum::destination::{DestinationName, SingleInputDestination};
 use reticulum::identity::PrivateIdentity;
-use reticulum::iface::ifac::{DEFAULT_IFAC_SIZE, IfacKey};
+use reticulum::iface::ifac::{IfacKey, DEFAULT_IFAC_SIZE};
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::TransportConfig;
@@ -25,16 +25,12 @@ const PASSPHRASE: &str = "interop-secret";
 const IFAC_BYTES: usize = 8; // python config `ifac_size = 64` bits
 
 fn python_dir() -> String {
-    std::env::var("RETICULUM_TEST_PYTHON_DIR").expect(
-        "set RETICULUM_TEST_PYTHON_DIR to the reference Reticulum checkout",
-    )
+    std::env::var("RETICULUM_TEST_PYTHON_DIR")
+        .expect("set RETICULUM_TEST_PYTHON_DIR to the reference Reticulum checkout")
 }
 
 fn py_config(name: &str) -> String {
-    let fixture = format!(
-        "{}/tests/rns-py-configs/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let fixture = format!("{}/tests/rns-py-configs/{name}", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("rn-ifac-py-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -89,33 +85,28 @@ async fn next_line_containing(
 
 #[tokio::test]
 async fn ifac_protected_tcp_exchange_with_python() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
 
     let config = py_config("tcp-ifac");
     let (mut child, mut lines) = spawn_announce_example(&config).await;
 
-    next_line_containing(&mut lines, "Announce example running", Duration::from_secs(15))
-        .await
-        .expect("python announce example ready");
+    next_line_containing(
+        &mut lines,
+        "Announce example running",
+        Duration::from_secs(15),
+    )
+    .await
+    .expect("python announce example ready");
 
     // Rust TCP client with the same access code.
-    let transport = TransportConfig::new(
-        "ifac-client",
-        &PrivateIdentity::new_from_rand(OsRng),
-        false,
-    )
-    .build();
+    let transport =
+        TransportConfig::new("ifac-client", &PrivateIdentity::new_from_rand(OsRng), false).build();
 
     let iface = {
         let manager = transport.iface_manager();
         let mut manager = manager.lock().await;
-        let address = manager.spawn(
-            TcpClient::new("127.0.0.1:4381"),
-            TcpClient::spawn,
-        );
+        let address = manager.spawn(TcpClient::new("127.0.0.1:4381"), TcpClient::spawn);
         manager.set_iface_ifac(&address, None, Some(PASSPHRASE), IFAC_BYTES);
         address
     };
@@ -150,11 +141,18 @@ async fn ifac_protected_tcp_exchange_with_python() {
         DestinationName::new("example_utilities", "announcesample.fruits"),
     );
     transport
-        .send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), Some(b"from rust"))
+        .send_announce(
+            &Arc::new(tokio::sync::Mutex::new(destination)),
+            Some(b"from rust"),
+        )
         .await;
 
-    let received = next_line_containing(&mut lines, "Received an announce from", Duration::from_secs(15))
-        .await;
+    let received = next_line_containing(
+        &mut lines,
+        "Received an announce from",
+        Duration::from_secs(15),
+    )
+    .await;
     assert!(received.is_some(), "python must receive the rust announce");
 
     let _ = child.start_kill();
@@ -165,19 +163,11 @@ async fn ifac_protected_tcp_exchange_with_python() {
 async fn ifac_rejects_packets_without_the_passphrase() {
     // A UDP pair where the receiver expects an access code but the sender
     // does not apply one: the packets must be dropped.
-    let receiver = TransportConfig::new(
-        "ifac-recv",
-        &PrivateIdentity::new_from_rand(OsRng),
-        false,
-    )
-    .build();
+    let receiver =
+        TransportConfig::new("ifac-recv", &PrivateIdentity::new_from_rand(OsRng), false).build();
 
-    let sender = TransportConfig::new(
-        "ifac-send",
-        &PrivateIdentity::new_from_rand(OsRng),
-        false,
-    )
-    .build();
+    let sender =
+        TransportConfig::new("ifac-send", &PrivateIdentity::new_from_rand(OsRng), false).build();
 
     let recv_iface = {
         let manager = receiver.iface_manager();
@@ -236,8 +226,7 @@ async fn ifac_rejects_packets_without_the_passphrase() {
         .send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), None)
         .await;
 
-    let received =
-        tokio::time::timeout(Duration::from_secs(10), announces.recv()).await;
+    let received = tokio::time::timeout(Duration::from_secs(10), announces.recv()).await;
     assert!(
         matches!(received, Ok(Ok(_))),
         "announces must flow once both sides share the access code"

@@ -57,7 +57,7 @@ async fn build_transport(name: &str, server_addr: &str, client_addr: &[&str]) ->
 async fn calculate_hop_distance() {
     setup();
 
-    let mut transport_a = build_transport("a", "127.0.0.1:8081", &[]).await;
+    let transport_a = build_transport("a", "127.0.0.1:8081", &[]).await;
     let transport_b = build_transport("b", "127.0.0.1:8082", &["127.0.0.1:8081"]).await;
     let transport_c =
         build_transport("c", "127.0.0.1:8083", &["127.0.0.1:8081", "127.0.0.1:8082"]).await;
@@ -84,7 +84,7 @@ async fn direct_path_request_and_response() {
     setup();
 
     let transport_a = build_transport("a", "127.0.0.1:8181", &[]).await;
-    let mut transport_b = build_transport("b", "127.0.0.1:8182", &["127.0.0.1:8181"]).await;
+    let transport_b = build_transport("b", "127.0.0.1:8182", &["127.0.0.1:8181"]).await;
 
     let id_b = PrivateIdentity::new_from_name("b");
 
@@ -107,13 +107,13 @@ async fn remote_path_request_and_response() {
     setup();
 
     let transport_a = build_transport("a", "127.0.0.1:8281", &[]).await;
-    let mut transport_b = build_transport_full(
+    let transport_b = build_transport_full(
         "b",
         "127.0.0.1:8282",
         &["127.0.0.1:8281"],
         true
     ).await;
-    let mut transport_c = build_transport("c", "127.0.0.1:8283", &["127.0.0.1:8282"]).await;
+    let transport_c = build_transport("c", "127.0.0.1:8283", &["127.0.0.1:8282"]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
     let dest_c = transport_c
@@ -154,7 +154,7 @@ async fn message_proof_over_remote_link() {
     let _transport_b =
         build_transport_full("b", "127.0.0.1:8382", &["127.0.0.1:8381"], true)
         .await;
-    let mut transport_c =
+    let transport_c =
         build_transport("c", "127.0.0.1:8383", &["127.0.0.1:8382"])
         .await;
 

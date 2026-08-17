@@ -22,7 +22,7 @@ async fn main() {
     log::info!(">>> TCP SERVER FOR CHANNEL EXAMPLE  <<<");
 
     let id = PrivateIdentity::new_from_name("link-example");
-    let mut transport = Transport::new(TransportConfig::new("server", &id, true));
+    let transport = Transport::new(TransportConfig::new("server", &id, true));
     log::trace!("transport instantiated");
 
     let dest = transport.add_destination(

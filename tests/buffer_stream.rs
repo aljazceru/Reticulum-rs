@@ -40,7 +40,7 @@ async fn build_transport(name: &str, bind: &str, forward: &str) -> (Transport, P
 async fn buffer_round_trip() {
     setup();
 
-    let (mut transport_a, id_a) = build_transport("a", "127.0.0.1:8181", "127.0.0.1:8182").await;
+    let (transport_a, id_a) = build_transport("a", "127.0.0.1:8181", "127.0.0.1:8182").await;
     let (transport_b, _) = build_transport("b", "127.0.0.1:8182", "127.0.0.1:8181").await;
 
     let mut in_link_events = transport_a.in_link_events();

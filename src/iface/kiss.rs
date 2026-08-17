@@ -284,10 +284,7 @@ impl SerialPortConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KissMode {
     Kiss,
-    Ax25 {
-        callsign: String,
-        ssid: u8,
-    },
+    Ax25 { callsign: String, ssid: u8 },
 }
 
 /// KISS beacon configuration (`id_interval` / `id_callsign`): transmit the
@@ -417,7 +414,10 @@ impl KissInterface {
                         stream
                     }
                     Err(_) => {
-                        log::warn!("kiss: couldn't open serial port <{}>, retrying", serial.port);
+                        log::warn!(
+                            "kiss: couldn't open serial port <{}>, retrying",
+                            serial.port
+                        );
                         tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }
@@ -730,9 +730,7 @@ mod tests {
         // Python: bytes([KISS.FEND])+bytes([0x00])+KISS.escape(data)+bytes([KISS.FEND])
         assert_eq!(
             encode_frame(&[0x7e, 0x7d, 0x01, 0xc0, 0xdb, 0xdc, 0xdd]),
-            vec![
-                0xc0, 0x00, 0x7e, 0x7d, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0xdc, 0xdd, 0xc0
-            ]
+            vec![0xc0, 0x00, 0x7e, 0x7d, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0xdc, 0xdd, 0xc0]
         );
 
         // empty data frame
@@ -799,9 +797,6 @@ mod tests {
 
         // regular data frame on port 0
         let data = encode_frame(&[0xaa, 0xbb]);
-        assert_eq!(
-            decoder.feed(&data),
-            vec![KissEvent::Data(vec![0xaa, 0xbb])]
-        );
+        assert_eq!(decoder.feed(&data), vec![KissEvent::Data(vec![0xaa, 0xbb])]);
     }
 }

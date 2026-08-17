@@ -41,7 +41,7 @@ async fn udp_pair(server_port: u16, client_port: u16) -> (Transport, Transport) 
 
 #[tokio::test]
 async fn snapshot_reflects_announced_paths() {
-    let (mut server, client) = udp_pair(4601, 4602).await;
+    let (server, client) = udp_pair(4601, 4602).await;
 
     let destination = server
         .add_destination(
@@ -88,7 +88,7 @@ async fn snapshot_reflects_announced_paths() {
 
 #[tokio::test]
 async fn status_report_shows_paths_and_interfaces() {
-    let (mut server, client) = udp_pair(4611, 4612).await;
+    let (server, client) = udp_pair(4611, 4612).await;
     let destination = server
         .add_destination(
             PrivateIdentity::new_from_rand(OsRng),

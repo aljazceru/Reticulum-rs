@@ -455,8 +455,7 @@ impl AutoPeer {
                     let mut output = OutputBuffer::new(&mut buffer[..]);
                     if packet.serialize(&mut output).is_ok() {
                         let ifac = channel_ifac.read().expect("ifac lock").clone();
-                        let wire =
-                            crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
+                        let wire = crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
                         if socket.send_to(&wire, peer_addr).await.is_ok() {
                             stats.count_tx(wire.len());
                         }
@@ -468,24 +467,25 @@ impl AutoPeer {
                         match crate::iface::ifac::decode(&datagram, ifac.as_deref()) {
                             Some(plain) => plain,
                             None => {
-                                log::debug!("auto_interface: dropping packet with invalid access code");
+                                log::debug!(
+                                    "auto_interface: dropping packet with invalid access code"
+                                );
                                 continue;
                             }
                         }
                     };
-                    match Packet::deserialize(&mut InputBuffer::new(&plain[..]))
-                {
-                    Ok(packet) => {
-                        stats.count_rx(datagram.len());
-                        let _ = rx_channel
-                            .send(RxMessage {
-                                address: iface_address,
-                                packet,
-                            })
-                            .await;
+                    match Packet::deserialize(&mut InputBuffer::new(&plain[..])) {
+                        Ok(packet) => {
+                            stats.count_rx(datagram.len());
+                            let _ = rx_channel
+                                .send(RxMessage {
+                                    address: iface_address,
+                                    packet,
+                                })
+                                .await;
+                        }
+                        Err(_) => log::debug!("auto: couldn't decode packet from {peer_addr}"),
                     }
-                    Err(_) => log::debug!("auto: couldn't decode packet from {peer_addr}"),
-                }
                 }
             }
         }
@@ -510,7 +510,10 @@ pub struct AutoInterface {
 }
 
 impl AutoInterface {
-    pub fn new(config: AutoInterfaceConfig, iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>) -> Self {
+    pub fn new(
+        config: AutoInterfaceConfig,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+    ) -> Self {
         Self {
             config,
             iface_manager,
@@ -543,11 +546,7 @@ impl AutoInterface {
             }
         });
 
-        let ifaces = suitable_interfaces(
-            &config.devices,
-            &config.ignored_devices,
-            config.adopt,
-        );
+        let ifaces = suitable_interfaces(&config.devices, &config.ignored_devices, config.adopt);
 
         if ifaces.is_empty() {
             log::warn!(
@@ -593,16 +592,17 @@ impl AutoInterface {
                     0
                 },
             );
-            let mcast_socket = match udp6_bind(&mcast_bind, true, Some((discovery_address, iface.ifindex))) {
-                Ok(socket) => socket,
-                Err(err) => {
-                    log::warn!(
-                        "auto: couldn't bind multicast discovery socket on {}: {err}",
-                        iface.name
-                    );
-                    continue;
-                }
-            };
+            let mcast_socket =
+                match udp6_bind(&mcast_bind, true, Some((discovery_address, iface.ifindex))) {
+                    Ok(socket) => socket,
+                    Err(err) => {
+                        log::warn!(
+                            "auto: couldn't bind multicast discovery socket on {}: {err}",
+                            iface.name
+                        );
+                        continue;
+                    }
+                };
 
             spawn_rx_loop(
                 cancel.clone(),
@@ -638,8 +638,7 @@ impl AutoInterface {
             }
 
             // data socket on the data port
-            let data_bind =
-                SocketAddrV6::new(iface.link_local, config.data_port, 0, iface.ifindex);
+            let data_bind = SocketAddrV6::new(iface.link_local, config.data_port, 0, iface.ifindex);
             match udp6_bind(&data_bind, false, None) {
                 Ok(socket) => {
                     spawn_rx_loop(
@@ -651,10 +650,7 @@ impl AutoInterface {
                     );
                 }
                 Err(err) => {
-                    log::warn!(
-                        "auto: couldn't bind data socket on {}: {err}",
-                        iface.name
-                    );
+                    log::warn!("auto: couldn't bind data socket on {}: {err}", iface.name);
                 }
             }
 
@@ -693,10 +689,13 @@ impl AutoInterface {
         // peer beacons: send discovery token to the multicast group
         for (_, ifindex, socket) in &beacon_sockets {
             let cancel = cancel.clone();
-            let Some(token) = tokens.get(ifindex) else { continue };
+            let Some(token) = tokens.get(ifindex) else {
+                continue;
+            };
             let token = *token;
             let socket = socket.clone();
-            let destination = SocketAddrV6::new(discovery_address, config.discovery_port, 0, *ifindex);
+            let destination =
+                SocketAddrV6::new(discovery_address, config.discovery_port, 0, *ifindex);
 
             tokio::spawn(async move {
                 loop {
@@ -830,9 +829,7 @@ impl AutoInterface {
             return;
         }
 
-        let Some((_, ifindex, socket)) = beacon_sockets
-            .iter()
-            .find(|(name, _, _)| name == ifname)
+        let Some((_, ifindex, socket)) = beacon_sockets.iter().find(|(name, _, _)| name == ifname)
         else {
             return;
         };
@@ -976,13 +973,21 @@ mod tests {
         // group "rstest":
         //   ff12:0:5113:b862:4c6f:e1fa:8d3c:c5f6
         assert_eq!(
-            mcast_discovery_address("rstest", DiscoveryScope::Link, MulticastAddressType::Temporary),
+            mcast_discovery_address(
+                "rstest",
+                DiscoveryScope::Link,
+                MulticastAddressType::Temporary
+            ),
             "ff12:0:5113:b862:4c6f:e1fa:8d3c:c5f6"
         );
 
         // permanent/site scope: ff05:0:5113:b862:4c6f:e1fa:8d3c:c5f6
         assert_eq!(
-            mcast_discovery_address("rstest", DiscoveryScope::Site, MulticastAddressType::Permanent),
+            mcast_discovery_address(
+                "rstest",
+                DiscoveryScope::Site,
+                MulticastAddressType::Permanent
+            ),
             "ff05:0:5113:b862:4c6f:e1fa:8d3c:c5f6"
         );
     }

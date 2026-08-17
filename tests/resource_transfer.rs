@@ -176,7 +176,7 @@ fn compression_roundtrip() {
 /// Two transports connected over loopback UDP with an active link.
 async fn connected_pair(server_port: u16, client_port: u16) -> (Transport, Transport, Arc<Mutex<Link>>) {
     let server_identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut server =
+    let server =
         TransportConfig::new("srv", &server_identity, false).build();
     let client = TransportConfig::new(
         "cli",

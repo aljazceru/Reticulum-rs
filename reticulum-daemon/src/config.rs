@@ -17,6 +17,13 @@ pub struct Config {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ReticulumConfig {
+    /// Enable the remote management destination
+    /// (Python `enable_remote_management`).
+    #[serde(default)]
+    pub remote_management: bool,
+    /// Enable the probe destination (Python `enable_remote_probe`).
+    #[serde(default)]
+    pub probe_destination: bool,
     #[serde(default)]
     pub enable_transport: bool,
     #[serde(default = "default_true")]
@@ -223,25 +230,61 @@ pub enum InterfaceConfig {
     Unsupported,
 }
 
-fn default_true() -> bool { true }
-fn default_serial_speed() -> u32 { 9600 }
-fn default_databits() -> u8 { 8 }
-fn default_parity() -> String { "N".to_string() }
-fn default_stopbits() -> u8 { 1 }
-fn default_local_ip() -> String { "127.0.0.1".to_string() }
-fn default_shared_port() -> u16 { 37428 }
-fn default_shared_instance_type() -> String { "domain".to_string() }
-fn default_control_port() -> u16 { 37429 }
-fn default_loglevel() -> log::LevelFilter { log::LevelFilter::Info }
+fn default_true() -> bool {
+    true
+}
+fn default_serial_speed() -> u32 {
+    9600
+}
+fn default_databits() -> u8 {
+    8
+}
+fn default_parity() -> String {
+    "N".to_string()
+}
+fn default_stopbits() -> u8 {
+    1
+}
+fn default_local_ip() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_shared_port() -> u16 {
+    37428
+}
+fn default_shared_instance_type() -> String {
+    "domain".to_string()
+}
+fn default_control_port() -> u16 {
+    37429
+}
+fn default_loglevel() -> log::LevelFilter {
+    log::LevelFilter::Info
+}
 // KISS CSMA defaults (KISSInterface.py)
-fn default_preamble() -> u32 { 350 }
-fn default_txtail() -> u32 { 20 }
-fn default_persistence() -> u32 { 64 }
-fn default_slottime() -> u32 { 20 }
-fn default_group_id() -> String { "reticulum".to_string() }
-fn default_discovery_port() -> u16 { 29716 }
-fn default_data_port() -> u16 { 42671 }
-fn default_respawn_delay() -> f32 { 5.0 }
+fn default_preamble() -> u32 {
+    350
+}
+fn default_txtail() -> u32 {
+    20
+}
+fn default_persistence() -> u32 {
+    64
+}
+fn default_slottime() -> u32 {
+    20
+}
+fn default_group_id() -> String {
+    "reticulum".to_string()
+}
+fn default_discovery_port() -> u16 {
+    29716
+}
+fn default_data_port() -> u16 {
+    42671
+}
+fn default_respawn_delay() -> f32 {
+    5.0
+}
 
 pub fn migrate_config(config_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if !config_file.exists() {
@@ -252,7 +295,7 @@ pub fn migrate_config(config_file: &Path) -> Result<(), Box<dyn std::error::Erro
     let content = fs::read_to_string(config_file)?;
     if toml::from_str::<Config>(&content).is_ok() {
         println!("File is already a valid TOML config: exiting");
-        return Ok(())
+        return Ok(());
     }
     let converted = convert_config(&content);
     // validate
@@ -260,7 +303,7 @@ pub fn migrate_config(config_file: &Path) -> Result<(), Box<dyn std::error::Erro
         Ok(_) => {}
         Err(err) => {
             eprintln!("error: converted text is not a valid TOML file");
-            return Err(err.into())
+            return Err(err.into());
         }
     }
     if cfg!(debug_assertions) {
@@ -268,7 +311,7 @@ pub fn migrate_config(config_file: &Path) -> Result<(), Box<dyn std::error::Erro
             Ok(_) => {}
             Err(err) => {
                 eprintln!("error: converted text is not a valid rs-rnsd Config file");
-                return Err(err.into())
+                return Err(err.into());
             }
         }
     }
@@ -283,7 +326,10 @@ pub fn migrate_config(config_file: &Path) -> Result<(), Box<dyn std::error::Erro
         config_file.with_extension("toml")
     };
     fs::write(&new_config_file, &converted)?;
-    println!("✓ Converted config written to: {}", new_config_file.display());
+    println!(
+        "✓ Converted config written to: {}",
+        new_config_file.display()
+    );
     println!();
     println!("Changes made:");
     println!("  - Converted numeric log level to log level string");
@@ -309,8 +355,11 @@ fn convert_config(content: &str) -> String {
             let rest = &line[value_start..];
             let value = rest.split_whitespace().next().unwrap_or(rest).trim();
             // Don't quote numbers or booleans
-            if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() 
-                || value == "true" || value == "false" {
+            if value.parse::<i64>().is_ok()
+                || value.parse::<f64>().is_ok()
+                || value == "true"
+                || value == "false"
+            {
                 return line.to_string();
             }
             // Quote the value
@@ -338,7 +387,10 @@ fn convert_config(content: &str) -> String {
         }
         // Detect interface block start
         if trimmed.starts_with("[[") && trimmed.ends_with("]]") {
-            let name = trimmed.trim_start_matches("[[").trim_end_matches("]]").trim();
+            let name = trimmed
+                .trim_start_matches("[[")
+                .trim_end_matches("]]")
+                .trim();
             if name != "interfaces" {
                 // Convert [[Interface Name]] to [[interfaces]]
                 output.push_str("\n[[interfaces]]\n");
@@ -363,12 +415,14 @@ fn convert_config(content: &str) -> String {
         }
 
         // Convert numeric loglevel
-        converted = re_loglevel.replace(&converted, |caps: &regex::Captures| {
-            let level_num: u8 = caps[2].parse().unwrap();
-            let level = python_log_filter(level_num);
-            let out = format!("{}{}", &caps[1], level);
-            out
-        }).to_string();
+        converted = re_loglevel
+            .replace(&converted, |caps: &regex::Captures| {
+                let level_num: u8 = caps[2].parse().unwrap();
+                let level = python_log_filter(level_num);
+                let out = format!("{}{}", &caps[1], level);
+                out
+            })
+            .to_string();
 
         // Quote unquoted string values (only for non-comments)
         if !converted.starts_with('#') {
@@ -394,6 +448,8 @@ fn convert_config(content: &str) -> String {
 impl Default for ReticulumConfig {
     fn default() -> Self {
         Self {
+            remote_management: false,
+            probe_destination: false,
             enable_transport: false,
             share_instance: false,
             shared_instance_port: 37428,
@@ -407,7 +463,9 @@ impl Default for ReticulumConfig {
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self { loglevel: default_loglevel() }
+        Self {
+            loglevel: default_loglevel(),
+        }
     }
 }
 
@@ -425,7 +483,11 @@ impl std::fmt::Debug for SharedInstanceDescription<'_> {
         } else if cfg!(unix) {
             write!(f, "domain \\0rns/{}", self.instance_name)
         } else {
-            write!(f, "tcp 127.0.0.1:{} (domain sockets unavailable)", self.port)
+            write!(
+                f,
+                "tcp 127.0.0.1:{} (domain sockets unavailable)",
+                self.port
+            )
         }
     }
 }
@@ -459,9 +521,11 @@ impl Config {
         } else if path.join("config").exists() {
             "config"
         } else {
-            let err = format!("no config.toml or config file found in config path {}",
-                path.display());
-            return Err(err.into())
+            let err = format!(
+                "no config.toml or config file found in config path {}",
+                path.display()
+            );
+            return Err(err.into());
         };
         let config_file = path.join(config_basename);
         let content = fs::read_to_string(&config_file)?;
@@ -474,16 +538,21 @@ impl Config {
             Err(err) => {
                 if config_basename == "config.toml" {
                     eprintln!("{config_file:?} is not valid TOML");
-                    return Err(err.into())
+                    return Err(err.into());
                 } else {
                     // attempt to convert
                     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     eprintln!("Your config file appears to be in Python Reticulum format.");
                     eprintln!("You can use the converter tool to migrate it to standard TOML:");
                     eprintln!();
-                    eprintln!("  cargo run -p reticulum-daemon -- convert-config {}", config_file.display());
+                    eprintln!(
+                        "  cargo run -p reticulum-daemon -- convert-config {}",
+                        config_file.display()
+                    );
                     eprintln!();
-                    eprintln!("This command will create a backup and convert your config to valid TOML.");
+                    eprintln!(
+                        "This command will create a backup and convert your config to valid TOML."
+                    );
                     eprintln!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
                     let converted = convert_config(&content);
                     toml::from_str(&converted)?
@@ -508,7 +577,9 @@ impl Config {
         Ok(config)
     }
 
-    pub fn load(custom_config_path: Option<&Path>) -> Result<(Self, PathBuf), Box<dyn std::error::Error>> {
+    pub fn load(
+        custom_config_path: Option<&Path>,
+    ) -> Result<(Self, PathBuf), Box<dyn std::error::Error>> {
         if let Some(path) = custom_config_path {
             let config = Self::from_file(path)?;
             return Ok((config, path.to_path_buf()));
@@ -523,7 +594,10 @@ impl Config {
             let config = Self::default_config();
             let config_file = default_dir.join("config.toml");
             fs::write(&config_file, toml::to_string_pretty(&config)?)?;
-            log::warn!("Created default configuration at: {}", config_file.display());
+            log::warn!(
+                "Created default configuration at: {}",
+                config_file.display()
+            );
             log::warn!("Please review and customize the configuration for your needs");
             Ok((config, default_dir))
         }
@@ -533,21 +607,19 @@ impl Config {
         Self {
             reticulum: ReticulumConfig::default(),
             logging: LoggingConfig::default(),
-            interfaces: vec![
-                NamedInterface {
-                    name: "Default TCP Server Interface".to_string(),
-                    mode: None,
-                    bitrate: None,
-                    ifac_size: None,
-                    networkname: None,
-                    passphrase: None,
-                    config: InterfaceConfig::TCPServerInterface {
-                        enabled: true,
-                        bind_host: "127.0.0.1".to_string(),
-                        bind_port: 4242,
-                    },
+            interfaces: vec![NamedInterface {
+                name: "Default TCP Server Interface".to_string(),
+                mode: None,
+                bitrate: None,
+                ifac_size: None,
+                networkname: None,
+                passphrase: None,
+                config: InterfaceConfig::TCPServerInterface {
+                    enabled: true,
+                    bind_host: "127.0.0.1".to_string(),
+                    bind_port: 4242,
                 },
-            ],
+            }],
         }
     }
 }
@@ -587,7 +659,9 @@ pub const KNOWN_RETICULUM_KEYS: &[&str] = &[
     "require_if_time_sync",
     "link_mtu_discovery",
     "remote_management",
+    "enable_remote_management",
     "probe_destination",
+    "enable_remote_probe",
     "enable_stranded_announce_rebroadcast",
 ];
 
@@ -599,8 +673,6 @@ pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] = &[
     "storagepath",
     "require_if_time_sync",
     "link_mtu_discovery",
-    "remote_management",
-    "probe_destination",
     "enable_stranded_announce_rebroadcast",
 ];
 
@@ -633,7 +705,12 @@ pub fn warn_about_unknown_keys(value: &toml::Value) {
     };
     for (section, contents) in table {
         match section.as_str() {
-            "reticulum" => warn_section(contents, KNOWN_RETICULUM_KEYS, KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS, "reticulum"),
+            "reticulum" => warn_section(
+                contents,
+                KNOWN_RETICULUM_KEYS,
+                KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS,
+                "reticulum",
+            ),
             "logging" => warn_section(contents, KNOWN_LOGGING_KEYS, &[], "logging"),
             "interfaces" => {
                 if let Some(entries) = contents.as_array() {
@@ -669,18 +746,15 @@ pub fn warn_about_unknown_keys(value: &toml::Value) {
     }
 }
 
-fn warn_section(
-    contents: &toml::Value,
-    known: &[&str],
-    unapplied: &[&str],
-    section: &str,
-) {
+fn warn_section(contents: &toml::Value, known: &[&str], unapplied: &[&str], section: &str) {
     let Some(table) = contents.as_table() else {
         return;
     };
     for key in table.keys() {
         if unapplied.contains(&key.as_str()) {
-            log::warn!("[{section}] key '{key}' is recognized but not yet applied by the Rust daemon");
+            log::warn!(
+                "[{section}] key '{key}' is recognized but not yet applied by the Rust daemon"
+            );
         } else if !known.contains(&key.as_str()) {
             log::warn!("Unknown key '{key}' in section [{section}]");
         }
@@ -717,8 +791,7 @@ mod tests {
         assert!(!config.reticulum.share_instance);
         assert_eq!(config.reticulum.shared_instance_port, 37428);
         assert_eq!(
-            config.reticulum.shared_instance_type,
-            "domain",
+            config.reticulum.shared_instance_type, "domain",
             "Python uses domain sockets for shared instances where available"
         );
         assert!(config.reticulum.instance_name.is_none());
@@ -846,7 +919,10 @@ port = "/dev/ttyACM0"
         let mut interfaces = config.interfaces.into_iter();
         match interfaces.next().unwrap().config {
             InterfaceConfig::AX25KISSInterface {
-                callsign, ssid, preamble, ..
+                callsign,
+                ssid,
+                preamble,
+                ..
             } => {
                 assert_eq!(callsign, "n0call");
                 assert_eq!(ssid, 7);

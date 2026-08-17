@@ -9,7 +9,7 @@ use reticulum::transport::{Transport, TransportConfig};
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
-    let mut transport = Transport::new(TransportConfig::default());
+    let transport = Transport::new(TransportConfig::default());
 
     log::info!("start tcp app");
 
