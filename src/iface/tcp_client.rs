@@ -42,6 +42,7 @@ impl TcpClient {
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
         let iface_stop = context.channel.stop.clone();
+        let stats = context.channel.stats.clone();
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_address = context.channel.address;
         let mut stream = { context.inner.lock().unwrap().stream.take() };
@@ -78,6 +79,7 @@ impl TcpClient {
                 }
             };
 
+            stats.set_online(false);
             if stream.is_err() {
                 log::info!("tcp_client: couldn't connect to <{}>", addr);
                 let retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -105,6 +107,7 @@ impl TcpClient {
             let stream = stream.unwrap();
             let (read_stream, write_stream) = stream.into_split();
 
+            stats.set_online(true);
             log::info!("tcp_client connected to <{}>", addr);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
@@ -115,6 +118,7 @@ impl TcpClient {
                 let stop = stop.clone();
                 let mut stream = read_stream;
                 let rx_channel = rx_channel.clone();
+                let stats = stats.clone();
 
                 tokio::spawn(async move {
                     let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
@@ -153,6 +157,7 @@ impl TcpClient {
                                                             if PACKET_TRACE {
                                                                 log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
                                                             }
+                                                            stats.count_rx(output.offset());
                                                             let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
                                                         } else {
                                                             log::warn!("tcp_client: couldn't decode packet");
@@ -184,6 +189,7 @@ impl TcpClient {
             let tx_task = {
                 let cancel = cancel.clone();
                 let tx_channel = tx_channel.clone();
+                let stats = stats.clone();
                 let mut stream = write_stream;
 
                 tokio::spawn(async move {
@@ -214,9 +220,11 @@ impl TcpClient {
 
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
-                                    if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok() {
-                                        let _ = stream.write_all(hdlc_output.as_slice()).await;
+                                    if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok()
+                                        && stream.write_all(hdlc_output.as_slice()).await.is_ok()
+                                    {
                                         let _ = stream.flush().await;
+                                        stats.count_tx(output.offset());
                                     }
                                 }
                             }
@@ -228,6 +236,7 @@ impl TcpClient {
             tx_task.await.unwrap();
             rx_task.await.unwrap();
 
+            stats.set_online(false);
             log::info!("tcp_client: disconnected from <{}>", addr);
         }
 

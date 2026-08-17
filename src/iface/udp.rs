@@ -37,12 +37,14 @@ impl UdpInterface {
         let bind_addr = { context.inner.lock().unwrap().bind_addr.clone() };
         let forward_addr = { context.inner.lock().unwrap().forward_addr.clone() };
         let iface_address = context.channel.address;
+        let stats = context.channel.stats.clone();
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
         loop {
             if context.cancel.is_cancelled() {
+                stats.set_online(false);
                 break;
             }
 
@@ -55,6 +57,7 @@ impl UdpInterface {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 continue;
             }
+            stats.set_online(true);
 
             let cancel = context.cancel.clone();
             let stop = CancellationToken::new();
@@ -68,6 +71,7 @@ impl UdpInterface {
             }
 
             log::info!("udp_interface bound to <{}>", bind_addr);
+            stats.set_online(true);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 3;
 
@@ -77,6 +81,7 @@ impl UdpInterface {
                 let stop = stop.clone();
                 let socket = read_socket;
                 let rx_channel = rx_channel.clone();
+                let stats = stats.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -101,6 +106,7 @@ impl UdpInterface {
                                             if PACKET_TRACE {
                                                 log::trace!("udp_interface: rx << ({}) {}", iface_address, packet);
                                             }
+                                            stats.count_rx(n);
                                             let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
                                         } else {
                                             log::warn!("udp_interface: couldn't decode packet");
@@ -122,6 +128,7 @@ impl UdpInterface {
                 let tx_task = {
                     let cancel = cancel.clone();
                     let tx_channel = tx_channel.clone();
+                    let stats = stats.clone();
                     let socket = write_socket;
 
                     tokio::spawn(async move {
@@ -147,8 +154,10 @@ impl UdpInterface {
                                         log::trace!("udp_interface: tx >> ({}) {}", iface_address, packet);
                                     }
                                     let mut output = OutputBuffer::new(&mut tx_buffer);
-                                    if packet.serialize(&mut output).is_ok() {
-                                        let _ = socket.send_to(output.as_slice(), &forward_addr).await;
+                                    if packet.serialize(&mut output).is_ok()
+                                        && socket.send_to(output.as_slice(), &forward_addr).await.is_ok()
+                                    {
+                                        stats.count_tx(output.offset());
                                     }
                                 }
                             };
@@ -160,6 +169,7 @@ impl UdpInterface {
 
             rx_task.await.unwrap();
 
+            stats.set_online(false);
             log::info!("udp_interface <{}>: closed", bind_addr);
         }
     }

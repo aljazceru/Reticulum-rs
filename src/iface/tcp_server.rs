@@ -26,6 +26,7 @@ impl TcpServer {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let addr = { context.inner.lock().unwrap().addr.clone() };
+        let stats = context.channel.stats.clone();
 
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
 
@@ -34,6 +35,7 @@ impl TcpServer {
 
         loop {
             if context.cancel.is_cancelled() {
+                stats.set_online(false);
                 break;
             }
 
@@ -48,6 +50,7 @@ impl TcpServer {
             }
 
             log::info!("tcp_server: listen on <{}>", addr);
+            stats.set_online(true);
 
             let listener = listener.unwrap();
 
@@ -105,6 +108,7 @@ impl TcpServer {
                 }
             }
 
+            stats.set_online(false);
             let _ = tokio::join!(tx_task);
         }
     }

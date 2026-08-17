@@ -23,6 +23,10 @@ pub struct ReticulumConfig {
     pub share_instance: bool,
     #[serde(default = "default_shared_port")]
     pub shared_instance_port: u16,
+    /// `shared_instance_type = tcp|domain` (Python: domain sockets where
+    /// available, TCP otherwise).
+    #[serde(default = "default_shared_instance_type")]
+    pub shared_instance_type: String,
     #[serde(default = "default_control_port")]
     pub instance_control_port: u16,
     #[serde(default)]
@@ -70,8 +74,29 @@ pub enum InterfaceConfig {
         forward_port: u16,
     },
     AutoInterface {
-        #[serde(default = "default_true")]
+        #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
+        /// Discovery group id (default "reticulum")
+        #[serde(default = "default_group_id")]
+        group_id: String,
+        /// Multicast discovery port (default 29716)
+        #[serde(default = "default_discovery_port")]
+        discovery_port: u16,
+        /// Unicast data port (default 42671)
+        #[serde(default = "default_data_port")]
+        data_port: u16,
+        /// Discovery scope: link (default), admin, site, organisation, global
+        #[serde(default)]
+        discovery_scope: Option<String>,
+        /// Multicast address type: temporary (default) or permanent
+        #[serde(default)]
+        multicast_address_type: Option<String>,
+        /// Allow-list of interface names (`devices`, comma-separated)
+        #[serde(default)]
+        devices: Option<String>,
+        /// Deny-list of interface names (`ignored_devices`, comma-separated)
+        #[serde(default)]
+        ignored_devices: Option<String>,
     },
     I2PInterface {
         #[serde(default = "default_true")]
@@ -101,45 +126,106 @@ pub enum InterfaceConfig {
         enable_central: bool,
     },
     KISSInterface {
-        #[serde(default = "default_true")]
+        #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
         port: String,
+        #[serde(default = "default_serial_speed")]
         speed: u32,
+        #[serde(default = "default_databits")]
         databits: u8,
+        #[serde(default = "default_parity")]
         parity: String,
+        #[serde(default = "default_stopbits")]
         stopbits: u8,
+        #[serde(default = "default_preamble")]
         preamble: u32,
+        #[serde(default = "default_txtail")]
         txtail: u32,
+        #[serde(default = "default_persistence")]
         persistence: u32,
+        #[serde(default = "default_slottime")]
         slottime: u32,
         #[serde(default)]
         flow_control: bool,
     },
     AX25KISSInterface {
-        #[serde(default = "default_true")]
+        #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
         callsign: String,
         ssid: u8,
         port: String,
+        #[serde(default = "default_serial_speed")]
         speed: u32,
+        #[serde(default = "default_databits")]
         databits: u8,
+        #[serde(default = "default_parity")]
         parity: String,
+        #[serde(default = "default_stopbits")]
         stopbits: u8,
+        #[serde(default = "default_preamble")]
         preamble: u32,
+        #[serde(default = "default_txtail")]
         txtail: u32,
+        #[serde(default = "default_persistence")]
         persistence: u32,
+        #[serde(default = "default_slottime")]
         slottime: u32,
         #[serde(default)]
         flow_control: bool,
+    },
+    SerialInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        port: String,
+        #[serde(default = "default_serial_speed")]
+        speed: u32,
+        #[serde(default = "default_databits")]
+        databits: u8,
+        #[serde(default = "default_parity")]
+        parity: String,
+        #[serde(default = "default_stopbits")]
+        stopbits: u8,
+    },
+    PipeInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        command: String,
+        /// Respawn delay in (fractional) seconds when the command exits
+        /// (Python `respawn_delay`, default 5)
+        #[serde(default = "default_respawn_delay")]
+        respawn_delay: f32,
+    },
+    LocalInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        #[serde(default = "default_local_ip")]
+        listen_ip: String,
+        #[serde(default = "default_shared_port")]
+        listen_port: u16,
     },
     #[serde(other)]
     Unsupported,
 }
 
 fn default_true() -> bool { true }
+fn default_serial_speed() -> u32 { 9600 }
+fn default_databits() -> u8 { 8 }
+fn default_parity() -> String { "N".to_string() }
+fn default_stopbits() -> u8 { 1 }
+fn default_local_ip() -> String { "127.0.0.1".to_string() }
 fn default_shared_port() -> u16 { 37428 }
+fn default_shared_instance_type() -> String { "domain".to_string() }
 fn default_control_port() -> u16 { 37429 }
 fn default_loglevel() -> log::LevelFilter { log::LevelFilter::Info }
+// KISS CSMA defaults (KISSInterface.py)
+fn default_preamble() -> u32 { 350 }
+fn default_txtail() -> u32 { 20 }
+fn default_persistence() -> u32 { 64 }
+fn default_slottime() -> u32 { 20 }
+fn default_group_id() -> String { "reticulum".to_string() }
+fn default_discovery_port() -> u16 { 29716 }
+fn default_data_port() -> u16 { 42671 }
+fn default_respawn_delay() -> f32 { 5.0 }
 
 pub fn migrate_config(config_file: &Path) -> Result<(), Box<dyn std::error::Error>> {
     if !config_file.exists() {
@@ -295,6 +381,7 @@ impl Default for ReticulumConfig {
             enable_transport: false,
             share_instance: false,
             shared_instance_port: 37428,
+            shared_instance_type: default_shared_instance_type(),
             instance_control_port: 37429,
             panic_on_interface_error: false,
             instance_name: None,
@@ -305,6 +392,25 @@ impl Default for ReticulumConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self { loglevel: default_loglevel() }
+    }
+}
+
+/// Debug-printable description of the shared-instance listener address.
+pub struct SharedInstanceDescription<'a> {
+    pub kind: &'a str,
+    pub port: u16,
+    pub instance_name: &'a str,
+}
+
+impl std::fmt::Debug for SharedInstanceDescription<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.kind.eq_ignore_ascii_case("tcp") {
+            write!(f, "tcp 127.0.0.1:{}", self.port)
+        } else if cfg!(unix) {
+            write!(f, "domain \\0rns/{}", self.instance_name)
+        } else {
+            write!(f, "tcp 127.0.0.1:{} (domain sockets unavailable)", self.port)
+        }
     }
 }
 
@@ -343,6 +449,10 @@ impl Config {
         };
         let config_file = path.join(config_basename);
         let content = fs::read_to_string(&config_file)?;
+        // Unknown keys must warn, never fail (Python __apply_config parity).
+        if let Ok(value) = toml::from_str::<toml::Value>(&content) {
+            warn_about_unknown_keys(&value);
+        }
         let config: Self = match toml::from_str(&content) {
             Ok(config) => config,
             Err(err) => {
@@ -365,8 +475,19 @@ impl Config {
             }
         };
         if config.reticulum.share_instance {
-            log::warn!("share_instance is enabled but shared instances are not supported in reticulum-rs");
-            log::warn!("Each Rust daemon process runs independently and is only limited by available ports");
+            let instance_name = config
+                .reticulum
+                .instance_name
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            log::info!(
+                "share_instance is enabled: the daemon will listen on a local shared instance ({:?})",
+                SharedInstanceDescription {
+                    kind: &config.reticulum.shared_instance_type,
+                    port: config.reticulum.shared_instance_port,
+                    instance_name: &instance_name,
+                }
+            );
         }
         Ok(config)
     }
@@ -420,5 +541,365 @@ pub fn python_log_filter(loglevel: u8) -> log::LevelFilter {
         5 => log::LevelFilter::Debug,
         6 => log::LevelFilter::Debug,
         _ => log::LevelFilter::Trace,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7.2 config parity: additional interface types + unknown-key warnings.
+// ---------------------------------------------------------------------------
+
+/// Keys of the `[reticulum]` section the daemon understands. Keys known from
+/// the Python implementation but not (yet) applied by the Rust daemon are
+/// listed separately in [`KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS`] so they are
+/// reported as "not yet supported" instead of "unknown".
+pub const KNOWN_RETICULUM_KEYS: &[&str] = &[
+    "enable_transport",
+    "share_instance",
+    "shared_instance_port",
+    "shared_instance_type",
+    "instance_control_port",
+    "instance_name",
+    "panic_on_interface_error",
+    "network_identity",
+    "static_transport_identity",
+    "storagepath",
+    "require_if_time_sync",
+    "link_mtu_discovery",
+    "remote_management",
+    "probe_destination",
+    "enable_stranded_announce_rebroadcast",
+];
+
+/// `[reticulum]` keys that are recognized but currently ignored by the Rust
+/// daemon.
+pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] = &[
+    "network_identity",
+    "static_transport_identity",
+    "storagepath",
+    "require_if_time_sync",
+    "link_mtu_discovery",
+    "remote_management",
+    "probe_destination",
+    "enable_stranded_announce_rebroadcast",
+];
+
+/// Keys of the `[logging]` section the daemon understands.
+pub const KNOWN_LOGGING_KEYS: &[&str] = &["loglevel", "logdest", "logfile"];
+
+/// Keys understood inside `[[interfaces]]` entries, independent of type.
+pub const KNOWN_INTERFACE_KEYS: &[&str] = &[
+    "name",
+    "type",
+    "enabled",
+    "interface_enabled",
+    "mode",
+    "configured_bitrate",
+    "ifac_size",
+    "ifac_key",
+    "ifac_netname",
+    "announce_rate_target",
+    "announce_rate_penalty",
+    "announce_rate_grace",
+    "announce_rate_min_squeeze",
+    "ingress_controlled",
+];
+
+/// Warn (never fail) about configuration keys the daemon does not know or
+/// does not apply — mirroring Python's `__apply_config` warnings.
+pub fn warn_about_unknown_keys(value: &toml::Value) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (section, contents) in table {
+        match section.as_str() {
+            "reticulum" => warn_section(contents, KNOWN_RETICULUM_KEYS, KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS, "reticulum"),
+            "logging" => warn_section(contents, KNOWN_LOGGING_KEYS, &[], "logging"),
+            "interfaces" => {
+                if let Some(entries) = contents.as_array() {
+                    for (index, entry) in entries.iter().enumerate() {
+                        let Some(entry_table) = entry.as_table() else {
+                            continue;
+                        };
+                        let iface_type = entry_table
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("<missing type>");
+                        let iface_name = entry_table
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unnamed");
+                        if !SUPPORTED_INTERFACE_TYPES.contains(&iface_type) {
+                            log::warn!(
+                                "Interface '{iface_name}' (#{index}) has type '{iface_type}' which is not supported yet"
+                            );
+                        }
+                        for key in entry_table.keys() {
+                            if !KNOWN_INTERFACE_KEYS.contains(&key.as_str()) {
+                                log::warn!(
+                                    "Unknown key '{key}' in interface '{iface_name}' (type '{iface_type}')"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            other => log::warn!("Unknown configuration section [{other}]"),
+        }
+    }
+}
+
+fn warn_section(
+    contents: &toml::Value,
+    known: &[&str],
+    unapplied: &[&str],
+    section: &str,
+) {
+    let Some(table) = contents.as_table() else {
+        return;
+    };
+    for key in table.keys() {
+        if unapplied.contains(&key.as_str()) {
+            log::warn!("[{section}] key '{key}' is recognized but not yet applied by the Rust daemon");
+        } else if !known.contains(&key.as_str()) {
+            log::warn!("Unknown key '{key}' in section [{section}]");
+        }
+    }
+}
+
+/// Interface types the Rust daemon can parse from `[[interfaces]]` entries.
+/// (Spawning support depends on the corresponding `reticulum::iface` module
+/// being available; see `main.rs`.)
+pub const SUPPORTED_INTERFACE_TYPES: &[&str] = &[
+    "TCPServerInterface",
+    "TCPClientInterface",
+    "UDPInterface",
+    "SerialInterface",
+    "PipeInterface",
+    "KISSInterface",
+    "AX25KISSInterface",
+    "RNodeInterface",
+    "RNodeMultiInterface",
+    "AutoInterface",
+    "I2PInterface",
+    "BLEInterface",
+    "LocalInterface",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_instance_defaults_match_python() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert!(!config.reticulum.share_instance);
+        assert_eq!(config.reticulum.shared_instance_port, 37428);
+        assert_eq!(
+            config.reticulum.shared_instance_type,
+            "domain",
+            "Python uses domain sockets for shared instances where available"
+        );
+        assert!(config.reticulum.instance_name.is_none());
+    }
+
+    #[test]
+    fn parse_shared_instance_options() {
+        let config: Config = toml::from_str(
+            r#"
+[reticulum]
+share_instance = true
+shared_instance_type = "tcp"
+shared_instance_port = 42840
+instance_name = "node-b"
+"#,
+        )
+        .unwrap();
+
+        assert!(config.reticulum.share_instance);
+        assert_eq!(config.reticulum.shared_instance_type, "tcp");
+        assert_eq!(config.reticulum.shared_instance_port, 42840);
+        assert_eq!(config.reticulum.instance_name.as_deref(), Some("node-b"));
+    }
+
+    #[test]
+    fn parse_domain_shared_instance() {
+        let config: Config = toml::from_str(
+            r#"
+[reticulum]
+share_instance = true
+instance_name = "second"
+
+[[interfaces]]
+name = "Test Pipe"
+type = "PipeInterface"
+command = "/bin/cat"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.reticulum.shared_instance_type, "domain");
+        assert_eq!(config.reticulum.instance_name.as_deref(), Some("second"));
+
+        let NamedInterface { name, config } = config.interfaces.into_iter().next().unwrap();
+        assert_eq!(name, "Test Pipe");
+        match config {
+            InterfaceConfig::PipeInterface {
+                enabled,
+                command,
+                respawn_delay,
+            } => {
+                assert!(enabled);
+                assert_eq!(command, "/bin/cat");
+                assert_eq!(respawn_delay, 5.0, "Python respawn_delay default is 5s");
+            }
+            other => panic!("unexpected interface config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_kiss_interface_with_python_defaults() {
+        // like a converted Python config: only the port is mandatory
+        let config: Config = toml::from_str(
+            r#"
+[[interfaces]]
+name = "Radio"
+type = "KISSInterface"
+port = "/dev/ttyUSB0"
+"#,
+        )
+        .unwrap();
+
+        let NamedInterface { config, .. } = config.interfaces.into_iter().next().unwrap();
+        match config {
+            InterfaceConfig::KISSInterface {
+                enabled,
+                port,
+                speed,
+                databits,
+                parity,
+                stopbits,
+                preamble,
+                txtail,
+                persistence,
+                slottime,
+                flow_control,
+            } => {
+                assert!(enabled);
+                assert_eq!(port, "/dev/ttyUSB0");
+                // Python constructor defaults (KISSInterface.py)
+                assert_eq!(speed, 9600);
+                assert_eq!(databits, 8);
+                assert_eq!(parity, "N");
+                assert_eq!(stopbits, 1);
+                assert_eq!(preamble, 350);
+                assert_eq!(txtail, 20);
+                assert_eq!(persistence, 64);
+                assert_eq!(slottime, 20);
+                assert!(!flow_control);
+            }
+            other => panic!("unexpected interface config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ax25_and_serial_interfaces() {
+        let config: Config = toml::from_str(
+            r#"
+[[interfaces]]
+name = "AX25 Radio"
+type = "AX25KISSInterface"
+callsign = "n0call"
+ssid = 7
+port = "/dev/ttyUSB1"
+preamble = 300
+
+[[interfaces]]
+name = "Raw Serial"
+type = "SerialInterface"
+port = "/dev/ttyACM0"
+"#,
+        )
+        .unwrap();
+
+        let mut interfaces = config.interfaces.into_iter();
+        match interfaces.next().unwrap().config {
+            InterfaceConfig::AX25KISSInterface {
+                callsign, ssid, preamble, ..
+            } => {
+                assert_eq!(callsign, "n0call");
+                assert_eq!(ssid, 7);
+                assert_eq!(preamble, 300);
+            }
+            other => panic!("unexpected interface config: {other:?}"),
+        }
+        match interfaces.next().unwrap().config {
+            InterfaceConfig::SerialInterface { port, speed, .. } => {
+                assert_eq!(port, "/dev/ttyACM0");
+                assert_eq!(speed, 9600);
+            }
+            other => panic!("unexpected interface config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_auto_interface_options() {
+        let config: Config = toml::from_str(
+            r#"
+[[interfaces]]
+name = "Auto"
+type = "AutoInterface"
+group_id = "mygroup"
+discovery_port = 29720
+data_port = 42675
+devices = "eth0, wlan0"
+ignored_devices = "docker0"
+discovery_scope = "site"
+multicast_address_type = "permanent"
+"#,
+        )
+        .unwrap();
+
+        let NamedInterface { config, .. } = config.interfaces.into_iter().next().unwrap();
+        match config {
+            InterfaceConfig::AutoInterface {
+                enabled,
+                group_id,
+                discovery_port,
+                data_port,
+                discovery_scope,
+                multicast_address_type,
+                devices,
+                ignored_devices,
+            } => {
+                assert!(enabled);
+                assert_eq!(group_id, "mygroup");
+                assert_eq!(discovery_port, 29720);
+                assert_eq!(data_port, 42675);
+                assert_eq!(discovery_scope.as_deref(), Some("site"));
+                assert_eq!(multicast_address_type.as_deref(), Some("permanent"));
+                assert_eq!(devices.as_deref(), Some("eth0, wlan0"));
+                assert_eq!(ignored_devices.as_deref(), Some("docker0"));
+            }
+            other => panic!("unexpected interface config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shared_instance_description_matches_python_address_format() {
+        let description = SharedInstanceDescription {
+            kind: "domain",
+            port: 37428,
+            instance_name: "default",
+        };
+        // LocalInterface.py: f"\0rns/{socket_path}"
+        assert!(format!("{description:?}").ends_with("rns/default"));
+
+        let description = SharedInstanceDescription {
+            kind: "tcp",
+            port: 42840,
+            instance_name: "default",
+        };
+        assert_eq!(format!("{description:?}"), "tcp 127.0.0.1:42840");
     }
 }

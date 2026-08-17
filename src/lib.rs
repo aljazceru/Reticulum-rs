@@ -24,7 +24,19 @@
 //! * [`iface::tcp_client::TcpClient`]
 //! * [`iface::tcp_server::TcpServer`]
 //! * [`iface::udp::UdpInterface`]
+//! * [`iface::local::LocalServer`] / [`iface::local::LocalClient`]: the local
+//!   shared-instance protocol (TCP or abstract unix domain socket)
+//! * `iface::pipe::PipeInterface` (feature `iface-pipe`): subprocess
+//!   stdin/stdout pipes with HDLC framing
+//! * `iface::serial::SerialInterface`, `iface::kiss::KissInterface` and AX.25
+//!   KISS via `KissInterface::new_ax25` (feature `iface-serial`): serial
+//!   ports with HDLC/KISS framing
+//! * `iface::auto::AutoInterface` (feature `iface-auto`, Linux): IPv6
+//!   link-local multicast peering with direct UDP unicast data
 //! * Kaonic
+//!
+//! Per-interface statistics (sent/received counters, byte counts, online
+//! status) are available via [`transport::Transport::interface_stats`].
 //!
 //! The main instance can be used to send messages to [`destination::Destination`]s directly
 //! or over [`destination::link::Link`]s.

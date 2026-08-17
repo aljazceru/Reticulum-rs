@@ -17,6 +17,11 @@ tokio = { version = "1.44.2", features = ["full"] }
 toml = "0.9.11"
 reticulum = { path = ".." }
 
+[features]
+iface-serial = ["reticulum/iface-serial"]
+iface-pipe = ["reticulum/iface-pipe"]
+iface-auto = ["reticulum/iface-auto"]
+
 [[bin]]
 name = "rs-rnsd"
 path = "src/main.rs"
