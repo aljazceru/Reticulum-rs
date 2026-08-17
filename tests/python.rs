@@ -252,7 +252,7 @@ async fn python_link_server() {
 
     let server_identity = PrivateIdentity::new_from_rand(rand_core::OsRng);
     //let server_identity = PrivateIdentity::new_from_name("test-python-link-server");
-    let mut transport = TransportConfig::default().build();
+    let transport = TransportConfig::default().build();
     let _ = transport.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:4242", Some("127.0.0.1:4243"), false),
         UdpInterface::spawn,
@@ -555,7 +555,7 @@ async fn python_identify_server() {
 
     let server_identity = PrivateIdentity::new_from_rand(rand_core::OsRng);
     //let server_identity = PrivateIdentity::new_from_name("test-python-link-server");
-    let mut transport = TransportConfig::default().build();
+    let transport = TransportConfig::default().build();
     let _ = transport.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:4242", Some("127.0.0.1:4243"), false),
         UdpInterface::spawn,

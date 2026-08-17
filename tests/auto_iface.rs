@@ -88,7 +88,7 @@ async fn auto_interface_peers_and_exchanges_announce() {
 
     // distinct ports from the defaults so a real reticulum on the host
     // isn't disturbed
-    let mut node_a = auto_transport(
+    let node_a = auto_transport(
         "auto-a",
         auto_config("rs-test-auto", "fe80::1", 39716),
     )

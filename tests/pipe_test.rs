@@ -35,7 +35,7 @@ fn setup() {
 async fn pipe_echo_with_cat() {
     setup();
 
-    let mut transport =
+    let transport =
         TransportConfig::new("pipe", &PrivateIdentity::new_from_rand(OsRng), false).build();
 
     transport.iface_manager().lock().await.spawn(

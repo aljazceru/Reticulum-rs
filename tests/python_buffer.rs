@@ -119,7 +119,7 @@ async fn python_writer_rust_reader() {
         .try_init();
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = rust_transport(4252, 4253).await;
+    let transport = rust_transport(4252, 4253).await;
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "buffer.stream"))
         .await;
@@ -130,7 +130,7 @@ async fn python_writer_rust_reader() {
     let mut in_link_events = transport.in_link_events();
     let mut channel_rx = None;
     let _link_arc: Option<()> = None;
-    let mut partner = spawn_buffer("writer", Some(&hash.to_hex_string()), 20_000, 30.0).await;
+    let partner = spawn_buffer("writer", Some(&hash.to_hex_string()), 20_000, 30.0).await;
     let mut lines = partner.lines.resubscribe();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);

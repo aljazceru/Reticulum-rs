@@ -52,7 +52,7 @@ async fn kiss_announce_over_pty_pair() {
 
     let (master, slave) = tokio_serial::SerialStream::pair().expect("pty pair");
 
-    let mut node_a = kiss_transport("kiss-a", KissMode::Kiss, master).await;
+    let node_a = kiss_transport("kiss-a", KissMode::Kiss, master).await;
     let node_b = kiss_transport("kiss-b", KissMode::Kiss, slave).await;
 
     time::sleep(Duration::from_secs(1)).await;
@@ -87,7 +87,7 @@ async fn ax25_kiss_announce_over_pty_pair() {
 
     let (master, slave) = tokio_serial::SerialStream::pair().expect("pty pair");
 
-    let mut node_a = kiss_transport(
+    let node_a = kiss_transport(
         "ax25-a",
         KissMode::Ax25 {
             callsign: "N0CALL".to_string(),
@@ -146,7 +146,7 @@ async fn serial_hdlc_announce_over_pty_pair() {
         transport
     }
 
-    let mut node_a = build("serial-a", master).await;
+    let node_a = build("serial-a", master).await;
     let node_b = build("serial-b", slave).await;
 
     time::sleep(Duration::from_secs(1)).await;

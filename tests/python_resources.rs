@@ -159,7 +159,7 @@ async fn python_sends_resource_to_rust() {
 
     // Rust server announces an interop resource destination
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = rust_transport(4242, 4243).await;
+    let transport = rust_transport(4242, 4243).await;
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "interop.resource"))
         .await;
@@ -262,7 +262,7 @@ async fn python_request_to_rust() {
     setup();
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = rust_transport(4242, 4243).await;
+    let transport = rust_transport(4242, 4243).await;
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "interop.request"))
         .await;

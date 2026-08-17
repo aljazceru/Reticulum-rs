@@ -180,7 +180,7 @@ async fn python_sends_encrypted_packet_to_rust() {
     setup();
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = rust_transport(4242, 4243).await;
+    let transport = rust_transport(4242, 4243).await;
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "identity.echo"))
         .await;
@@ -378,7 +378,7 @@ async fn announce_ratchet_round_trip() {
     setup();
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = rust_transport(4242, 4243).await;
+    let transport = rust_transport(4242, 4243).await;
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "identity.echo"))
         .await;

@@ -76,10 +76,7 @@ async fn spawn_rnsd() -> Child {
             return child;
         }
 
-        match child.try_wait().expect("rnsd status") {
-            Some(status) => panic!("python rnsd exited early: {status}"),
-            None => {}
-        }
+        if let Some(status) = child.try_wait().expect("rnsd status") { panic!("python rnsd exited early: {status}") }
 
         time::sleep(Duration::from_millis(250)).await;
     }
