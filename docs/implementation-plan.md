@@ -1241,6 +1241,7 @@ buffer streams) are still open; see the phase descriptions above.
 | 6.2 Announce queueing & egress control | ✅ `iface/control.rs`: per-interface ingress control (ic_* burst detection, held announces with penalty/release), announce cap airtime budgeting with queued announces, mode-based announce forwarding policy (internal/roaming/boundary), `PATHFINDER_RW` random retransmit window, `PATHFINDER_R` retries |
 | 6.3 Path request parity | ✅ full `path_request` branch order (local response / known path with grace+roaming grace / local-client forwarding / mode-gated recursive search with ingress+egress PR limiting / local-client fan-out), `await_path` async API, `PATH_REQUEST_TIMEOUT`/MI pending-request tracking, discovery-request dedupe with tag reuse |
 | 6.8 Packet cache requests | ✅ announce packet cache by hash, `CACHE_REQUEST` context handling (replay + link answer) |
+| 6.4 Tunnels | ✅ `transport/tunnels.rs`: signed synthesize packets on fixed PLAIN dest `rnstransport.tunnel.synthesize` (176-byte wire format, remote transport identity signature validation), tunnel table with path association, void/restore on re-appearance (Python restore rules: unknown/expired/worse-path checks), `TUNNEL_TIMEOUT` expiry, `Transport::synthesize_tunnel`/`void_tunnel`/`tunnel_table_snapshot`, iface `tunnel_id`/`wants_tunnel` |
 | 6.5 Blackholes | ✅ `transport/blackholes.rs`, identity-hash announce filtering, pack/merge lists |
 | 7.2/7.4 Daemon config & lifecycle | ✅ config parity for new interfaces + shared-instance keys, identity persistence |
 | 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp |
@@ -1253,7 +1254,7 @@ buffer streams) are still open; see the phase descriptions above.
 * 5.5 RNodeInterface (+Multi) — serial command protocol, hardware validation
 * 5.6 I2PInterface — SAMv3 session management
 * 5.8 Backbone/Weave modules (Local shares the Backbone *model* already)
-* 6.4 tunnels, 6.6 Discovery module, 6.7 remote management/probe destination
+* 6.6 Discovery module, 6.7 remote management/probe destination
 * 7.1 `reticulum::Reticulum` facade + 7.3 shared-instance RPC (pickle protocol) — the daemon serves
   local clients directly via `LocalServer` instead
 * 9.2 cargo-fuzz targets, 9.3 criterion benches

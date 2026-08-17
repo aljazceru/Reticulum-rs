@@ -42,7 +42,8 @@ impl PathTable {
     pub fn expire_paths(&mut self) -> usize {
         let now = (self.now)();
         let before = self.map.len();
-        self.map.retain(|_, entry| now.saturating_sub(entry.timestamp) < PATHFINDER_E);
+        self.map
+            .retain(|_, entry| now.saturating_sub(entry.timestamp) < PATHFINDER_E);
         before - self.map.len()
     }
 
@@ -70,7 +71,10 @@ impl PathTable {
     }
 
     pub fn path_is_unresponsive(&self, destination: &AddressHash) -> bool {
-        self.map.get(destination).map(|e| e.unresponsive).unwrap_or(false)
+        self.map
+            .get(destination)
+            .map(|e| e.unresponsive)
+            .unwrap_or(false)
     }
 
     /// Remove a single path (Python `Transport.drop_path`).
@@ -89,8 +93,34 @@ impl PathTable {
         self.map.get(destination)
     }
 
+    /// Insert a path restored from a tunnel table entry
+    /// (Python `handle_tunnel` restore: writes the tunnel path entry
+    /// directly into the path table).
+    pub fn insert_restored(
+        &mut self,
+        destination: AddressHash,
+        received_from: AddressHash,
+        hops: u8,
+        iface: AddressHash,
+        packet_hash: crate::hash::Hash,
+    ) {
+        self.map.insert(
+            destination,
+            PathEntry {
+                received_from,
+                hops,
+                iface,
+                timestamp: (self.now)(),
+                unresponsive: false,
+                packet_hash,
+            },
+        );
+    }
+
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
-        self.map.get(destination).map(|entry| (entry.received_from, entry.iface))
+        self.map
+            .get(destination)
+            .map(|entry| (entry.received_from, entry.iface))
     }
 
     pub fn handle_announce(
@@ -148,7 +178,7 @@ impl PathTable {
                     ifac_flag: IfacFlag::Open,
                     header_type: HeaderType::Type2,
                     hops: original_packet.header.hops + 1,
-                    .. original_packet.header
+                    ..original_packet.header
                 },
                 ifac: None,
                 destination: original_packet.destination,
@@ -196,7 +226,7 @@ impl PathTable {
             Packet {
                 header: Header {
                     header_type: HeaderType::Type2,
-                    .. original_packet.header
+                    ..original_packet.header
                 },
                 ifac: original_packet.ifac,
                 destination: original_packet.destination,

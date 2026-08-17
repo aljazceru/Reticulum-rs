@@ -6,8 +6,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::destination::DestinationName;
 use crate::destination::PlainInputDestination;
-use crate::hash::AddressHash;
 use crate::hash::ADDRESS_HASH_SIZE;
+use crate::hash::AddressHash;
 use crate::identity::EmptyIdentity;
 use crate::packet::DestinationType;
 use crate::packet::Header;

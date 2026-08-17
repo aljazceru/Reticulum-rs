@@ -29,9 +29,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
+use crate::iface::RxMessage;
 use crate::iface::hdlc::Hdlc;
 use crate::iface::hdlc::HdlcDecoder;
-use crate::iface::RxMessage;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 

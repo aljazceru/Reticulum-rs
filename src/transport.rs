@@ -4,7 +4,7 @@ use std::time::Duration;
 use alloc::sync::Arc;
 use rand_core::OsRng;
 use reticulum_core::identity::Signer;
-use tokio::sync::{broadcast, Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -25,16 +25,15 @@ use crate::iface::{
     InterfaceManager, InterfaceMode, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType,
 };
 use crate::packet::{
-    DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
-    PACKET_MDU,
+    DestinationType, Header, HeaderType, PACKET_MDU, Packet, PacketContext, PacketDataBuffer,
+    PacketType,
 };
 use crate::resource::{
-    self,
+    self, ResourceEvent, ResourceOptions,
     manager::{
-        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
-        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
+        RequestContext as RequestCtx, RequestEvent, RequestEventData, ResourceManager,
+        ResourceStrategy, pack_request, pack_response, request_id as make_request_id,
     },
-    ResourceEvent, ResourceOptions,
 };
 use crate::storage::{KnownDestinations, KnownRatchets, Storage};
 
@@ -45,15 +44,17 @@ mod link_table;
 mod packet_cache;
 mod path_requests;
 mod path_table;
+mod tunnels;
 
-pub use blackholes::{Blackholes, SharedBlackholes, BLACKHOLE_TIMEOUT};
+pub use blackholes::{BLACKHOLE_TIMEOUT, Blackholes, SharedBlackholes};
 
 use self::announce_limits::AnnounceLimits;
 use self::announce_table::AnnounceTable;
 use self::link_table::LinkTable;
 use self::packet_cache::PacketCache;
-use self::path_requests::{create_path_request_destination, PathRequests, TagBytes};
+use self::path_requests::{PathRequests, TagBytes, create_path_request_destination};
 use self::path_table::PathTable;
+use self::tunnels::{TunnelPath, Tunnels};
 
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
@@ -276,6 +277,13 @@ pub(crate) struct TransportHandler {
 
     fixed_dest_path_requests: AddressHash,
 
+    /// Fixed PLAIN destination for tunnel synthesis
+    /// (Python `tunnel_synthesize_destination`).
+    fixed_dest_tunnel_synthesize: AddressHash,
+
+    /// Tunnel table (Python `Transport.tunnels`).
+    tunnels: Tunnels,
+
     cancel: CancellationToken,
 }
 
@@ -431,6 +439,10 @@ impl Transport {
                 blackhole_publish,
             ))),
             path_requests,
+            tunnels: Tunnels::new(),
+            fixed_dest_tunnel_synthesize: tunnels::create_tunnel_synthesize_destination()
+                .desc
+                .address_hash,
             storage,
             known_destinations: KnownDestinations::new(),
             known_ratchets: KnownRatchets::new(),
@@ -858,7 +870,7 @@ impl Transport {
     }
 
     #[allow(unused)] // mocked out in the test build, so the linter
-                     // would complain about dead code
+    // would complain about dead code
     pub(crate) async fn bind_link_to_channel(
         &self,
         id: LinkId,
@@ -2573,6 +2585,28 @@ async fn handle_announce<'a>(
             .path_table
             .handle_announce(packet, packet.transport, iface);
 
+        // If the receiving interface is a tunnel, associate the path with
+        // the tunnel for later restore
+        // (Python announce handling: `paths[destination_hash] = [...]`).
+        let tunnel_id = {
+            let manager = handler.iface_manager.lock().await;
+            manager.iface_tunnel(&iface)
+        };
+        if let Some(tunnel_id) = tunnel_id {
+            let expires = crate::time::now() + path_table::PATHFINDER_E;
+            handler.tunnels.associate_path(
+                &tunnel_id,
+                packet.destination,
+                TunnelPath {
+                    received_from: dest_hash,
+                    hops: packet.header.hops + 1,
+                    expires,
+                    packet_hash: packet.hash(),
+                },
+                time::Instant::now(),
+            );
+        }
+
         let retransmit = handler.config.retransmit;
         if retransmit {
             let transport_id = *handler.config.identity.address_hash();
@@ -2898,9 +2932,81 @@ async fn handle_fixed_destinations<'a>(
     if packet.destination == handler.fixed_dest_path_requests {
         handle_path_request(packet, handler, iface).await;
         true
+    } else if packet.destination == handler.fixed_dest_tunnel_synthesize {
+        handle_tunnel_synthesize(packet, handler, iface).await;
+        true
     } else {
         false
     }
+}
+
+/// Handle a tunnel synthesis packet on the fixed PLAIN destination
+/// (Python `Transport.tunnel_synthesize_handler` -> `handle_tunnel`).
+async fn handle_tunnel_synthesize<'a>(
+    packet: &Packet,
+    handler: &mut MutexGuard<'a, TransportHandler>,
+    iface: AddressHash,
+) {
+    let Some(synthesis) = tunnels::decode_tunnel_synthesize(packet.data.as_slice()) else {
+        log::debug!(
+            "tp({}): ignoring malformed tunnel synthesis packet",
+            handler.config.name
+        );
+        return;
+    };
+
+    let tunnel_id = synthesis.tunnel_id;
+
+    // Python restore rules: restore a tunnel path when the current path
+    // is unknown, expired, or not better (fewer hops) than the tunnel
+    // path.
+    let handling = handler
+        .tunnels
+        .handle_tunnel(tunnel_id, iface, time::Instant::now());
+    let mut restored = 0;
+    if let tunnels::TunnelHandling::Restored { candidates } = handling {
+        let now = crate::time::now();
+        let mut declined = Vec::new();
+
+        for (destination, path) in candidates {
+            let should_restore = match handler.path_table.get(&destination) {
+                None => true,
+                Some(entry) => {
+                    let expired = now.saturating_sub(entry.timestamp) >= path_table::PATHFINDER_E;
+                    expired || path.hops <= entry.hops
+                }
+            };
+
+            if should_restore {
+                handler.path_table.insert_restored(
+                    destination,
+                    path.received_from,
+                    path.hops,
+                    iface,
+                    path.packet_hash,
+                );
+                restored += 1;
+            } else {
+                declined.push(destination);
+            }
+        }
+
+        handler.tunnels.finish_restore(&tunnel_id, &declined);
+    }
+
+    handler
+        .iface_manager
+        .lock()
+        .await
+        .set_iface_tunnel(&iface, Some(tunnel_id));
+
+    log::info!(
+        "tp({}): tunnel endpoint {} established on {} (restored {} paths)",
+        handler.config.name,
+        tunnel_id,
+        iface,
+        restored
+    );
 }
 
 async fn handle_link_request_as_destination<'a>(
@@ -3111,6 +3217,15 @@ async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
 
 async fn handle_cleanup<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     handler.iface_manager.lock().await.cleanup();
+
+    // Expire unused tunnel entries (Python `Transport.jobs`).
+    let removed = handler.tunnels.clean(time::Instant::now());
+    if removed > 0 {
+        log::debug!(
+            "tp({}): removed {removed} expired tunnel entries",
+            handler.config.name
+        );
+    }
 
     // Cull timed-out packet receipts (Python `Transport.clean`).
     let receipt_timeout = handler.config.timer_config.keep_packet_cached;
@@ -3566,6 +3681,17 @@ mod tests {
 /// One entry of the path table snapshot
 /// (Python `Reticulum.get_path_table()` dict entries:
 /// `hash`, `hops`, `via`, `interface`).
+/// Snapshot of one tunnel table entry (Python `get_tunnel_table`).
+#[derive(Debug, Clone)]
+pub struct TunnelTableSnapshotEntry {
+    /// Id of the tunnel (`full_hash(pub_key || iface_hash)`).
+    pub tunnel_id: AddressHash,
+    /// Interface the tunnel is currently bound to (`None` when voided).
+    pub iface: Option<AddressHash>,
+    /// Number of paths associated with the tunnel.
+    pub paths: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PathTableSnapshotEntry {
     /// Destination hash the path leads to.
@@ -3652,6 +3778,73 @@ impl Transport {
             inbound: handler.in_links.len(),
             outbound: handler.out_links.len(),
         }
+    }
+
+    /// Synthesize a tunnel for an interface: announce the signed
+    /// `pub_key || iface_hash || random_hash || signature` payload on the
+    /// fixed `rnstransport.tunnel.synthesize` destination, directly on the
+    /// interface (Python `Transport.synthesize_tunnel`).
+    pub async fn synthesize_tunnel(&self, iface: AddressHash) -> Result<(), RnsError> {
+        let handler = self.handler.lock().await;
+
+        let transport_id = if handler.config.retransmit {
+            Some(*handler.config.identity.address_hash())
+        } else {
+            None
+        };
+
+        let packet = tunnels::synthesize_tunnel_packet(
+            &handler.config.identity,
+            &iface,
+            handler.fixed_dest_tunnel_synthesize,
+            transport_id,
+        );
+
+        handler
+            .iface_manager
+            .lock()
+            .await
+            .set_iface_wants_tunnel(&iface, false);
+
+        handler
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet,
+            })
+            .await;
+
+        Ok(())
+    }
+
+    /// Unbind a tunnel from its interface while keeping its learned paths
+    /// for a later restore (Python `Transport.void_tunnel_interface`).
+    pub async fn void_tunnel(&self, tunnel_id: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+
+        if let Some(iface) = handler.tunnels.get(tunnel_id).and_then(|e| e.iface) {
+            handler
+                .iface_manager
+                .lock()
+                .await
+                .set_iface_tunnel(&iface, None);
+        }
+
+        handler.tunnels.void(tunnel_id)
+    }
+
+    /// Snapshot of the tunnel table: tunnel id, bound interface, number of
+    /// associated paths (Python `Reticulum.get_tunnel_table`).
+    pub async fn tunnel_table_snapshot(&self) -> Vec<TunnelTableSnapshotEntry> {
+        let handler = self.handler.lock().await;
+        handler
+            .tunnels
+            .iter()
+            .map(|(tunnel_id, entry)| TunnelTableSnapshotEntry {
+                tunnel_id: *tunnel_id,
+                iface: entry.iface,
+                paths: entry.paths.len(),
+            })
+            .collect()
     }
 
     /// Hash of the identity this transport instance runs with

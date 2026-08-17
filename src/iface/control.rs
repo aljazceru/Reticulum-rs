@@ -15,7 +15,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::buffer::OutputBuffer;
 use crate::hash::AddressHash;
-use crate::packet::{Packet, PacketType, PACKET_MDU};
+use crate::packet::{PACKET_MDU, Packet, PacketType};
 use crate::serde::Serialize;
 
 /// Offset of the 10-byte random blob inside announce data
@@ -219,6 +219,12 @@ pub struct IfaceControlState {
     /// (Python `is_local_client_interface`: interfaces spawned by a
     /// `LocalInterface` server with `is_local_shared_instance`).
     pub is_local_client: bool,
+    /// Tunnel id this interface is currently bound to
+    /// (Python `Interface.tunnel_id`).
+    pub tunnel_id: Option<AddressHash>,
+    /// The interface requested a tunnel synthesis
+    /// (Python `Interface.wants_tunnel`).
+    pub wants_tunnel: bool,
 
     params: IfaceControlParams,
 
@@ -255,6 +261,8 @@ impl IfaceControlState {
             announces_from_internal: true,
             announces_to_internal: None,
             is_local_client: false,
+            tunnel_id: None,
+            wants_tunnel: false,
             params: IfaceControlParams::default(),
             announce_allowed_at: now,
             ia_freq_deque: VecDeque::new(),
@@ -333,11 +341,7 @@ impl IfaceControlState {
             deque.pop_front();
         }
         let span = span.as_secs_f64();
-        if span <= 0.0 {
-            0.0
-        } else {
-            n as f64 / span
-        }
+        if span <= 0.0 { 0.0 } else { n as f64 / span }
     }
 
     /// Incoming announce frequency in Hz
@@ -669,9 +673,11 @@ mod tests {
         assert_eq!(state.held_announces_len(), 1);
 
         // Held announces are not released while the burst penalty is active.
-        assert!(state
-            .release_held_announce(t0 + Duration::from_secs(2))
-            .is_none());
+        assert!(
+            state
+                .release_held_announce(t0 + Duration::from_secs(2))
+                .is_none()
+        );
     }
 
     #[test]

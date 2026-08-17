@@ -18,11 +18,11 @@ pub mod pipe;
 pub mod serial;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 use tokio::task;
@@ -326,6 +326,26 @@ impl InterfaceManager {
     pub fn set_iface_local_client(&self, address: &AddressHash) -> bool {
         self.with_control(address, |control| control.is_local_client = true)
             .is_some()
+    }
+
+    /// Bind an interface to a tunnel id
+    /// (Python `Interface.tunnel_id`).
+    pub fn set_iface_tunnel(&self, address: &AddressHash, tunnel_id: Option<AddressHash>) -> bool {
+        self.with_control(address, |control| control.tunnel_id = tunnel_id)
+            .is_some()
+    }
+
+    /// Request tunnel synthesis for an interface
+    /// (Python `Interface.wants_tunnel`).
+    pub fn set_iface_wants_tunnel(&self, address: &AddressHash, wants: bool) -> bool {
+        self.with_control(address, |control| control.wants_tunnel = wants)
+            .is_some()
+    }
+
+    /// The tunnel id an interface is bound to, if any.
+    pub fn iface_tunnel(&self, address: &AddressHash) -> Option<AddressHash> {
+        self.with_control(address, |control| control.tunnel_id)
+            .flatten()
     }
 
     /// Whether an interface is a local shared-instance client.
