@@ -82,11 +82,12 @@ impl PyChild {
             .expect("spawn python rncp");
         let stdout = child.stdout.take().expect("stdout");
         let (tx, rx) = broadcast::channel(128);
+        let tx_forward = tx.clone();
         tokio::spawn(async move {
             let mut lines = tokio::io::BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 println!("py: {line}");
-                let _ = tx.send(line);
+                let _ = tx_forward.send(line);
             }
         });
         (Self { child, lines: tx }, rx)

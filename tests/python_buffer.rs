@@ -29,12 +29,27 @@ impl Drop for Partner {
     }
 }
 
-async fn spawn_buffer(mode: &str, destination: Option<&str>, size: usize, timeout: f64) -> Partner {
+async fn spawn_buffer(
+    mode: &str,
+    destination: Option<&str>,
+    size: usize,
+    timeout: f64,
+) -> Partner {
+    spawn_buffer_on("tests/rns-py-configs/udp-buffer", mode, destination, size, timeout).await
+}
+
+async fn spawn_buffer_on(
+    config: &str,
+    mode: &str,
+    destination: Option<&str>,
+    size: usize,
+    timeout: f64,
+) -> Partner {
     let mut child = Command::new("python3")
         .arg("-u")
         .arg("tests/py-interop/buffer.py")
         .arg("--config")
-        .arg("tests/rns-py-configs/udp-buffer")
+        .arg(config)
         .arg("--mode")
         .arg(mode)
         .arg("--size")
@@ -104,7 +119,7 @@ async fn python_writer_rust_reader() {
         .try_init();
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut transport = rust_transport(4242, 4243).await;
+    let mut transport = rust_transport(4252, 4253).await;
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "buffer.stream"))
         .await;
@@ -176,7 +191,7 @@ async fn rust_writer_python_reader() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
 
-    let partner = spawn_buffer("reader", None, 0, 40.0).await;
+    let partner = spawn_buffer_on("tests/rns-py-configs/udp-buffer2", "reader", None, 0, 40.0).await;
     let mut lines = partner.lines.resubscribe();
 
     let dest_line = wait_line(&mut lines, "[PYI] destination", 20).await.expect("destination");
@@ -187,7 +202,7 @@ async fn rust_writer_python_reader() {
         .to_string();
     let dest_hash = reticulum::hash::AddressHash::new_from_hex_string(&hex).expect("hash");
 
-    let transport = rust_transport(4242, 4243).await;
+    let transport = rust_transport(4262, 4263).await;
     transport.request_path(&dest_hash, None, None).await;
 
     let mut announces = transport.recv_announces().await;

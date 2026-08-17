@@ -26,11 +26,19 @@ impl Drop for Partner {
 }
 
 async fn spawn_plain(send: Option<&str>, listen_secs: f64) -> Partner {
+    spawn_plain_on("tests/rns-py-configs/udp-plain", send, listen_secs).await
+}
+
+async fn spawn_plain_on(
+    config: &str,
+    send: Option<&str>,
+    listen_secs: f64,
+) -> Partner {
     let mut child = Command::new("python3")
         .arg("-u")
         .arg("tests/py-interop/plain.py")
         .arg("--config")
-        .arg("tests/rns-py-configs/udp")
+        .arg(config)
         .args(send.map(|s| vec!["--send".to_string(), s.to_string()]).unwrap_or_default())
         .args(vec![
             "--listen-secs".to_string(),
@@ -110,7 +118,7 @@ async fn python_broadcast_received_by_rust() {
 
     let mut transport = TransportConfig::default().build();
     transport.iface_manager().lock().await.spawn(
-        UdpInterface::new("127.0.0.1:4242", Some("127.0.0.1:4243"), false),
+        UdpInterface::new("127.0.0.1:4272", Some("127.0.0.1:4273"), false),
         UdpInterface::spawn,
     );
 
@@ -123,7 +131,7 @@ async fn python_broadcast_received_by_rust() {
     let hash = destination.lock().await.desc.address_hash;
 
     let mut data_events = transport.received_data_events();
-    let partner = spawn_plain(Some("hello from python broadcast"), 5.0).await;
+    let partner = spawn_plain_on("tests/rns-py-configs/udp-plain2", Some("hello from python broadcast"), 5.0).await;
     let mut lines = partner.lines.resubscribe();
     wait_line(&mut lines, "[PYI] sent", 15).await.expect("python sent");
 
