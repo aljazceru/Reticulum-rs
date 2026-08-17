@@ -240,7 +240,6 @@ async fn proof_strategy_matrix() {
 
         let address = destination.lock().await.desc.address_hash;
         server.send_announce(&destination, None).await;
-        eprintln!("DEBUG: sent announce for {address}, waiting");
         wait_announce(&mut announces, &address, Duration::from_secs(10))
             .await
             .expect("announce");
