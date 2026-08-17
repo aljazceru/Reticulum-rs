@@ -2,21 +2,17 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use alloc::sync::Arc;
-use reticulum_core::identity::Signer;
 use rand_core::OsRng;
+use reticulum_core::identity::Signer;
 use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(not(test))]
 use crate::channel::{self, Channel};
-use crate::destination::link::{Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket,
-    LinkHandleResult, LinkId, LinkPayload, LinkPayloadSink, LinkStatus};
-use crate::resource::{
-    self, manager::{pack_request, pack_response, request_id as make_request_id,
-        RequestContext as RequestCtx, RequestEventData, RequestEvent,
-        ResourceManager, ResourceStrategy},
-    ResourceEvent, ResourceOptions,
+use crate::destination::link::{
+    Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket, LinkHandleResult, LinkId,
+    LinkPayload, LinkPayloadSink, LinkStatus,
 };
 use crate::destination::{
     DestinationAnnounce, DestinationDesc, DestinationHandleStatus, DestinationName,
@@ -25,12 +21,22 @@ use crate::destination::{
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 use crate::identity::PrivateIdentity;
-use crate::iface::{InterfaceManager, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType};
-use crate::storage::{KnownDestinations, KnownRatchets, Storage};
+use crate::iface::{
+    InterfaceManager, InterfaceMode, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType,
+};
 use crate::packet::{
     DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
     PACKET_MDU,
 };
+use crate::resource::{
+    self,
+    manager::{
+        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
+        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
+    },
+    ResourceEvent, ResourceOptions,
+};
+use crate::storage::{KnownDestinations, KnownRatchets, Storage};
 
 mod announce_limits;
 mod announce_table;
@@ -56,6 +62,16 @@ pub const PATHFINDER_M: usize = 128; // Max hops
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
+
+/// Grace time before a path response announce is made, allows directly
+/// reachable peers to respond first (Python `PATH_REQUEST_GRACE`).
+pub const PATH_REQUEST_GRACE: Duration = Duration::from_millis(400);
+/// Extra grace for roaming-mode interfaces (Python `PATH_REQUEST_RG`).
+pub const PATH_REQUEST_RG: Duration = Duration::from_millis(1500);
+/// Random window for announce rebroadcast (Python `PATHFINDER_RW`).
+pub const PATHFINDER_RW: Duration = Duration::from_millis(500);
+
+pub use path_requests::PATH_REQUEST_TIMEOUT;
 
 #[derive(Clone)]
 pub struct ReceivedData {
@@ -180,7 +196,7 @@ impl LinkEventSink for BroadcastLinkEventSink {
 }
 
 #[derive(Clone)]
-pub (crate) struct BroadcastLinkPayloadSink(broadcast::Sender<LinkPayload>);
+pub(crate) struct BroadcastLinkPayloadSink(broadcast::Sender<LinkPayload>);
 
 impl From<broadcast::Sender<LinkPayload>> for BroadcastLinkPayloadSink {
     fn from(sender: broadcast::Sender<LinkPayload>) -> Self {
@@ -411,9 +427,9 @@ impl Transport {
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             resources: ResourceManager::new(),
-            blackholes: std::sync::Arc::new(tokio::sync::RwLock::new(
-                blackholes::Blackholes::new(blackhole_publish),
-            )),
+            blackholes: std::sync::Arc::new(tokio::sync::RwLock::new(blackholes::Blackholes::new(
+                blackhole_publish,
+            ))),
             path_requests,
             storage,
             known_destinations: KnownDestinations::new(),
@@ -508,28 +524,52 @@ impl Transport {
 
     /// Remove an identity from the blackhole list.
     pub async fn unblackhole_identity(&self, identity: &AddressHash) -> bool {
-        self.handler.lock().await.blackholes.write().await.unblackhole(identity)
+        self.handler
+            .lock()
+            .await
+            .blackholes
+            .write()
+            .await
+            .unblackhole(identity)
     }
 
     /// Whether an identity is blackholed.
     pub async fn is_blackholed(&self, identity: &AddressHash) -> bool {
-        self.handler.lock().await.blackholes.read().await.is_blackholed(identity)
+        self.handler
+            .lock()
+            .await
+            .blackholes
+            .read()
+            .await
+            .is_blackholed(identity)
     }
 
     /// Mark the path to a destination unresponsive
     /// (Python `Transport.mark_path_unresponsive`).
     pub async fn mark_path_unresponsive(&self, destination: &AddressHash) -> bool {
-        self.handler.lock().await.path_table.mark_path_unresponsive(destination)
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .mark_path_unresponsive(destination)
     }
 
     /// Mark the path to a destination responsive again.
     pub async fn mark_path_responsive(&self, destination: &AddressHash) -> bool {
-        self.handler.lock().await.path_table.mark_path_responsive(destination)
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .mark_path_responsive(destination)
     }
 
     /// Whether the path to a destination is marked unresponsive.
     pub async fn path_is_unresponsive(&self, destination: &AddressHash) -> bool {
-        self.handler.lock().await.path_table.path_is_unresponsive(destination)
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .path_is_unresponsive(destination)
     }
 
     /// Forget the path to a destination (Python `Transport.drop_path`).
@@ -638,7 +678,10 @@ impl Transport {
             let destination = destination.lock().await;
             if let Some(ratchets) = destination.ratchets() {
                 let mut ratchets = ratchets.to_vec();
-                crate::storage::clean_destination_ratchets(&mut ratchets, destination.retained_ratchets);
+                crate::storage::clean_destination_ratchets(
+                    &mut ratchets,
+                    destination.retained_ratchets,
+                );
 
                 if let Err(error) = crate::storage::save_destination_ratchets(
                     &*storage,
@@ -804,18 +847,21 @@ impl Transport {
     ///
     /// Fails if there is already a `Channel` wrapping `link`.
     #[cfg(not(test))]
-    pub async fn mk_channel<M>(&self, link: Arc<Mutex<Link>>)
-        -> Result<(Channel<M>, broadcast::Receiver<M>), RnsError>
-    where M: channel::Message
+    pub async fn mk_channel<M>(
+        &self,
+        link: Arc<Mutex<Link>>,
+    ) -> Result<(Channel<M>, broadcast::Receiver<M>), RnsError>
+    where
+        M: channel::Message,
     {
         Channel::new(self, link).await
     }
 
-    #[allow(unused)]  // mocked out in the test build, so the linter
-                      // would complain about dead code
-    pub (crate) async fn bind_link_to_channel(
+    #[allow(unused)] // mocked out in the test build, so the linter
+                     // would complain about dead code
+    pub(crate) async fn bind_link_to_channel(
         &self,
-        id: LinkId
+        id: LinkId,
     ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
         self.handler.lock().await.bind_link_to_channel(id).await
     }
@@ -835,6 +881,46 @@ impl Transport {
             .await
             .request_path(destination, on_iface, tag)
             .await
+    }
+
+    /// Request a path to the destination from the network and wait until
+    /// the path is available or the timeout is reached
+    /// (Python `RNS.Transport.await_path`).
+    ///
+    /// Returns `true` if a path to the destination was found.
+    pub async fn await_path(
+        &self,
+        destination: &AddressHash,
+        timeout: Option<Duration>,
+        on_iface: Option<AddressHash>,
+    ) -> bool {
+        let deadline = time::Instant::now() + timeout.unwrap_or(PATH_REQUEST_TIMEOUT);
+
+        if self.has_path(destination).await {
+            return true;
+        }
+
+        self.request_path(destination, on_iface, None).await;
+
+        while time::Instant::now() < deadline {
+            if self.has_path(destination).await {
+                return true;
+            }
+
+            time::sleep(Duration::from_millis(50)).await;
+        }
+
+        self.has_path(destination).await
+    }
+
+    /// Whether an automated path request for `destination` may be sent now,
+    /// honouring `PATH_REQUEST_MI` (20 s minimum interval).
+    pub async fn path_request_allowed(&self, destination: &AddressHash) -> bool {
+        self.handler
+            .lock()
+            .await
+            .path_requests
+            .request_allowed(destination)
     }
 
     pub fn out_link_events(&self) -> broadcast::Receiver<LinkEventData> {
@@ -885,7 +971,12 @@ impl Transport {
 
     /// Subscribe to request (request/response) events.
     pub async fn request_events(&self) -> broadcast::Receiver<RequestEventData> {
-        self.handler.lock().await.resources.request_events.subscribe()
+        self.handler
+            .lock()
+            .await
+            .resources
+            .request_events
+            .subscribe()
     }
 
     /// Set the resource acceptance strategy for a link
@@ -935,7 +1026,8 @@ impl Transport {
         link: &Arc<Mutex<Link>>,
         data: Vec<u8>,
     ) -> Result<AddressHash, RnsError> {
-        self.send_resource_with_options(link, data, ResourceOptions::default()).await
+        self.send_resource_with_options(link, data, ResourceOptions::default())
+            .await
     }
 
     /// Send an arbitrary-size payload as a resource with options
@@ -953,11 +1045,8 @@ impl Transport {
         }
 
         // reserve a slot and build the resource under the link lock
-        let mut resource = crate::resource::outbound::OutgoingResource::new(
-            data,
-            &link_guard,
-            options,
-        )?;
+        let mut resource =
+            crate::resource::outbound::OutgoingResource::new(data, &link_guard, options)?;
 
         let mut tx = crate::resource::ResourceTx::default();
         let active = handler
@@ -1016,9 +1105,8 @@ impl Transport {
                 ..Default::default()
             };
             // Build + advertise directly (single outstanding request is fine)
-            let mut resource = crate::resource::outbound::OutgoingResource::new(
-                packed, &link_guard, opts,
-            )?;
+            let mut resource =
+                crate::resource::outbound::OutgoingResource::new(packed, &link_guard, opts)?;
             let mut tx = crate::resource::ResourceTx::default();
             resource.advertise(&link_guard, &mut tx)?;
             for p in tx.packets {
@@ -1032,7 +1120,10 @@ impl Transport {
                 .push(resource);
         }
 
-        handler.resources.pending_requests.insert(rid, *link_guard.id());
+        handler
+            .resources
+            .pending_requests
+            .insert(rid, *link_guard.id());
         Ok(rid)
     }
 
@@ -1051,9 +1142,11 @@ impl Transport {
             }
             match time::timeout(remaining, rx.recv()).await {
                 Ok(Ok(event)) => match event.event {
-                    RequestEvent::Response { request_id: rid, data, .. } if rid == request_id => {
-                        return Some(data)
-                    }
+                    RequestEvent::Response {
+                        request_id: rid,
+                        data,
+                        ..
+                    } if rid == request_id => return Some(data),
                     RequestEvent::Failed { request_id: rid } if rid == request_id => return None,
                     _ => continue,
                 },
@@ -1086,11 +1179,12 @@ impl Transport {
 
     /// Send an unencrypted packet to a PLAIN destination
     /// (Python `RNS.Packet(plain_destination, data).send()`).
-    pub async fn send_to_plain_destination(&self, name: DestinationName, data: &[u8]) -> Result<AddressHash, RnsError> {
-        let destination = PlainInputDestination::new(
-            reticulum_core::identity::EmptyIdentity,
-            name,
-        );
+    pub async fn send_to_plain_destination(
+        &self,
+        name: DestinationName,
+        data: &[u8],
+    ) -> Result<AddressHash, RnsError> {
+        let destination = PlainInputDestination::new(reticulum_core::identity::EmptyIdentity, name);
         let address = destination.desc.address_hash;
 
         let mut packet_data = PacketDataBuffer::new();
@@ -1262,10 +1356,9 @@ impl Transport {
     /// (Python `Identity._unretain_destination_data`).
     pub async fn unretain_destination_data(&self, destination_hash: &AddressHash) -> bool {
         let mut handler = self.handler.lock().await;
-        let unretained =
-            handler
-                .known_destinations
-                .unretain(destination_hash, unix_time_now());
+        let unretained = handler
+            .known_destinations
+            .unretain(destination_hash, unix_time_now());
         persist_known_destinations(&mut handler);
         unretained
     }
@@ -1281,10 +1374,7 @@ impl Transport {
     pub async fn save_known_destinations(&self) -> Result<(), RnsError> {
         let mut handler = self.handler.lock().await;
 
-        let storage = handler
-            .storage
-            .clone()
-            .ok_or(RnsError::Storage)?;
+        let storage = handler.storage.clone().ok_or(RnsError::Storage)?;
 
         handler.known_destinations.save(&*storage)
     }
@@ -1294,10 +1384,7 @@ impl Transport {
     pub async fn load_known_destinations(&self) -> Result<(), RnsError> {
         let mut handler = self.handler.lock().await;
 
-        let storage = handler
-            .storage
-            .clone()
-            .ok_or(RnsError::Storage)?;
+        let storage = handler.storage.clone().ok_or(RnsError::Storage)?;
 
         handler.known_destinations.load(&*storage)
     }
@@ -1310,9 +1397,10 @@ impl Transport {
     ) -> Option<[u8; reticulum_core::identity::RATCHET_KEY_LENGTH]> {
         let mut handler = self.handler.lock().await;
 
-        let storage = handler.storage.clone().unwrap_or_else(|| {
-            std::sync::Arc::new(crate::storage::MemoryStorage::new())
-        });
+        let storage = handler
+            .storage
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::storage::MemoryStorage::new()));
 
         handler
             .known_ratchets
@@ -1324,9 +1412,10 @@ impl Transport {
     pub async fn current_ratchet_id(&self, destination_hash: &AddressHash) -> Option<[u8; 10]> {
         let mut handler = self.handler.lock().await;
 
-        let storage = handler.storage.clone().unwrap_or_else(|| {
-            std::sync::Arc::new(crate::storage::MemoryStorage::new())
-        });
+        let storage = handler
+            .storage
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::storage::MemoryStorage::new()));
 
         handler
             .known_ratchets
@@ -1341,9 +1430,10 @@ impl Transport {
         let mut handler = self.handler.lock().await;
         let now = unix_time_now();
 
-        let storage = handler.storage.clone().unwrap_or_else(|| {
-            std::sync::Arc::new(crate::storage::MemoryStorage::new())
-        });
+        let storage = handler
+            .storage
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(crate::storage::MemoryStorage::new()));
 
         let TransportHandler {
             path_table,
@@ -1356,11 +1446,7 @@ impl Transport {
 
         // Python removes the ratchet files of stale destinations.
         for hash in &stale {
-            let path = format!(
-                "{}/{}",
-                crate::storage::RATCHETS_DIR,
-                hash.to_hex_string()
-            );
+            let path = format!("{}/{}", crate::storage::RATCHETS_DIR, hash.to_hex_string());
             storage.remove(&path);
         }
 
@@ -1413,8 +1499,14 @@ impl Transport {
             let destination = destination.lock().await;
             let private_identity = handler.config.identity.clone();
 
-            let mut ratchets = destination.ratchets().map(|keys| keys.to_vec()).unwrap_or_default();
-            crate::storage::clean_destination_ratchets(&mut ratchets, destination.retained_ratchets);
+            let mut ratchets = destination
+                .ratchets()
+                .map(|keys| keys.to_vec())
+                .unwrap_or_default();
+            crate::storage::clean_destination_ratchets(
+                &mut ratchets,
+                destination.retained_ratchets,
+            );
 
             crate::storage::save_destination_ratchets(
                 &*storage,
@@ -1516,7 +1608,8 @@ impl TransportHandler {
         let link = if let Some(link) = self.find_in_link(&link_id) {
             Some((link, &self.link_in_event_tx))
         } else {
-            self.find_out_link(&link_id).map(|link| (link, &self.link_out_event_tx))
+            self.find_out_link(&link_id)
+                .map(|link| (link, &self.link_out_event_tx))
         };
         if let Some((link, event_tx)) = link {
             let mut link = link.lock().await;
@@ -1551,7 +1644,7 @@ impl TransportHandler {
                         }
                     }
                 }
-            },
+            }
         }
 
         let is_new = self.packet_cache.lock().await.update(packet);
@@ -1576,7 +1669,7 @@ impl TransportHandler {
 
     async fn bind_link_to_channel(
         &mut self,
-        id: LinkId
+        id: LinkId,
     ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
         if self.channel_table.contains_key(&id) {
             return Err(RnsError::ChannelError);
@@ -1650,21 +1743,22 @@ fn create_single_destination_proof(
 
 /// Validate a proof for an outbound SINGLE-destination packet and emit a
 /// [`ReceiptEvent`] (Python `PacketReceipt.validate_proof`).
-fn validate_single_destination_proof(
-    handler: &mut TransportHandler,
-    packet: &Packet,
-) -> bool {
+fn validate_single_destination_proof(handler: &mut TransportHandler, packet: &Packet) -> bool {
     let Some(receipt) = handler.receipts.get(&packet.destination).cloned() else {
         return false;
     };
 
     let proof = packet.data.as_slice();
-    let signature = crate::identity::Signature::from_slice(&proof[proof.len().saturating_sub(64)..])
-        .expect("signature length");
+    let signature =
+        crate::identity::Signature::from_slice(&proof[proof.len().saturating_sub(64)..])
+            .expect("signature length");
 
     let valid = if proof.len() == 64 {
         // Implicit proof: signature only
-        receipt.identity.verify(receipt.packet_hash.as_slice(), &signature).is_ok()
+        receipt
+            .identity
+            .verify(receipt.packet_hash.as_slice(), &signature)
+            .is_ok()
     } else if proof.len() == 96 {
         // Explicit proof: packet hash + signature
         let proof_hash = &proof[..32];
@@ -1688,10 +1782,7 @@ fn validate_single_destination_proof(
     valid
 }
 
-async fn handle_proof<'a>(
-    packet: &Packet,
-    mut handler: MutexGuard<'a, TransportHandler>
-) {
+async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
     log::trace!(
         "tp({}): handle proof for {}",
         handler.config.name,
@@ -1701,7 +1792,7 @@ async fn handle_proof<'a>(
     // Resource proofs (receiver -> sender) are handled by the resource
     // engine; they are never encrypted (Python Packet.pack rules).
     if packet.context == PacketContext::ResourceProof {
-                // `out_links` is keyed by destination hash while `in_links` is keyed
+        // `out_links` is keyed by destination hash while `in_links` is keyed
         // by link id, so scan for the link matching the packet destination.
         let mut link = None;
         for candidate in handler.out_links.values() {
@@ -1714,7 +1805,9 @@ async fn handle_proof<'a>(
         let link = link.or_else(|| handler.in_links.get(&packet.destination).cloned());
         if let Some(link) = link {
             let link_guard = link.lock().await;
-            handler.resources.handle_proof(&link_guard, packet.data.as_slice());
+            handler
+                .resources
+                .handle_proof(&link_guard, packet.data.as_slice());
             drop(link_guard);
             handler.resources.cleanup();
         }
@@ -1743,7 +1836,7 @@ async fn handle_proof<'a>(
             &handler.link_out_event_tx,
             handler.channel_table.get(&link_id),
             packet,
-            true
+            true,
         ) {
             let rtt_packet = link.create_rtt();
             handler.send_packet(rtt_packet).await;
@@ -1758,7 +1851,7 @@ async fn handle_proof<'a>(
             &handler.link_in_event_tx,
             handler.channel_table.get(&link_id),
             packet,
-            false
+            false,
         );
     }
 
@@ -1803,11 +1896,12 @@ async fn handle_keepalive_response<'a>(
         let lookup = handler.link_table.handle_keepalive(packet);
 
         if let Some((propagated, iface)) = lookup {
-            handler.send(TxMessage {
-                tx_type: TxMessageType::Direct(iface),
-                packet: propagated,
-            })
-            .await;
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(iface),
+                    packet: propagated,
+                })
+                .await;
         }
 
         return true;
@@ -1874,9 +1968,7 @@ async fn handle_resource_packet<'a>(
             }
             if completed {
                 let mut tx = crate::resource::ResourceTx::default();
-                if let Some((_hash, data)) =
-                    handler.resources.assemble_completed(&link, &mut tx)
-                {
+                if let Some((_hash, data)) = handler.resources.assemble_completed(&link, &mut tx) {
                     for p in tx.packets {
                         handler.send_packet(p).await;
                     }
@@ -1889,7 +1981,12 @@ async fn handle_resource_packet<'a>(
                         let link_for_dispatch = link_arc.clone();
                         drop(link);
                         handle_incoming_request(
-                            &link_for_dispatch, rid, _time, path_hash, req_payload, handler,
+                            &link_for_dispatch,
+                            rid,
+                            _time,
+                            path_hash,
+                            req_payload,
+                            handler,
                         )
                         .await;
                     }
@@ -1902,7 +1999,9 @@ async fn handle_resource_packet<'a>(
             true
         }
         Ctx::ResourceProof => {
-            handler.resources.handle_proof(&link, packet.data.as_slice());
+            handler
+                .resources
+                .handle_proof(&link, packet.data.as_slice());
             handler.resources.cleanup();
             true
         }
@@ -2007,8 +2106,7 @@ async fn handle_request_or_response_packet<'a>(
             true
         }
         PacketContext::Response => {
-            let Some((rid, response)) = crate::resource::manager::unpack_response(plaintext)
-            else {
+            let Some((rid, response)) = crate::resource::manager::unpack_response(plaintext) else {
                 return false;
             };
             handler
@@ -2030,8 +2128,58 @@ async fn handle_request_or_response_packet<'a>(
     }
 }
 
+/// Fulfill a cache request from the local packet cache
+/// (Python `Transport.cache_request_packet`): a 32-byte packet hash is
+/// looked up; if found, the cached packet is replayed into transport
+/// processing. Announces are replayed as announces.
+async fn handle_cache_request<'a>(
+    packet: &Packet,
+    handler: &mut MutexGuard<'a, TransportHandler>,
+) -> bool {
+    let data = packet.data.as_slice();
+
+    if data.len() != crate::packet::HASHLENGTH_BYTES {
+        return false;
+    }
+
+    let request_hash = crate::hash::Hash::new_from_slice(data);
+    let cached = handler
+        .packet_cache
+        .lock()
+        .await
+        .get_cached_announce(&request_hash);
+
+    match cached {
+        Some(cached) => {
+            log::trace!(
+                "tp({}): cache request hit for {}",
+                handler.config.name,
+                cached.destination
+            );
+
+            // Only announces are ever force-cached
+            // (Python `should_cache` currently disables general caching),
+            // so replay through announce processing.
+            handle_announce(&cached, handler, packet.destination).await;
+
+            true
+        }
+        None => false,
+    }
+}
+
 async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
     let mut data_handled = false;
+
+    // Cache requests: if this instance can fulfill the request from its
+    // local packet cache, replay the cached packet and stop processing
+    // (Python `Transport.inbound`: `if packet.context == CACHE_REQUEST:
+    // if Transport.cache_request_packet(packet): return`).
+    if packet.context == PacketContext::CacheRequest
+        && handle_cache_request(packet, &mut handler).await
+    {
+        return;
+    }
 
     if packet.header.destination_type == DestinationType::Link {
         let mut local_out_link_handled = false;
@@ -2045,6 +2193,26 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
             }
 
             let mut link = link.lock().await;
+            // A cache request arriving over an established link is
+            // answered with the cached packet contents
+            // (Python link receive: `get_cached_packet` and resend).
+            if packet.context == PacketContext::CacheRequest
+                && packet.data.as_slice().len() == crate::packet::HASHLENGTH_BYTES
+            {
+                let request_hash = crate::hash::Hash::new_from_slice(packet.data.as_slice());
+                let cached = handler
+                    .packet_cache
+                    .lock()
+                    .await
+                    .get_cached_announce(&request_hash);
+                if let Some(cached) = cached {
+                    if let Ok(response) = link.data_packet(cached.data.as_slice()) {
+                        handler.send_packet(response).await;
+                        return;
+                    }
+                }
+            }
+
             let channel_tx = handler.channel_table.get(link.id());
 
             // Proof strategy of the destination owning this link gates
@@ -2057,12 +2225,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                 .and_then(|destination| destination.try_lock().ok())
                 .map(|destination| destination.proof_strategy());
 
-            let result = link.handle_packet(
-                &handler.link_in_event_tx,
-                channel_tx,
-                packet,
-                false
-            );
+            let result = link.handle_packet(&handler.link_in_event_tx, channel_tx, packet, false);
 
             match result {
                 LinkHandleResult::KeepAlive => {
@@ -2115,7 +2278,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                     &handler.link_out_event_tx,
                     handler.channel_table.get(&link_id),
                     packet,
-                    true
+                    true,
                 );
 
                 if let LinkHandleResult::MessageReceived(Some(proof)) = result {
@@ -2157,11 +2320,14 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
         if let Some(_destination) = handler.plain_in_destinations.get(&packet.destination) {
             data_handled = true;
 
-            handler.received_data_tx.send(ReceivedData {
-                destination: packet.destination,
-                data: packet.data,
-                decrypted: false,
-            }).ok();
+            handler
+                .received_data_tx
+                .send(ReceivedData {
+                    destination: packet.destination,
+                    data: packet.data,
+                    decrypted: false,
+                })
+                .ok();
         }
     }
 
@@ -2169,11 +2335,14 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
         if let Some(_destination) = handler.plain_in_destinations.get(&packet.destination) {
             data_handled = true;
 
-            handler.received_data_tx.send(ReceivedData {
-                destination: packet.destination,
-                data: packet.data,
-                decrypted: false,
-            }).ok();
+            handler
+                .received_data_tx
+                .send(ReceivedData {
+                    destination: packet.destination,
+                    data: packet.data,
+                    decrypted: false,
+                })
+                .ok();
         }
         // Plain packets are never routed elsewhere: everyone on a shared
         // interface receives them directly.
@@ -2196,11 +2365,14 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                 Ok(plain_text) => {
                     let data = PacketDataBuffer::new_from_slice(plain_text);
 
-                    handler.received_data_tx.send(ReceivedData {
-                        destination: packet.destination,
-                        data,
-                        decrypted: true,
-                    }).ok();
+                    handler
+                        .received_data_tx
+                        .send(ReceivedData {
+                            destination: packet.destination,
+                            data,
+                            decrypted: true,
+                        })
+                        .ok();
 
                     // Python `Transport`/`Link` prove incoming packets
                     // according to the destination's proof strategy.
@@ -2238,7 +2410,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
 
 async fn handle_announce<'a>(
     packet: &Packet,
-    mut handler: MutexGuard<'a, TransportHandler>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
     iface: AddressHash,
 ) {
     if handler.has_destination(&packet.destination) {
@@ -2257,6 +2429,43 @@ async fn handle_announce<'a>(
                 packet.destination
             );
             return;
+        }
+    }
+
+    // Ingress control (Python `Transport.inbound` announce path):
+    // sample the announce, and hold it if the interface is currently
+    // ingress limiting. Announces for destinations with waiting path
+    // requests are never limited.
+    {
+        handler.iface_manager.lock().await.received_announce(&iface);
+
+        let known_path = handler.path_table.get(&packet.destination).is_some();
+        let pending_request = handler.path_requests.has_pending(&packet.destination);
+
+        if !known_path && !pending_request {
+            let limited = {
+                let manager = handler.iface_manager.lock().await;
+                manager
+                    .with_control(&iface, |control| {
+                        control.should_ingress_limit(time::Instant::now())
+                    })
+                    .unwrap_or(false)
+            };
+
+            if limited {
+                {
+                    let manager = handler.iface_manager.lock().await;
+                    manager.with_control(&iface, |control| {
+                        control.hold_announce(packet, PATHFINDER_M as u8)
+                    });
+                }
+                log::trace!(
+                    "tp({}): holding announce for {} due to ingress limiting",
+                    handler.config.name,
+                    packet.destination
+                );
+                return;
+            }
         }
     }
 
@@ -2301,7 +2510,7 @@ async fn handle_announce<'a>(
             announce.app_data.map(|data| data.to_vec()),
             now,
         );
-        persist_known_destinations(&mut handler);
+        persist_known_destinations(handler);
 
         // Python `Identity._remember_ratchet` for announces carrying a
         // ratchet key.
@@ -2339,7 +2548,26 @@ async fn handle_announce<'a>(
                 .insert(packet.destination, destination.clone());
         }
 
+        // Cache the announce for later path responses and cache requests
+        // (Python `Transport.cache(force_cache=True, packet_type="announce")`).
+        handler.packet_cache.lock().await.cache_announce(packet);
+
         handler.announce_table.add(packet, dest_hash, iface);
+
+        // If we have a waiting discovery path request for this destination,
+        // answer it immediately with a path response announce on the
+        // requesting interface (Python `discovery_path_requests` handling).
+        if handler.path_requests.clear_discovery(&packet.destination) {
+            let hops = packet.header.hops + 1;
+            handler
+                .announce_table
+                .add_response(packet.destination, iface, hops, Duration::ZERO);
+            log::trace!(
+                "tp({}): got matching announce, answering waiting discovery path request for {}",
+                handler.config.name,
+                packet.destination
+            );
+        }
 
         handler
             .path_table
@@ -2389,74 +2617,277 @@ async fn handle_path_request<'a>(
     handler: &mut MutexGuard<'a, TransportHandler>,
     iface: AddressHash,
 ) {
-    if let Some(request) = handler.path_requests.decode(packet.data.as_slice()) {
-        if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
-            let response = dest
-                .lock()
-                .await
-                .path_response(OsRng, None)
-                .expect("valid path response");
+    let request = match handler.path_requests.decode(packet.data.as_slice()) {
+        Some(request) => request,
+        None => return,
+    };
+
+    // Ingress sampling (Python `packet.receiving_interface.received_path_request()`).
+    handler
+        .iface_manager
+        .lock()
+        .await
+        .received_path_request(&iface);
+
+    // The destination is local to this system: announce it directly to the
+    // requestor as a path response (Python `local_destination.announce(path_response=True)`).
+    if let Some(dest) = handler.single_in_destinations.get(&request.destination) {
+        let response = dest
+            .lock()
+            .await
+            .path_response(OsRng, None)
+            .expect("valid path response");
+
+        handler
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(iface),
+                packet: response,
+            })
+            .await;
+
+        log::trace!(
+            "tp({}): answering path request for {}, destination is local to this system",
+            handler.config.name,
+            request.destination
+        );
+
+        return;
+    }
+
+    if handler.config.retransmit {
+        // The path is known: schedule a path response announce after a
+        // grace period (Python `Transport.path_request` "path is known").
+        if let Some(entry) = handler.path_table.get(&request.destination) {
+            // Don't answer if the next hop is the requestor itself
+            // (circular request suppression).
+            if let Some(requestor_id) = request.requesting_transport {
+                if requestor_id == entry.received_from {
+                    log::trace!(
+                        "tp({}): dropping circular path request from {}",
+                        handler.config.name,
+                        request.destination
+                    );
+                    return;
+                }
+            }
+
+            // Roaming-mode interfaces don't answer path requests when the
+            // next hop is on the same roaming-mode interface.
+            let mode = handler.iface_manager.lock().await.iface_mode(&iface);
+            if mode == InterfaceMode::Roaming && entry.iface == iface {
+                log::trace!(
+                    "tp({}): not answering path request on roaming-mode interface, next hop is on same interface",
+                    handler.config.name
+                );
+                return;
+            }
+
+            // Directly reachable peers answer first: wait the grace
+            // period, longer on roaming-mode interfaces.
+            let grace = PATH_REQUEST_GRACE
+                + if mode == InterfaceMode::Roaming {
+                    PATH_REQUEST_RG
+                } else {
+                    Duration::ZERO
+                };
+
+            let hops = entry.hops;
 
             handler
-                .send(TxMessage {
-                    tx_type: TxMessageType::Direct(iface),
-                    packet: response,
-                })
-                .await;
+                .announce_table
+                .add_response(request.destination, iface, hops, grace);
 
             log::trace!(
-                "tp({}): send direct path response over {}",
+                "tp({}): answering path request for {}, path is known ({} hops, grace {:?})",
                 handler.config.name,
-                iface
+                request.destination,
+                hops,
+                grace
             );
 
             return;
         }
+    }
 
-        if handler.config.retransmit {
-            if let Some(entry) = handler.path_table.get(&request.destination) {
-                if let Some(requestor_id) = request.requesting_transport {
-                    if requestor_id == entry.received_from {
-                        log::trace!(
-                            "tp({}): dropping circular path request from {}",
-                            handler.config.name,
-                            request.destination
-                        );
-                        return;
-                    }
-                }
+    // The destination is unknown. Branch order follows Python
+    // `Transport.path_request`:
+    //   1. request from a local client: forward on all other interfaces
+    //   2. receiving mode warrants path discovery: gated recursive search
+    //   3. otherwise: forward to local clients, or ignore
+    let from_local_client = {
+        let manager = handler.iface_manager.lock().await;
+        manager.is_local_client_iface(&iface)
+    };
 
-                let hops = entry.hops;
+    // One discovery request at a time per destination.
+    let discovery_pending = handler
+        .path_requests
+        .discovery_pending(&request.destination);
 
-                handler
-                    .announce_table
-                    .add_response(request.destination, iface, hops);
+    if from_local_client && !discovery_pending {
+        log::trace!(
+            "tp({}): forwarding path request from local client for {} to all other interfaces",
+            handler.config.name,
+            request.destination
+        );
+        handler
+            .path_requests
+            .register_discovery(&request.destination);
 
-                log::trace!(
-                    "tp({}): scheduled remote path response to {} ({} hops) over {}",
-                    handler.config.name,
-                    request.destination,
-                    hops,
-                    iface
-                );
-
-                return;
+        let interfaces = handler.iface_manager.lock().await.live_iface_addresses();
+        for (other, online) in interfaces {
+            if other == iface || !online {
+                continue;
             }
-        }
-
-        if let Some(packet) =
+            handler.iface_manager.lock().await.sent_path_request(&other);
             handler
-                .path_requests
-                .generate_recursive(&request.destination, Some(iface), None)
-        {
-            handler
-                .send(TxMessage {
-                    tx_type: TxMessageType::Broadcast(Some(iface)),
-                    packet,
-                })
+                .request_path(&request.destination, Some(other), None)
                 .await;
         }
+        return;
     }
+
+    // `should_search_for_unknown`: the receiving interface mode warrants
+    // active path discovery
+    // (Python `DISCOVER_PATHS_FOR`, `recursive_prs` or boundary mode with
+    // `BOUNDARY_SEARCH_MODES`).
+    // Outer `None`: this interface mode does not search at all.
+    // Inner `None`: search all interfaces; inner `Some`: restrict the
+    // search to these interface modes.
+    let search_plan: Option<Option<Vec<InterfaceMode>>> = {
+        let manager = handler.iface_manager.lock().await;
+        manager
+            .with_control(&iface, |control| {
+                if control.recursive_prs
+                    || InterfaceMode::DISCOVER_PATHS_FOR.contains(&control.mode)
+                {
+                    Some(None)
+                } else if control.mode == InterfaceMode::Boundary {
+                    Some(Some(InterfaceMode::BOUNDARY_SEARCH_MODES.to_vec()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(None)
+    };
+
+    // `search` is Some when a recursive search should be performed;
+    // its inner value restricts the search to specific interface modes.
+    let search: Option<Option<Vec<InterfaceMode>>> = search_plan;
+
+    if let Some(search_modes) = search {
+        // Abort recursive path request if the receiving interface has a
+        // path-request burst active (Python `should_ingress_limit_pr`).
+        let ingress_limited = {
+            let manager = handler.iface_manager.lock().await;
+            manager
+                .with_control(&iface, |control| {
+                    control.should_ingress_limit_pr(time::Instant::now())
+                })
+                .unwrap_or(false)
+        };
+        if ingress_limited {
+            log::trace!(
+                "tp({}): not sending recursive path request due to active ingress limiting",
+                handler.config.name
+            );
+            return;
+        }
+
+        if discovery_pending {
+            log::trace!(
+                "tp({}): there is already a waiting path request for {}",
+                handler.config.name,
+                request.destination
+            );
+            return;
+        }
+
+        handler
+            .path_requests
+            .register_discovery(&request.destination);
+
+        log::trace!(
+            "tp({}): attempting to discover unknown path to {} on behalf of path request",
+            handler.config.name,
+            request.destination
+        );
+
+        // Forward the path request on all interfaces except the requestor
+        // interface, reusing the tag to avoid loops.
+        let tag = request.tag_bytes.clone();
+
+        let interfaces = handler.iface_manager.lock().await.live_iface_addresses();
+        for (other, online) in interfaces {
+            if other == iface || !online {
+                continue;
+            }
+
+            if let Some(modes) = &search_modes {
+                let mode = handler.iface_manager.lock().await.iface_mode(&other);
+                if !modes.contains(&mode) {
+                    continue;
+                }
+            }
+
+            // Respect path-request egress control on the outgoing interface
+            // (Python `should_egress_limit_pr`).
+            let egress_limited = {
+                let manager = handler.iface_manager.lock().await;
+                manager
+                    .with_control(&other, |control| {
+                        control.should_egress_limit_pr(time::Instant::now())
+                    })
+                    .unwrap_or(false)
+            };
+            if egress_limited {
+                log::trace!(
+                    "tp({}): not sending recursive path request due to active egress limiting",
+                    handler.config.name
+                );
+                continue;
+            }
+
+            handler.iface_manager.lock().await.sent_path_request(&other);
+            handler
+                .request_path(&request.destination, Some(other), Some(tag.clone()))
+                .await;
+        }
+
+        return;
+    }
+
+    // Forward the path request to local clients when it did not originate
+    // from one (Python: "Forwarding path request to local clients").
+    let local_clients = handler
+        .iface_manager
+        .lock()
+        .await
+        .local_client_iface_addresses();
+    if !from_local_client && !local_clients.is_empty() {
+        log::trace!(
+            "tp({}): forwarding path request for {} to local clients",
+            handler.config.name,
+            request.destination
+        );
+        for client_iface in local_clients {
+            handler
+                .iface_manager
+                .lock()
+                .await
+                .sent_path_request(&client_iface);
+            handler
+                .request_path(&request.destination, Some(client_iface), None)
+                .await;
+        }
+        return;
+    }
+
+    log::trace!(
+        "tp({}): ignoring path request for {}, no path known",
+        handler.config.name,
+        request.destination
+    );
 }
 
 async fn handle_fixed_destinations<'a>(
@@ -2509,7 +2940,9 @@ async fn handle_link_request_as_destination<'a>(
                     // follow the destination's proof strategy.
                     link.prove_messages(proof_strategy != ProofStrategy::None);
 
-                    handler.send_packet(link.prove(&handler.link_in_event_tx)).await;
+                    handler
+                        .send_packet(link.prove(&handler.link_in_event_tx))
+                        .await;
 
                     log::debug!(
                         "tp({}): save input link {} for destination {}",
@@ -2534,12 +2967,9 @@ async fn handle_link_request_as_intermediate<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
-    handler.link_table.add(
-        packet,
-        packet.destination,
-        received_from,
-        next_hop,
-    );
+    handler
+        .link_table
+        .add(packet, packet.destination, received_from, next_hop);
 
     send_to_next_hop(packet, &handler, None).await;
 }
@@ -2547,7 +2977,7 @@ async fn handle_link_request_as_intermediate<'a>(
 async fn handle_link_request<'a>(
     packet: &Packet,
     iface: AddressHash,
-    handler: MutexGuard<'a, TransportHandler>
+    handler: MutexGuard<'a, TransportHandler>,
 ) {
     if let Some(destination) = handler
         .single_in_destinations
@@ -2590,11 +3020,19 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
             LinkStatus::Active if link.elapsed() > timer_config.in_link_stale => {
                 link.stale();
             }
-            LinkStatus::Stale if link.elapsed() > timer_config.in_link_stale + timer_config.in_link_close => {
-                if let Some(packet) = link.teardown(&handler.link_in_event_tx).unwrap_or_else(|err| {
-                    log::error!("tp({}): teardown stale in-link error: {err:?}", handler.config.name);
-                    None
-                }) {
+            LinkStatus::Stale
+                if link.elapsed() > timer_config.in_link_stale + timer_config.in_link_close =>
+            {
+                if let Some(packet) =
+                    link.teardown(&handler.link_in_event_tx)
+                        .unwrap_or_else(|err| {
+                            log::error!(
+                                "tp({}): teardown stale in-link error: {err:?}",
+                                handler.config.name
+                            );
+                            None
+                        })
+                {
                     handler.send_packet(packet).await
                 }
                 links_to_remove.push(*link_entry.0);
@@ -2621,14 +3059,18 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     if link.elapsed() > timer_config.out_link_restart {
                         link.restart();
                     }
-                } else if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close {
-                    if let Some(packet) = link.teardown(&handler.link_out_event_tx).unwrap_or_else(|err| {
-                        log::error!(
-                            "tp({}): teardown stale out-link error: {err:?}",
-                            handler.config.name
-                        );
-                        None
-                    }) {
+                } else if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close
+                {
+                    if let Some(packet) =
+                        link.teardown(&handler.link_out_event_tx)
+                            .unwrap_or_else(|err| {
+                                log::error!(
+                                    "tp({}): teardown stale out-link error: {err:?}",
+                                    handler.config.name
+                                );
+                                None
+                            })
+                    {
                         handler.send_packet(packet).await
                     }
                     links_to_remove.push(*link_entry.0);
@@ -2772,7 +3214,7 @@ async fn manage_transport(
                         match packet.header.packet_type {
                             PacketType::Announce => handle_announce(
                                 &packet,
-                                handler,
+                                &mut handler,
                                 message.address
                             ).await,
                             PacketType::LinkRequest => handle_link_request(
@@ -2788,6 +3230,56 @@ async fn manage_transport(
             }
         })
     };
+
+    // Interface control ticker (Python drives these with
+    // `threading.Timer`s and the 1s transport jobs):
+    // * releases ingress-held announces back into processing
+    //   (`Interface.process_held_announces`),
+    // * transmits queued announces when the airtime budget allows
+    //   (`Interface.process_announce_queue`),
+    // * transmits grace-delayed path responses.
+    {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(Duration::from_millis(100)) => {
+                        let mut handler = handler.lock().await;
+
+                        let released = {
+                            let manager = handler.iface_manager.lock().await;
+                            manager.release_held_announces()
+                        };
+                        for (iface, packet) in released {
+                            log::trace!(
+                                "tp({}): releasing held announce packet from {}",
+                                handler.config.name,
+                                iface
+                            );
+                            handle_announce(&packet, &mut handler, iface).await;
+                        }
+
+                        let messages = {
+                            let manager = handler.iface_manager.lock().await;
+                            manager.process_announce_queues()
+                        };
+                        for message in messages {
+                            handler.send(message).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     {
         let handler = handler.clone();
@@ -2981,9 +3473,7 @@ mod tests {
 
     #[tokio::test]
     async fn drop_duplicates() {
-        let transport = TransportConfig::default()
-            .set_retransmit(true)
-            .build();
+        let transport = TransportConfig::default().set_retransmit(true).build();
 
         let handler = transport.get_handler();
 
@@ -3006,7 +3496,9 @@ mod tests {
                 .await
         );
 
-        handle_announce(&announce, handler.lock().await, next_hop_iface).await;
+        let mut handler_guard = handler.lock().await;
+        handle_announce(&announce, &mut handler_guard, next_hop_iface).await;
+        drop(handler_guard);
 
         let data_packet: Packet = Packet {
             data: PacketDataBuffer::new_from_slice(b"foo"),
@@ -3017,7 +3509,7 @@ mod tests {
 
         let different_packet = Packet {
             data: PacketDataBuffer::new_from_slice(b"bar"),
-            .. data_packet
+            ..data_packet
         };
 
         assert!(
@@ -3111,14 +3603,23 @@ impl Transport {
     /// Whether a path to `destination` is currently known
     /// (Python `RNS.Transport.has_path`).
     pub async fn has_path(&self, destination: &AddressHash) -> bool {
-        self.handler.lock().await.path_table.get(destination).is_some()
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .get(destination)
+            .is_some()
     }
 
     /// Next hop for `destination`: the transport instance hash to route
     /// through (`via`) and the interface address to send on
     /// (Python `RNS.Transport.next_hop` + `next_hop_interface`).
     pub async fn next_hop(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
-        self.handler.lock().await.path_table.next_hop_full(destination)
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .next_hop_full(destination)
     }
 
     /// Snapshot of the whole path table

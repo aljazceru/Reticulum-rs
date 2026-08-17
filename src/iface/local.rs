@@ -165,12 +165,10 @@ impl LocalServer {
                 use std::os::linux::net::SocketAddrExt;
                 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
-                let socket_address = UnixSocketAddr::from_abstract_name(
-                    format!("rns/{instance_name}").as_bytes(),
-                )
-                .ok()?;
-                let listener = std::os::unix::net::UnixListener::bind_addr(&socket_address)
-                    .ok()?;
+                let socket_address =
+                    UnixSocketAddr::from_abstract_name(format!("rns/{instance_name}").as_bytes())
+                        .ok()?;
+                let listener = std::os::unix::net::UnixListener::bind_addr(&socket_address).ok()?;
                 listener.set_nonblocking(true).ok()?;
                 let listener = tokio::net::UnixListener::from_std(listener).ok()?;
                 Some(Listener::Unix(listener))
@@ -223,7 +221,10 @@ impl LocalServer {
                 }
             };
 
-            log::info!("local_server: shared instance listening on <{}>", address.describe());
+            log::info!(
+                "local_server: shared instance listening on <{}>",
+                address.describe()
+            );
             stats.set_online(true);
 
             // Drain tx messages: actual clients are spawned as their own
@@ -255,7 +256,12 @@ impl LocalServer {
                     client = Self::accept(&mut listener) => {
                         if let Some(client) = client {
                             let mut iface_manager = iface_manager.lock().await;
-                            iface_manager.spawn(client, LocalClient::spawn);
+                            let address =
+                                iface_manager.spawn(client, LocalClient::spawn);
+                            // Interfaces spawned by the shared instance are
+                            // local client interfaces
+                            // (Python `is_local_shared_instance`).
+                            iface_manager.set_iface_local_client(&address);
                         }
                     }
                 }
@@ -325,12 +331,10 @@ impl LocalClient {
                 use std::os::linux::net::SocketAddrExt;
                 use std::os::unix::net::SocketAddr as UnixSocketAddr;
 
-                let socket_address = UnixSocketAddr::from_abstract_name(
-                    format!("rns/{instance_name}").as_bytes(),
-                )
-                .ok()?;
-                let stream = std::os::unix::net::UnixStream::connect_addr(&socket_address)
-                    .ok()?;
+                let socket_address =
+                    UnixSocketAddr::from_abstract_name(format!("rns/{instance_name}").as_bytes())
+                        .ok()?;
+                let stream = std::os::unix::net::UnixStream::connect_addr(&socket_address).ok()?;
                 stream.set_nonblocking(true).ok()?;
                 Some(StreamType::Unix(
                     tokio::net::UnixStream::from_std(stream).ok()?,
@@ -348,7 +352,11 @@ impl LocalClient {
         let mut stream = context.inner.lock().unwrap().stream.take();
 
         if let Some(address) = &address {
-            log::debug!("local_client[{}]: connecting to shared instance <{}>", name, address.describe());
+            log::debug!(
+                "local_client[{}]: connecting to shared instance <{}>",
+                name,
+                address.describe()
+            );
         }
 
         let (rx_channel, tx_channel) = context.channel.split();
@@ -426,7 +434,10 @@ impl LocalClient {
             log::debug!(
                 "local_client[{}]: connected to <{}>",
                 name,
-                address.as_ref().map(|a| a.describe()).unwrap_or_else(|| "client".into())
+                address
+                    .as_ref()
+                    .map(|a| a.describe())
+                    .unwrap_or_else(|| "client".into())
             );
 
             // Start receive task

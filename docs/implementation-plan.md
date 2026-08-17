@@ -1204,6 +1204,8 @@ with M9 for team-load leveling.
 | 4 Buffer streams | ✅ `src/buffer_stream.rs`: StreamDataMessage wire format (SMT_STREAM_DATA), AsyncRead/AsyncWrite reader/writer, compression heuristic |
 | 6.1 Path expiry | ✅ timestamps, PATHFINDER_E expiry sweep, mark/drop path APIs |
 | 6.5 Blackholes | ✅ `transport/blackholes.rs` with pack/merge list, announce filtering, clean task |
+| 6.2/6.3/6.8 transport control | ✅ `src/iface/control.rs` (modes, ic_* ingress limits, held/queued announces, announce cap, PR ingress/egress gates) wired into transport egress (`InterfaceManager::send`), announce ingress limiting, Python-parity `handle_path_request`, `await_path`, announce packet cache + CACHE_REQUEST |
+| python.rs harness fix | ✅ PYTHONPATH + absolute config for the Python example partners |
 
 Remaining phases (identity persistence, ratchets, plain/group destinations,
 interfaces, tunnels/blackholes/discovery, daemon/RPC, `rn*` utilities,
@@ -1236,6 +1238,9 @@ buffer streams) are still open; see the phase descriptions above.
 | 5.7 PipeInterface | ✅ feature `iface-pipe` (shlex, respawn; `/bin/cat` tests) |
 | 5.9 Interface statistics | ✅ counters + `Transport::interface_stats()` |
 | 6.1 Path table upgrades | ✅ timestamps, PATHFINDER_E expiry, unresponsive marking, drop APIs, snapshot |
+| 6.2 Announce queueing & egress control | ✅ `iface/control.rs`: per-interface ingress control (ic_* burst detection, held announces with penalty/release), announce cap airtime budgeting with queued announces, mode-based announce forwarding policy (internal/roaming/boundary), `PATHFINDER_RW` random retransmit window, `PATHFINDER_R` retries |
+| 6.3 Path request parity | ✅ full `path_request` branch order (local response / known path with grace+roaming grace / local-client forwarding / mode-gated recursive search with ingress+egress PR limiting / local-client fan-out), `await_path` async API, `PATH_REQUEST_TIMEOUT`/MI pending-request tracking, discovery-request dedupe with tag reuse |
+| 6.8 Packet cache requests | ✅ announce packet cache by hash, `CACHE_REQUEST` context handling (replay + link answer) |
 | 6.5 Blackholes | ✅ `transport/blackholes.rs`, identity-hash announce filtering, pack/merge lists |
 | 7.2/7.4 Daemon config & lifecycle | ✅ config parity for new interfaces + shared-instance keys, identity persistence |
 | 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp |
@@ -1248,8 +1253,7 @@ buffer streams) are still open; see the phase descriptions above.
 * 5.5 RNodeInterface (+Multi) — serial command protocol, hardware validation
 * 5.6 I2PInterface — SAMv3 session management
 * 5.8 Backbone/Weave modules (Local shares the Backbone *model* already)
-* 6.2 announce ingress/egress caps (`ic_*`/`ec_*`), 6.3 path-request timing gates (`await_path`),
-  6.4 tunnels, 6.6 Discovery module, 6.7 remote management/probe destination, 6.8 cache requests
+* 6.4 tunnels, 6.6 Discovery module, 6.7 remote management/probe destination
 * 7.1 `reticulum::Reticulum` facade + 7.3 shared-instance RPC (pickle protocol) — the daemon serves
   local clients directly via `LocalServer` instead
 * 9.2 cargo-fuzz targets, 9.3 criterion benches

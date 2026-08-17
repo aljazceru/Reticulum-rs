@@ -1,12 +1,13 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use rand_core::{OsRng, RngCore};
 use tokio::time::{Duration, Instant};
 
 use crate::hash::AddressHash;
 use crate::iface::{TxMessage, TxMessageType};
 use crate::packet::{
-    DestinationType, Header, HeaderType, IfacFlag,
-    Packet, PacketContext, PacketType, PropagationType
+    DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketType,
+    PropagationType,
 };
 
 #[derive(Clone)]
@@ -20,10 +21,7 @@ pub struct AnnounceEntry {
 }
 
 impl AnnounceEntry {
-    pub fn retransmit(
-        &mut self,
-        transport_id: &AddressHash,
-    ) -> Option<TxMessage> {
+    pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
         if self.retries == 0 || Instant::now() >= self.timeout {
             return None;
         }
@@ -33,10 +31,7 @@ impl AnnounceEntry {
         Some(self.always_retransmit(transport_id))
     }
 
-    pub fn always_retransmit(
-        &self,
-        transport_id: &AddressHash,
-    ) -> TxMessage {
+    pub fn always_retransmit(&self, transport_id: &AddressHash) -> TxMessage {
         let context = if self.response_to_iface.is_some() {
             PacketContext::PathResponse
         } else {
@@ -68,14 +63,13 @@ impl AnnounceEntry {
         };
 
         TxMessage { tx_type, packet }
-
     }
 }
 
 struct AnnounceCache {
     newer: Option<BTreeMap<AddressHash, AnnounceEntry>>,
     older: Option<BTreeMap<AddressHash, AnnounceEntry>>,
-    capacity: usize
+    capacity: usize,
 }
 
 impl AnnounceCache {
@@ -83,7 +77,7 @@ impl AnnounceCache {
         Self {
             newer: Some(BTreeMap::new()),
             older: None,
-            capacity
+            capacity,
         }
     }
 
@@ -124,20 +118,21 @@ impl AnnounceTable {
         }
     }
 
-    pub fn add(
-        &mut self,
-        announce: &Packet,
-        destination: AddressHash,
-        received_from: AddressHash
-    ) {
+    pub fn add(&mut self, announce: &Packet, destination: AddressHash, received_from: AddressHash) {
         let now = Instant::now();
         let hops = announce.header.hops + 1;
 
+        // Retransmit within a small random window
+        // (Python: `retransmit_timeout = now + rand()*PATHFINDER_RW`,
+        // `retries = PATHFINDER_R`).
+        let rand_window =
+            Duration::from_secs_f64((OsRng.next_u64() >> 11) as f64 / (1u64 << 53) as f64 * 0.5);
+
         let entry = AnnounceEntry {
             packet: *announce,
-            timeout: now + Duration::from_secs(60),
+            timeout: now + rand_window,
             received_from,
-            retries: 5, // TODO: make this configurable too?
+            retries: 1, // Python `PATHFINDER_R`
             hops,
             response_to_iface: None,
         };
@@ -151,10 +146,14 @@ impl AnnounceTable {
         destination: AddressHash,
         to_iface: AddressHash,
         hops: u8,
+        grace: Duration,
     ) {
         response.retries = 1;
         response.hops = hops;
-        response.timeout = Instant::now() + Duration::from_secs(60);
+        // Python `Transport.path_request`: responses are retransmitted
+        // after a short grace period (plus extra grace on roaming-mode
+        // interfaces) so directly reachable peers can answer first.
+        response.timeout = Instant::now() + grace;
         response.response_to_iface = Some(to_iface);
 
         self.responses.insert(destination, response);
@@ -164,15 +163,16 @@ impl AnnounceTable {
         &mut self,
         destination: AddressHash,
         to_iface: AddressHash,
-        hops: u8
+        hops: u8,
+        grace: Duration,
     ) -> bool {
         if let Some(entry) = self.map.get(&destination) {
-            self.do_add_response(entry.clone(), destination, to_iface, hops);
+            self.do_add_response(entry.clone(), destination, to_iface, hops, grace);
             return true;
         }
 
         if let Some(entry) = self.cache.get(&destination) {
-            self.do_add_response(entry.clone(), destination, to_iface, hops);
+            self.do_add_response(entry.clone(), destination, to_iface, hops, grace);
             return true;
         }
 
@@ -185,13 +185,12 @@ impl AnnounceTable {
         transport_id: &AddressHash,
     ) -> Option<TxMessage> {
         // temporary hack
-        self.map.get_mut(dest_hash).and_then(|e| e.retransmit(transport_id))
+        self.map
+            .get_mut(dest_hash)
+            .and_then(|e| e.retransmit(transport_id))
     }
 
-    pub fn tx_to_retransmit(
-        &mut self,
-        transport_id: &AddressHash,
-    ) -> Vec<TxMessage> {
+    pub fn tx_to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
         let mut messages = vec![];
         let mut completed = vec![];
 
@@ -237,10 +236,7 @@ impl AnnounceTable {
         messages
     }
 
-    pub fn tx_to_retransmit_old(
-        &mut self,
-        transport_id: &AddressHash,
-    ) -> Vec<TxMessage> {
+    pub fn tx_to_retransmit_old(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
         let mut messages = vec![];
 
         if let Some(ref cache) = self.cache.newer {

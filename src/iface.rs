@@ -1,3 +1,4 @@
+pub mod control;
 pub mod hdlc;
 pub mod local;
 
@@ -7,20 +8,21 @@ pub mod udp;
 
 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
 pub mod auto;
-#[cfg(feature = "iface-pipe")]
-pub mod pipe;
 #[cfg(feature = "iface-serial")]
 pub mod ax25;
 #[cfg(feature = "iface-serial")]
 pub mod kiss;
+#[cfg(feature = "iface-pipe")]
+pub mod pipe;
 #[cfg(feature = "iface-serial")]
 pub mod serial;
 
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use tokio::sync::mpsc;
 use tokio::task;
@@ -28,7 +30,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hash::AddressHash;
 use crate::hash::Hash;
-use crate::packet::Packet;
+pub use crate::iface::control::{IfaceControlParams, IfaceControlState, InterfaceMode};
+use crate::packet::{Packet, PacketType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
 pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
@@ -194,6 +197,9 @@ pub struct InterfaceManager {
     rx_send: InterfaceRxSender,
     cancel: CancellationToken,
     ifaces: Vec<LocalInterface>,
+    /// Per-interface transport control state (Python `Interface` ingress /
+    /// egress control attributes).
+    controls: Mutex<HashMap<AddressHash, IfaceControlState>>,
 }
 
 impl InterfaceManager {
@@ -207,6 +213,7 @@ impl InterfaceManager {
             rx_send,
             cancel: CancellationToken::new(),
             ifaces: Vec::new(),
+            controls: Mutex::new(HashMap::new()),
         }
     }
 
@@ -216,12 +223,7 @@ impl InterfaceManager {
 
     /// Create a new interface channel registered under `name` (configuration
     /// name, used for statistics) and `kind` (interface type).
-    pub fn new_channel_named(
-        &mut self,
-        tx_cap: usize,
-        name: &str,
-        kind: &str,
-    ) -> InterfaceChannel {
+    pub fn new_channel_named(&mut self, tx_cap: usize, name: &str, kind: &str) -> InterfaceChannel {
         self.counter += 1;
 
         let counter_bytes = self.counter.to_le_bytes();
@@ -243,6 +245,11 @@ impl InterfaceManager {
             stop: stop.clone(),
             stats: stats.clone(),
         });
+
+        self.controls
+            .lock()
+            .expect("iface control lock")
+            .insert(address, IfaceControlState::new(tokio::time::Instant::now()));
 
         InterfaceChannel {
             rx_channel: self.rx_send.clone(),
@@ -282,7 +289,145 @@ impl InterfaceManager {
             let iface = self.ifaces.remove(index);
             iface.stats.set_online(false);
             iface.stop.cancel();
+            self.controls
+                .lock()
+                .expect("iface control lock")
+                .remove(address);
         }
+    }
+
+    /// Run `f` with the control state of one interface
+    /// (Python reads/writes attributes directly on the interface object).
+    pub fn with_control<R>(
+        &self,
+        address: &AddressHash,
+        f: impl FnOnce(&mut IfaceControlState) -> R,
+    ) -> Option<R> {
+        let mut controls = self.controls.lock().expect("iface control lock");
+        controls.get_mut(address).map(f)
+    }
+
+    /// Configure the interface mode of an interface
+    /// (Python interface `mode` configuration option).
+    pub fn set_iface_mode(&self, address: &AddressHash, mode: InterfaceMode) -> bool {
+        self.with_control(address, |control| control.mode = mode)
+            .is_some()
+    }
+
+    /// Configure the nominal bitrate of an interface in bits per second
+    /// (Python interface `bitrate` configuration option).
+    pub fn set_iface_bitrate(&self, address: &AddressHash, bitrate: u64) -> bool {
+        self.with_control(address, |control| control.bitrate = bitrate)
+            .is_some()
+    }
+
+    /// Mark an interface as a local shared-instance client
+    /// (Python `is_local_client_interface`).
+    pub fn set_iface_local_client(&self, address: &AddressHash) -> bool {
+        self.with_control(address, |control| control.is_local_client = true)
+            .is_some()
+    }
+
+    /// Whether an interface is a local shared-instance client.
+    pub fn is_local_client_iface(&self, address: &AddressHash) -> bool {
+        self.with_control(address, |control| control.is_local_client)
+            .unwrap_or(false)
+    }
+
+    /// Addresses of live local-client interfaces
+    /// (Python `Transport.local_client_interfaces`).
+    pub fn local_client_iface_addresses(&self) -> Vec<AddressHash> {
+        let controls = self.controls.lock().expect("iface control lock");
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .filter(|iface| {
+                controls
+                    .get(&iface.address)
+                    .map(|control| control.is_local_client)
+                    .unwrap_or(false)
+            })
+            .map(|iface| iface.address)
+            .collect()
+    }
+
+    /// The interface mode of an interface (default `Full`).
+    pub fn iface_mode(&self, address: &AddressHash) -> InterfaceMode {
+        self.with_control(address, |control| control.mode)
+            .unwrap_or(InterfaceMode::Full)
+    }
+
+    /// Account a received announce on an interface
+    /// (Python `Interface.received_announce`).
+    pub fn received_announce(&self, address: &AddressHash) {
+        let now = tokio::time::Instant::now();
+        self.with_control(address, |control| control.received_announce(now));
+    }
+
+    /// Account a sent announce on an interface
+    /// (Python `Interface.sent_announce`).
+    pub fn sent_announce(&self, address: &AddressHash) {
+        let now = tokio::time::Instant::now();
+        self.with_control(address, |control| control.sent_announce(now));
+    }
+
+    /// Account a received path request on an interface
+    /// (Python `Interface.received_path_request`).
+    pub fn received_path_request(&self, address: &AddressHash) {
+        let now = tokio::time::Instant::now();
+        self.with_control(address, |control| control.received_path_request(now));
+    }
+
+    /// Account a sent path request on an interface
+    /// (Python `Interface.sent_path_request`).
+    pub fn sent_path_request(&self, address: &AddressHash) {
+        let now = tokio::time::Instant::now();
+        self.with_control(address, |control| control.sent_path_request(now));
+    }
+
+    /// Release held announces on all interfaces whose burst penalty has
+    /// elapsed (Python `Interface.process_held_announces`, driven by
+    /// `threading.Timer` there and by the transport ticker here).
+    /// Returns the interface each packet was held on, for re-injection.
+    pub fn release_held_announces(&self) -> Vec<(AddressHash, Packet)> {
+        let now = tokio::time::Instant::now();
+        let mut controls = self.controls.lock().expect("iface control lock");
+        let mut released = Vec::new();
+        for (address, control) in controls.iter_mut() {
+            while let Some(packet) = control.release_held_announce(now) {
+                released.push((*address, packet));
+            }
+        }
+        released
+    }
+
+    /// Transmit queued announces whose airtime budget allows it
+    /// (Python `Interface.process_announce_queue`). Returns the direct
+    /// transmit messages for the transport to send.
+    pub fn process_announce_queues(&self) -> Vec<TxMessage> {
+        let now = tokio::time::Instant::now();
+        let mut controls = self.controls.lock().expect("iface control lock");
+        let mut messages = Vec::new();
+        for (address, control) in controls.iter_mut() {
+            while let Some(packet) = control.take_queued_announce(now) {
+                control.sent_announce(now);
+                messages.push(TxMessage {
+                    tx_type: TxMessageType::Direct(*address),
+                    packet,
+                });
+            }
+        }
+        messages
+    }
+
+    /// Addresses of all live interfaces with their online status,
+    /// for fan-out decisions (path request forwarding).
+    pub fn live_iface_addresses(&self) -> Vec<(AddressHash, bool)> {
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .map(|iface| (iface.address, iface.stats.online()))
+            .collect()
     }
 
     /// Snapshot of the statistics of all live interfaces.
@@ -349,6 +494,8 @@ impl InterfaceManager {
     }
 
     pub async fn send(&self, message: TxMessage) {
+        let is_announce = message.packet.header.packet_type == PacketType::Announce;
+
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
                 TxMessageType::Broadcast(address) => {
@@ -357,14 +504,85 @@ impl InterfaceManager {
                         should_send = address != iface.address;
                     }
 
+                    // Announce forwarding policy between interface modes
+                    // (Python `Transport.outbound` MODE_INTERNAL /
+                    // MODE_ROAMING / MODE_BOUNDARY gating). Directly
+                    // addressed transmissions (path responses) and locally
+                    // originated announces bypass the policy.
+                    if should_send && is_announce && message.packet.header.hops > 0 {
+                        should_send = self.announce_forwarding_allowed(&iface.address, address);
+                    }
+
                     should_send
-                },
+                }
                 TxMessageType::Direct(address) => address == iface.address,
             };
 
             if should_send && !iface.stop.is_cancelled() {
+                // Egress airtime budgeting for forwarded announces
+                // (Python announce cap + `Interface.announce_queue`).
+                if is_announce && message.packet.header.hops > 0 {
+                    let now = tokio::time::Instant::now();
+                    let size = control::packet_wire_len(&message.packet);
+                    let allowed = self.with_control(&iface.address, |control| {
+                        if control.try_transmit_announce(size, now) {
+                            control.sent_announce(now);
+                            true
+                        } else {
+                            control.queue_announce(message.packet, now);
+                            false
+                        }
+                    });
+
+                    if !allowed.unwrap_or(true) {
+                        continue;
+                    }
+                }
+
                 let _ = iface.tx_send.send(message).await;
             }
+        }
+    }
+
+    /// Whether an announce received on `from_iface` (or locally originated
+    /// when `None`) may be forwarded onto `to_iface`
+    /// (Python `Transport.outbound` mode interaction rules).
+    pub fn announce_forwarding_allowed(
+        &self,
+        to_iface: &AddressHash,
+        from_iface: Option<AddressHash>,
+    ) -> bool {
+        let to_mode = self.iface_mode(to_iface);
+
+        match to_mode {
+            InterfaceMode::Internal => {
+                // Only boundary-mode or explicitly enabled interfaces may
+                // inject announces into internal-mode interfaces.
+                match from_iface {
+                    None => true,
+                    Some(from) => {
+                        let from_mode = self.iface_mode(&from);
+                        from_mode == InterfaceMode::Boundary
+                            || self
+                                .with_control(&from, |control| {
+                                    control.announces_to_internal == Some(true)
+                                })
+                                .unwrap_or(false)
+                    }
+                }
+            }
+            InterfaceMode::Roaming => match from_iface {
+                None => true,
+                Some(from) => {
+                    let from_mode = self.iface_mode(&from);
+                    from_mode != InterfaceMode::Roaming && from_mode != InterfaceMode::Boundary
+                }
+            },
+            InterfaceMode::Boundary => match from_iface {
+                None => true,
+                Some(from) => self.iface_mode(&from) != InterfaceMode::Roaming,
+            },
+            _ => true,
         }
     }
 }

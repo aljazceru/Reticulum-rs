@@ -1,8 +1,8 @@
-use alloc::collections::{BTreeSet, BTreeMap};
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use rand_core::OsRng;
 
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 
 use crate::destination::DestinationName;
 use crate::destination::PlainInputDestination;
@@ -19,10 +19,14 @@ use crate::packet::PacketDataBuffer;
 use crate::packet::PacketType;
 use crate::packet::PropagationType;
 
+/// Default timeout for client path requests in seconds
+/// (Python `Transport.PATH_REQUEST_TIMEOUT`).
+pub const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn create_path_request_destination() -> PlainInputDestination {
     PlainInputDestination::new(
-        EmptyIdentity { },
-        DestinationName::new("rnstransport","path.request")
+        EmptyIdentity {},
+        DestinationName::new("rnstransport", "path.request"),
     )
 }
 
@@ -35,7 +39,7 @@ pub fn create_random_tag() -> TagBytes {
 pub struct PathRequest {
     pub destination: AddressHash,
     pub requesting_transport: Option<AddressHash>,
-    pub tag_bytes: TagBytes
+    pub tag_bytes: TagBytes,
 }
 
 impl PathRequest {
@@ -44,7 +48,11 @@ impl PathRequest {
             log::info!(
                 "tp({}): ignoring malformed path request: no {}",
                 transport_name,
-                if data.len() < ADDRESS_HASH_SIZE { "destination" } else { "tag" }
+                if data.len() < ADDRESS_HASH_SIZE {
+                    "destination"
+                } else {
+                    "tag"
+                }
             );
             return None;
         }
@@ -58,11 +66,9 @@ impl PathRequest {
         let mut tag_end = data.len();
 
         if data.len() > ADDRESS_HASH_SIZE * 2 {
-            requesting_transport = Some(
-                AddressHash::new_from_slice(
-                    &data[ADDRESS_HASH_SIZE..2*ADDRESS_HASH_SIZE]
-                )
-            );
+            requesting_transport = Some(AddressHash::new_from_slice(
+                &data[ADDRESS_HASH_SIZE..2 * ADDRESS_HASH_SIZE],
+            ));
             tag_start = ADDRESS_HASH_SIZE * 2;
         }
 
@@ -72,7 +78,11 @@ impl PathRequest {
 
         let tag_bytes = data[tag_start..tag_end].into();
 
-        Some(Self { destination, requesting_transport, tag_bytes })
+        Some(Self {
+            destination,
+            requesting_transport,
+            tag_bytes,
+        })
     }
 }
 
@@ -81,7 +91,16 @@ pub struct PathRequests {
     name: String,
     transport_id: Option<AddressHash>,
     controlled_destination: PlainInputDestination,
+    /// Outstanding (discovery) path requests sent on behalf of an unknown
+    /// destination (Python `Transport.discovery_path_requests`).
     discovery: BTreeMap<AddressHash, Instant>,
+    /// Path requests issued locally, with the time they were last sent
+    /// (Python `Transport.path_requests` accounting, used to exempt
+    /// announces for requested destinations from ingress limiting).
+    pending: BTreeMap<AddressHash, Instant>,
+    /// Minimum interval between automated path requests for the same
+    /// destination (Python `Transport.PATH_REQUEST_MI`).
+    min_request_interval: Duration,
 }
 
 impl PathRequests {
@@ -92,6 +111,8 @@ impl PathRequests {
             transport_id,
             controlled_destination: create_path_request_destination(),
             discovery: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            min_request_interval: Duration::from_secs(20),
         }
     }
 
@@ -99,9 +120,9 @@ impl PathRequests {
         let path_request = PathRequest::decode(data, &self.name);
 
         if let Some(ref request) = path_request {
-            let is_new = self.cache.insert(
-                (request.destination, request.tag_bytes.clone())
-            );
+            let is_new = self
+                .cache
+                .insert((request.destination, request.tag_bytes.clone()));
 
             if !is_new {
                 log::info!(
@@ -116,11 +137,9 @@ impl PathRequests {
         path_request
     }
 
-    pub fn generate(
-        &mut self,
-        destination: &AddressHash,
-        tag: Option<TagBytes>
-    ) -> Packet {
+    pub fn generate(&mut self, destination: &AddressHash, tag: Option<TagBytes>) -> Packet {
+        self.pending.insert(*destination, Instant::now());
+
         let mut data = PacketDataBuffer::new_from_slice(destination.as_slice());
 
         if let Some(transport_id) = self.transport_id {
@@ -145,51 +164,53 @@ impl PathRequests {
             destination,
             transport: self.transport_id,
             context: PacketContext::None,
-            data
+            data,
         }
     }
 
-    fn allow_recursive(
-        &mut self,
-        destination: &AddressHash,
-        #[expect(unused)]
-        on_iface: Option<AddressHash>,
-    ) -> bool {
+    /// Whether a locally issued path request for `destination` is still
+    /// outstanding (Python: `destination_hash in Transport.path_requests`).
+    /// Entries expire after `PATH_REQUEST_TIMEOUT`.
+    pub fn has_pending(&mut self, destination: &AddressHash) -> bool {
         let now = Instant::now();
-
-        if let Some(timeout) = self.discovery.get(destination) {
-            if *timeout < now {
-                log::info!(
-                    "tp({}): rejecting discovery path request for destination {} as a request is already pending",
-                    self.name,
-                    destination
-                );
-                return false;
+        match self.pending.get(destination) {
+            Some(at) if now - *at < PATH_REQUEST_TIMEOUT => true,
+            Some(_) => {
+                self.pending.remove(destination);
+                false
             }
+            None => false,
         }
-
-        // TODO implement announce queue and announce cap, reject requests based on that
-        // This will need the currently unused argument.
-
-        true
     }
 
-    pub fn generate_recursive(
-        &mut self,
-        destination: &AddressHash,
-        on_iface: Option<AddressHash>,
-        tag: Option<TagBytes>,
-    ) -> Option<Packet> {
-        if self.allow_recursive(destination, on_iface) {
-            log::trace!(
-                "tp({}): sending discovery path request for {}",
-                self.name,
-                destination
-            );
+    /// Whether a recursive discovery request for `destination` is currently
+    /// waiting (Python `Transport.discovery_path_requests`).
+    pub fn discovery_pending(&self, destination: &AddressHash) -> bool {
+        match self.discovery.get(destination) {
+            Some(timeout) => Instant::now() < *timeout,
+            None => false,
+        }
+    }
 
-            Some(self.generate(destination, tag))
-        } else {
-            None
+    /// Register a waiting discovery path request for `destination`
+    /// (Python inserts `{"destination_hash", "timeout", "requesting_interface"}`).
+    pub fn register_discovery(&mut self, destination: &AddressHash) {
+        self.discovery
+            .insert(*destination, Instant::now() + PATH_REQUEST_TIMEOUT);
+    }
+
+    /// A matching announce arrived for a waiting discovery request
+    /// (Python removes the entry in `Transport.inbound`).
+    pub fn clear_discovery(&mut self, destination: &AddressHash) -> bool {
+        self.discovery.remove(destination).is_some()
+    }
+
+    /// Whether an automated path request for `destination` may be sent now,
+    /// honouring `PATH_REQUEST_MI` (Python automated path request gating).
+    pub fn request_allowed(&mut self, destination: &AddressHash) -> bool {
+        match self.pending.get(destination) {
+            Some(at) => Instant::now() - *at >= self.min_request_interval,
+            None => true,
         }
     }
 }
@@ -208,5 +229,39 @@ mod tests {
         let decoded = testee.decode(encoded.data.as_slice()).unwrap();
 
         assert_eq!(decoded.destination, dest);
+    }
+
+    #[test]
+    fn pending_requests_expire() {
+        let mut testee = PathRequests::new("", None);
+        let dest = AddressHash::new_from_rand(OsRng);
+
+        assert!(!testee.has_pending(&dest));
+
+        testee.generate(&dest, None);
+        assert!(testee.has_pending(&dest));
+
+        testee.pending.insert(
+            dest,
+            Instant::now() - PATH_REQUEST_TIMEOUT - Duration::from_secs(1),
+        );
+        assert!(!testee.has_pending(&dest));
+    }
+
+    #[test]
+    fn discovery_registration() {
+        let mut testee = PathRequests::new("", None);
+        let dest = AddressHash::new_from_rand(OsRng);
+
+        assert!(!testee.discovery_pending(&dest));
+        testee.register_discovery(&dest);
+        assert!(testee.discovery_pending(&dest));
+        assert!(testee.clear_discovery(&dest));
+        assert!(!testee.discovery_pending(&dest));
+
+        // Requests are gated on waiting discovery entries in the transport
+        // layer via `discovery_pending`.
+        testee.register_discovery(&dest);
+        assert!(testee.discovery_pending(&dest));
     }
 }
