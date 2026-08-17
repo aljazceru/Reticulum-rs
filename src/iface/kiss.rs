@@ -383,6 +383,7 @@ impl KissInterface {
         let iface_stop = context.channel.stop.clone();
         let stats = context.channel.stats.clone();
         let iface_address = context.channel.address;
+        let channel_ifac = context.channel.ifac.clone();
 
         let mode = context.inner.lock().unwrap().mode.clone();
         let serial = context.inner.lock().unwrap().serial.clone();
@@ -446,6 +447,7 @@ impl KissInterface {
                 let rx_channel = rx_channel.clone();
                 let tx_state = tx_state.clone();
                 let ready_notify = ready_notify.clone();
+                let channel_ifac_rx = channel_ifac.clone();
                 let mode = mode.clone();
                 let decoder_mtu = match &mode {
                     KissMode::Kiss => HW_MTU,
@@ -480,8 +482,24 @@ impl KissInterface {
 
                                                 if let Some(payload) = payload {
                                                     stats.count_rx(frame.len());
+                                                    let plain = {
+                                                        let ifac = channel_ifac_rx
+                                                            .read()
+                                                            .expect("ifac lock")
+                                                            .clone();
+                                                        match crate::iface::ifac::decode(
+                                                            &payload,
+                                                            ifac.as_deref(),
+                                                        ) {
+                                                            Some(plain) => plain,
+                                                            None => {
+                                                                log::debug!("kiss: dropping packet with invalid access code");
+                                                                continue;
+                                                            }
+                                                        }
+                                                    };
                                                     match Packet::deserialize(
-                                                        &mut InputBuffer::new(&payload),
+                                                        &mut InputBuffer::new(&plain[..]),
                                                     ) {
                                                         Ok(packet) => {
                                                             let _ = rx_channel
@@ -523,6 +541,7 @@ impl KissInterface {
                 let stats = stats.clone();
                 let tx_state = tx_state.clone();
                 let ready_notify = ready_notify.clone();
+                let channel_ifac = channel_ifac.clone();
                 let beacon = beacon.clone();
                 let mode = mode.clone();
                 let mut write_half = write_half;
@@ -591,7 +610,11 @@ impl KissInterface {
                                 if packet.serialize(&mut output).is_err() {
                                     continue;
                                 }
-                                Some(output.as_slice().to_vec())
+                                let ifac = channel_ifac.read().expect("ifac lock").clone();
+                                Some(crate::iface::ifac::encode(
+                                    output.as_slice(),
+                                    ifac.as_deref(),
+                                ))
                             }
                             None | Some(None) => {
                                 // process_queue: exactly one queued packet

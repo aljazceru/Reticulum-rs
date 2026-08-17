@@ -45,6 +45,7 @@ impl TcpClient {
         let stats = context.channel.stats.clone();
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_address = context.channel.address;
+        let channel_ifac = context.channel.ifac.clone();
         let mut stream = { context.inner.lock().unwrap().stream.take() };
 
         let (rx_channel, tx_channel) = context.channel.split();
@@ -119,6 +120,7 @@ impl TcpClient {
                 let mut stream = read_stream;
                 let rx_channel = rx_channel.clone();
                 let stats = stats.clone();
+                let channel_ifac_rx = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     let mut hdlc_rx_buffer = [0u8; BUFFER_SIZE];
@@ -153,7 +155,23 @@ impl TcpClient {
                                                     let frame_buffer = &mut rx_buffer[frame.0..frame.1+1];
                                                     let mut output = OutputBuffer::new(&mut hdlc_rx_buffer[..]);
                                                     if Hdlc::decode(frame_buffer, &mut output).is_ok() {
-                                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(output.as_slice())) {
+                                                        let plain = {
+                                                            let ifac = channel_ifac_rx
+                                                                .read()
+                                                                .expect("ifac lock")
+                                                                .clone();
+                                                            match crate::iface::ifac::decode(
+                                                                output.as_slice(),
+                                                                ifac.as_deref(),
+                                                            ) {
+                                                                Some(plain) => plain,
+                                                                None => {
+                                                                    log::debug!("tcp_client_interface: dropping packet with invalid access code");
+                                                                    continue;
+                                                                }
+                                                            }
+                                                        };
+                                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&plain[..])) {
                                                             if PACKET_TRACE {
                                                                 log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
                                                             }
@@ -191,6 +209,7 @@ impl TcpClient {
                 let tx_channel = tx_channel.clone();
                 let stats = stats.clone();
                 let mut stream = write_stream;
+                let channel_ifac = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -217,14 +236,20 @@ impl TcpClient {
                                 }
                                 let mut output = OutputBuffer::new(&mut tx_buffer);
                                 if packet.serialize(&mut output).is_ok() {
+                                    let wire = {
+                                        let ifac = channel_ifac
+                                            .read()
+                                            .expect("ifac lock")
+                                            .clone();
+                                        crate::iface::ifac::encode(output.as_slice(), ifac.as_deref())
+                                    };
 
-                                    let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
-
-                                    if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok()
-                                        && stream.write_all(hdlc_output.as_slice()).await.is_ok()
+                                    let mut framed = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
+                                    if Hdlc::encode(&wire, &mut framed).is_ok()
+                                        && stream.write_all(framed.as_slice()).await.is_ok()
                                     {
                                         let _ = stream.flush().await;
-                                        stats.count_tx(output.offset());
+                                        stats.count_tx(wire.len());
                                     }
                                 }
                             }

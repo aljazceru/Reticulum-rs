@@ -1099,6 +1099,7 @@ version = "0.1.0"
 dependencies = [
  "bzip2",
  "env_logger",
+ "hkdf",
  "log",
  "rand_core",
  "reticulum-core",

@@ -347,6 +347,7 @@ impl LocalClient {
         let iface_stop = context.channel.stop.clone();
         let stats = context.channel.stats.clone();
         let iface_address = context.channel.address;
+        let channel_ifac = context.channel.ifac.clone();
         let name = context.inner.lock().unwrap().name.clone();
         let address = context.inner.lock().unwrap().address.clone();
         let mut stream = context.inner.lock().unwrap().stream.take();
@@ -447,6 +448,7 @@ impl LocalClient {
                 let stats = stats.clone();
                 let rx_channel = rx_channel.clone();
                 let mut stream = read_half;
+                let channel_ifac_rx = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     let mut decoder = HdlcDecoder::new(HW_MTU);
@@ -474,7 +476,23 @@ impl LocalClient {
                                     });
 
                                     for frame in frames.drain(..) {
-                                        match Packet::deserialize(&mut InputBuffer::new(&frame)) {
+                                        let plain = {
+                                            let ifac = channel_ifac_rx
+                                                .read()
+                                                .expect("ifac lock")
+                                                .clone();
+                                            match crate::iface::ifac::decode(
+                                                &frame,
+                                                ifac.as_deref(),
+                                            ) {
+                                                Some(plain) => plain,
+                                                None => {
+                                                    log::debug!("local_client: dropping packet with invalid access code");
+                                                    continue;
+                                                }
+                                            }
+                                        };
+                                        match Packet::deserialize(&mut InputBuffer::new(&plain[..])) {
                                             Ok(packet) => {
                                                 if PACKET_TRACE {
                                                     log::trace!(
@@ -516,6 +534,7 @@ impl LocalClient {
                 let tx_channel = tx_channel.clone();
                 let stats = stats.clone();
                 let mut stream = write_half;
+                let channel_ifac = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -539,9 +558,12 @@ impl LocalClient {
                         let mut buffer = [0u8; 8192 + 16];
                         let mut output = OutputBuffer::new(&mut buffer[..]);
                         if packet.serialize(&mut output).is_ok() {
-                            let frame = Hdlc::encode_frame_vec(output.as_slice());
+                            let ifac = channel_ifac.read().expect("ifac lock").clone();
+                            let wire =
+                                crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
+                            let frame = Hdlc::encode_frame_vec(&wire);
                             if stream_write_all(&mut stream, &frame).await.is_ok() {
-                                stats.count_tx(output.offset());
+                                stats.count_tx(wire.len());
                             }
                         }
                     }

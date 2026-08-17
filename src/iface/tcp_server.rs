@@ -29,6 +29,7 @@ impl TcpServer {
         let stats = context.channel.stats.clone();
 
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
+        let server_ifac = context.channel.ifac.clone();
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -99,10 +100,20 @@ impl TcpServer {
 
                             let mut iface_manager = iface_manager.lock().await;
 
-                            iface_manager.spawn(
+                            let address = iface_manager.spawn(
                                 TcpClient::new_from_stream(client.1.to_string(), client.0),
                                 TcpClient::spawn,
                             );
+
+                            // Spawned connection interfaces inherit the
+                            // server's interface access code
+                            // (Python TCPServerInterface inheritance).
+                            let inherited = server_ifac.read().expect("ifac lock").clone();
+                            if inherited.is_some() {
+                                iface_manager.with_iface_ifac(&address, |slot| {
+                                    *slot.write().expect("ifac lock") = inherited.clone();
+                                });
+                            }
                         }
                     }
                 }

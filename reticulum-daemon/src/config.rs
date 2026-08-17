@@ -46,6 +46,22 @@ pub struct NamedInterface {
     pub name: String,
     #[serde(flatten)]
     pub config: InterfaceConfig,
+    /// Interface mode (Python `mode`: full/access_point/roaming/boundary/
+    /// gateway/point_to_point/internal).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Nominal bitrate in bits per second (Python `configured_bitrate`).
+    #[serde(default, alias = "configured_bitrate")]
+    pub bitrate: Option<u64>,
+    /// Interface access code size in bits (Python `ifac_size`).
+    #[serde(default)]
+    pub ifac_size: Option<usize>,
+    /// Access code network name (Python `networkname` / `network_name`).
+    #[serde(default, alias = "network_name")]
+    pub networkname: Option<String>,
+    /// Access code passphrase (Python `passphrase` / `pass_phrase`).
+    #[serde(default, alias = "pass_phrase")]
+    pub passphrase: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -520,6 +536,11 @@ impl Config {
             interfaces: vec![
                 NamedInterface {
                     name: "Default TCP Server Interface".to_string(),
+                    mode: None,
+                    bitrate: None,
+                    ifac_size: None,
+                    networkname: None,
+                    passphrase: None,
                     config: InterfaceConfig::TCPServerInterface {
                         enabled: true,
                         bind_host: "127.0.0.1".to_string(),
@@ -741,7 +762,7 @@ command = "/bin/cat"
         assert_eq!(config.reticulum.shared_instance_type, "domain");
         assert_eq!(config.reticulum.instance_name.as_deref(), Some("second"));
 
-        let NamedInterface { name, config } = config.interfaces.into_iter().next().unwrap();
+        let NamedInterface { name, config, .. } = config.interfaces.into_iter().next().unwrap();
         assert_eq!(name, "Test Pipe");
         match config {
             InterfaceConfig::PipeInterface {

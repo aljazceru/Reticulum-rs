@@ -136,6 +136,7 @@ impl PipeInterface {
         let iface_stop = context.channel.stop.clone();
         let stats = context.channel.stats.clone();
         let iface_address = context.channel.address;
+        let channel_ifac = context.channel.ifac.clone();
 
         let command = context.inner.lock().unwrap().command.clone();
         let respawn_delay = context.inner.lock().unwrap().respawn_delay;
@@ -178,6 +179,7 @@ impl PipeInterface {
                 let stop = stop.clone();
                 let stats = stats.clone();
                 let rx_channel = rx_channel.clone();
+                let channel_ifac_rx = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     let mut decoder = HdlcDecoder::new(HW_MTU);
@@ -203,8 +205,24 @@ impl PipeInterface {
                                     });
 
                                     for frame in frames.drain(..) {
+                                        let plain = {
+                                            let ifac = channel_ifac_rx
+                                                .read()
+                                                .expect("ifac lock")
+                                                .clone();
+                                            match crate::iface::ifac::decode(
+                                                &frame,
+                                                ifac.as_deref(),
+                                            ) {
+                                                Some(plain) => plain,
+                                                None => {
+                                                    log::debug!("pipe: dropping packet with invalid access code");
+                                                    continue;
+                                                }
+                                            }
+                                        };
                                         match Packet::deserialize(
-                                            &mut InputBuffer::new(&frame),
+                                            &mut InputBuffer::new(&plain[..]),
                                         ) {
                                             Ok(packet) => {
                                                 stats.count_rx(frame.len());
@@ -238,6 +256,7 @@ impl PipeInterface {
                 let stop = stop.clone();
                 let tx_channel = tx_channel.clone();
                 let stats = stats.clone();
+                let channel_ifac = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -253,10 +272,13 @@ impl PipeInterface {
                         let mut buffer = [0u8; 2048];
                         let mut output = OutputBuffer::new(&mut buffer[..]);
                         if packet.serialize(&mut output).is_ok() {
-                            let frame = Hdlc::encode_frame_vec(output.as_slice());
+                            let ifac = channel_ifac.read().expect("ifac lock").clone();
+                            let wire =
+                                crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
+                            let frame = Hdlc::encode_frame_vec(&wire);
                             if stdin.write_all(&frame).await.is_ok() {
                                 let _ = stdin.flush().await;
-                                stats.count_tx(output.offset());
+                                stats.count_tx(wire.len());
                             } else {
                                 stop.cancel();
                                 break;

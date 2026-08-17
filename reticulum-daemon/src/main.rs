@@ -169,39 +169,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        match iface.config {
+        match &iface.config {
             InterfaceConfig::TCPServerInterface { bind_host, bind_port, .. } => {
                 let addr = format!("{}:{}", bind_host.trim_end_matches(':'), bind_port);
                 log::info!("Enabling interface '{}': TCP Server on {}", iface.name, addr);
-                iface_manager.lock().await.spawn(
+                let address = iface_manager.lock().await.spawn(
                     TcpServer::new(addr, iface_manager.clone()),
                     TcpServer::spawn,
                 );
+                configure_iface(&iface_manager, &address, &iface).await;
             }
             InterfaceConfig::TCPClientInterface { target_host, target_port, .. } => {
                 let addr = format!("{}:{}", target_host.trim_end_matches(':'), target_port);
                 log::info!("Enabling interface '{}': TCP Client to {}", iface.name, addr);
-                iface_manager.lock().await.spawn(
+                let address = iface_manager.lock().await.spawn(
                     TcpClient::new(addr),
                     TcpClient::spawn,
                 );
+                configure_iface(&iface_manager, &address, &iface).await;
             }
             InterfaceConfig::UDPInterface { listen_ip, listen_port, forward_ip, forward_port, .. } => {
                 let bind_addr = format!("{}:{}", listen_ip, listen_port);
                 let forward_addr = format!("{}:{}", forward_ip, forward_port);
                 log::info!("Enabling interface '{}': UDP {}→{}", iface.name, bind_addr, forward_addr);
-                iface_manager.lock().await.spawn(
+                let address = iface_manager.lock().await.spawn(
                     UdpInterface::new(bind_addr, Some(forward_addr), false),
                     UdpInterface::spawn,
                 );
+                configure_iface(&iface_manager, &address, &iface).await;
             }
             InterfaceConfig::AutoInterface { group_id, discovery_port, data_port, discovery_scope, multicast_address_type, devices, ignored_devices, .. } => {
                 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
                 {
                     let mut auto_config = AutoInterfaceConfig {
-                        group_id,
-                        discovery_port,
-                        data_port,
+                        group_id: group_id.clone(),
+                        discovery_port: *discovery_port,
+                        data_port: *data_port,
                         ..AutoInterfaceConfig::default()
                     };
 
@@ -234,11 +237,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         auto_config.group_id,
                         auto_config.discovery_port
                     );
-                    iface_manager.lock().await.spawn_named(
+                    let address = iface_manager.lock().await.spawn_named(
                         &iface.name,
                         AutoInterface::new(auto_config, iface_manager.clone()),
                         AutoInterface::spawn,
                     );
+                    configure_iface(&iface_manager, &address, &iface).await;
                 }
 
                 #[cfg(not(all(feature = "iface-auto", target_os = "linux")))]
@@ -262,19 +266,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InterfaceConfig::KISSInterface { port, speed, databits, parity, stopbits, preamble, txtail, persistence, slottime, flow_control, .. } => {
                 #[cfg(feature = "iface-serial")]
                 {
-                    let serial = SerialPortConfig::new(port.clone(), speed)
-                        .with_format(databits, parity, stopbits);
-                    let csma = CsmaParams::new(preamble, txtail, persistence, slottime);
+                    let serial = SerialPortConfig::new(port.clone(), *speed)
+                        .with_format(*databits, parity.clone(), *stopbits);
+                    let csma = CsmaParams::new(*preamble, *txtail, *persistence, *slottime);
 
                     log::info!(
                         "Enabling interface '{}': KISS on {port} at {speed} baud (csma preamble={preamble} txtail={txtail} persistence={persistence} slottime={slottime})",
                         iface.name
                     );
-                    iface_manager.lock().await.spawn_named(
+                    let address = iface_manager.lock().await.spawn_named(
                         &iface.name,
-                        KissInterface::new(serial, csma, flow_control),
+                        KissInterface::new(serial, csma, *flow_control),
                         KissInterface::spawn,
                     );
+                    configure_iface(&iface_manager, &address, &iface).await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -289,18 +294,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InterfaceConfig::SerialInterface { port, speed, databits, parity, stopbits, .. } => {
                 #[cfg(feature = "iface-serial")]
                 {
-                    let serial = SerialPortConfig::new(port.clone(), speed)
-                        .with_format(databits, parity, stopbits);
+                    let serial = SerialPortConfig::new(port.clone(), *speed)
+                        .with_format(*databits, parity.clone(), *stopbits);
 
                     log::info!(
                         "Enabling interface '{}': Serial (HDLC) on {port} at {speed} baud",
                         iface.name
                     );
-                    iface_manager.lock().await.spawn_named(
+                    let address = iface_manager.lock().await.spawn_named(
                         &iface.name,
                         SerialInterface::new(serial),
                         SerialInterface::spawn,
                     );
+                    configure_iface(&iface_manager, &address, &iface).await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -321,11 +327,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Enabling interface '{}': Pipe command '{command}' (respawn delay {respawn_delay:?})",
                         iface.name
                     );
-                    iface_manager.lock().await.spawn_named(
+                    let address = iface_manager.lock().await.spawn_named(
                         &iface.name,
                         PipeInterface::new(command).with_respawn_delay(respawn_delay),
                         PipeInterface::spawn,
                     );
+                    configure_iface(&iface_manager, &address, &iface).await;
                 }
 
                 #[cfg(not(feature = "iface-pipe"))]
@@ -348,7 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     iface_manager.lock().await.spawn_named(
                         &iface.name,
-                        LocalServer::new(SharedInstanceAddress::tcp(listen_port), iface_manager.clone()),
+                        LocalServer::new(SharedInstanceAddress::tcp(*listen_port), iface_manager.clone()),
                         LocalServer::spawn,
                     );
                 } else {
@@ -361,11 +368,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InterfaceConfig::AX25KISSInterface { callsign, ssid, port, speed, databits, parity, stopbits, preamble, txtail, persistence, slottime, flow_control, .. } => {
                 #[cfg(feature = "iface-serial")]
                 {
-                    let serial = SerialPortConfig::new(port.clone(), speed)
-                        .with_format(databits, parity, stopbits);
-                    let csma = CsmaParams::new(preamble, txtail, persistence, slottime);
+                    let serial = SerialPortConfig::new(port.clone(), *speed)
+                        .with_format(*databits, parity.clone(), *stopbits);
+                    let csma = CsmaParams::new(*preamble, *txtail, *persistence, *slottime);
 
-                    match KissInterface::new_ax25(callsign.clone(), ssid, serial, csma, flow_control) {
+                    match KissInterface::new_ax25(callsign.clone(), *ssid, serial, csma, *flow_control) {
                         Ok(interface) => {
                             log::info!(
                                 "Enabling interface '{}': AX.25 KISS {callsign}-{ssid} on {port} at {speed} baud",
@@ -421,4 +428,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Shutdown signal received, cleaning up");
     drop(transport);
     Ok(())
+}
+
+
+/// Apply per-interface common options after spawning
+/// (Python `Reticulum._add_interface`: mode, bitrate, IFAC derivation).
+async fn configure_iface(
+    iface_manager: &std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
+    address: &reticulum::hash::AddressHash,
+    iface: &reticulum_daemon::config::NamedInterface,
+) {
+    let manager = iface_manager.lock().await;
+
+    if let Some(mode) = iface.mode.as_deref().and_then(reticulum::iface::InterfaceMode::from_name) {
+        manager.set_iface_mode(address, mode);
+    } else if let Some(mode) = iface.mode.as_deref() {
+        log::warn!(
+            "Interface '{}' has unknown mode '{mode}', keeping default",
+            iface.name
+        );
+    }
+
+    if let Some(bitrate) = iface.bitrate {
+        manager.set_iface_bitrate(address, bitrate);
+    }
+
+    if iface.networkname.is_some() || iface.passphrase.is_some() {
+        let size = iface
+            .ifac_size
+            .map(|bits| (bits / 8).max(reticulum::iface::ifac::IFAC_MIN_SIZE))
+            .unwrap_or(reticulum::iface::ifac::DEFAULT_IFAC_SIZE);
+
+        manager.set_iface_ifac(
+            address,
+            iface.networkname.as_deref(),
+            iface.passphrase.as_deref(),
+            size,
+        );
+
+        log::info!(
+            "Interface '{}' is access-code protected (ifac size {size} bytes)",
+            iface.name
+        );
+    }
 }

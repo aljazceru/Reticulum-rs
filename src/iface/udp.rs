@@ -38,6 +38,7 @@ impl UdpInterface {
         let forward_addr = { context.inner.lock().unwrap().forward_addr.clone() };
         let iface_address = context.channel.address;
         let stats = context.channel.stats.clone();
+        let channel_ifac = context.channel.ifac.clone();
 
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -82,6 +83,7 @@ impl UdpInterface {
                 let socket = read_socket;
                 let rx_channel = rx_channel.clone();
                 let stats = stats.clone();
+                let channel_ifac = channel_ifac.clone();
 
                 tokio::spawn(async move {
                     loop {
@@ -102,7 +104,25 @@ impl UdpInterface {
                                         break;
                                     }
                                     Ok((n, _in_addr)) => {
-                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&rx_buffer[..n])) {
+                                        let plain = {
+                                            let ifac = channel_ifac
+                                                .read()
+                                                .expect("ifac lock")
+                                                .clone();
+                                            match crate::iface::ifac::decode(
+                                                &rx_buffer[..n],
+                                                ifac.as_deref(),
+                                            ) {
+                                                Some(plain) => plain,
+                                                None => {
+                                                    log::debug!(
+                                                        "udp_interface: dropping packet with invalid access code"
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        };
+                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&plain[..])) {
                                             if PACKET_TRACE {
                                                 log::trace!("udp_interface: rx << ({}) {}", iface_address, packet);
                                             }
@@ -130,6 +150,7 @@ impl UdpInterface {
                     let tx_channel = tx_channel.clone();
                     let stats = stats.clone();
                     let socket = write_socket;
+                    let channel_ifac = channel_ifac.clone();
 
                     tokio::spawn(async move {
                         loop {
@@ -154,10 +175,18 @@ impl UdpInterface {
                                         log::trace!("udp_interface: tx >> ({}) {}", iface_address, packet);
                                     }
                                     let mut output = OutputBuffer::new(&mut tx_buffer);
-                                    if packet.serialize(&mut output).is_ok()
-                                        && socket.send_to(output.as_slice(), &forward_addr).await.is_ok()
-                                    {
-                                        stats.count_tx(output.offset());
+                                    if packet.serialize(&mut output).is_ok() {
+                                        let ifac = channel_ifac
+                                            .read()
+                                            .expect("ifac lock")
+                                            .clone();
+                                        let wire = crate::iface::ifac::encode(
+                                            output.as_slice(),
+                                            ifac.as_deref(),
+                                        );
+                                        if socket.send_to(&wire, &forward_addr).await.is_ok() {
+                                            stats.count_tx(wire.len());
+                                        }
                                     }
                                 }
                             };

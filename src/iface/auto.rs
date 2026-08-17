@@ -412,6 +412,7 @@ impl AutoPeer {
         let iface_stop = context.channel.stop.clone();
         let stats = context.channel.stats.clone();
         let iface_address = context.channel.address;
+        let channel_ifac = context.channel.ifac.clone();
 
         let peer_addr = context.inner.lock().unwrap().peer_addr;
         let socket = context.inner.lock().unwrap().socket.clone();
@@ -452,13 +453,27 @@ impl AutoPeer {
                     let packet = message.packet;
                     let mut buffer = [0u8; 2048];
                     let mut output = OutputBuffer::new(&mut buffer[..]);
-                    if packet.serialize(&mut output).is_ok()
-                        && socket.send_to(output.as_slice(), peer_addr).await.is_ok()
-                    {
-                        stats.count_tx(output.offset());
+                    if packet.serialize(&mut output).is_ok() {
+                        let ifac = channel_ifac.read().expect("ifac lock").clone();
+                        let wire =
+                            crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
+                        if socket.send_to(&wire, peer_addr).await.is_ok() {
+                            stats.count_tx(wire.len());
+                        }
                     }
                 }
-                Event::Rx(datagram) => match Packet::deserialize(&mut InputBuffer::new(&datagram))
+                Event::Rx(datagram) => {
+                    let plain = {
+                        let ifac = channel_ifac.read().expect("ifac lock").clone();
+                        match crate::iface::ifac::decode(&datagram, ifac.as_deref()) {
+                            Some(plain) => plain,
+                            None => {
+                                log::debug!("auto_interface: dropping packet with invalid access code");
+                                continue;
+                            }
+                        }
+                    };
+                    match Packet::deserialize(&mut InputBuffer::new(&plain[..]))
                 {
                     Ok(packet) => {
                         stats.count_rx(datagram.len());
@@ -470,7 +485,8 @@ impl AutoPeer {
                             .await;
                     }
                     Err(_) => log::debug!("auto: couldn't decode packet from {peer_addr}"),
-                },
+                }
+                }
             }
         }
 

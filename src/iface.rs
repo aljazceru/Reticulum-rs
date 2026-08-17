@@ -1,5 +1,6 @@
 pub mod control;
 pub mod hdlc;
+pub mod ifac;
 pub mod local;
 
 pub mod tcp_client;
@@ -137,7 +138,14 @@ pub struct InterfaceChannel {
     pub tx_channel: InterfaceTxReceiver,
     pub stop: CancellationToken,
     pub stats: Arc<InterfaceCounters>,
+    /// Interface access code configuration for this interface
+    /// (Python `interface.ifac_identity`); packets are wrapped/unwrapped
+    /// by the interface worker when present.
+    pub ifac: IfacSlot,
 }
+
+/// Shared IFAC configuration slot of an interface.
+pub type IfacSlot = Arc<std::sync::RwLock<Option<Arc<ifac::IfacKey>>>>;
 
 impl InterfaceChannel {
     pub fn make_rx_channel(cap: usize) -> (InterfaceRxSender, InterfaceRxReceiver) {
@@ -160,6 +168,7 @@ impl InterfaceChannel {
             tx_channel,
             stop,
             stats: Arc::new(InterfaceCounters::default()),
+            ifac: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -183,6 +192,7 @@ struct LocalInterface {
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
     stats: Arc<InterfaceCounters>,
+    ifac: IfacSlot,
 }
 
 pub struct InterfaceContext<T: Interface> {
@@ -237,6 +247,8 @@ impl InterfaceManager {
         let stats = Arc::new(InterfaceCounters::default());
         stats.set_online(false);
 
+        let ifac: IfacSlot = Arc::new(std::sync::RwLock::new(None));
+
         self.ifaces.push(LocalInterface {
             address,
             name: name.to_string(),
@@ -244,6 +256,7 @@ impl InterfaceManager {
             tx_send,
             stop: stop.clone(),
             stats: stats.clone(),
+            ifac: ifac.clone(),
         });
 
         self.controls
@@ -257,6 +270,7 @@ impl InterfaceManager {
             address,
             stop,
             stats,
+            ifac,
         }
     }
 
@@ -333,6 +347,35 @@ impl InterfaceManager {
     pub fn set_iface_tunnel(&self, address: &AddressHash, tunnel_id: Option<AddressHash>) -> bool {
         self.with_control(address, |control| control.tunnel_id = tunnel_id)
             .is_some()
+    }
+
+    /// Configure the interface access code of an interface
+    /// (Python `ifac_size` / `networkname` / `passphrase` interface
+    /// options; Python `Reticulum._add_interface` derivation).
+    pub fn set_iface_ifac(
+        &self,
+        address: &AddressHash,
+        netname: Option<&str>,
+        netkey: Option<&str>,
+        size: usize,
+    ) -> bool {
+        let key = ifac::IfacKey::derive(netname, netkey, size);
+        self.with_iface_ifac(address, move |slot| {
+            *slot.write().expect("ifac lock") = Some(Arc::new(key));
+        })
+        .is_some()
+    }
+
+    /// Access the IFAC configuration slot of an interface.
+    pub fn with_iface_ifac<R>(
+        &self,
+        address: &AddressHash,
+        f: impl FnOnce(&IfacSlot) -> R,
+    ) -> Option<R> {
+        self.ifaces
+            .iter()
+            .find(|iface| &iface.address == address)
+            .map(|iface| f(&iface.ifac))
     }
 
     /// Request tunnel synthesis for an interface
@@ -651,6 +694,7 @@ mod tests {
             mut tx_channel,
             stop,
             stats,
+            ..
         } = channel;
 
         stats.set_online(true);
