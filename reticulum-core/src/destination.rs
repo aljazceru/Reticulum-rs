@@ -5,6 +5,7 @@ use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
 use rand_core::CryptoRngCore;
 use x25519_dalek::PublicKey;
 
+use alloc::vec::Vec;
 use core::{fmt, marker::PhantomData};
 
 use crate::{
@@ -550,13 +551,10 @@ impl Destination<PrivateIdentity, Input, Single> {
         rng: R,
         now_secs: u64,
     ) -> Option<([u8; RATCHET_KEY_LENGTH], [u8; RATCHET_KEY_LENGTH])> {
-        let rotate = match self.ratchets.as_ref() {
-            Some(ratchets) => {
-                ratchets.is_empty()
-                    || now_secs > self.latest_ratchet_time + self.ratchet_interval
-            }
-            None => return None,
-        };
+        let ratchets = self.ratchets.as_ref()?;
+
+        let rotate = ratchets.is_empty()
+            || now_secs > self.latest_ratchet_time + self.ratchet_interval;
 
         if rotate {
             let new_ratchet = generate_ratchet(rng);

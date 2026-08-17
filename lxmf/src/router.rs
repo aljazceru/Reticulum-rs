@@ -1131,6 +1131,7 @@ impl LxmRouter {
                         destination_type: DestinationType::Single,
                         packet_type: PacketType::Data,
                         hops: 0,
+                        context_flag: false,
                     },
                     ifac: None,
                     destination: destination_hash,
@@ -1787,6 +1788,7 @@ impl LxmRouter {
         let AnnounceEvent {
             destination,
             app_data,
+            ratchet: _,
         } = event;
 
         let (identity, address_hash, name_hash) = {
@@ -1872,7 +1874,7 @@ impl LxmRouter {
         let mut received = self.transport.received_data_events();
 
         loop {
-            let Ok(ReceivedData { destination, data }) = received.recv().await else {
+            let Ok(ReceivedData { destination, data, decrypted }) = received.recv().await else {
                 return;
             };
 
@@ -1887,27 +1889,37 @@ impl LxmRouter {
                 delivery_dest.identity.clone()
             };
 
-            // Opportunistic delivery: the packet data is the encrypted
-            // message without the destination hash prefix.
-            match decrypt_for_identity(&delivery_identity, data.as_slice()) {
-                Ok(plaintext) => {
-                    let mut lxmf_data =
-                        Vec::with_capacity(DESTINATION_LENGTH + plaintext.len());
-                    lxmf_data.extend_from_slice(destination.as_slice());
-                    lxmf_data.extend_from_slice(&plaintext);
+            // Opportunistic delivery: the transport already decrypts
+            // SINGLE-destination packets (Python `Destination.receive`
+            // parity) and delivers the plaintext without the destination
+            // hash prefix. Fall back to decrypting the raw token ourselves
+            // when the transport could not (e.g. another node's token relayed
+            // through a transport node).
+            let plaintext: Vec<u8> = if decrypted {
+                // The transport already decrypted the SINGLE-destination
+                // packet (Python `Destination.receive` parity).
+                data.as_slice().to_vec()
+            } else {
+                match decrypt_for_identity(&delivery_identity, data.as_slice()) {
+                    Ok(plaintext) => plaintext.to_vec(),
+                    Err(e) => {
+                        log::debug!("Could not decrypt opportunistic LXMF data: {e}");
+                        continue;
+                    }
+                }
+            };
 
-                    self.lxmf_delivery(&lxmf_data, Some(OPPORTUNISTIC), None, false, false)
-                        .await
-                        .ok();
-                }
-                Err(e) => {
-                    log::debug!("Could not decrypt opportunistic LXMF data: {e}");
-                }
-            }
+            let mut lxmf_data = Vec::with_capacity(DESTINATION_LENGTH + plaintext.len());
+            lxmf_data.extend_from_slice(destination.as_slice());
+            lxmf_data.extend_from_slice(&plaintext);
+
+            self.lxmf_delivery(&lxmf_data, Some(OPPORTUNISTIC), None, false, false)
+                .await
+                .ok();
         }
     }
 
-    /// Watch for completed incoming resources on the delivery destination's
+
     /// links and ingest them as LXMF messages.
     async fn resource_event_watcher(self: Arc<Self>) {
         let mut events = self.transport.resource_events().await;

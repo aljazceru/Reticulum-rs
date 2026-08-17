@@ -219,15 +219,24 @@ impl IdentityFiles for Identity {
 
 /// In-memory mirror of Python `Identity.known_destinations`, persisted as
 /// msgpack into [`KNOWN_DESTINATIONS_FILE`].
+///
+/// Like a Python dict, entries keep insertion order: re-remembering a
+/// destination updates it in place, and new destinations are appended.
+/// The persisted file therefore matches Python byte for byte.
 #[derive(Default)]
 pub struct KnownDestinations {
-    entries: BTreeMap<AddressHash, KnownDestinationData>,
+    entries: Vec<(AddressHash, KnownDestinationData)>,
+    index: BTreeMap<AddressHash, usize>,
     dirty: bool,
 }
 
 impl KnownDestinations {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn position(&self, destination_hash: &AddressHash) -> Option<usize> {
+        self.index.get(destination_hash).copied()
     }
 
     /// Remember the identity of an announced destination
@@ -240,15 +249,18 @@ impl KnownDestinations {
         app_data: Option<Vec<u8>>,
         now: f64,
     ) {
-        match self.entries.get_mut(&destination_hash) {
-            Some(entry) => {
+        match self.position(&destination_hash) {
+            Some(position) => {
+                let entry = &mut self.entries[position].1;
                 entry.time = now;
                 entry.packet_hash = packet_hash;
                 entry.public_key = public_key;
                 entry.app_data = app_data;
             }
             None => {
-                self.entries.insert(
+                self.index
+                    .insert(destination_hash, self.entries.len());
+                self.entries.push((
                     destination_hash,
                     KnownDestinationData {
                         time: now,
@@ -257,7 +269,7 @@ impl KnownDestinations {
                         app_data,
                         uses: DestinationUses::Never,
                     },
-                );
+                ));
             }
         }
 
@@ -274,7 +286,7 @@ impl KnownDestinations {
 
     /// Recall without marking the entry used (Python `recall(_no_use=True)`).
     pub fn recall_no_use(&self, destination_hash: &AddressHash) -> Option<Identity> {
-        let entry = self.entries.get(destination_hash)?;
+        let (_, entry) = self.entries.get(self.position(destination_hash)?)?;
         Some(Identity::new_from_slices(
             &entry.public_key[..reticulum_core::identity::PUBLIC_KEY_LENGTH],
             &entry.public_key[reticulum_core::identity::PUBLIC_KEY_LENGTH..],
@@ -285,22 +297,26 @@ impl KnownDestinations {
     pub fn recall_app_data(&mut self, destination_hash: &AddressHash, now: f64) -> Option<Vec<u8>> {
         let app_data = self
             .entries
-            .get(destination_hash)
-            .and_then(|entry| entry.app_data.clone())?;
+            .get(self.position(destination_hash)?)
+            .and_then(|(_, entry)| entry.app_data.clone())?;
         self.mark_used(destination_hash, now);
         Some(app_data)
     }
 
     /// Mark destination data used (Python `_used_destination_data`).
     pub fn mark_used(&mut self, destination_hash: &AddressHash, now: f64) -> bool {
-        match self.entries.get_mut(destination_hash) {
-            Some(entry) if !entry.uses.is_retained() => {
-                entry.uses = DestinationUses::LastUsed(now);
-                self.dirty = true;
-                true
-            }
-            _ => false,
+        let Some(position) = self.position(destination_hash) else {
+            return false;
+        };
+
+        let entry = &mut self.entries[position].1;
+        if entry.uses.is_retained() {
+            return false;
         }
+
+        entry.uses = DestinationUses::LastUsed(now);
+        self.dirty = true;
+        true
     }
 
     /// Keep destination data across cleanups (Python `_retain_destination_data`).
@@ -314,8 +330,8 @@ impl KnownDestinations {
     }
 
     fn set_uses(&mut self, destination_hash: &AddressHash, uses: DestinationUses) -> bool {
-        if let Some(entry) = self.entries.get_mut(destination_hash) {
-            entry.uses = uses;
+        if let Some(position) = self.position(destination_hash) {
+            self.entries[position].1.uses = uses;
             self.dirty = true;
             return true;
         }
@@ -381,15 +397,24 @@ impl KnownDestinations {
             .map(|(hash, _)| *hash)
             .collect();
 
-        for hash in &stale {
-            self.entries.remove(hash);
-        }
+        let stale_set: std::collections::HashSet<AddressHash> = stale.iter().copied().collect();
+        self.entries.retain(|(hash, _)| !stale_set.contains(hash));
+        self.reindex();
 
         if !stale.is_empty() {
             self.dirty = true;
         }
 
         stale
+    }
+
+    fn reindex(&mut self) {
+        self.index = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(position, (hash, _))| (*hash, position))
+            .collect();
     }
 
     pub fn len(&self) -> usize {
@@ -401,18 +426,18 @@ impl KnownDestinations {
     }
 
     pub fn get(&self, destination_hash: &AddressHash) -> Option<&KnownDestinationData> {
-        self.entries.get(destination_hash)
+        let (_, entry) = self.entries.get(self.position(destination_hash)?)?;
+        Some(entry)
     }
 
     pub fn contains(&self, destination_hash: &AddressHash) -> bool {
-        self.entries.contains_key(destination_hash)
+        self.position(destination_hash).is_some()
     }
 
-    /// All entries in destination-hash order (the file write order is
-    /// insertion order in Python; a stable order keeps round-trips
-    /// deterministic).
+    /// All entries in insertion order, matching the Python dict order that
+    /// is written to the storage file.
     pub fn entries(&self) -> Vec<(AddressHash, KnownDestinationData)> {
-        self.entries.iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.entries.clone()
     }
 
     /// Serialise to the Python `known_destinations` file format.
@@ -441,7 +466,8 @@ impl KnownDestinations {
         };
 
         let entries = unpack_known_destinations(&bytes)?;
-        self.entries = entries.into_iter().collect();
+        self.entries = entries;
+        self.reindex();
         self.dirty = false;
 
         Ok(())
@@ -456,7 +482,7 @@ impl KnownDestinations {
 /// `ratchets/<destination hash hex>` files.
 #[derive(Default)]
 pub struct KnownRatchets {
-    ratchets: BTreeMap<AddressHash, [u8; RATCHET_KEY_LENGTH]>,
+    ratchets: BTreeMap<AddressHash, ([u8; RATCHET_KEY_LENGTH], f64)>,
 }
 
 impl KnownRatchets {
@@ -478,11 +504,11 @@ impl KnownRatchets {
         ratchet: [u8; RATCHET_KEY_LENGTH],
         now: f64,
     ) -> Result<(), RnsError> {
-        if self.ratchets.get(&destination_hash) == Some(&ratchet) {
+        if self.ratchets.get(&destination_hash).map(|(known, _)| *known) == Some(ratchet) {
             return Ok(());
         }
 
-        self.ratchets.insert(destination_hash, ratchet);
+        self.ratchets.insert(destination_hash, (ratchet, now));
 
         let data = RatchetFileData { ratchet, received: now };
         storage.write(&Self::ratchet_path(&destination_hash), &pack_ratchet(&data)?)
@@ -501,14 +527,17 @@ impl KnownRatchets {
             let bytes = storage.read(&Self::ratchet_path(destination_hash))?;
             let data = unpack_ratchet(&bytes).ok()?;
 
-            if now >= data.received + RATCHET_EXPIRY_SECS as f64 {
-                return None;
-            }
-
-            self.ratchets.insert(*destination_hash, data.ratchet);
+            self.ratchets
+                .insert(*destination_hash, (data.ratchet, data.received));
         }
 
-        self.ratchets.get(destination_hash).copied()
+        let (ratchet, received) = self.ratchets.get(destination_hash).copied()?;
+
+        if now >= received + RATCHET_EXPIRY_SECS as f64 {
+            return None;
+        }
+
+        Some(ratchet)
     }
 
     /// The id of the current ratchet

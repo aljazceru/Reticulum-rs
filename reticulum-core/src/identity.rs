@@ -7,9 +7,9 @@ use ed25519_dalek::{VerifyingKey, SIGNATURE_LENGTH};
 pub use ed25519_dalek::ed25519::signature::Signer;
 pub use ed25519_dalek::{Signature, SigningKey};
 use sha2::{Digest, Sha256};
-use x25519_dalek::{EphemeralSecret, SharedSecret, StaticSecret};
+use x25519_dalek::{EphemeralSecret, SharedSecret};
 
-pub use x25519_dalek::PublicKey;
+pub use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::{
     crypt::fernet::{Fernet, PlainText, Token},
@@ -975,7 +975,7 @@ impl<'a> MsgReader<'a> {
         match marker {
             0x90..=0x9f => Ok((marker & 0x0f) as u32),
             0xdc => Ok(self.read_u16()? as u32),
-            0xdd => Ok(self.read_u32()? as u32),
+            0xdd => self.read_u32(),
             _ => Err(RnsError::PacketError),
         }
     }

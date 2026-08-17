@@ -61,6 +61,9 @@ const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
 pub struct ReceivedData {
     pub destination: AddressHash,
     pub data: PacketDataBuffer,
+    /// Whether the transport already decrypted the payload (SINGLE
+    /// destinations); receivers must not decrypt again.
+    pub decrypted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -537,6 +540,11 @@ impl Transport {
     /// Forget all paths learned over an interface (Python `drop_all_via`).
     pub async fn drop_all_via(&self, iface: &AddressHash) -> usize {
         self.handler.lock().await.path_table.drop_all_via(iface)
+    }
+
+    /// Return any known path's destination hash (diagnostics/tests).
+    pub async fn handler_public_path_probe(&self) -> Option<AddressHash> {
+        self.handler.lock().await.path_table.any_destination()
     }
 
     /// Number of hops to a destination, if known.
@@ -1717,15 +1725,14 @@ async fn handle_proof<'a>(
     // to the truncated packet hash of the proved packet.
     if packet.header.destination_type == DestinationType::Single
         && handler.receipts.contains_key(&packet.destination)
+        && validate_single_destination_proof(&mut handler, packet)
     {
-        if validate_single_destination_proof(&mut handler, packet) {
-            log::trace!(
-                "tp({}): valid proof for packet {}",
-                handler.config.name,
-                packet.destination
-            );
-            return;
-        }
+        log::trace!(
+            "tp({}): valid proof for packet {}",
+            handler.config.name,
+            packet.destination
+        );
+        return;
     }
 
     for link in handler.out_links.values() {
@@ -2153,6 +2160,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
             handler.received_data_tx.send(ReceivedData {
                 destination: packet.destination,
                 data: packet.data,
+                decrypted: false,
             }).ok();
         }
     }
@@ -2164,6 +2172,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
             handler.received_data_tx.send(ReceivedData {
                 destination: packet.destination,
                 data: packet.data,
+                decrypted: false,
             }).ok();
         }
         // Plain packets are never routed elsewhere: everyone on a shared
@@ -2190,6 +2199,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                     handler.received_data_tx.send(ReceivedData {
                         destination: packet.destination,
                         data,
+                        decrypted: true,
                     }).ok();
 
                     // Python `Transport`/`Link` prove incoming packets
@@ -2263,6 +2273,21 @@ async fn handle_announce<'a>(
     if let Ok((destination, announce)) = DestinationAnnounce::validate(packet) {
         let dest_hash = destination.identity.address_hash;
         let public_key = destination.identity.to_bytes();
+
+        // Drop announces whose announced identity is blackholed
+        // (Python checks inside `validate_announce`).
+        {
+            let blackholes = handler.blackholes.read().await;
+            if blackholes.is_blackholed(&dest_hash) {
+                log::debug!(
+                    "tp({}): dropping announce from blackholed identity {}",
+                    handler.config.name,
+                    dest_hash
+                );
+                return;
+            }
+        }
+
         let destination = Arc::new(Mutex::new(destination));
 
         // Python `Identity.remember(packet.get_hash(), destination_hash,
@@ -3085,12 +3110,7 @@ impl Transport {
     /// through (`via`) and the interface address to send on
     /// (Python `RNS.Transport.next_hop` + `next_hop_interface`).
     pub async fn next_hop(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
-        self.handler
-            .lock()
-            .await
-            .path_table
-            .next_hop_full(destination)
-            .map(|(via, iface)| (via, iface))
+        self.handler.lock().await.path_table.next_hop_full(destination)
     }
 
     /// Snapshot of the whole path table

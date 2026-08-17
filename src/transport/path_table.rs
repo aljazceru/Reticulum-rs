@@ -5,15 +5,27 @@ use crate::{
     packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType},
 };
 
+/// Path expiry time (Python `Transport.PATHFINDER_E` = 1 week).
+pub const PATHFINDER_E: core::time::Duration = core::time::Duration::from_secs(60 * 60 * 24 * 7);
+
 pub struct PathEntry {
     pub received_from: AddressHash,
     pub hops: u8,
     pub iface: AddressHash,
+    /// When this path was learned (unstable time base; only differences
+    /// matter).
+    pub timestamp: core::time::Duration,
+    /// Paths marked unresponsive are skipped for new link attempts until a
+    /// fresh announce arrives (Python `mark_path_unresponsive`).
+    pub unresponsive: bool,
+    /// Hash of the announce packet that created this path, for analytics.
+    pub packet_hash: crate::hash::Hash,
 }
 
 pub struct PathTable {
     map: HashMap<AddressHash, PathEntry>,
     reroute_eager: bool,
+    now: fn() -> core::time::Duration,
 }
 
 impl PathTable {
@@ -21,7 +33,56 @@ impl PathTable {
         Self {
             map: HashMap::new(),
             reroute_eager,
+            now: crate::time::now,
         }
+    }
+
+    /// Drop paths older than `PATHFINDER_E`
+    /// (Python `Transport.expire_paths`).
+    pub fn expire_paths(&mut self) -> usize {
+        let now = (self.now)();
+        let before = self.map.len();
+        self.map.retain(|_, entry| now.saturating_sub(entry.timestamp) < PATHFINDER_E);
+        before - self.map.len()
+    }
+
+    /// Mark a path unresponsive so link attempts prefer alternatives
+    /// (Python `Transport.mark_path_unresponsive`).
+    pub fn mark_path_unresponsive(&mut self, destination: &AddressHash) -> bool {
+        match self.map.get_mut(destination) {
+            Some(entry) => {
+                entry.unresponsive = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Clear the unresponsive mark (Python `Transport.mark_path_responsive`).
+    pub fn mark_path_responsive(&mut self, destination: &AddressHash) -> bool {
+        match self.map.get_mut(destination) {
+            Some(entry) => {
+                entry.unresponsive = false;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn path_is_unresponsive(&self, destination: &AddressHash) -> bool {
+        self.map.get(destination).map(|e| e.unresponsive).unwrap_or(false)
+    }
+
+    /// Remove a single path (Python `Transport.drop_path`).
+    pub fn drop_path(&mut self, destination: &AddressHash) -> bool {
+        self.map.remove(destination).is_some()
+    }
+
+    /// Remove all paths learned via an interface (Python `drop_all_via`).
+    pub fn drop_all_via(&mut self, iface: &AddressHash) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, entry| &entry.iface != iface);
+        before - self.map.len()
     }
 
     pub fn get(&self, destination: &AddressHash) -> Option<&PathEntry> {
@@ -54,6 +115,9 @@ impl PathTable {
             received_from,
             hops,
             iface,
+            timestamp: (self.now)(),
+            unresponsive: false,
+            packet_hash: announce.hash(),
         };
 
         self.map.insert(announce.destination, new_entry);
@@ -96,6 +160,13 @@ impl PathTable {
         )
     }
 
+    /// Route an outbound packet (Python `Transport.outbound`).
+    ///
+    /// Only packets with more than one hop to the destination are inserted
+    /// into transport (header type 2 with the next-hop transport id);
+    /// directly reachable destinations are transmitted as-is. Python drops
+    /// data packets carrying a transport id that is not its own, so
+    /// wrapping single-hop packets would never be delivered.
     pub fn handle_packet(&mut self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
         if original_packet.header.header_type == HeaderType::Type2 {
             return (*original_packet, None);
@@ -116,6 +187,11 @@ impl PathTable {
             None => return (*original_packet, None),
         };
 
+        if entry.hops <= 1 {
+            // Directly reachable: transmit the packet unchanged.
+            return (*original_packet, Some(entry.iface));
+        }
+
         (
             Packet {
                 header: Header {
@@ -130,5 +206,36 @@ impl PathTable {
             },
             Some(entry.iface),
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only snapshots for tooling (`rnpath`/`rnstatus`, Phase 8 utilities).
+// Appended for the Phase 7/8 utilities work; the routing logic above is
+// untouched.
+// ---------------------------------------------------------------------------
+
+impl PathTable {
+    /// Iterate over all known paths (destination, entry).
+    #[allow(dead_code)] // len/is_empty used by rnstatus tooling builds
+    pub fn iter(&self) -> impl Iterator<Item = (&AddressHash, &PathEntry)> {
+        self.map.iter()
+    }
+
+    /// Any known destination hash (diagnostics/tests).
+    pub fn any_destination(&self) -> Option<AddressHash> {
+        self.map.keys().next().copied()
+    }
+
+    /// Number of known paths.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether any path is known.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
