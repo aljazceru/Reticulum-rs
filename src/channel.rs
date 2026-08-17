@@ -403,6 +403,9 @@ struct Outbound {
     params: Arc<Mutex<ChannelParams>>,
     timeouts_tx: mpsc::Sender<Hash>,
     cancel: CancellationToken,
+    /// Hash of the most recently sent, not-yet-delivered message
+    /// (for stream backpressure).
+    last_pending: Option<Hash>,
 }
 
 
@@ -426,7 +429,15 @@ impl Outbound {
             params,
             timeouts_tx,
             cancel: CancellationToken::new(),
+            last_pending: None,
         }
+    }
+
+    /// Receiver for the delivery receipt of the most recently sent message
+    /// (stream backpressure). Returns `None` when nothing is pending.
+    async fn last_pending_receipt(&mut self) -> Option<broadcast::Receiver<bool>> {
+        let hash = self.last_pending?;
+        self.watch_delivery(hash).await
     }
 
     pub fn cancel(&self) -> CancellationToken {
@@ -469,6 +480,9 @@ impl Outbound {
         adjust_params(&mut self.params.lock().await, rtt);
 
         self.delivered.insert(packet_hash);
+        if self.last_pending == Some(packet_hash) {
+            self.last_pending = None;
+        }
 
         let result = sent_message.delivered.send(true);
 
@@ -752,7 +766,23 @@ pub struct Channel<M: Message> {
 }
 
 
+impl<M: Message> Clone for Channel<M> {
+    fn clone(&self) -> Self {
+        Self {
+            link: Arc::clone(&self.link),
+            outbound: Arc::clone(&self.outbound),
+            incoming: self.incoming.clone(),
+        }
+    }
+}
+
 impl<M: Message> Channel<M> {
+    /// Clone this channel handle (shares the same outbound queue and
+    /// incoming broadcast sender).
+    pub fn clone_for_stream(&self) -> Self {
+        self.clone()
+    }
+
     pub(crate) async fn new(
         transport: &Transport,
         link: Arc<Mutex<Link>>,
@@ -822,6 +852,12 @@ impl<M: Message> Channel<M> {
     /// Create an additional receiver for the channel's incoming messages.
     pub fn subscribe(&self) -> broadcast::Receiver<M> {
         self.incoming.subscribe()
+    }
+
+    /// Receiver for the delivery receipt of the most recently sent message,
+    /// if one is pending (used by stream pumps for backpressure).
+    pub async fn last_receipt(&self) -> Option<tokio::sync::broadcast::Receiver<bool>> {
+        self.outbound.lock().await.last_pending_receipt().await
     }
 }
 

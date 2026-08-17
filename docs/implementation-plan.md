@@ -115,12 +115,12 @@ Legend: ✅ done (parity or near-parity), 🟡 partial (exists but incomplete),
 | `Buffer.py` | 371 | ❌ | `buffer.rs` is a byte-buffer helper, not link streams |
 | `Transport.py` | 3706 | 🟡 | announces, paths, dedup cache, link relay, rate limit, retransmit ✅; **expiry ❌, announce caps/egress control 🟡 (simplistic), tunnels ❌, blackholes ❌, cache requests ❌, remote mgmt ❌, path stats ❌** |
 | `Discovery.py` | 864 | ❌ | |
-| `Reticulum.py` | 1997 | 🟡 | daemon skeleton only; **config parity 🟡, persistence ❌, shared-instance API ❌, RPC ❌, stats ❌** |
+| `Reticulum.py` | 1997 | 🟡 | daemon with identity persistence, config parity (warn-not-fail), SIGINT/SIGTERM shutdown; **shared-instance API ❌, RPC ❌, stats 🟡 (iface snapshot only)** |
 | `Interfaces/`: TCP client/server, UDP | — | ✅ `src/iface/{tcp_client,tcp_server,udp}.rs`, HDLC ✅ | |
 | `Interfaces/`: Auto, Local, Serial, KISS, AX.25 KISS, RNode(+Multi), I2P, Pipe, Backbone, Weave, Android | ~8000 | ❌ | daemon config *parses* some types but logs "not yet supported" |
 | IFAC (netname/netkey auth) | (Interface.py, Transport.py) | ❌ | flag bit parsed (`IfacFlag`), never computed/validated |
-| `Utilities/rnsd.py` | — | 🟡 `reticulum-daemon` | no identity persistence, no shared instance, no control/RPC |
-| `Utilities/` rnstatus, rnpath, rnprobe, rnsh, rncp, rnx, rnid, rnir, rnodeconf, rnpkg | — | ❌ | none ported |
+| `Utilities/rnsd.py` | — | 🟡 `reticulum-daemon` | identity persistence + restart stability ✅, `--version` ✅; no shared instance, no control/RPC |
+| `Utilities/` rnstatus, rnpath, rnprobe, rnsh, rncp, rnx, rnid, rnir, rnodeconf, rnpkg | — | 🟡 `reticulum-utils` (`rn` binary) | rnid ✅ (generate/save/inspect), rnpath ✅ (lookup + table, local), rnstatus 🟡 (local only; iface stats minimal), rncp ✅ (send/serve/fetch, Python-interop send both ways); rnprobe/rnsh/rnx/rnir/rnodeconf/rnpkg ❌ |
 | Stale docs | — | 🟡 | README mentions `proto/kaonic` + `kaonic_client.rs` which don't exist in-tree |
 
 ---
@@ -1195,8 +1195,15 @@ with M9 for team-load leveling.
 | 2.7 Requests & responses | ✅ packet + resource-backed both directions, handler registry, `await_request_response` |
 | Python interop (resources/requests) | ✅ `tests/python_resources.rs`: Rust→Py and Py→Rust resource transfer (60–80 KB) and request/response incl. resource-backed responses |
 | Python test-suite parity | ✅ `tests/parity.rs`: SHA-256 vectors, fixed identity hashes, known signature, valid/invalid announce, fixed destination hash |
-| LXMF crate | ✅ new `lxmf/` crate (byte-exact message format, stamps, peers, router) |
+| LXMF crate | ✅ new `lxmf/` crate (byte-exact message format, stamps, peers, router) + resource-backed delivery |
 | LXST crate | ✅ new `lxst/` crate (audio codecs, wire protocol, pipelines, calls) |
+| 2.3 Proof strategies | ✅ `ProofStrategy::{None,App,All}`, destination setter, link proof gating |
+| 2.2 GROUP destinations | ✅ name-hash addressing + transport routing (no invented crypto, parity) |
+| 2.5 Announce handlers | ✅ `AnnounceEvent::matches_aspect`, `Transport::subscribe_announces` |
+| 2.6 accepts_links | ✅ `Destination::set_accepts_links`, link-request gating |
+| 4 Buffer streams | ✅ `src/buffer_stream.rs`: StreamDataMessage wire format (SMT_STREAM_DATA), AsyncRead/AsyncWrite reader/writer, compression heuristic |
+| 6.1 Path expiry | ✅ timestamps, PATHFINDER_E expiry sweep, mark/drop path APIs |
+| 6.5 Blackholes | ✅ `transport/blackholes.rs` with pack/merge list, announce filtering, clean task |
 
 Remaining phases (identity persistence, ratchets, plain/group destinations,
 interfaces, tunnels/blackholes/discovery, daemon/RPC, `rn*` utilities,
