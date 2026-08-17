@@ -108,13 +108,13 @@
 #   type = TCPServerInterface
 #   enabled = yes
 #   listen_ip = 127.0.0.1
-#   listen_port = 4243
+#   listen_port = 4253
 
 [[UDP Interface]]
   type = UDPInterface
   enabled = yes
   listen_ip = 0.0.0.0
-  listen_port = 4243
+  listen_port = 4253
   #forward_ip = 255.255.255.255
   forward_ip = 127.0.0.1
-  forward_port = 4242
+  forward_port = 4252
