@@ -20,6 +20,22 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
 - 🧪 Example clients for testnets and real deployments
 - 📨 `lxmf` crate: the LXMF messaging layer (byte-exact Python LXMF format)
 - 🎙 `lxst` crate: LXST audio streaming, codecs and calls
+- 🛡 Interface access codes (IFAC): access-code-protected interfaces with
+  HKDF masking, byte-exact against Python
+- 🚦 Transport control parity: per-interface ingress limiting (burst
+  detection, held announces), announce-cap airtime budgeting with queued
+  announces, interface-mode announce forwarding policy, path-request
+  timing gates and `await_path`
+- 🕳 Tunnels (synthesize/void/restore), blackholes and packet cache requests
+- 📡 Network interface discovery: `reticulum-discovery` crate with LXMF
+  work-function-stamped announces, discovered-interface tracking and TCP
+  autoconnect
+- 🛠 Remote management & probe destinations (`rnstransport.remote.management`,
+  `rnstransport.probe`), remote-management allow lists
+- 🏗 `Reticulum` facade: the Python `RNS.Reticulum` entrypoint surface for
+  embedding
+- 🔍 Fuzz/property tests for all wire decoders and criterion benchmarks
+  for the transport hot paths
 
 ## Structure
 
@@ -33,7 +49,8 @@ Reticulum-rs/
 │   └── buffer.rs
 ├── reticulum-core/      # no_std protocol core (crypto, identity, packet)
 ├── reticulum-daemon/    # RNS daemon + config conversion
-├── reticulum-utils/     # rn* utilities (rnid, rnpath, rnstatus, rncp)
+├── reticulum-utils/     # rn* utilities (rnid, rnpath, rnstatus, rncp, rnprobe)
+├── reticulum-discovery/ # network interface discovery + blackhole updater
 ├── lxmf/                # LXMF message format, stamps, peers, router
 ├── lxst/                # LXST audio streaming, codecs, calls
 ├── tests/               # unit, interop and parity tests
