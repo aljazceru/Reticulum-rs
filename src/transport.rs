@@ -346,6 +346,12 @@ impl TransportConfig {
         self
     }
 
+    /// Whether this instance routes traffic for other peers
+    /// (Python `Reticulum.transport_enabled`).
+    pub fn transport_enabled(&self) -> bool {
+        self.broadcast
+    }
+
     pub fn set_broadcast(mut self, broadcast: bool) -> Self {
         self.broadcast = broadcast;
         self
