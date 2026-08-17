@@ -114,10 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "rns-daemon".to_string());
     log::info!("Instance name: {instance_name}");
 
-    let transport =
+    let transport = std::sync::Arc::new(
         TransportConfig::new(&instance_name, &identity, config.reticulum.enable_transport)
             .set_retransmit(config.reticulum.enable_transport)
-            .build();
+            .build(),
+    );
 
     let iface_manager = transport.iface_manager();
 
@@ -151,7 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    for iface in config.interfaces {
+    for iface in &config.interfaces {
         let enabled = match &iface.config {
             InterfaceConfig::TCPServerInterface { enabled, .. } => *enabled,
             InterfaceConfig::TCPClientInterface { enabled, .. } => *enabled,
@@ -188,7 +189,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     TcpServer::new(addr, iface_manager.clone()),
                     TcpServer::spawn,
                 );
-                configure_iface(&iface_manager, &address, &iface).await;
+                configure_iface(&iface_manager, &address, iface).await;
             }
             InterfaceConfig::TCPClientInterface {
                 target_host,
@@ -205,7 +206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .lock()
                     .await
                     .spawn(TcpClient::new(addr), TcpClient::spawn);
-                configure_iface(&iface_manager, &address, &iface).await;
+                configure_iface(&iface_manager, &address, iface).await;
             }
             InterfaceConfig::UDPInterface {
                 listen_ip,
@@ -226,7 +227,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     UdpInterface::new(bind_addr, Some(forward_addr), false),
                     UdpInterface::spawn,
                 );
-                configure_iface(&iface_manager, &address, &iface).await;
+                configure_iface(&iface_manager, &address, iface).await;
             }
             InterfaceConfig::AutoInterface {
                 group_id,
@@ -282,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         AutoInterface::new(auto_config, iface_manager.clone()),
                         AutoInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, &iface).await;
+                    configure_iface(&iface_manager, &address, iface).await;
                 }
 
                 #[cfg(not(all(feature = "iface-auto", target_os = "linux")))]
@@ -351,7 +352,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KissInterface::new(serial, csma, *flow_control),
                         KissInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, &iface).await;
+                    configure_iface(&iface_manager, &address, iface).await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -398,7 +399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         SerialInterface::new(serial),
                         SerialInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, &iface).await;
+                    configure_iface(&iface_manager, &address, iface).await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -429,7 +430,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         PipeInterface::new(command).with_respawn_delay(respawn_delay),
                         PipeInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, &iface).await;
+                    configure_iface(&iface_manager, &address, iface).await;
                 }
 
                 #[cfg(not(feature = "iface-pipe"))]
@@ -547,6 +548,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Network interface discovery (Python RNS/Discovery.py): enabled
+    // when any interface is configured `discoverable`.
+    let discoverable: Vec<_> = config
+        .interfaces
+        .iter()
+        .filter(|iface| iface.discoverable)
+        .collect();
+
+    if !discoverable.is_empty() {
+        let transport_identity = transport.identity_private();
+        let announcer = reticulum_discovery::InterfaceAnnouncer::start(
+            &transport,
+            &transport_identity,
+            reticulum_discovery::DEFAULT_STAMP_VALUE,
+            reticulum_discovery::ANNOUNCER_INTERVAL,
+        )
+        .await;
+
+        let transport_id = transport.identity_hash().await;
+        for iface in &discoverable {
+            let info = discovery_info_for(iface, &config, transport_id);
+            if let Some(info) = info {
+                log::info!(
+                    "Announcing interface '{}' as discoverable {}",
+                    iface.name,
+                    info.interface_type
+                );
+                announcer.announce_interface(info).await;
+            } else {
+                log::warn!(
+                    "Interface '{}' is discoverable but its type has no discovery mapping yet",
+                    iface.name
+                );
+            }
+        }
+
+        // Listen for other nodes' discovery announces.
+        reticulum_discovery::InterfaceDiscovery::start(
+            &transport,
+            reticulum_discovery::DEFAULT_STAMP_VALUE,
+            false,
+        )
+        .await;
+    }
+
     // Management destinations (Python Transport.start: probe and remote
     // management destinations when enabled in the configuration).
     if config.reticulum.probe_destination {
@@ -627,4 +673,50 @@ async fn configure_iface(
             iface.name
         );
     }
+}
+
+
+/// Build the discovery description of a discoverable interface
+/// (Python `InterfaceAnnouncer.get_interface_announce_data`).
+fn discovery_info_for(
+    iface: &reticulum_daemon::config::NamedInterface,
+    config: &reticulum_daemon::config::Config,
+    transport_id: reticulum::hash::AddressHash,
+) -> Option<reticulum_discovery::InterfaceInfo> {
+    use reticulum_daemon::config::InterfaceConfig;
+
+    let interface_type = match &iface.config {
+        InterfaceConfig::TCPServerInterface { .. } => "TCPServerInterface",
+        InterfaceConfig::KISSInterface { .. } => "KISSInterface",
+        _ => return None,
+    };
+
+    let (reachable_on, port) = match &iface.config {
+        InterfaceConfig::TCPServerInterface { bind_port, .. } => {
+            (iface.reachable_on.clone(), Some(*bind_port))
+        }
+        _ => (None, None),
+    };
+
+    let _ = config;
+
+    Some(reticulum_discovery::InterfaceInfo {
+        interface_type: interface_type.to_string(),
+        transport: config.reticulum.enable_transport,
+        transport_id,
+        name: iface.discovery_name.clone().or(Some(iface.name.clone())),
+        latitude: None,
+        longitude: None,
+        height: None,
+        reachable_on,
+        port,
+        frequency: None,
+        bandwidth: None,
+        spreadingfactor: None,
+        codingrate: None,
+        channel: None,
+        modulation: None,
+        ifac_netname: None,
+        ifac_netkey: None,
+    })
 }

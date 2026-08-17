@@ -69,6 +69,24 @@ pub struct NamedInterface {
     /// Access code passphrase (Python `passphrase` / `pass_phrase`).
     #[serde(default, alias = "pass_phrase")]
     pub passphrase: Option<String>,
+    /// Announce this interface for network discovery
+    /// (Python `discoverable`).
+    #[serde(default)]
+    pub discoverable: bool,
+    /// Discovery announce interval in minutes, minimum 5
+    /// (Python `announce_interval`).
+    #[serde(default, alias = "announce_interval")]
+    pub discovery_announce_interval_minutes: Option<u64>,
+    /// Discovery announce stamp cost (Python `discovery_stamp_value`).
+    #[serde(default)]
+    pub discovery_stamp_value: Option<u32>,
+    /// Discovery name of the interface (Python `discovery_name`).
+    #[serde(default)]
+    pub discovery_name: Option<String>,
+    /// Externally reachable host for connectable interfaces
+    /// (Python `reachable_on`).
+    #[serde(default)]
+    pub reachable_on: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -614,6 +632,11 @@ impl Config {
                 ifac_size: None,
                 networkname: None,
                 passphrase: None,
+                discoverable: false,
+                discovery_announce_interval_minutes: None,
+                discovery_stamp_value: None,
+                discovery_name: None,
+                reachable_on: None,
                 config: InterfaceConfig::TCPServerInterface {
                     enabled: true,
                     bind_host: "127.0.0.1".to_string(),
@@ -695,6 +718,11 @@ pub const KNOWN_INTERFACE_KEYS: &[&str] = &[
     "announce_rate_grace",
     "announce_rate_min_squeeze",
     "ingress_controlled",
+    "discoverable",
+    "announce_interval",
+    "discovery_stamp_value",
+    "discovery_name",
+    "reachable_on",
 ];
 
 /// Warn (never fail) about configuration keys the daemon does not know or

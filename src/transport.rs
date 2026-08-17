@@ -4081,4 +4081,10 @@ impl Transport {
     pub async fn instance_name(&self) -> String {
         self.handler.lock().await.config.name.clone()
     }
+
+    /// The private identity of this transport instance
+    /// (for subsystems that need to announce or sign on its behalf).
+    pub fn identity_private(&self) -> PrivateIdentity {
+        self.handler.blocking_lock().config.identity.clone()
+    }
 }

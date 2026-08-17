@@ -1144,10 +1144,25 @@ dependencies = [
  "rand_core",
  "regex",
  "reticulum",
+ "reticulum-discovery",
  "reticulum-utils",
  "serde",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "reticulum-discovery"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "lxmf",
+ "rand_core",
+ "reticulum",
+ "rmp",
+ "rmpv",
+ "tokio",
 ]
 
 [[package]]
