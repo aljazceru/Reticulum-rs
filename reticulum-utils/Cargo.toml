@@ -1,0 +1,31 @@
+[package]
+name = "reticulum-utils"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = """
+rn* utility tools (rnid, rnpath, rnstatus, rncp) for the Reticulum-rs
+network stack, mirroring the Python Reticulum Utilities.
+"""
+
+[dependencies]
+reticulum = { path = ".." }
+
+clap = { version = "4.0", features = ["derive"] }
+env_logger = "0.10"
+log = "0.4"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+rmp = "0.8.14"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.44.2", features = ["full"] }
+tokio-util = "0.7.15"
+toml = "0.9.11"
+
+[features]
+# Gate for the Python interop tests, mirroring the root crate's flag.
+python-tests = []
+
+[[bin]]
+name = "rn"
+path = "src/main.rs"

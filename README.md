@@ -33,6 +33,7 @@ Reticulum-rs/
 │   └── buffer.rs
 ├── reticulum-core/      # no_std protocol core (crypto, identity, packet)
 ├── reticulum-daemon/    # RNS daemon + config conversion
+├── reticulum-utils/     # rn* utilities (rnid, rnpath, rnstatus, rncp)
 ├── lxmf/                # LXMF message format, stamps, peers, router
 ├── lxst/                # LXST audio streaming, codecs, calls
 ├── tests/               # unit, interop and parity tests
@@ -82,6 +83,49 @@ cargo run -p reticulum-daemon -- -c /path/to/config/dir
 ```
 
 The daemon searches for either `config` (legacy filename) or `config.toml` in the specified directory.
+
+The daemon persists its identity as a hex key file (`identity` in the config
+directory) so the instance — and any destination derived from it — stays
+stable across restarts. Unknown configuration keys produce warnings instead
+of failing, and serial/KISS/pipe/local interface entries are parsed (they
+log "not yet supported" until the corresponding interface modules land).
+`--version` prints the version; SIGINT/SIGTERM trigger a clean shutdown.
+
+### Utilities (`rn` binary)
+
+The Python `rn*` utilities are ported as subcommands of one multi-call
+binary, `rn` (crate `reticulum-utils`). All tools accept `--config <dir>`
+like the Python versions (default `~/.reticulum`) and run their own
+transport with the interfaces configured there.
+
+```bash
+# rnid: generate an identity, save it, and inspect it later
+cargo run -p reticulum-utils --bin rn -- id --generate /tmp/my.rid
+cargo run -p reticulum-utils --bin rn -- id --identity /tmp/my.rid
+cargo run -p reticulum-utils --bin rn -- id --identity /tmp/my.rid --public
+
+# rnpath: look up a path (or dump the path table as text/JSON)
+cargo run -p reticulum-utils --bin rn -- path -w 20 <destination_hash>
+cargo run -p reticulum-utils --bin rn -- path --table
+cargo run -p reticulum-utils --bin rn -- path --table --json
+
+# rnstatus: interface table, path table, link counts, instance identity
+cargo run -p reticulum-utils --bin rn -- status
+cargo run -p reticulum-utils --bin rn -- status --json
+
+# rncp: receive into a directory (accept anyone), then send a file to it
+cargo run -p reticulum-utils --bin rn -- cp --serve /tmp/incoming --no-auth
+cargo run -p reticulum-utils --bin rn -- cp /tmp/file.bin <listener_hash>
+
+# rncp: fetch from a listener that allows fetching
+cargo run -p reticulum-utils --bin rn -- cp --serve /tmp/shared --no-auth --allow-fetch --jail /tmp/shared
+cargo run -p reticulum-utils --bin rn -- cp --fetch /tmp/shared/hello.txt <listener_hash>
+```
+
+`rn cp` speaks the same protocol as `python3 Utilities/rncp.py`
+(`rncp.receive` destinations, resource metadata `{"name": ...}`, link
+identification, `fetch_file` requests), so Rust and Python tools can
+exchange files in both directions.
 
 ### Run Examples
 
@@ -140,3 +184,23 @@ This project is licensed under the MIT license.
 
 © Beechat Network Systems Ltd. All rights reserved.
 https://beechat.network/
+
+## Buffer streams
+
+```rust,ignore
+use reticulum::buffer_stream::{create_bidirectional_buffer, StreamDataMessage};
+
+// Both ends upgrade a link to a channel of stream frames:
+let (channel, incoming) = transport.mk_channel::<StreamDataMessage>(link).await?;
+let stream = create_bidirectional_buffer(&channel, incoming, 1, 2);
+// stream.reader: AsyncRead, stream.writer: AsyncWrite — wire-compatible
+// with Python RNS.Buffer readers/writers.
+```
+
+## Feature flags
+
+- `bz2` (default) — bzip2 compression for resources and buffer streams
+- `iface-serial` — Serial/KISS/AX.25 KISS interfaces
+- `iface-pipe` — subprocess pipe interface
+- `iface-auto` — AutoInterface (Linux, IPv6 link-local multicast)
+- `python-tests` — Python interop tests (`RETICULUM_TEST_PYTHON_DIR` + `PYTHONPATH`)

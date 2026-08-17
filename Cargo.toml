@@ -58,7 +58,6 @@ iface-pipe = []
 # AutoInterface (IPv6 link-local multicast peering)
 iface-auto = ["dep:socket2"]
 
-
 [build-dependencies]
 tonic-build = "0.13.0"
 
@@ -71,7 +70,8 @@ members = [
   "reticulum-core",
   "reticulum-daemon",
   "lxmf",
-  "lxst"
+  "lxst",
+  "reticulum-utils"
 ]
 
 [[example]]

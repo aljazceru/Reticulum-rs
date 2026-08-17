@@ -103,3 +103,20 @@ impl LinkTable {
         }
     }
 }
+
+impl LinkTable {
+    /// Number of entries in the link table (pending + active links).
+    ///
+    /// Python parity: `RNS.Transport.get_link_count()` returns
+    /// `len(Transport.link_table)`.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the link table is empty.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}

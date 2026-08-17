@@ -3085,6 +3085,14 @@ pub struct PathTableSnapshotEntry {
     pub via: AddressHash,
     /// Interface address the path is routed over.
     pub iface: AddressHash,
+    /// Whether the path is marked unresponsive (Python
+    /// `mark_path_unresponsive`; new announces clear it).
+    pub unresponsive: bool,
+    /// Seconds since the path was learned (Python reports an absolute
+    /// `timestamp`; the transport time base is monotonic since start).
+    pub age_secs: u64,
+    /// Hash of the announce packet that created/refreshed the path.
+    pub announce_hash: crate::hash::Hash,
 }
 
 /// Link table counters (Python `get_link_count` and the separate count of
@@ -3114,11 +3122,10 @@ impl Transport {
     }
 
     /// Snapshot of the whole path table
-    /// (Python `Reticulum.get_path_table`).
-    ///
-    /// Note: path expiry timestamps are not tracked yet, so — unlike the
-    /// Python dict entries — no `expires` field is available.
+    /// (Python `Reticulum.get_path_table`). Paths older than
+    /// `PATHFINDER_E` (one week) are expired by the cleanup task.
     pub async fn path_table_snapshot(&self) -> Vec<PathTableSnapshotEntry> {
+        let now = crate::time::now();
         let handler = self.handler.lock().await;
         handler
             .path_table
@@ -3128,6 +3135,9 @@ impl Transport {
                 hops: entry.hops,
                 via: entry.received_from,
                 iface: entry.iface,
+                unresponsive: entry.unresponsive,
+                age_secs: now.saturating_sub(entry.timestamp).as_secs(),
+                announce_hash: entry.packet_hash,
             })
             .collect()
     }

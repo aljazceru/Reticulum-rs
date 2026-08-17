@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use clap::Parser;
 use rand_core::OsRng;
 use reticulum::identity::PrivateIdentity;
+use reticulum::iface::local::LocalServer;
+use reticulum::iface::local::SharedInstanceAddress;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::iface::udp::UdpInterface;
-use reticulum::iface::local::LocalServer;
-use reticulum::iface::local::SharedInstanceAddress;
 use reticulum::transport::TransportConfig;
 use tokio::signal;
 
@@ -30,8 +30,15 @@ use reticulum::iface::serial::SerialInterface;
 #[cfg(feature = "iface-pipe")]
 use reticulum::iface::pipe::PipeInterface;
 
-mod config;
-use self::config::{Config, InterfaceConfig};
+use reticulum_daemon::config::{Config, InterfaceConfig};
+
+/// File the daemon identity is persisted to (hex format, see
+/// `reticulum_utils::common::save_private_identity`), relative to the config
+/// directory. Python stores the transport identity under
+/// `storage/identities` in raw-key format; we keep the daemon identity at
+/// the config-dir root in hex so `rn id -i <configdir>/identity` can inspect
+/// it.
+const IDENTITY_FILE: &str = "identity";
 
 /// Reticulum-rs daemon
 #[derive(Parser)]
@@ -59,7 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cmd = Command::parse();
     if let Some(subcommand) = cmd.convert_config {
         match subcommand {
-            Subcommand::ConvertConfig { config_file } => return config::migrate_config(&config_file)
+            Subcommand::ConvertConfig { config_file } => {
+                return reticulum_daemon::config::migrate_config(&config_file)
+            }
         }
     }
 
@@ -71,9 +80,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Configuration loaded from: {}", config_path.display());
     log::info!("Reticulum daemon starting");
 
-    let identity = PrivateIdentity::new_from_rand(OsRng);
+    // Load (or create + persist) the daemon identity so the instance — and
+    // every destination derived from it — stays stable across restarts
+    // (Phase 7.4). The daemon announces nothing by default.
+    let identity_path = config_path.join(IDENTITY_FILE);
+    let identity = match reticulum_utils::common::load_private_identity(&identity_path) {
+        Ok(identity) => {
+            log::info!(
+                "Loaded daemon identity {} from {}",
+                reticulum_utils::common::prettyhexrep(identity.address_hash().as_slice()),
+                identity_path.display()
+            );
+            identity
+        }
+        Err(_err) if !identity_path.exists() => {
+            let identity = PrivateIdentity::new_from_rand(OsRng);
+            reticulum_utils::common::save_private_identity(&identity_path, &identity)?;
+            log::info!(
+                "Generated new daemon identity {} and persisted it to {}",
+                reticulum_utils::common::prettyhexrep(identity.address_hash().as_slice()),
+                identity_path.display()
+            );
+            identity
+        }
+        Err(err) => return Err(format!("could not load daemon identity: {err}").into()),
+    };
+
+    let instance_name = config
+        .reticulum
+        .instance_name
+        .clone()
+        .unwrap_or_else(|| "rns-daemon".to_string());
+    log::info!("Instance name: {instance_name}");
+
     let transport = TransportConfig::new(
-            "rns-daemon",
+            &instance_name,
             &identity,
             config.reticulum.enable_transport)
         .set_retransmit(config.reticulum.enable_transport)
@@ -362,7 +403,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Reticulum instance running, interfaces initialized");
 
-    signal::ctrl_c().await?;
+    // Clean shutdown on SIGINT (Ctrl-C) and SIGTERM.
+    let sigterm = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut term) => term.recv().await,
+            Err(err) => {
+                log::warn!("could not listen for SIGTERM: {err}");
+                std::future::pending::<Option<()>>().await
+            }
+        }
+    };
+    tokio::select! {
+        _ = signal::ctrl_c() => {},
+        _ = sigterm => {},
+    }
 
     log::info!("Shutdown signal received, cleaning up");
     drop(transport);

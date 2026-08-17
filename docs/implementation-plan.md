@@ -1208,3 +1208,48 @@ with M9 for team-load leveling.
 Remaining phases (identity persistence, ratchets, plain/group destinations,
 interfaces, tunnels/blackholes/discovery, daemon/RPC, `rn*` utilities,
 buffer streams) are still open; see the phase descriptions above.
+
+---
+
+## Progress log (final consolidated state)
+
+| Item | Status |
+|---|---|
+| 0.x foundations | ✅ storage trait (`src/storage/`), interface stats, protocol constants |
+| 1.1 Identity files | ✅ hex save/load, Python-compatible layout |
+| 1.2 Known destinations | ✅ msgpack byte-exact `known_destinations` file, recall APIs, announce hooks |
+| 1.3 Announce ratchets | ✅ context_flag bit, ratchet rotation, 30-day store, Python interop |
+| 1.4 Retention/cleaning | ✅ dirty-tracked autosave + clean with expiry |
+| 2.1 PLAIN destinations | ✅ + Python broadcast interop both directions |
+| 2.2 GROUP destinations | ✅ parseable + name-hash addressing (no invented crypto, parity) |
+| 2.3 Proof strategies | ✅ PROVE_NONE/APP/ALL for link + SINGLE packets, receipts |
+| 2.4 SINGLE-packet crypto | ✅ ratchet-aware encrypt/decrypt, byte-exact vs Python |
+| 2.5 Announce handlers | ✅ `subscribe_announces`, `AnnounceEvent::matches_aspect` |
+| 2.6 Link callbacks/accepts_links | ✅ `set_accepts_links` gating, RemoteIdentified events |
+| 2.7 Requests & responses | ✅ packet + resource-backed, Python interop both directions |
+| 2.8 Link MTU discovery | ✅ signalling bytes in LR/proof, `mtu/mdu/sdu` |
+| 3.x Resources | ✅ full engine incl. compression/metadata/segmentation; Python interop 60–80 KB both directions |
+| 4 Buffer streams | ✅ `src/buffer_stream.rs`, SMT_STREAM_DATA wire format, AsyncRead/Write, Python interop |
+| 5.2 AutoInterface | ✅ feature `iface-auto` (Linux-only; hash-token beacons, reverse peering, AutoPeer data) |
+| 5.3 LocalInterface + shared instance | ✅ default feature; TCP 37428 + abstract-unix; Python interop both directions |
+| 5.4 Serial + KISS + AX.25 | ✅ feature `iface-serial` (framing, CSMA commands, flow control, beacon; pty tests) |
+| 5.7 PipeInterface | ✅ feature `iface-pipe` (shlex, respawn; `/bin/cat` tests) |
+| 5.9 Interface statistics | ✅ counters + `Transport::interface_stats()` |
+| 6.1 Path table upgrades | ✅ timestamps, PATHFINDER_E expiry, unresponsive marking, drop APIs, snapshot |
+| 6.5 Blackholes | ✅ `transport/blackholes.rs`, identity-hash announce filtering, pack/merge lists |
+| 7.2/7.4 Daemon config & lifecycle | ✅ config parity for new interfaces + shared-instance keys, identity persistence |
+| 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp |
+| LXMF crate | ✅ byte-exact message format, stamps, peers, router + resource-backed delivery |
+| LXST crate | ✅ codecs, wire protocol, pipelines, calls |
+
+## Remaining open (documented, lower priority)
+
+* 5.1 IFAC (interface access codes) — `InterfaceState.ifac_size` hook exists, encode/validate not wired
+* 5.5 RNodeInterface (+Multi) — serial command protocol, hardware validation
+* 5.6 I2PInterface — SAMv3 session management
+* 5.8 Backbone/Weave modules (Local shares the Backbone *model* already)
+* 6.2 announce ingress/egress caps (`ic_*`/`ec_*`), 6.3 path-request timing gates (`await_path`),
+  6.4 tunnels, 6.6 Discovery module, 6.7 remote management/probe destination, 6.8 cache requests
+* 7.1 `reticulum::Reticulum` facade + 7.3 shared-instance RPC (pickle protocol) — the daemon serves
+  local clients directly via `LocalServer` instead
+* 9.2 cargo-fuzz targets, 9.3 criterion benches
