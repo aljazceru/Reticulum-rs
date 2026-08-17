@@ -278,6 +278,21 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
 
     let transport = Arc::new(transport);
 
+    // Wait for the configured interfaces to come up (UDP binds retry on
+    // address conflicts) so the startup announce is not sent into the void.
+    {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            if transport.interface_stats().await.iter().any(|stats| stats.online) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        if !transport.interface_stats().await.iter().any(|stats| stats.online) {
+            log::warn!("rncp: no interface came up within 15s; announcing anyway");
+        }
+    }
+
     // Announce at startup (and periodically when requested).
     {
         let transport = transport.clone();

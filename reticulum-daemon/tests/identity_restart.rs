@@ -12,7 +12,7 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn write_config(dir: &PathBuf) {
+fn write_config(dir: &std::path::Path) {
     std::fs::write(
         dir.join("config.toml"),
         "[reticulum]\nenable_transport = false\n\n[logging]\nloglevel = \"Info\"\n",
@@ -21,7 +21,7 @@ fn write_config(dir: &PathBuf) {
 }
 
 /// Run the daemon until it logs its identity, then SIGTERM it.
-fn identity_hash_from_run(config_dir: &PathBuf) -> (String, std::process::ExitStatus) {
+fn identity_hash_from_run(config_dir: &std::path::Path) -> (String, std::process::ExitStatus) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rs-rnsd"))
         .arg("--config-dir")
         .arg(config_dir)
@@ -35,11 +35,12 @@ fn identity_hash_from_run(config_dir: &PathBuf) -> (String, std::process::ExitSt
     for line in std::io::BufReader::new(stderr).lines() {
         let line = line.expect("read line");
         eprintln!("daemon: {line}");
-        if let Some(rest) = line.split_once("daemon identity <").map(|(_, rest)| rest) {
-            if let Some(hex) = rest.split('>').next() {
-                hash = Some(hex.to_string());
-                break;
-            }
+        if let Some(hex) = line
+            .split_once("daemon identity <")
+            .and_then(|(_, rest)| rest.split('>').next())
+        {
+            hash = Some(hex.to_string());
+            break;
         }
     }
 

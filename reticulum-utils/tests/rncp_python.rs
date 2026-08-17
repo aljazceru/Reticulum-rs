@@ -1,24 +1,25 @@
 #![cfg(feature = "python-tests")]
 
-//! rncp interop against the Python `Utilities/rncp.py`:
+//! rncp interop against the Python `RNS/Utilities/rncp.py`:
 //! * Rust sender → Python listener
 //! * Python sender → Rust listener
 //!
-//! Uses the same UDP test network as `tests/python_resources.rs`
-//! (Python on 4243 → 4242, Rust on 4242 → 4243).
+//! Each test gets its own isolated Python config directory
+//! (`tests/rns-py-configs/udp-rncp{,2}`: `share_instance = No`, unique
+//! instance names and dedicated UDP port pairs) so the partners never
+//! attach to leftover shared instances or collide with the other
+//! interop suites running concurrently in a workspace test run.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
-use rand_core::OsRng;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 use reticulum::destination::{DestinationName, SingleInputDestination};
-use reticulum::identity::PrivateIdentity;
 use reticulum_utils::common::load_or_create_private_identity;
 use reticulum_utils::rncp::{self, SendOptions, ServeOptions};
 use tokio_util::sync::CancellationToken;
@@ -43,16 +44,36 @@ fn temp_dir(name: &str) -> PathBuf {
 }
 
 /// A config dir whose transport talks to the Python UDP test interface.
-fn rust_config_dir(name: &str) -> PathBuf {
+/// Each caller gets its own port pair so workspace-wide parallel test
+/// binaries never collide.
+fn rust_config_dir(name: &str, listen: u16, forward: u16) -> PathBuf {
     let dir = temp_dir(name);
     std::fs::write(
         dir.join("config.toml"),
-        "[[interfaces]]\nname = \"To Python\"\ntype = \"UDPInterface\"\nenabled = true\n\
-         listen_ip = \"127.0.0.1\"\nlisten_port = 4242\n\
-         forward_ip = \"127.0.0.1\"\nforward_port = 4243\n",
+        format!(
+            "[[interfaces]]\nname = \"To Python\"\ntype = \"UDPInterface\"\nenabled = true\n\
+             listen_ip = \"127.0.0.1\"\nlisten_port = {listen}\n\
+             forward_ip = \"127.0.0.1\"\nforward_port = {forward}\n"
+        ),
     )
     .unwrap();
     dir
+}
+
+/// Copy the fixture config `tests/rns-py-configs/<name>/config` into a
+/// fresh temp directory and return its path.
+///
+/// The copy keeps the run hermetic: the Python partner generates its own
+/// storage (identities, caches) inside the temp dir instead of mutating the
+/// repository fixture or recalling stale destinations from a previous run.
+/// Resolved from the crate manifest because the test binary's cwd is the
+/// crate dir while the Python partner runs with the Python repo as its cwd.
+fn py_config(name: &str) -> String {
+    let fixture = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/rns-py-configs"))
+        .join(name);
+    let dir = temp_dir(&format!("pycfg-{name}"));
+    std::fs::copy(fixture.join("config"), dir.join("config")).expect("copy fixture config");
+    dir.to_str().unwrap().to_string()
 }
 
 fn rncp_destination_hash(config_dir: &Path) -> reticulum::hash::AddressHash {
@@ -65,16 +86,20 @@ fn rncp_destination_hash(config_dir: &Path) -> reticulum::hash::AddressHash {
 
 struct PyChild {
     child: tokio::process::Child,
-    lines: broadcast::Sender<String>,
 }
 
 impl PyChild {
     async fn spawn(args: &[&str]) -> (Self, broadcast::Receiver<String>) {
+        // The tool lives at RNS/Utilities/rncp.py inside the Python repo
+        // (there is no top-level Utilities/ dir); run from the repo root
+        // with PYTHONPATH set so `import RNS` resolves.
+        let python_dir = RETICULUM_PYTHON_DIR.to_string();
         let mut child = Command::new("python3")
             .arg("-u")
-            .arg("Utilities/rncp.py")
+            .arg("RNS/Utilities/rncp.py")
             .args(args)
-            .current_dir(&*RETICULUM_PYTHON_DIR)
+            .current_dir(&python_dir)
+            .env("PYTHONPATH", &python_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -90,7 +115,7 @@ impl PyChild {
                 let _ = tx_forward.send(line);
             }
         });
-        (Self { child, lines: tx }, rx)
+        (Self { child }, rx)
     }
 
     async fn next_line_containing(
@@ -132,14 +157,17 @@ async fn rust_sender_to_python_listener() {
     let _guard = TEST_MUTEX.lock().await;
 
     let save_dir = temp_dir("py-save");
-    let config_dir = rust_config_dir("py-send-client");
+    let config_dir = rust_config_dir("py-send-client", 4292, 4293);
     let payload = test_file(&config_dir, 120_000);
 
+    // -v raises the python loglevel to INFO so "rncp listening on"
+    // (LOG_INFO) is visible; "Saved received file to" is LOG_NOTICE.
     let (listener, mut lines) = PyChild::spawn(&[
         "--config",
-        "tests/rns-py-configs/udp",
+        &py_config("udp-rncp"),
         "-l",
         "-n",
+        "-v",
         "-b",
         "5",
         "-w",
@@ -186,7 +214,7 @@ async fn python_sender_to_rust_listener() {
     setup();
     let _guard = TEST_MUTEX.lock().await;
 
-    let config_dir = rust_config_dir("py-recv-server");
+    let config_dir = rust_config_dir("py-recv-server", 4302, 4303);
     let save_dir = temp_dir("rust-save");
 
     let payload = test_file(&config_dir, 60_000);
@@ -204,11 +232,14 @@ async fn python_sender_to_rust_listener() {
         let shutdown = shutdown.clone();
         tokio::spawn(async move { rncp::serve_with_shutdown(options, shutdown).await })
     };
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Give the listener time to bind its interface and announce before the
+    // python sender starts requesting the path (serve announces every 5s).
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     let (sender, mut lines) = PyChild::spawn(&[
         "--config",
-        "tests/rns-py-configs/udp",
+        &py_config("udp-rncp2"),
+        "-v",
         "-w",
         "30",
         payload.to_str().unwrap(),

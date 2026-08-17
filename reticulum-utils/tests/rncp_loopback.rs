@@ -19,7 +19,7 @@ fn temp_dir(name: &str) -> PathBuf {
     dir
 }
 
-fn write_udp_config(dir: &PathBuf, listen_port: u16, forward_port: u16) {
+fn write_udp_config(dir: &std::path::Path, listen_port: u16, forward_port: u16) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("config.toml"),
@@ -34,7 +34,7 @@ fn write_udp_config(dir: &PathBuf, listen_port: u16, forward_port: u16) {
 
 /// The `rncp.receive` destination hash for the identity stored at
 /// `config_dir/storage/identities/rncp` (what the listener announces).
-fn rncp_destination_hash(config_dir: &PathBuf) -> reticulum::hash::AddressHash {
+fn rncp_destination_hash(config_dir: &std::path::Path) -> reticulum::hash::AddressHash {
     let (identity, _) =
         load_or_create_private_identity(&config_dir.join("storage/identities/rncp")).unwrap();
     SingleInputDestination::new(identity, DestinationName::new(rncp::APP_NAME, "receive"))
@@ -42,7 +42,7 @@ fn rncp_destination_hash(config_dir: &PathBuf) -> reticulum::hash::AddressHash {
         .address_hash
 }
 
-fn test_file(dir: &PathBuf, size: usize) -> PathBuf {
+fn test_file(dir: &std::path::Path, size: usize) -> PathBuf {
     let path = dir.join("payload.bin");
     // Deliberately poorly-compressible data so the resource engine moves the
     // full chunked stream.
@@ -51,7 +51,7 @@ fn test_file(dir: &PathBuf, size: usize) -> PathBuf {
     path
 }
 
-async fn wait_for_file(dir: &PathBuf, name: &str, timeout: Duration) -> Option<PathBuf> {
+async fn wait_for_file(dir: &std::path::Path, name: &str, timeout: Duration) -> Option<PathBuf> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         for entry in std::fs::read_dir(dir).ok()? {
