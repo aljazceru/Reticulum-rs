@@ -82,6 +82,15 @@ impl AddressHash {
         Self(hash)
     }
 
+    /// Copy exactly `ADDRESS_HASH_SIZE` already-encoded address bytes into
+    /// an `AddressHash` without hashing. Returns `None` for wrong-length
+    /// input (wire fields carry ready-made address hashes; hashing them
+    /// again would produce unrelated addresses).
+    pub fn new_from_raw_slice(data: &[u8]) -> Option<Self> {
+        let bytes: [u8; ADDRESS_HASH_SIZE] = data.try_into().ok()?;
+        Some(Self(bytes))
+    }
+
     pub fn new_from_hash(hash: &Hash) -> Self {
         let mut address_hash = [0u8; ADDRESS_HASH_SIZE];
         address_hash.copy_from_slice(&hash.0[0..ADDRESS_HASH_SIZE]);

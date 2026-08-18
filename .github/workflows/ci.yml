@@ -36,9 +36,10 @@ jobs:
           cargo clippy --workspace --all-targets
           cargo clippy -p reticulum --all-targets --all-features
           cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
-
-          cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
-      cargo check -p reticulum-core --no-default-features --features no_std --target thumbv7em-none-eabihf
+      - name: no_std bare-metal check
+        run: |
+          rustup target add thumbv7em-none-eabihf
+          cargo check -p reticulum-core --no-default-features --features no_std --target thumbv7em-none-eabihf
 
   test:
     runs-on: ubuntu-latest

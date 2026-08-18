@@ -502,11 +502,17 @@ impl OutgoingResource {
             return Ok(None);
         };
 
-        let seek_index = self.segment_index; // next segment index - 1
+        // Python arithmetic: seek_index = segment_index - 1; segment 1
+        // covers [0, first_read_size), segment N > 1 covers
+        // [first_read_size + (N-2)*MAX, ... + MAX). With
+        // `self.segment_index` = the completed segment, the NEXT segment's
+        // index is segment_index + 1.
+        let next_segment = self.segment_index + 1;
         let first_read_size = MAX_EFFICIENT_SIZE - self.metadata_size;
-        let (start, end) = if self.segment_index == 1 {
+        let (start, end) = if next_segment == 1 {
             (0, core::cmp::min(first_read_size, stream.len()))
         } else {
+            let seek_index = next_segment - 1;
             let start = first_read_size + (seek_index - 1) * MAX_EFFICIENT_SIZE;
             let end = core::cmp::min(start + MAX_EFFICIENT_SIZE, stream.len());
             (start, end)
@@ -521,7 +527,7 @@ impl OutgoingResource {
             start..end,
             stream.len(),
             self.total_segments,
-            self.segment_index + 1,
+            next_segment,
             Some(self.original_hash),
             link,
             opts,

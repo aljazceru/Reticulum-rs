@@ -75,19 +75,25 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
 
     // The command handler executes the command and builds the response.
     let allow_all = options.allow_all;
-    let allowed = options.allowed.clone();
+    let allowed = std::sync::Arc::new(options.allowed.clone());
     transport
-        .register_request_handler(&address, "command", move |ctx| {
-            if !allow_all {
-                let Some(remote) = &ctx.remote_identity else {
-                    return None;
-                };
-                if !allowed.contains(&remote.address_hash) {
-                    return None;
+        .register_async_request_handler(&address, "command", {
+            let allowed = allowed.clone();
+            move |ctx| {
+                let allowed = allowed.clone();
+                async move {
+                    if !allow_all {
+                        let Some(remote) = &ctx.remote_identity else {
+                            return None;
+                        };
+                        if !allowed.contains(&remote.address_hash) {
+                            return None;
+                        }
+                    }
+
+                    Some(execute_request(&ctx.data).await)
                 }
             }
-
-            Some(execute_request(&ctx.data))
         })
         .await;
 
@@ -107,7 +113,7 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
 
 /// Decode the request payload and execute the command
 /// (Python `execute_received_command`).
-pub fn execute_request(data: &[u8]) -> Vec<u8> {
+pub async fn execute_request(data: &[u8]) -> Vec<u8> {
     use rmpv::Value;
 
     let mut cursor = std::io::Cursor::new(data);
@@ -121,25 +127,78 @@ pub fn execute_request(data: &[u8]) -> Vec<u8> {
         .unwrap_or_default()
         .to_string();
 
+    // [command, timeout, o_limit, e_limit, stdin]
+    let timeout_secs = items
+        .get(1)
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30)
+        .clamp(1, 3600);
+
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64();
 
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(&command)
-        .output();
+    // The request handler runs while the transport handler is locked, so
+    // a blocking `Command::output()` (e.g. `sleep 100000`) would stall
+    // the whole transport despite the client-supplied timeout. Run the
+    // child asynchronously with a kill timer instead.
+    Box::pin(async move {
+        let child = match tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .stdin(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return pack_result(None),
+        };
 
-    let concluded = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+        // wait_with_output consumes the child; use a kill-on-timeout
+        // wrapper that keeps a handle for start_kill.
+        let mut child = child;
+        let wait = async {
+            use tokio::io::AsyncReadExt;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_end(&mut stdout).await;
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_end(&mut stderr).await;
+            }
+            let status = child.wait().await.ok();
+            status.map(|status| std::process::Output { status, stdout, stderr })
+        };
 
-    match output {
-        Ok(output) => pack_result(Some((output, started, concluded))),
-        Err(_) => pack_result(None),
-    }
+        let output = match tokio::time::timeout(
+            Duration::from_secs(timeout_secs.max(1)),
+            wait,
+        )
+        .await
+        {
+            Ok(Some(output)) => Some(output),
+            // timed out: kill the child so it cannot linger.
+            Err(_) => {
+                let _ = child.start_kill();
+                None
+            }
+            _ => None,
+        };
+
+        let concluded = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        match output {
+            Some(output) => pack_result(Some((output, started, concluded))),
+            None => pack_result(None),
+        }
+    })
+    .await
 }
 
 /// Pack the response list (Python `result` layout).

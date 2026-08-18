@@ -371,6 +371,36 @@ impl InterfaceManager {
         .is_some())
     }
 
+    /// Spawn an interface worker with its IFAC slot already populated,
+    /// so the worker never observes an unauthenticated frame before the
+    /// key is installed (needed on multithreaded runtimes where `spawn`
+    /// may begin polling immediately).
+    pub fn spawn_with_ifac<T, F, R>(
+        &mut self,
+        inner: T,
+        worker: F,
+        ifac: Arc<ifac::IfacKey>,
+    ) -> AddressHash
+    where
+        T: Interface,
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let kind = interface_kind_name::<T>();
+        let channel = self.new_channel_named(1, &kind, &kind);
+        *channel.ifac.write().expect("ifac lock") = Some(ifac);
+
+        let context = InterfaceContext::<T> {
+            inner: Arc::new(Mutex::new(inner)),
+            channel,
+            cancel: self.cancel.clone(),
+        };
+
+        let address = context.channel.address;
+        task::spawn(worker(context));
+        address
+    }
+
     /// Access the IFAC configuration slot of an interface.
     pub fn with_iface_ifac<R>(
         &self,

@@ -11,7 +11,7 @@ use reticulum::transport::TransportConfig;
 
 /// Fixed key shared with the Python golden vector (64 bytes = AES-256,
 /// the default mode of both `Token.generate_key()` and this crate).
-fn key() -> [u8; 64] {
+fn key() -> [u8; reticulum::destination::GROUP_KEY_SIZE] {
     core::array::from_fn(|i| i as u8)
 }
 

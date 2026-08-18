@@ -82,8 +82,9 @@ async fn split_resource_transfers_all_segments() {
     a.send_resource(&link, payload.clone()).await.expect("send");
 
     let mut segments_completed = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(480);
-    while segments_completed < 3 && tokio::time::Instant::now() < deadline {
+    let expected = 2;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    while segments_completed < expected && tokio::time::Instant::now() < deadline {
         let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await else {
             break;
         };
@@ -93,7 +94,7 @@ async fn split_resource_transfers_all_segments() {
     }
 
     assert!(
-        segments_completed >= 2,
-        "expected both segment completions for a 1.25 MiB payload, got {segments_completed}"
+        segments_completed >= expected,
+        "expected {expected} segment completions for a 1.25 MiB payload, got {segments_completed}"
     );
 }

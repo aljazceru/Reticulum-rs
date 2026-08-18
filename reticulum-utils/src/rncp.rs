@@ -429,7 +429,18 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
                 match event {
                     LinkEvent::Activated => {
                         log::info!("Incoming link established");
-                        transport.set_resource_strategy(id, ResourceStrategy::All).await;
+                        // Resource acceptance is enabled only once the link
+                        // has identified AND the identity passed the
+                        // allowlist: enabling it earlier lets
+                        // unauthenticated remotes allocate resource
+                        // transfers (decryption, decompression, buffers)
+                        // before the auth check, a remote
+                        // resource-exhaustion vector.
+                        if allow_all {
+                            transport
+                                .set_resource_strategy(id, ResourceStrategy::All)
+                                .await;
+                        }
                     }
                     LinkEvent::RemoteIdentified(identity) => {
                         let sender = identity.address_hash;
@@ -438,6 +449,10 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
                         if !allow_all && !allowed.contains(&sender) {
                             log::warn!("Sender not allowed, tearing down link");
                             let _ = transport.link_close(id).await;
+                        } else {
+                            transport
+                                .set_resource_strategy(id, ResourceStrategy::All)
+                                .await;
                         }
                     }
                     LinkEvent::Closed => {

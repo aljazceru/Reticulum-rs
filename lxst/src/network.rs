@@ -70,7 +70,16 @@ pub fn pack_signalling(signals: &[u8]) -> Result<Vec<u8>, LxstError> {
     rmp::encode::write_array_len(&mut buf, signals.len() as u32)
         .map_err(|e| LxstError::WireFormat(e.to_string()))?;
     for &s in signals {
-        rmp::encode::write_pfix(&mut buf, s & 0x7f)
+        // Signals are positive fixints (0x00-0x7f). Masking an
+        // out-of-range value would silently change its meaning (0x80 ->
+        // status code 0, turning a profile/unknown signal into a call
+        // control event) — reject instead.
+        if s > 0x7f {
+            return Err(LxstError::WireFormat(format!(
+                "signal {s:#x} outside positive-fixint range"
+            )));
+        }
+        rmp::encode::write_pfix(&mut buf, s)
             .map_err(|e| LxstError::WireFormat(e.to_string()))?;
     }
     Ok(buf)

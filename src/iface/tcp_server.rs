@@ -100,20 +100,28 @@ impl TcpServer {
 
                             let mut iface_manager = iface_manager.lock().await;
 
-                            let address = iface_manager.spawn(
-                                TcpClient::new_from_stream(client.1.to_string(), client.0),
-                                TcpClient::spawn,
-                            );
-
                             // Spawned connection interfaces inherit the
                             // server's interface access code
-                            // (Python TCPServerInterface inheritance).
+                            // (Python TCPServerInterface inheritance). The
+                            // key is installed BEFORE the worker is
+                            // spawned: on a multithreaded runtime the
+                            // worker may otherwise begin decoding a frame
+                            // before the slot is populated.
                             let inherited = server_ifac.read().expect("ifac lock").clone();
-                            if inherited.is_some() {
-                                iface_manager.with_iface_ifac(&address, |slot| {
-                                    *slot.write().expect("ifac lock") = inherited.clone();
-                                });
-                            }
+                            let peer = TcpClient::new_from_stream(client.1.to_string(), client.0);
+
+                            let _address = if let Some(key) = inherited {
+                                iface_manager.spawn_with_ifac(
+                                    peer,
+                                    TcpClient::spawn,
+                                    key,
+                                )
+                            } else {
+                                iface_manager.spawn(
+                                    peer,
+                                    TcpClient::spawn,
+                                )
+                            };
                         }
                     }
                 }

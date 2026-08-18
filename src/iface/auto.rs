@@ -531,6 +531,12 @@ impl AutoInterface {
         let config = context.inner.lock().unwrap().config.clone();
         let iface_manager = context.inner.lock().unwrap().iface_manager.clone();
 
+        // The parent AutoInterface's access code: all traffic is carried by
+        // spawned AutoPeer interfaces, so each peer must inherit it or the
+        // configured networkname/passphrase protection silently applies to
+        // nothing (Python AutoPeer copies the parent's ifac_* attributes).
+        let parent_ifac = *context.channel.ifac.read().expect("ifac lock");
+
         // The AutoInterface itself never carries data (Python
         // `process_outgoing` is a pass); drain manager tx messages, peers
         // are separate interfaces.
@@ -822,6 +828,7 @@ impl AutoInterface {
         peers: &mut HashMap<Ipv6Addr, PeerEntry>,
         addr: Ipv6Addr,
         ifname: &str,
+        parent_ifac: &Option<Arc<crate::iface::ifac::IfacKey>>,
     ) {
         if let Some(peer) = peers.get_mut(&addr) {
             // refresh_peer
@@ -841,10 +848,14 @@ impl AutoInterface {
         let peer = AutoPeer::new(peer_addr, socket.clone(), data_rx);
 
         let name = format!("AutoPeer[{ifname}/{addr}]");
-        let address = iface_manager
-            .lock()
-            .await
-            .spawn_named(name, peer, AutoPeer::spawn);
+        let mut manager = iface_manager.lock().await;
+        let address = manager.spawn_named(name, peer, AutoPeer::spawn);
+        if let Some(key) = parent_ifac.clone() {
+            manager.with_iface_ifac(&address, |slot| {
+                *slot.write().expect("ifac lock") = Some(key);
+            });
+        }
+        drop(manager);
 
         let now = tokio::time::Instant::now();
         peers.insert(

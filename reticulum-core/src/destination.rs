@@ -667,7 +667,13 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
 /// instead. Token format `iv || ciphertext || hmac` is byte-compatible
 /// with the reference `Destination.prv`.
 pub struct GroupKey {
+    /// Decrypt/verify view of the token keys (no entropy consumed).
     fernet: crate::crypt::fernet::Fernet<crate::crypt::fernet::ZeroRng>,
+    /// Encryption view with real entropy: every encryption generates a
+    /// fresh cryptographically secure IV. `ZeroRng` here would fix the IV
+    /// at zero, breaking CBC confidentiality across repeated plaintexts.
+    #[cfg(feature = "std")]
+    fernet_enc: crate::crypt::fernet::Fernet<rand_core::OsRng>,
     raw: [u8; GROUP_KEY_SIZE],
 }
 
@@ -696,6 +702,12 @@ impl GroupKey {
                 &raw[half..],
                 crate::crypt::fernet::ZeroRng,
             ),
+            #[cfg(feature = "std")]
+            fernet_enc: crate::crypt::fernet::Fernet::<rand_core::OsRng>::new_from_slices(
+                &raw[..half],
+                &raw[half..],
+                rand_core::OsRng,
+            ),
             raw,
         }
     }
@@ -706,16 +718,34 @@ impl GroupKey {
     }
 
     /// Encrypt a payload into `out_buf`, returning the token bytes
-    /// (Python `Token.encrypt`).
+    /// (Python `Token.encrypt`). Uses a fresh cryptographically secure IV
+    /// per encryption (hosted targets).
+    #[cfg(feature = "std")]
     pub fn encrypt<'a>(
         &self,
         plaintext: &[u8],
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], crate::error::RnsError> {
         let plain = crate::crypt::fernet::PlainText(plaintext);
-        self.fernet
+        self.fernet_enc
             .encrypt(plain, out_buf)
             .map(|token| token.as_bytes())
+    }
+
+    /// Encrypt with a caller-provided RNG (bare-metal embedding).
+    pub fn encrypt_with_rng<'a, R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        plaintext: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], crate::error::RnsError> {
+        let fernet = crate::crypt::fernet::Fernet::<R>::new_from_slices(
+            &self.raw[..GROUP_KEY_SIZE / 2],
+            &self.raw[GROUP_KEY_SIZE / 2..],
+            rng,
+        );
+        let plain = crate::crypt::fernet::PlainText(plaintext);
+        fernet.encrypt(plain, out_buf).map(|token| token.as_bytes())
     }
 
     /// Verify and decrypt a token into `out_buf`
@@ -783,7 +813,9 @@ impl<D: Direction> Destination<EmptyIdentity, D, Group> {
     }
 
     /// Encrypt a payload with the destination's group key
-    /// (Python `Destination.encrypt` for GROUP).
+    /// (Python `Destination.encrypt` for GROUP). Fresh secure IV per
+    /// packet on hosted targets; `_with_rng` form for bare metal.
+    #[cfg(feature = "std")]
     pub fn encrypt_group<'a>(
         &self,
         plaintext: &[u8],
@@ -791,6 +823,19 @@ impl<D: Direction> Destination<EmptyIdentity, D, Group> {
     ) -> Result<&'a [u8], crate::error::RnsError> {
         match &self.group_key {
             Some(key) => key.encrypt(plaintext, out_buf),
+            None => Err(crate::error::RnsError::CryptoError),
+        }
+    }
+
+    /// Encrypt with a caller-provided RNG (bare-metal embedding).
+    pub fn encrypt_group_with_rng<'a, R: CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        plaintext: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], crate::error::RnsError> {
+        match &self.group_key {
+            Some(key) => key.encrypt_with_rng(rng, plaintext, out_buf),
             None => Err(crate::error::RnsError::CryptoError),
         }
     }

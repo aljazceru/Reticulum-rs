@@ -345,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sam_addr
                         );
                         let session_id = format!("{}-{}", iface.name, std::process::id());
-                        iface_manager.lock().await.spawn_named(
+                        let address = iface_manager.lock().await.spawn_named(
                             &iface.name,
                             reticulum::iface::i2p::I2pServer::new(
                                 sam_addr.clone(),
@@ -354,6 +354,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ),
                             reticulum::iface::i2p::I2pServer::spawn,
                         );
+                        // Apply mode/bitrate/IFAC to the connectable server
+                        // so spawned inbound peers inherit the protection.
+                        configure_iface(&iface_manager, &address, iface).await;
                     }
 
                     for (index, peer) in peers.iter().enumerate() {
@@ -866,19 +869,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Reticulum instance running, interfaces initialized");
 
-    // Clean shutdown on SIGINT (Ctrl-C) and SIGTERM.
-    let sigterm = async {
-        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(mut term) => term.recv().await,
-            Err(err) => {
-                log::warn!("could not listen for SIGTERM: {err}");
-                std::future::pending::<Option<()>>().await
+    // Clean shutdown on SIGINT (Ctrl-C), and SIGTERM where available
+    // (not on Windows).
+    #[cfg(unix)]
+    {
+        let sigterm = async {
+            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+                Ok(mut term) => term.recv().await,
+                Err(err) => {
+                    log::warn!("could not listen for SIGTERM: {err}");
+                    std::future::pending::<Option<()>>().await
+                }
             }
+        };
+        tokio::select! {
+            _ = signal::ctrl_c() => {},
+            _ = sigterm => {},
         }
-    };
-    tokio::select! {
-        _ = signal::ctrl_c() => {},
-        _ = sigterm => {},
+    }
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await.ok();
     }
 
     log::info!("Shutdown signal received, cleaning up");

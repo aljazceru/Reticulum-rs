@@ -218,7 +218,9 @@ impl InterfaceInfo {
             rmpv::Value::Binary(bytes) => bytes,
             _ => return None,
         };
-        let transport_id = AddressHash::new_from_slice(transport_id_bytes);
+        // The field carries a ready-made 16-byte address hash; copy it
+        // (re-hashing produces an unrelated address).
+        let transport_id = AddressHash::new_from_raw_slice(transport_id_bytes)?;
 
         let str_field = |key: &str| -> Option<String> {
             fields.get(key).and_then(|v| v.as_str()).map(str::to_string)
@@ -800,11 +802,13 @@ impl BlackholeUpdater {
         let mut added = 0;
         for item in items {
             if let rmpv::Value::Binary(bytes) = item {
-                let identity = AddressHash::new_from_slice(&bytes);
-                let mut blackholes = blackholes.write().await;
-                if !blackholes.is_blackholed(&identity) {
-                    blackholes.blackhole(identity, own);
-                    added += 1;
+                // Raw 16-byte identity hashes: copy, never re-hash.
+                if let Some(identity) = AddressHash::new_from_raw_slice(&bytes) {
+                    let mut blackholes = blackholes.write().await;
+                    if !blackholes.is_blackholed(&identity) {
+                        blackholes.blackhole(identity, own);
+                        added += 1;
+                    }
                 }
             }
         }

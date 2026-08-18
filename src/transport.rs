@@ -1083,6 +1083,39 @@ impl Transport {
             .register_request_handler(*destination, path, Arc::new(handler));
     }
 
+    /// Register an async request handler for a path on one of our inbound
+    /// destinations. Async handlers keep the transport responsive for
+    /// long-running work (e.g. remote command execution).
+    ///
+    /// The async future is awaited directly on the transport's async
+    /// packet task (no blocking bridge), so it must be Send + 'static.
+    pub async fn register_async_request_handler<F, Fut>(
+        &self,
+        destination: &AddressHash,
+        path: &str,
+        handler: F,
+    ) where
+        F: Fn(RequestCtx) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
+    {
+        let user_handler = std::sync::Arc::new(handler);
+        // Async handlers are stored separately and awaited directly on the
+        // async packet task — a blocking bridge would deadlock
+        // current-thread runtimes.
+        self.handler
+            .lock()
+            .await
+            .resources
+            .register_async_request_handler(
+                *destination,
+                path,
+                Arc::new(move |ctx| {
+                    let user_handler = user_handler.clone();
+                    Box::pin(async move { user_handler(ctx).await })
+                }),
+            );
+    }
+
     /// Send an arbitrary-size payload as a resource over an established link.
     pub async fn send_resource(
         &self,
@@ -1201,12 +1234,15 @@ impl Transport {
         request_id: AddressHash,
         timeout: core::time::Duration,
     ) -> Option<Vec<u8>> {
+        // Subscribe first: a response arriving between the completed-map
+        // check and the subscription would otherwise be stored and
+        // broadcast with no receiver, and this loop would never recheck.
+        let mut rx = self.request_events().await;
+
         // A response may already have completed.
         if let Some(result) = self.take_completed_response(request_id).await {
             return result;
         }
-
-        let mut rx = self.request_events().await;
         let deadline = time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(time::Instant::now());
@@ -1219,8 +1255,17 @@ impl Transport {
                         request_id: rid,
                         data,
                         ..
-                    } if rid == request_id => return Some(data),
-                    RequestEvent::Failed { request_id: rid } if rid == request_id => return None,
+                    } if rid == request_id => {
+                        // Consumed through the event channel: drop any
+                        // retained copy so long-running processes do not
+                        // accumulate one buffer per completed request.
+                        self.discard_completed_response(rid).await;
+                        return Some(data);
+                    }
+                    RequestEvent::Failed { request_id: rid } if rid == request_id => {
+                        self.discard_completed_response(rid).await;
+                        return None;
+                    }
                     _ => continue,
                 },
                 _ => return None,
@@ -1238,6 +1283,13 @@ impl Transport {
             .resources
             .completed_responses
             .remove(&request_id)
+    }
+
+    /// Drop a retained response that was consumed through the event
+    /// channel (prevents unbounded accumulation per completed request).
+    async fn discard_completed_response(&self, request_id: AddressHash) {
+        let mut handler = self.handler.lock().await;
+        handler.resources.completed_responses.remove(&request_id);
     }
 
     /// Register a PLAIN (unencrypted broadcast) input destination
@@ -1294,7 +1346,17 @@ impl Transport {
         data: &[u8],
         group_key: Option<&[u8; reticulum_core::destination::GROUP_KEY_SIZE]>,
     ) -> Result<AddressHash, RnsError> {
-        if data.len() > crate::packet::PACKET_PROTOCOL_MDU {
+        // With a group key the token adds IV (16) + HMAC (32) + CBC block
+        // padding (up to 16): enforce the encrypted MDU so packets never
+        // exceed the fixed 500-byte Reticulum MTU.
+        let limit = if group_key.is_some() {
+            crate::packet::PACKET_PROTOCOL_MDU
+                .saturating_sub(crate::packet::TOKEN_OVERHEAD)
+                .saturating_sub(crate::packet::AES128_BLOCKSIZE)
+        } else {
+            crate::packet::PACKET_PROTOCOL_MDU
+        };
+        if data.len() > limit {
             return Err(RnsError::InvalidArgument);
         }
 
@@ -2199,6 +2261,36 @@ async fn handle_resource_packet<'a>(
     handled
 }
 
+/// Send a request response as a packet or resource
+/// (shared by the sync and async handler paths).
+async fn send_response<'a>(
+    link: &Link,
+    rid: &AddressHash,
+    response: &[u8],
+    handler: &mut MutexGuard<'a, TransportHandler>,
+) {
+    let packed = pack_response(rid, response);
+    if packed.len() <= link.mdu() {
+        if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
+            handler.send_packet(packet).await;
+        }
+    } else {
+        let opts = ResourceOptions {
+            request_id: Some(*rid),
+            is_response: true,
+            ..Default::default()
+        };
+        match handler.resources.send_resource(link, packed, opts) {
+            Ok(tx) => {
+                for p in tx.packets {
+                    handler.send_packet(p).await;
+                }
+            }
+            Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
+        }
+    }
+}
+
 async fn handle_incoming_request<'a>(
     link: &Arc<Mutex<Link>>,
     rid: AddressHash,
@@ -2210,6 +2302,26 @@ async fn handle_incoming_request<'a>(
     let link = link.lock().await;
     let destination = link.destination().address_hash;
     let remote_identity = link.remote_identity();
+
+    // Async handlers are awaited directly on this task.
+    if let Some(async_fn) = handler
+        .resources
+        .async_request_handler(&destination, &path_hash)
+    {
+        if let Some(response) = async_fn(RequestCtx {
+            path_hash,
+            data: request_data,
+            request_id: rid,
+            link_id: *link.id(),
+            remote_identity,
+            requested_at,
+        })
+        .await
+        {
+            send_response(&link, &rid, &response, handler).await;
+        }
+        return;
+    }
 
     let handler_fn = handler
         .resources
@@ -2232,26 +2344,7 @@ async fn handle_incoming_request<'a>(
     });
 
     if let Some(response) = response {
-        let packed = pack_response(&rid, &response);
-        if packed.len() <= link.mdu() {
-            if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
-                handler.send_packet(packet).await;
-            }
-        } else {
-            let opts = ResourceOptions {
-                request_id: Some(rid),
-                is_response: true,
-                ..Default::default()
-            };
-            match handler.resources.send_resource(&link, packed, opts) {
-                Ok(tx) => {
-                    for p in tx.packets {
-                        handler.send_packet(p).await;
-                    }
-                }
-                Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
-            }
-        }
+        send_response(&link, &rid, &response, handler).await;
     }
 }
 

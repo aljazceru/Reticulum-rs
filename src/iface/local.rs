@@ -160,7 +160,7 @@ impl LocalServer {
                 let listener = TcpListener::bind(("127.0.0.1", *port)).await.ok()?;
                 Some(Listener::Tcp(listener))
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             SharedInstanceAddress::UnixAbstract { instance_name } => {
                 use std::os::linux::net::SocketAddrExt;
                 use std::os::unix::net::SocketAddr as UnixSocketAddr;

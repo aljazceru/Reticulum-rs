@@ -1008,7 +1008,13 @@ impl<'a> MsgReader<'a> {
     }
 
     fn read_fixed_bin<const N: usize>(&mut self) -> Result<[u8; N], RnsError> {
-        let slice = self.read_bin()?;
+        let len = self.read_bin_len()?;
+        if len != N {
+            // Corrupt or truncated persistence files must fail cleanly,
+            // not panic.
+            return Err(RnsError::PacketError);
+        }
+        let slice = self.take(N)?;
         let mut out = [0u8; N];
         out.copy_from_slice(slice);
         Ok(out)

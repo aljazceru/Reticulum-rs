@@ -2,6 +2,7 @@
 //! link, routes resource packets and runs watchdog checks.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, Mutex};
@@ -49,6 +50,13 @@ pub struct RequestContext {
 pub type RequestHandler =
     Arc<dyn Fn(RequestContext) -> Option<Vec<u8>> + Send + Sync>;
 
+/// Async request handler: awaited on the async packet task.
+pub type AsyncRequestHandler = Arc<
+    dyn Fn(RequestContext) -> Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub(crate) struct ResourceManager {
     pub out: HashMap<LinkId, Vec<OutgoingResource>>,
     pub incoming: HashMap<LinkId, Vec<IncomingResource>>,
@@ -61,7 +69,12 @@ pub(crate) struct ResourceManager {
     pub pending_requests: HashMap<AddressHash, LinkId>,
     /// Responses that completed before the caller began awaiting them,
     /// retained until collected (broadcast retains no history).
+    /// Async request handlers by (destination, path hash).
+    pub async_request_handlers: HashMap<AddressHash, HashMap<AddressHash, AsyncRequestHandler>>,
     pub completed_responses: HashMap<AddressHash, Option<Vec<u8>>>,
+    /// Accumulated bytes of split resources by original hash
+    /// (Python appends per-segment assembled data to storage).
+    pub split_assembly: HashMap<crate::hash::Hash, Vec<u8>>,
     pub events: broadcast::Sender<ResourceEvent>,
     pub request_events: broadcast::Sender<RequestEventData>,
     pub max_decompressed_size: usize,
@@ -102,7 +115,9 @@ impl ResourceManager {
             started_callbacks: HashMap::new(),
             request_handlers: HashMap::new(),
             pending_requests: HashMap::new(),
+            async_request_handlers: HashMap::new(),
             completed_responses: HashMap::new(),
+            split_assembly: HashMap::new(),
             events,
             request_events,
             max_decompressed_size: DEFAULT_MAX_DECOMPRESSED_SIZE,
@@ -325,6 +340,33 @@ impl ResourceManager {
         tx.packets.extend(part_tx.packets);
     }
 
+    /// Register an async request handler (awaited on the async packet
+    /// task).
+    pub fn register_async_request_handler(
+        &mut self,
+        destination: AddressHash,
+        path: &str,
+        handler: AsyncRequestHandler,
+    ) {
+        let path_hash = AddressHash::new_from_slice(path.as_bytes());
+        self.async_request_handlers
+            .entry(destination)
+            .or_default()
+            .insert(path_hash, handler);
+    }
+
+    /// Look up the async handler for a destination/path.
+    pub fn async_request_handler(
+        &self,
+        destination: &AddressHash,
+        path_hash: &AddressHash,
+    ) -> Option<AsyncRequestHandler> {
+        self.async_request_handlers
+            .get(destination)
+            .and_then(|handlers| handlers.get(path_hash))
+            .cloned()
+    }
+
     /// Whether any request handler is registered for the link's
     /// destination (requests without a handler can never be serviced).
     fn has_request_handlers(&self, link: &Link) -> bool {
@@ -420,24 +462,57 @@ impl ResourceManager {
                     let metadata = resource.metadata.clone();
                     let advertisement = resource.advertisement_of();
 
-                    let is_request = resource.request_id.is_some() && !resource.is_response;
+                    let _is_request = resource.request_id.is_some() && !resource.is_response;
                     let is_response = resource.is_response;
                     let request_id = resource.request_id;
                     let is_final = resource.segment_index == resource.total_segments;
 
+                    // Split resources accumulate across segments (Python
+                    // appends each segment's assembled data to the storage
+                    // file keyed by original_hash): only the final event
+                    // carries the complete data.
+                    let (event_hash, event_data) = if resource.split {
+                        let buffer = self
+                            .split_assembly
+                            .entry(resource.original_hash)
+                            .or_default();
+                        buffer.extend_from_slice(&data);
+
+                        if is_final {
+                            let complete = self.split_assembly.remove(&resource.original_hash);
+                            (resource.original_hash, complete)
+                        } else {
+                            (resource.original_hash, None)
+                        }
+                    } else {
+                        (hash, Some(data.clone()))
+                    };
+
                     let _ = self.events.send(ResourceEvent {
                         link_id: *link.id(),
-                        hash,
+                        hash: event_hash,
                         status: ResourceStatus::Complete,
                         progress,
-                        data: if is_final { Some(data.clone()) } else { None },
+                        data: event_data,
                         metadata,
                         advertisement: Some(advertisement),
                     });
 
+                    // Request/response payloads span segments: the packed
+                    // request/response lives in the FIRST segment; the
+                    // complete data is what later segments append to.
+                    let full_data = if resource.split {
+                        self.split_assembly
+                            .get(&resource.original_hash)
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        data.clone()
+                    };
+
                     let response_rid = if is_response && is_final { request_id } else { None };
                     if let Some(request_id) = response_rid {
-                        let event = match unpack_response(&data) {
+                        let event = match unpack_response(&full_data) {
                             Some((rid, response)) if rid == request_id => {
                                 // Retain for late awaiters before emitting.
                                 self.completed_responses.insert(rid, Some(response.clone()));
@@ -460,10 +535,9 @@ impl ResourceManager {
                         self.pending_requests.remove(&request_id);
                     }
 
-                    if is_request && is_final {
-                        return Some((hash, data));
-                    }
-                    return Some((hash, data));
+                    // Split requests deliver the accumulated payload once
+                    // the final segment lands.
+                    return Some((event_hash, full_data));
                 }
                 Err(err) => {
                     log::debug!("resource: assembly failed: {err:?}");
@@ -530,7 +604,18 @@ impl ResourceManager {
                     if resource.split && resource.segment_index < resource.total_segments {
                         // Prepare lazily if not pre-built.
                         if resource.next_segment.is_none() {
-                            let opts = ResourceOptions::default();
+                            // Preserve request metadata across segments:
+                            // later response segments keep request_id and
+                            // is_response so the receiver routes them as
+                            // responses (dropping them, as
+                            // ResourceOptions::default() did, made later
+                            // segments look like ordinary resources that
+                            // get rejected under the default strategy).
+                            let opts = ResourceOptions {
+                                request_id: resource.request_id,
+                                is_response: resource.is_response,
+                                ..ResourceOptions::default()
+                            };
                             match resource.prepare_next_segment(link, opts) {
                                 Ok(next) => resource.next_segment = next,
                                 Err(error) => {
