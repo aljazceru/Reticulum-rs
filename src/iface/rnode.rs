@@ -521,16 +521,38 @@ pub struct RnodeLink {
 
 impl RnodeLink {
     /// Open a serial link.
+    ///
+    /// USB-serial devices need a moment to release the tty after a
+    /// previous close; an immediate reopen can fail with EIO, so the
+    /// open is retried briefly.
     #[cfg(feature = "iface-serial")]
     pub async fn serial(port: &str, baudrate: u32) -> Result<Self, RnsError> {
         let builder = tokio_serial::new(port, baudrate);
-        let port =
-            tokio_serial::SerialStream::open(&builder).map_err(|_| RnsError::ConnectionError)?;
-        let (reader, writer) = tokio::io::split(port);
-        Ok(Self {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-        })
+
+        let mut last_err = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+            }
+            match tokio_serial::SerialStream::open(&builder) {
+                Ok(port) => {
+                    let (reader, writer) = tokio::io::split(port);
+                    return Ok(Self {
+                        reader: Box::new(reader),
+                        writer: Box::new(writer),
+                    });
+                }
+                Err(error) => {
+                    log::debug!(
+                        "rnode: serial open attempt {attempt} on {port} failed: {error}; retrying"
+                    );
+                    last_err = Some(error);
+                }
+            }
+        }
+
+        let _ = last_err;
+        Err(RnsError::ConnectionError)
     }
 
     /// Open a TCP link (Python `use_tcp`).

@@ -26,6 +26,10 @@ use reticulum::identity::PrivateIdentity;
 use reticulum::iface::rnode::*;
 use reticulum::transport::{Transport, TransportConfig};
 
+/// Hardware tests share one physical serial port, so they must not run
+/// concurrently (cargo's default is parallel per-test threads).
+static HW_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn hw_port() -> Option<String> {
     std::env::var("RETICULUM_HW_RNODE").ok().filter(|s| !s.is_empty())
 }
@@ -76,6 +80,7 @@ async fn hw_detect_firmware_and_identity() {
         eprintln!("skipping: no RETICULUM_HW_RNODE[_TCP] set");
         return;
     };
+    let _guard = HW_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = Arc::new(TransportConfig::new("hw-rnode", &identity, false).build());
@@ -103,6 +108,7 @@ async fn hw_device_info_via_rnodeconf() {
         eprintln!("skipping: no RETICULUM_HW_RNODE set");
         return;
     };
+    let _guard = HW_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let info = reticulum_utils::rnodeconf::device_info(
         &reticulum_utils::rnodeconf::DeviceTarget::Serial {
@@ -137,6 +143,7 @@ async fn hw_radio_config_validation() {
         eprintln!("skipping: no RETICULUM_HW_RNODE[_TCP] set");
         return;
     };
+    let _guard = HW_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let ok = reticulum_utils::rnodeconf::validate_config(
         &reticulum_utils::rnodeconf::DeviceTarget::Tcp {
@@ -161,6 +168,7 @@ async fn hw_packet_transmit() {
         eprintln!("skipping: no RETICULUM_HW_RNODE[_TCP] set");
         return;
     };
+    let _guard = HW_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = Arc::new(TransportConfig::new("hw-tx", &identity, false).build());
