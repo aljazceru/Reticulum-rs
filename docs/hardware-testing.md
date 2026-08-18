@@ -63,26 +63,48 @@ with an `RNodeInterface` each and exchange announces — the tier-4
 ## Field report: Heltec V3 (2026-08-18)
 
 A Heltec V3 (ESP32-S3, SX1262, 8 MB flash) was provisioned as a test
-device:
+device. **Heltec V3 is officially supported RNode hardware** (product
+`0xC1`, model `0xCA` 850-950 MHz, official release builds and
+`rnodeconf` support) — an earlier revision of this report wrongly
+generalised a 2023 issue (#73, from when V3 support was *added*) into
+"BLE not fleshed out". Corrected findings:
 
-* flashed RNode firmware 1.86 (and 1.80) at the reference offsets —
-  bootloader **0x0** for ESP32-S3 (not 0x1000), partitions 0x8000,
-  boot_app0 0xe000, app 0x10000, console 0x210000
-* bootstrapped EEPROM (product 0xC1, model 0xCA 850-950 MHz, hwrev 1)
-  with the MD5 checksum block, and stored the partition SHA-256 via
-  `CMD_FW_HASH`
+**What was validated against real hardware (all green):**
+* full flashing flow at the reference offsets — note the ESP32-S3
+  bootloader goes at **0x0**, not 0x1000 (bootloader 0x0, partitions
+  0x8000, boot_app0 0xe000, app 0x10000, console 0x210000)
+* EEPROM identity bootstrap (product/model/hwrev/serial/MD5 checksum/
+  signature/info-lock), the `ADDR_CONF_BT` enable byte, and the
+  `CMD_FW_HASH` firmware-hash handshake
+* the **entire serial command protocol of `iface/rnode.rs` against
+  genuine firmware 1.86 and 1.80**: detect burst responses (fw 1.86,
+  platform 0x80, MCU 0x81), configuration echo with real SX1262
+  frequency quantization (867,500,000 → 867,499,996 — the ±100 Hz
+  validation tolerance is correct), battery/temperature telemetry,
+  radio-state reporting
 
-**Result:** the device answers detect (fw 1.86, platform 0x80, MCU
-0x81), echoes configuration with real SX1262 frequency quantization and
-streams battery/temperature telemetry — the entire serial command path
-of `iface/rnode.rs` was validated against genuine firmware and silicon.
-The radio itself does not come up on this board: firmware
-`device_init()` requires `bt_ready`, and the ESP32-S3 BLE bring-up
-(`btStart`/bluedroid) fails silently in this firmware line (see upstream
-issue #73 — "serial only … BLE is not fleshed out"), so `hw_ready` stays
-false and the radio reports offline. **The reference Python
-`RNodeInterface` fails identically on this hardware**, which is parity —
-our implementation matches the reference behaviour exactly.
+**What did not come up, and why (evidence-backed):**
+the radio never reports online. In this firmware line the radio is
+gated by `device_init()`, which requires `bt_ready`; `bt_ready` requires
+`btStart()` to succeed. Probes performed:
+* `CMD_HASHES` (target + calculated firmware hashes) and `CMD_DEV_HASH`
+  return zeros → `device_init()`'s body never executes → `bt_ready` is
+  false
+* with the BT-enable byte set and a hard reset, no BLE advertisement
+  appears on a scan with a working adapter (neighbors do) → the BT
+  controller does not come up on this unit
+* the **reference Python `RNodeInterface` fails identically** on this
+  device ("Radio reporting state is offline") — behaviour parity with
+  our port is exact
+
+This is a board/unit bring-up condition (BT controller init), not a
+board-support gap and not a defect in the port. Candidate causes on
+this unit: its prior life as a Meshtastic node (NVS state), a
+hardware/revision variant (this board exposes a CP2102 UART bridge), or
+a firmware BLE bring-up issue on S3. A factory-fresh Heltec V3 (or any
+classic-RNode board) provisioned via `rnodeconf --autoinstall` should
+be used to complete tier-4 radio validation; the env-gated tests in
+`tests/hardware_rnode.rs` need no changes for that.
 
 The device was restored to its original firmware from the backup:
 
@@ -91,9 +113,10 @@ hw-backup/heltec_v3_meshtastic_2.7.5_backup.bin   # full 8 MB image
 uv tool run esptool --port /dev/ttyUSB2 --baud 921600 write-flash 0x0 hw-backup/heltec_v3_meshtastic_2.7.5_backup.bin
 ```
 
-Reprovisioning notes (for when a suitable single-band RNode is
-available): `hw-backup/bootstrap_eeprom.py` shows the EEPROM identity
-layout; the ESP32-S3 bootloader offset pitfall is the one that bites.
+Reprovisioning notes: `hw-backup/bootstrap_eeprom.py` shows the EEPROM
+identity layout (plus the `ADDR_CONF_BT` byte and `CMD_FW_HASH`
+handshake used above); the ESP32-S3 bootloader offset pitfall is the one
+that bites.
 
 ## I2P and Backbone hardware
 
