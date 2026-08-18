@@ -12,7 +12,14 @@ pub struct LinkEntry {
     pub original_destination: AddressHash,
     pub remaining_hops: u8,
     pub validated: bool,
+    /// Last forwarded activity; validated entries expire when idle
+    /// (Python removes them after LINK_TIMEOUT).
+    pub last_activity: Instant,
 }
+
+/// Idle lifetime of a validated intermediary link
+/// (Python `LINK_TIMEOUT` = `STALE_TIME * 1.25` = 30 min).
+const LINK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn send_backwards(packet: &Packet, entry: &LinkEntry) -> (Packet, AddressHash) {
     let propagated = Packet {
@@ -60,7 +67,8 @@ impl LinkTable {
             received_from,
             original_destination: destination,
             remaining_hops: 0,
-            validated: false
+            validated: false,
+            last_activity: now,
         };
 
         self.0.insert(link_id, entry);
@@ -70,8 +78,10 @@ impl LinkTable {
         self.0.get(link_id).filter(|e| e.validated).map(|e| e.original_destination)
     }
 
-    pub fn handle_keepalive(&self, packet: &Packet) -> Option<(Packet, AddressHash)> {
-        self.0.get(&packet.destination).map(|entry| send_backwards(packet, entry))
+    pub fn handle_keepalive(&mut self, packet: &Packet) -> Option<(Packet, AddressHash)> {
+        let entry = self.0.get_mut(&packet.destination)?;
+        entry.last_activity = Instant::now();
+        Some(send_backwards(packet, entry))
     }
 
     pub fn handle_proof(&mut self, proof: &Packet) -> Option<(Packet, AddressHash)> {
@@ -92,7 +102,12 @@ impl LinkTable {
 
         for (link_id, entry) in &self.0 {
             if entry.validated {
-                // TODO remove active timed out links
+                // Validated entries expire after LINK_TIMEOUT of inactivity
+                // (Python `LINK_TIMEOUT`; without this, unbounded unique
+                // links accumulate until process restart).
+                if now.saturating_duration_since(entry.last_activity) > LINK_TIMEOUT {
+                    stale.push(*link_id);
+                }
             } else if entry.proof_timeout <= now {
                 stale.push(*link_id);
             }

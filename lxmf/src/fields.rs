@@ -349,6 +349,11 @@ impl FieldValue {
             Marker::FixMap(_) | Marker::Map16 | Marker::Map32 => {
                 let len = rmp::decode::read_map_len(rd)
                     .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))? as usize;
+                // Same bound as arrays: each entry needs at least two
+                // input bytes (key + value markers).
+                if len.saturating_mul(2) > rd.len() {
+                    return Err(LxmfError::InvalidFormat);
+                }
                 let mut entries = Vec::with_capacity(len);
                 for _ in 0..len {
                     let key = FieldValue::unpack(rd)?;

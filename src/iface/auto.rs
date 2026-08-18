@@ -535,7 +535,7 @@ impl AutoInterface {
         // spawned AutoPeer interfaces, so each peer must inherit it or the
         // configured networkname/passphrase protection silently applies to
         // nothing (Python AutoPeer copies the parent's ifac_* attributes).
-        let parent_ifac = *context.channel.ifac.read().expect("ifac lock");
+        let parent_ifac = context.channel.ifac.read().expect("ifac lock").clone();
 
         // The AutoInterface itself never carries data (Python
         // `process_outgoing` is a pass); drain manager tx messages, peers
@@ -747,6 +747,7 @@ impl AutoInterface {
                                         &mut peers,
                                         src_addr,
                                         &ifname,
+                                        &parent_ifac,
                                     )
                                     .await;
                                 }

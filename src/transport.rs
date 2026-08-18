@@ -877,13 +877,16 @@ impl Transport {
 
         let link = Arc::new(Mutex::new(link));
 
-        self.send_packet(packet).await;
-
+        // Register BEFORE sending: a fast proof arriving between the send
+        // and the insert would find no outbound link and be discarded
+        // (Python registers the pending link before its request goes out).
         self.handler
             .lock()
             .await
             .out_links
             .insert(destination.address_hash, link.clone());
+
+        self.send_packet(packet).await;
 
         link
     }
@@ -2121,7 +2124,7 @@ async fn send_to_next_hop<'a>(
 
 async fn handle_keepalive_response<'a>(
     packet: &Packet,
-    handler: &MutexGuard<'a, TransportHandler>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     if packet.context == PacketContext::KeepAlive
         && packet.data.as_slice().first() == Some(&KEEP_ALIVE_RESPONSE)
@@ -2292,32 +2295,43 @@ async fn send_response<'a>(
 }
 
 async fn handle_incoming_request<'a>(
-    link: &Arc<Mutex<Link>>,
+    link_arc: &Arc<Mutex<Link>>,
     rid: AddressHash,
     requested_at: f64,
     path_hash: AddressHash,
     request_data: Vec<u8>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
-    let link = link.lock().await;
+    let link = link_arc.lock().await;
     let destination = link.destination().address_hash;
     let remote_identity = link.remote_identity();
 
-    // Async handlers are awaited directly on this task.
+    // Async handlers run WITHOUT the transport/link locks held: snapshot
+    // the inputs, drop the link guard, run the future on the runtime, and
+    // send the response afterwards. Awaiting user code while holding both
+    // locks deadlocked any handler that re-entered transport APIs
+    // (send_packet/request/send_resource) and stalled all packet
+    // processing for slow handlers.
     if let Some(async_fn) = handler
         .resources
         .async_request_handler(&destination, &path_hash)
     {
-        if let Some(response) = async_fn(RequestCtx {
+        let link_id = *link.id();
+        let _mdu = link.mdu();
+        drop(link);
+
+        let response = async_fn(RequestCtx {
             path_hash,
             data: request_data,
             request_id: rid,
-            link_id: *link.id(),
+            link_id,
             remote_identity,
             requested_at,
         })
-        .await
-        {
+        .await;
+
+        if let Some(response) = response {
+            let link = link_arc.lock().await;
             send_response(&link, &rid, &response, handler).await;
         }
         return;
@@ -2571,7 +2585,7 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
             }
         }
 
-        if !local_out_link_handled && handle_keepalive_response(packet, &handler).await {
+        if !local_out_link_handled && handle_keepalive_response(packet, &mut handler).await {
             return;
         }
 
@@ -3602,6 +3616,26 @@ async fn manage_transport(
                             message.address
                         ).await {
                             continue;
+                        }
+
+                        // Filter packets in transport addressed to other
+                        // instances (Python `packet_filter`): directed
+                        // type-2 data must not be processed by every
+                        // router that hears it.
+                        if packet.header.header_type == HeaderType::Type2
+                            && packet.header.packet_type != PacketType::Announce
+                        {
+                            if let Some(transport_id) = packet.transport {
+                                let own = *handler.config.identity.address_hash();
+                                if transport_id != own {
+                                    log::trace!(
+                                        "tp({}): ignored packet in transport for other instance {}",
+                                        handler.config.name,
+                                        transport_id
+                                    );
+                                    continue;
+                                }
+                            }
                         }
 
                         if !handler.filter_duplicate_packets(&packet).await {

@@ -376,7 +376,13 @@ impl RnodeParser {
             }
 
             let Some(byte) = self.unescape(byte) else { continue };
-            self.data_buffer.push(byte);
+
+            // Bound the accumulating frame: a malicious TCP endpoint can
+            // stream unterminated bytes indefinitely (Python caps
+            // data_buffer at HW_MTU).
+            if self.data_buffer.len() < 2048 {
+                self.data_buffer.push(byte);
+            }
         }
     }
 
