@@ -9,6 +9,9 @@ pub mod udp;
 
 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
 pub mod auto;
+pub mod backbone;
+#[cfg(feature = "iface-i2p")]
+pub mod i2p;
 #[cfg(feature = "iface-serial")]
 pub mod ax25;
 #[cfg(feature = "iface-serial")]
@@ -383,6 +386,23 @@ impl InterfaceManager {
     pub fn set_iface_wants_tunnel(&self, address: &AddressHash, wants: bool) -> bool {
         self.with_control(address, |control| control.wants_tunnel = wants)
             .is_some()
+    }
+
+    /// Addresses of interfaces currently requesting tunnel synthesis
+    /// (Python `Interface.wants_tunnel`).
+    pub fn interfaces_wanting_tunnel(&self) -> Vec<AddressHash> {
+        let controls = self.controls.lock().expect("iface control lock");
+        self.ifaces
+            .iter()
+            .filter(|iface| {
+                !iface.stop.is_cancelled()
+                    && controls
+                        .get(&iface.address)
+                        .map(|control| control.wants_tunnel)
+                        .unwrap_or(false)
+            })
+            .map(|iface| iface.address)
+            .collect()
     }
 
     /// The tunnel id an interface is bound to, if any.

@@ -114,6 +114,46 @@ pub enum InterfaceConfig {
         forward_ip: String,
         forward_port: u16,
     },
+    I2PInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        /// Published peers to connect to (base64 destinations).
+        #[serde(default)]
+        peers: Vec<String>,
+        /// Accept inbound streams and publish this instance's
+        /// destination (Python `connectable`).
+        #[serde(default)]
+        connectable: bool,
+        /// SAM bridge address (default 127.0.0.1:7656).
+        sam_address: Option<String>,
+    },
+    BackboneInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        listen_ip: String,
+        #[serde(alias = "listen_port")]
+        bind_port: u16,
+        /// Block fast-flapping remote connections
+        /// (Python `block_fast_flapping`).
+        #[serde(default = "default_backbone_flap_block")]
+        block_fast_flapping: bool,
+        /// Fast-flap threshold in seconds (Python
+        /// `fast_flapping_threshold`).
+        fast_flapping_threshold: Option<f64>,
+        /// Allowed fast flaps before blocking (Python
+        /// `fast_flapping_grace`).
+        fast_flapping_grace: Option<u32>,
+        /// Fast-flap block expiry in minutes (Python
+        /// `fast_flapping_block_time`).
+        fast_flapping_block_time: Option<f64>,
+    },
+    BackboneClientInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        #[serde(alias = "target_host")]
+        target_ip: String,
+        target_port: u16,
+    },
     AutoInterface {
         #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
@@ -138,13 +178,6 @@ pub enum InterfaceConfig {
         /// Deny-list of interface names (`ignored_devices`, comma-separated)
         #[serde(default)]
         ignored_devices: Option<String>,
-    },
-    I2PInterface {
-        #[serde(default = "default_true")]
-        enabled: bool,
-        #[serde(default)]
-        connectable: bool,
-        peers: String,
     },
     RNodeInterface {
         #[serde(default = "default_true", alias = "interface_enabled")]
@@ -249,6 +282,10 @@ pub enum InterfaceConfig {
 }
 
 fn default_true() -> bool {
+    true
+}
+
+fn default_backbone_flap_block() -> bool {
     true
 }
 fn default_serial_speed() -> u32 {

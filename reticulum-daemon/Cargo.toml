@@ -23,6 +23,7 @@ reticulum-utils = { path = "../reticulum-utils" }
 iface-serial = ["reticulum/iface-serial"]
 iface-pipe = ["reticulum/iface-pipe"]
 iface-auto = ["reticulum/iface-auto"]
+iface-i2p = ["reticulum/iface-i2p"]
 
 [[bin]]
 name = "rs-rnsd"

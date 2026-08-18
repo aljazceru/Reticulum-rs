@@ -159,6 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InterfaceConfig::UDPInterface { enabled, .. } => *enabled,
             InterfaceConfig::AutoInterface { enabled, .. } => *enabled,
             InterfaceConfig::I2PInterface { enabled, .. } => *enabled,
+            InterfaceConfig::BackboneInterface { enabled, .. } => *enabled,
+            InterfaceConfig::BackboneClientInterface { enabled, .. } => *enabled,
             InterfaceConfig::RNodeInterface { enabled, .. } => *enabled,
             InterfaceConfig::BLEInterface { enabled, .. } => *enabled,
             InterfaceConfig::KISSInterface { enabled, .. } => *enabled,
@@ -303,11 +305,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            InterfaceConfig::I2PInterface { .. } => {
-                log::warn!(
-                    "Interface '{}' type 'I2PInterface' is not yet supported",
-                    iface.name
+            InterfaceConfig::I2PInterface { peers, connectable, sam_address, .. } => {
+                #[cfg(feature = "iface-i2p")]
+                {
+                    let sam_addr = sam_address
+                        .clone()
+                        .unwrap_or_else(|| "127.0.0.1:7656".to_string());
+
+                    if *connectable {
+                        log::info!(
+                            "Enabling interface '{}': I2P server (connectable) via SAM {}",
+                            iface.name,
+                            sam_addr
+                        );
+                        let session_id = format!("{}-{}", iface.name, std::process::id());
+                        iface_manager.lock().await.spawn_named(
+                            &iface.name,
+                            reticulum::iface::i2p::I2pServer::new(
+                                sam_addr.clone(),
+                                session_id,
+                                iface_manager.clone(),
+                            ),
+                            reticulum::iface::i2p::I2pServer::spawn,
+                        );
+                    }
+
+                    for (index, peer) in peers.iter().enumerate() {
+                        log::info!(
+                            "Enabling interface '{}': I2P peer {index} via SAM {}",
+                            iface.name,
+                            sam_addr
+                        );
+                        let session_id = format!("{}-{}-{index}", iface.name, std::process::id());
+                        let address = iface_manager.lock().await.spawn_named(
+                            &format!("{}-peer-{index}", iface.name),
+                            reticulum::iface::i2p::I2pPeer::new_initiator(
+                                &sam_addr,
+                                &session_id,
+                                peer,
+                            )
+                            .with_manager(iface_manager.clone()),
+                            reticulum::iface::i2p::I2pPeer::spawn,
+                        );
+                        configure_iface(&iface_manager, &address, iface).await;
+                    }
+
+                    if !*connectable && peers.is_empty() {
+                        log::warn!(
+                            "Interface '{}' (I2P) has neither connectable = yes nor peers",
+                            iface.name
+                        );
+                    }
+                }
+
+                #[cfg(not(feature = "iface-i2p"))]
+                {
+                    let _ = (peers, connectable, sam_address);
+                    log::warn!(
+                        "Interface '{}' type 'I2PInterface' requires building the daemon with --features iface-i2p",
+                        iface.name
+                    );
+                }
+            }
+            InterfaceConfig::BackboneInterface {
+                listen_ip, bind_port, block_fast_flapping, fast_flapping_threshold,
+                fast_flapping_grace, fast_flapping_block_time, ..
+            } => {
+                let addr = format!("{}:{}", listen_ip.trim_end_matches(':'), bind_port);
+
+                let table = reticulum::iface::backbone::FastFlapTable::new(
+                    *block_fast_flapping,
+                    fast_flapping_threshold
+                        .map(|seconds| std::time::Duration::from_secs_f64(seconds.max(0.1)))
+                        .unwrap_or(reticulum::iface::backbone::FAST_FLAP_THRESHOLD),
+                    fast_flapping_grace
+                        .unwrap_or(reticulum::iface::backbone::FAST_FLAP_GRACE),
+                    fast_flapping_block_time
+                        .map(|minutes| std::time::Duration::from_secs_f64(minutes.max(0.1) * 60.0))
+                        .unwrap_or(reticulum::iface::backbone::FAST_FLAP_EXPIRY),
                 );
+
+                log::info!("Enabling interface '{}': Backbone server on {}", iface.name, addr);
+                let address = iface_manager.lock().await.spawn_named(
+                    &iface.name,
+                    reticulum::iface::backbone::BackboneServer::new(
+                        addr,
+                        iface_manager.clone(),
+                        std::sync::Arc::new(tokio::sync::Mutex::new(table)),
+                    ),
+                    reticulum::iface::backbone::BackboneServer::spawn,
+                );
+                configure_iface(&iface_manager, &address, iface).await;
+            }
+            InterfaceConfig::BackboneClientInterface { target_ip, target_port, .. } => {
+                let addr = format!("{}:{}", target_ip.trim_end_matches(':'), target_port);
+                log::info!("Enabling interface '{}': Backbone client to {}", iface.name, addr);
+                let address = iface_manager.lock().await.spawn_named(
+                    &iface.name,
+                    reticulum::iface::backbone::BackboneClient::new(addr)
+                        .with_manager(iface_manager.clone()),
+                    reticulum::iface::backbone::BackboneClient::spawn,
+                );
+                configure_iface(&iface_manager, &address, iface).await;
             }
             InterfaceConfig::RNodeInterface { .. } => {
                 log::warn!(

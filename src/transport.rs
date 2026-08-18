@@ -3408,6 +3408,54 @@ async fn manage_transport(
                         for message in messages {
                             handler.send(message).await;
                         }
+
+                        // Interfaces that came up (I2P peers, backbone
+                        // clients, RNodeMulti transports) request tunnel
+                        // synthesis via `wants_tunnel`
+                        // (Python `Transport.synthesize_tunnel`).
+                        let synth = {
+                            let manager = handler.iface_manager.lock().await;
+                            manager.interfaces_wanting_tunnel()
+                        };
+                        for iface in synth {
+                            let already_bound = handler
+                                .iface_manager
+                                .lock()
+                                .await
+                                .iface_tunnel(&iface)
+                                .is_some();
+                            if already_bound {
+                                continue;
+                            }
+
+                            let transport_id =
+                                if handler.config.retransmit {
+                                    Some(*handler.config.identity.address_hash())
+                                } else {
+                                    None
+                                };
+
+                            let packet = tunnels::synthesize_tunnel_packet(
+                                &handler.config.identity,
+                                &iface,
+                                handler.fixed_dest_tunnel_synthesize,
+                                transport_id,
+                            );
+
+                            handler.iface_manager.lock().await.set_iface_wants_tunnel(&iface, false);
+
+                            log::debug!(
+                                "tp({}): synthesizing tunnel for interface {iface}",
+                                handler.config.name
+                            );
+
+                            handler
+                                .send(TxMessage {
+                                    tx_type: TxMessageType::Direct(iface),
+                                    packet,
+                                })
+                                .await;
+                        }
                     }
                 }
             }
