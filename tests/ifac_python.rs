@@ -107,7 +107,9 @@ async fn ifac_protected_tcp_exchange_with_python() {
         let manager = transport.iface_manager();
         let mut manager = manager.lock().await;
         let address = manager.spawn(TcpClient::new("127.0.0.1:4381"), TcpClient::spawn);
-        manager.set_iface_ifac(&address, None, Some(PASSPHRASE), IFAC_BYTES);
+        manager
+            .set_iface_ifac(&address, None, Some(PASSPHRASE), IFAC_BYTES)
+            .expect("valid IFAC");
         address
     };
 
@@ -176,7 +178,9 @@ async fn ifac_rejects_packets_without_the_passphrase() {
             UdpInterface::new("127.0.0.1:4392", Some("127.0.0.1:4393"), true),
             UdpInterface::spawn,
         );
-        manager.set_iface_ifac(&address, Some("private-net"), None, DEFAULT_IFAC_SIZE);
+        manager
+            .set_iface_ifac(&address, Some("private-net"), None, DEFAULT_IFAC_SIZE)
+            .expect("valid IFAC");
         address
     };
 
@@ -215,7 +219,9 @@ async fn ifac_rejects_packets_without_the_passphrase() {
         drop(manager);
         let manager = sender.iface_manager();
         let manager = manager.lock().await;
-        manager.set_iface_ifac(&address, Some("private-net"), None, DEFAULT_IFAC_SIZE);
+        manager
+            .set_iface_ifac(&address, Some("private-net"), None, DEFAULT_IFAC_SIZE)
+            .expect("valid IFAC");
     }
 
     let destination = SingleInputDestination::new(
@@ -233,5 +239,5 @@ async fn ifac_rejects_packets_without_the_passphrase() {
     );
 
     let _ = recv_iface;
-    let _ = IfacKey::derive(None, None, 1);
+    let _ = IfacKey::derive(None, None, 1).expect("valid IFAC");
 }

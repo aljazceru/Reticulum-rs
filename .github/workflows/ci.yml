@@ -65,3 +65,23 @@ jobs:
           cargo test -p reticulum-core --all-targets --no-default-features --features="embassy-time"
           # bzip2 compression matrix for resources
           cargo test -p reticulum --features bz2 --test resource_transfer
+
+  windows-storage:
+    runs-on: windows-latest
+    needs: check
+    timeout-minutes: 10
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95
+      - name: install protoc
+        uses: arduino/setup-protoc@v3
+      - name: test atomic storage replacement
+        run: cargo test -p reticulum --lib storage::tests::filesystem_writes_replace_existing_files_and_clean_temporaries

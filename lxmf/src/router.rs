@@ -21,13 +21,13 @@
 //! identification, and opportunistic packet delivery receipts (RNS packet
 //! proofs are not surfaced by the transport yet).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rand_core::OsRng;
-use reticulum::destination::link::{LinkEvent, LinkEventData, LinkStatus};
-use reticulum::destination::{DestinationDesc, SingleInputDestination};
+use reticulum::destination::link::{LinkEvent, LinkEventData, LinkId, LinkStatus};
+use reticulum::destination::{DestinationDesc, ProofStrategy, SingleInputDestination};
 use reticulum::hash::{AddressHash, Hash, HASH_SIZE};
 use reticulum::identity::{Identity, PrivateIdentity};
 use reticulum::packet::{
@@ -367,6 +367,8 @@ pub struct LxmRouter {
     propagation_destination: Arc<Mutex<SingleInputDestination>>,
     propagation_destination_hash: AddressHash,
     delivery: Mutex<Option<DeliveryDestination>>,
+    /// Inbound links activated specifically for our delivery destination.
+    delivery_links: Mutex<HashSet<LinkId>>,
     storage_path: PathBuf,
     message_path: PathBuf,
     name: Option<String>,
@@ -434,6 +436,7 @@ impl LxmRouter {
             let destination = transport
                 .add_destination(delivery_identity.clone(), delivery_name())
                 .await;
+            destination.lock().await.proof_strategy = ProofStrategy::All;
             let address_hash = destination.lock().await.desc.address_hash;
             state
                 .known_identities
@@ -460,6 +463,7 @@ impl LxmRouter {
             propagation_destination,
             propagation_destination_hash,
             delivery: Mutex::new(delivery_destination),
+            delivery_links: Mutex::new(HashSet::new()),
             storage_path,
             message_path,
             name: name.map(Into::into),
@@ -1933,11 +1937,7 @@ impl LxmRouter {
                 continue;
             }
 
-            let is_delivery_link = {
-                let delivery = self.delivery.lock().await;
-                delivery.as_ref().is_some()
-            };
-            if !is_delivery_link {
+            if !self.delivery_links.lock().await.contains(&event.link_id) {
                 continue;
             }
 
@@ -1964,6 +1964,16 @@ impl LxmRouter {
 
             match event.event {
                 LinkEvent::Activated => {
+                    let is_delivery_destination = {
+                        let delivery = self.delivery.lock().await;
+                        delivery
+                            .as_ref()
+                            .is_some_and(|dest| event.address_hash == dest.address_hash)
+                    };
+                    if !is_delivery_destination {
+                        continue;
+                    }
+                    self.delivery_links.lock().await.insert(event.id);
                     // Make the responder side prove link data packets so
                     // that senders receive delivery receipts, and accept
                     // resource transfers (large messages arrive as
@@ -1990,6 +2000,9 @@ impl LxmRouter {
                     self.lxmf_delivery(payload.as_slice(), Some(DIRECT), None, false, false)
                         .await
                         .ok();
+                }
+                LinkEvent::Closed => {
+                    self.delivery_links.lock().await.remove(&event.id);
                 }
                 _ => {}
             }

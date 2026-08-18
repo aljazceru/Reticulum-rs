@@ -141,6 +141,12 @@ struct ShArgs {
     /// Run a session listener
     #[arg(short, long)]
     serve: bool,
+    /// Accept shell sessions from anyone.
+    #[arg(short = 'A', long)]
+    allow_all: bool,
+    /// Allow this identity hash (repeatable).
+    #[arg(short = 'a', long = "allowed")]
+    allowed: Vec<String>,
     /// Run one command in a session
     #[arg(short, long)]
     command: Option<String>,
@@ -632,10 +638,17 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
     init_logging(1);
 
     let udp_loopback = parse_udp_pair(args.udp_loopback.as_deref());
+    let allowed = args
+        .allowed
+        .iter()
+        .map(|hash| parse_hash(hash).map_err(|err| err.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     if args.serve {
         let options = reticulum_utils::rnsh::ServeOptions {
             config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+            allow_all: args.allow_all,
+            allowed,
             udp_loopback,
         };
 
@@ -657,6 +670,8 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
 
     let options = reticulum_utils::rnsh::ServeOptions {
         config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+        allow_all: false,
+        allowed: Vec::new(),
         udp_loopback,
     };
 

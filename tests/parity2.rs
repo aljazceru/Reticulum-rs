@@ -38,6 +38,10 @@ async fn pair(ports: (u16, u16)) -> (Transport, Transport, Arc<Mutex<Link>>) {
     let destination = server
         .add_destination(server_identity, DestinationName::new("test", "proofs"))
         .await;
+    destination
+        .lock()
+        .await
+        .set_proof_strategy(ProofStrategy::All);
     let hash = destination.lock().await.desc.address_hash;
     server.send_announce(&destination, None).await;
 
@@ -75,7 +79,7 @@ async fn proof_strategy_prove_all_delivers_proofs() {
     let (server, client, link) = pair((4611, 4612)).await;
     let _ = server;
 
-    // Default strategy is PROVE_ALL: sending data must produce a Proof event
+    // The test destination explicitly uses PROVE_ALL.
     let mut events = client.out_link_events();
     let packet = link.lock().await.data_packet(b"prove me").expect("packet");
     client.send_packet(packet).await;

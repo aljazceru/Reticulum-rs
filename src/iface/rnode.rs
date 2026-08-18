@@ -73,8 +73,8 @@ pub const CMD_ERROR: u8 = 0x90;
 pub const DETECT_REQ: u8 = 0x73;
 pub const DETECT_RESP: u8 = 0x46;
 
-pub const RADIO_STATE_ON: u8 = 0x08;
-pub const RADIO_STATE_OFF: u8 = 0x09;
+pub const RADIO_STATE_ON: u8 = 0x01;
+pub const RADIO_STATE_OFF: u8 = 0x00;
 
 /// RSSI is reported as `byte - RSSI_OFFSET` dBm
 /// (Python `RSSI_OFFSET`).
@@ -487,6 +487,31 @@ pub struct RnodeShared {
     pub interface_ready: bool,
 }
 
+async fn wait_for_interface_ready(
+    state: &SharedRnodeState,
+    cancel: &tokio_util::sync::CancellationToken,
+    link_cancel: &tokio_util::sync::CancellationToken,
+) -> bool {
+    loop {
+        if state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .interface_ready
+        {
+            return true;
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return false,
+            _ = link_cancel.cancelled() => return false,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+    }
+}
+
+fn vport_transmit_frames(index: u8, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    (kiss_frame(CMD_SEL_INT, &[index]), kiss_frame(CMD_DATA, data))
+}
+
 /// One open link to an RNode device: serial or TCP
 /// (Python serial / `use_tcp` modes).
 pub struct RnodeLink {
@@ -662,6 +687,8 @@ pub struct RnodeInterface {
     pub serial_port: Option<String>,
     pub baudrate: u32,
     pub config: RnodeRadioConfig,
+    /// Require a CMD_READY notification before each transmission.
+    pub flow_control: bool,
     /// Interface manager of the owning transport (tunnel synthesis).
     pub iface_manager: Option<Arc<tokio::sync::Mutex<InterfaceManager>>>,
     /// Shared radio state, exposed to embedders for diagnostics.
@@ -675,6 +702,7 @@ impl RnodeInterface {
             serial_port: None,
             baudrate: 115200,
             config,
+            flow_control: false,
             iface_manager: None,
             state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
         }
@@ -687,6 +715,7 @@ impl RnodeInterface {
             serial_port: Some(port.into()),
             baudrate,
             config,
+            flow_control: false,
             iface_manager: None,
             state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
         }
@@ -694,6 +723,11 @@ impl RnodeInterface {
 
     pub fn with_manager(mut self, manager: Arc<tokio::sync::Mutex<InterfaceManager>>) -> Self {
         self.iface_manager = Some(manager);
+        self
+    }
+
+    pub fn with_flow_control(mut self, flow_control: bool) -> Self {
+        self.flow_control = flow_control;
         self
     }
 
@@ -746,7 +780,10 @@ impl RnodeInterface {
             };
             let mut link = link;
 
-            let config = { context.inner.lock().unwrap().config.clone() };
+            let (config, flow_control) = {
+                let inner = context.inner.lock().unwrap();
+                (inner.config.clone(), inner.flow_control)
+            };
 
             // Detection + firmware + radio validation
             // (Python connect sequence).
@@ -769,9 +806,11 @@ impl RnodeInterface {
 
             let mut writer = link.writer;
             let mut reader = link.reader;
+            let link_cancel = tokio_util::sync::CancellationToken::new();
 
             let rx_task = {
                 let cancel = context.cancel.clone();
+                let link_cancel = link_cancel.clone();
                 let stats = stats.clone();
                 let rx_channel = rx_channel.clone();
                 let state = state.clone();
@@ -783,6 +822,7 @@ impl RnodeInterface {
                     loop {
                         let closed = tokio::select! {
                             _ = cancel.cancelled() => true,
+                            _ = link_cancel.cancelled() => true,
                             result = reader.read(&mut buffer) => match result {
                                 Ok(0) | Err(_) => true,
                                 Ok(n) => {
@@ -824,6 +864,7 @@ impl RnodeInterface {
                         };
 
                         if closed {
+                            link_cancel.cancel();
                             break;
                         }
                     }
@@ -832,52 +873,83 @@ impl RnodeInterface {
 
             let tx_task = {
                 let cancel = context.cancel.clone();
+                let link_cancel = link_cancel.clone();
                 let stats = stats.clone();
                 let state = state.clone();
-                let mut tx_channel = tx_channel_slot.take().unwrap();
+                let tx_channel = tx_channel_slot.take();
 
                 tokio::spawn(async move {
+                    let mut tx_channel = tx_channel?;
                     loop {
                         let mut buffer = [0u8; 2048];
 
                         let message = tokio::select! {
                             _ = cancel.cancelled() => break,
+                            _ = link_cancel.cancelled() => break,
                             message = tx_channel.recv() => match message {
                                 Some(message) => message,
                                 None => break,
                             },
                         };
 
-                        // Flow control: wait for interface readiness
-                        // (Python CMD_READY handling).
-                        loop {
-                            let ready = state
-                                .read()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .interface_ready;
-                            if ready {
-                                break;
+                        if flow_control {
+                            // Flow control: wait for interface readiness
+                            // (Python CMD_READY handling).
+                            if !wait_for_interface_ready(&state, &cancel, &link_cancel).await {
+                                return Some(tx_channel);
                             }
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
 
                         let packet = message.packet;
                         let mut output = OutputBuffer::new(&mut buffer[..]);
                         if packet.serialize(&mut output).is_ok() {
                             let frame = kiss_frame(CMD_DATA, output.as_slice());
-                            if writer.write_all(&frame).await.is_ok() {
-                                let _ = writer.flush().await;
+                            if writer.write_all(&frame).await.is_ok()
+                                && writer.flush().await.is_ok()
+                            {
                                 stats.count_tx(output.offset());
+                                if flow_control {
+                                    state
+                                        .write()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .interface_ready = false;
+                                }
                             } else {
+                                link_cancel.cancel();
                                 break;
                             }
                         }
                     }
+
+                    Some(tx_channel)
                 })
             };
 
-            let _ = tokio::join!(tx_task, rx_task);
+            let mut rx_task = rx_task;
+            let mut tx_task = tx_task;
+            let tx_result = tokio::select! {
+                _ = &mut rx_task => {
+                    link_cancel.cancel();
+                    tx_task.await
+                }
+                result = &mut tx_task => {
+                    link_cancel.cancel();
+                    let _ = rx_task.await;
+                    result
+                }
+                _ = context.cancel.cancelled() => {
+                    link_cancel.cancel();
+                    let _ = rx_task.await;
+                    tx_task.await
+                }
+            };
+            if let Ok(Some(tx_channel)) = tx_result {
+                tx_channel_slot = Some(tx_channel);
+            }
             stats.set_online(false);
+            if context.cancel.is_cancelled() {
+                break;
+            }
             log::warn!("rnode: device link lost, reconnecting");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
@@ -1075,11 +1147,13 @@ impl RnodeMultiInterface {
                 "rnode_multi: device online with {} virtual ports",
                 vports.len()
             );
+            let link_cancel = tokio_util::sync::CancellationToken::new();
 
             // Writer pump: vport peers submit packets through the
             // channel; each is framed with its port's data command.
             let writer_task = {
                 let cancel = context.cancel.clone();
+                let link_cancel = link_cancel.clone();
                 let stats = stats.clone();
                 let mut writer = link.writer;
                 let mut vport_rx = vport_rx;
@@ -1088,6 +1162,7 @@ impl RnodeMultiInterface {
                     loop {
                         let outgoing = tokio::select! {
                             _ = cancel.cancelled() => break,
+                            _ = link_cancel.cancelled() => break,
                             outgoing = vport_rx.recv() => match outgoing {
                                 Some(outgoing) => outgoing,
                                 None => break,
@@ -1095,15 +1170,17 @@ impl RnodeMultiInterface {
                         };
 
                         let (index, data) = outgoing;
-                        let command = CMD_INT_DATA
-                            .get(index as usize)
-                            .copied()
-                            .unwrap_or(CMD_DATA);
-                        let frame = kiss_frame(command, &data);
-                        if writer.write_all(&frame).await.is_ok() {
-                            let _ = writer.flush().await;
+                        // RNodeMulti selects a virtual interface first; data
+                        // itself is always transmitted with the normal data
+                        // command. Per-port data commands are receive-only.
+                        let (select, frame) = vport_transmit_frames(index, &data);
+                        if writer.write_all(&select).await.is_ok()
+                            && writer.write_all(&frame).await.is_ok()
+                            && writer.flush().await.is_ok()
+                        {
                             stats.count_tx(data.len());
                         } else {
+                            link_cancel.cancel();
                             break;
                         }
                     }
@@ -1114,6 +1191,7 @@ impl RnodeMultiInterface {
             // spawned vport peers by their data command.
             let reader_task = {
                 let cancel = context.cancel.clone();
+                let link_cancel = link_cancel.clone();
                 let mut reader = link.reader;
                 let state = state.clone();
                 let inbound = inbound.clone();
@@ -1125,6 +1203,7 @@ impl RnodeMultiInterface {
                     loop {
                         let closed = tokio::select! {
                             _ = cancel.cancelled() => true,
+                            _ = link_cancel.cancelled() => true,
                             result = reader.read(&mut buffer) => match result {
                                 Ok(0) | Err(_) => true,
                                 Ok(n) => {
@@ -1160,14 +1239,34 @@ impl RnodeMultiInterface {
                         };
 
                         if closed {
+                            link_cancel.cancel();
                             break;
                         }
                     }
                 })
             };
 
-            let _ = tokio::join!(writer_task, reader_task);
+            let mut writer_task = writer_task;
+            let mut reader_task = reader_task;
+            tokio::select! {
+                _ = &mut writer_task => {
+                    link_cancel.cancel();
+                    let _ = reader_task.await;
+                }
+                _ = &mut reader_task => {
+                    link_cancel.cancel();
+                    let _ = writer_task.await;
+                }
+                _ = context.cancel.cancelled() => {
+                    link_cancel.cancel();
+                    let _ = writer_task.await;
+                    let _ = reader_task.await;
+                }
+            }
             stats.set_online(false);
+            if context.cancel.is_cancelled() {
+                break;
+            }
             log::warn!("rnode_multi: device link lost, reconnecting");
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         }
@@ -1257,3 +1356,50 @@ impl Interface for RnodeVportPeer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radio_state_and_multi_transmit_frames_match_protocol() {
+        assert_eq!(RADIO_STATE_ON, 0x01);
+        assert_eq!(RADIO_STATE_OFF, 0x00);
+
+        let (select, data) = vport_transmit_frames(3, b"payload");
+        assert_eq!(select, kiss_frame(CMD_SEL_INT, &[3]));
+        assert_eq!(data, kiss_frame(CMD_DATA, b"payload"));
+        assert_ne!(data, kiss_frame(CMD_INT_DATA[3], b"payload"));
+    }
+
+    #[tokio::test]
+    async fn flow_control_waits_for_each_ready_event_and_observes_cancellation() {
+        let state = Arc::new(std::sync::RwLock::new(RnodeShared::default()));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let link_cancel = tokio_util::sync::CancellationToken::new();
+
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            let cancel = cancel.clone();
+            let link_cancel = link_cancel.clone();
+            async move { wait_for_interface_ready(&state, &cancel, &link_cancel).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished());
+        state.write().unwrap().interface_ready = true;
+        assert!(waiter.await.unwrap());
+
+        // A successful transmission consumes readiness, so the next one
+        // blocks until another CMD_READY. Cancellation must still wake it.
+        state.write().unwrap().interface_ready = false;
+        let waiter = tokio::spawn({
+            let state = state.clone();
+            let cancel = cancel.clone();
+            let link_cancel = link_cancel.clone();
+            async move { wait_for_interface_ready(&state, &cancel, &link_cancel).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished());
+        link_cancel.cancel();
+        assert!(!waiter.await.unwrap());
+    }
+}

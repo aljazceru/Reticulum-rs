@@ -9,17 +9,19 @@
 //! requires a controlling terminal; the session protocol shape is
 //! identical.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand_core::OsRng;
 use reticulum::channel::Message;
-use reticulum::destination::DestinationName;
+use reticulum::destination::{DestinationName, ProofStrategy};
 use reticulum::hash::AddressHash;
-use reticulum::identity::PrivateIdentity;
+use reticulum::identity::Identity;
 use reticulum::transport::Transport;
-use crate::common::{build_tool_transport, resolve_config_dir, ToolTransportOptions};
+use crate::common::{
+    build_tool_transport, load_or_create_private_identity, resolve_config_dir, ToolTransportOptions,
+};
 use serde::{Deserialize, Serialize};
 
 pub const APP_NAME: &str = "rnsh";
@@ -54,6 +56,10 @@ impl Message for SessionMessage {
 /// Options for the shell listener (`rnsh --serve`).
 pub struct ServeOptions {
     pub config_dir: PathBuf,
+    /// Accept sessions from any identified or unidentified peer.
+    pub allow_all: bool,
+    /// Remote identities allowed to start shell sessions.
+    pub allowed: Vec<AddressHash>,
     pub udp_loopback: Option<(u16, u16)>,
 }
 
@@ -61,9 +67,20 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             config_dir: resolve_config_dir(None),
+            allow_all: false,
+            allowed: Vec::new(),
             udp_loopback: Some((5001, 5002)),
         }
     }
+}
+
+fn remote_authorized(
+    allow_all: bool,
+    allowed: &HashSet<AddressHash>,
+    remote: Option<&Identity>,
+) -> bool {
+    allow_all
+        || remote.is_some_and(|identity| allowed.contains(&identity.address_hash))
 }
 
 /// Run an `rnsh` listener. Returns the announced destination hash; the
@@ -80,31 +97,41 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
     );
 
     let identity_path = options.config_dir.join("storage/identities/rnsh");
-    let identity = load_or_create(&identity_path)?;
+    let (identity, _) = load_or_create_private_identity(&identity_path)
+        .map_err(|err| err.to_string())?;
 
     let destination = transport
         .add_destination(identity, DestinationName::new(APP_NAME, "shell"))
         .await;
+    destination
+        .lock()
+        .await
+        .set_proof_strategy(ProofStrategy::All);
     let address = destination.lock().await.desc.address_hash;
 
     // Establish a channel per incoming link and serve exec sessions.
     let event_transport = transport.clone();
+    let allow_all = options.allow_all;
+    let allowed: HashSet<AddressHash> = options.allowed.iter().copied().collect();
     tokio::spawn(async move {
         let mut link_events = event_transport.in_link_events();
         loop {
             let Ok(event) = link_events.recv().await else { return };
-            if !matches!(event.event, reticulum::destination::link::LinkEvent::Activated) {
-                continue;
-            }
-
-            // Serve the session on this link.
-            let session_transport = event_transport.clone();
-            let link_id = event.id;
-            tokio::spawn(async move {
-                if let Some(link) = find_link(&session_transport, link_id).await {
-                    run_session(session_transport, link).await;
+            match event.event {
+                reticulum::destination::link::LinkEvent::Activated if allow_all => {
+                    start_session(event_transport.clone(), event.id).await;
                 }
-            });
+                reticulum::destination::link::LinkEvent::RemoteIdentified(identity)
+                    if !allow_all && remote_authorized(false, &allowed, Some(&identity)) =>
+                {
+                    start_session(event_transport.clone(), event.id).await;
+                }
+                reticulum::destination::link::LinkEvent::RemoteIdentified(_) if !allow_all => {
+                    log::warn!("rnsh: unauthorized identity attempted a session");
+                    let _ = event_transport.link_close(event.id).await;
+                }
+                _ => {}
+            }
         }
     });
 
@@ -122,53 +149,73 @@ async fn find_link(
     transport.find_in_link(&link_id).await
 }
 
-async fn run_session(transport: Arc<Transport>, link: Arc<tokio::sync::Mutex<reticulum::destination::link::Link>>) {
+async fn start_session(
+    transport: Arc<Transport>,
+    link_id: reticulum::destination::link::LinkId,
+) {
+    let Some(link) = find_link(&transport, link_id).await else {
+        return;
+    };
     let (channel, mut receiver) = match transport.mk_channel::<SessionMessage>(link).await {
         Ok(pair) => pair,
         Err(_) => return,
     };
-    while let Ok(message) = receiver.recv().await {
-        if let SessionMessage::Command(command) = message {
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .output();
 
-            match output {
-                Ok(output) => {
-                    let _ = channel
-                        .send(&SessionMessage::Output(output.stdout))
+    tokio::spawn(async move {
+        while let Ok(message) = receiver.recv().await {
+            if let SessionMessage::Command(command) = message {
+                let output = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .output();
+
+                match output {
+                    Ok(output) => {
+                        if !output.stdout.is_empty()
+                            && !send_when_ready(
+                                &channel,
+                                SessionMessage::Output(output.stdout),
+                            )
+                            .await
+                        {
+                            break;
+                        }
+                        if !output.stderr.is_empty()
+                            && !send_when_ready(
+                                &channel,
+                                SessionMessage::Output(output.stderr),
+                            )
+                            .await
+                        {
+                            break;
+                        }
+                        let _ = send_when_ready(
+                            &channel,
+                            SessionMessage::Exit(output.status.code().unwrap_or(-1)),
+                        )
                         .await;
-                    let _ = channel
-                        .send(&SessionMessage::Output(output.stderr))
-                        .await;
-                    let _ = channel
-                        .send(&SessionMessage::Exit(output.status.code().unwrap_or(-1)))
-                        .await;
-                }
-                Err(_) => {
-                    let _ = channel.send(&SessionMessage::Exit(-1)).await;
+                    }
+                    Err(_) => {
+                        let _ = send_when_ready(&channel, SessionMessage::Exit(-1)).await;
+                    }
                 }
             }
         }
-    }
+    });
 }
 
-fn load_or_create(path: &std::path::Path) -> Result<PrivateIdentity, String> {
-    if path.exists() {
-        if let Ok(hex) = std::fs::read_to_string(path) {
-            if let Ok(identity) = PrivateIdentity::new_from_hex_string(hex.trim()) {
-                return Ok(identity);
-            }
+async fn send_when_ready(
+    channel: &reticulum::channel::Channel<SessionMessage>,
+    message: SessionMessage,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if channel.is_ready().await && channel.send(&message).await.is_ok() {
+            return true;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-
-    let identity = PrivateIdentity::new_from_rand(OsRng);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, identity.to_hex_string()).map_err(|e| e.to_string())?;
-    Ok(identity)
+    false
 }
 
 /// Run one command in a session on the remote listener
@@ -185,6 +232,9 @@ pub async fn run_command(
         udp_loopback: options.udp_loopback,
     })
     .await;
+    let identity_path = options.config_dir.join("storage/identities/rnsh");
+    let (client_identity, _) = load_or_create_private_identity(&identity_path)
+        .map_err(|err| err.to_string())?;
 
     if !transport
         .await_path(destination, Some(Duration::from_secs(15)), None)
@@ -208,6 +258,12 @@ pub async fn run_command(
 
     let mut events = transport.out_link_events();
     let _ = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
+    let identify = link
+        .lock()
+        .await
+        .identify(&client_identity)
+        .map_err(|err| format!("identify failed: {err:?}"))?;
+    transport.send_packet(identify).await;
 
     let (channel, mut receiver) = transport
         .mk_channel::<SessionMessage>(link)
@@ -230,4 +286,32 @@ pub async fn run_command(
     }
 
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand_core::OsRng;
+    use reticulum::identity::PrivateIdentity;
+
+    #[test]
+    fn authentication_is_deny_by_default_and_allow_all_is_explicit() {
+        let authorized = PrivateIdentity::new_from_rand(OsRng);
+        let unauthorized = PrivateIdentity::new_from_rand(OsRng);
+        let allowed = HashSet::from([*authorized.address_hash()]);
+
+        assert!(remote_authorized(
+            false,
+            &allowed,
+            Some(authorized.as_identity())
+        ));
+        assert!(!remote_authorized(
+            false,
+            &allowed,
+            Some(unauthorized.as_identity())
+        ));
+        assert!(!remote_authorized(false, &allowed, None));
+        assert!(!remote_authorized(false, &HashSet::new(), None));
+        assert!(remote_authorized(true, &HashSet::new(), None));
+    }
 }

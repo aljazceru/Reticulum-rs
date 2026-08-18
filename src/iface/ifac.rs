@@ -24,6 +24,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 
 use crate::hash::Hash;
+use crate::error::RnsError;
 use crate::identity::SigningKey;
 use reticulum_core::identity::Signer;
 
@@ -36,6 +37,8 @@ pub const IFAC_SALT: [u8; 32] = [
 
 /// Minimum IFAC size in bytes (Python `Reticulum.IFAC_MIN_SIZE`).
 pub const IFAC_MIN_SIZE: usize = 1;
+/// Maximum IFAC signature truncation length (one Ed25519 signature).
+pub const IFAC_MAX_SIZE: usize = 64;
 
 /// Default IFAC size in bytes when none is configured
 /// (Python `Interface.DEFAULT_IFAC_SIZE`).
@@ -67,7 +70,14 @@ impl IfacKey {
     /// passphrase (Python `Reticulum._add_interface`):
     /// `origin = full_hash(netname)? [+ full_hash(netkey)?]`,
     /// `key = HKDF(64, origin_hash, IFAC_SALT)`.
-    pub fn derive(netname: Option<&str>, netkey: Option<&str>, size: usize) -> Self {
+    pub fn derive(
+        netname: Option<&str>,
+        netkey: Option<&str>,
+        size: usize,
+    ) -> Result<Self, RnsError> {
+        if size > IFAC_MAX_SIZE {
+            return Err(RnsError::InvalidArgument);
+        }
         let mut origin = Vec::new();
 
         if let Some(netname) = netname {
@@ -89,11 +99,11 @@ impl IfacKey {
         let mut sign_seed = [0u8; 32];
         sign_seed.copy_from_slice(&key_bytes[32..]);
 
-        Self {
+        Ok(Self {
             key: key_bytes,
             sign_key: SigningKey::from_bytes(&sign_seed),
             size: size.max(IFAC_MIN_SIZE),
-        }
+        })
     }
 
     /// Truncated access-code signature: the last `size` bytes of the
@@ -203,7 +213,8 @@ mod tests {
 
     #[test]
     fn roundtrip_and_rejection() {
-        let key = IfacKey::derive(Some("ifac-test-network"), Some("correct horse"), 8);
+        let key = IfacKey::derive(Some("ifac-test-network"), Some("correct horse"), 8)
+            .expect("valid IFAC");
 
         let raw: Vec<u8> = (0..128u8).collect();
 
@@ -222,7 +233,8 @@ mod tests {
         assert!(key.strip(&tampered).is_none());
 
         // A different network name cannot unwrap.
-        let other = IfacKey::derive(Some("other-network"), Some("correct horse"), 8);
+        let other = IfacKey::derive(Some("other-network"), Some("correct horse"), 8)
+            .expect("valid IFAC");
         assert!(other.strip(&wrapped).is_none());
 
         // Packets without the IFAC flag are rejected.
@@ -233,17 +245,37 @@ mod tests {
 
     #[test]
     fn deterministic_derivation() {
-        let a = IfacKey::derive(Some("net"), Some("pass"), 8);
-        let b = IfacKey::derive(Some("net"), Some("pass"), 8);
-        let c = IfacKey::derive(None, Some("pass"), 8);
+        let a = IfacKey::derive(Some("net"), Some("pass"), 8).expect("valid IFAC");
+        let b = IfacKey::derive(Some("net"), Some("pass"), 8).expect("valid IFAC");
+        let c = IfacKey::derive(None, Some("pass"), 8).expect("valid IFAC");
 
         let raw = [7u8; 64];
         assert_eq!(a.apply(&raw), b.apply(&raw));
         assert_ne!(a.apply(&raw), c.apply(&raw));
 
         // Default minimum size applies.
-        let small = IfacKey::derive(Some("net"), None, 0);
+        let small = IfacKey::derive(Some("net"), None, 0).expect("valid IFAC");
         assert_eq!(small.size, IFAC_MIN_SIZE);
+    }
+
+    #[test]
+    fn derivation_enforces_signature_size_bounds() {
+        assert_eq!(
+            IfacKey::derive(Some("net"), None, 1)
+                .expect("one-byte IFAC")
+                .size,
+            1
+        );
+        assert_eq!(
+            IfacKey::derive(Some("net"), None, IFAC_MAX_SIZE)
+                .expect("full signature IFAC")
+                .size,
+            IFAC_MAX_SIZE
+        );
+        assert!(matches!(
+            IfacKey::derive(Some("net"), None, IFAC_MAX_SIZE + 1),
+            Err(RnsError::InvalidArgument)
+        ));
     }
 
     #[test]
@@ -254,7 +286,7 @@ mod tests {
         //   ident  = RNS.Identity.from_bytes(key)
         //   ifac   = ident.sign(raw)[-8:]
         //   mask   = hkdf(len(raw)+8, ifac, salt=key)
-        let key = IfacKey::derive(Some("net"), Some("pass"), 8);
+        let key = IfacKey::derive(Some("net"), Some("pass"), 8).expect("valid IFAC");
 
         let raw: Vec<u8> = (0..64u8).collect();
         let wrapped = key.apply(&raw);

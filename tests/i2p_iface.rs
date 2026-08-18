@@ -49,12 +49,11 @@ async fn read_line(stream: &mut TcpStream) -> Option<String> {
 
 /// A minimal SAMv3 bridge: sessions by id, and STREAM CONNECT spliced to
 /// a parked STREAM ACCEPT for the target destination.
-async fn sam_bridge(port: u16) {
+async fn sam_bridge(port: u16, sessions: Sessions) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .unwrap();
 
-    let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
     let connectors: Connectors = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
     loop {
@@ -66,9 +65,13 @@ async fn sam_bridge(port: u16) {
         let connectors = connectors.clone();
         tokio::spawn(async move {
             let mut socket = socket;
+            let mut control_session = None;
 
             loop {
                 let Some(line) = read_line(&mut socket).await else {
+                    if let Some(id) = &control_session {
+                        sessions.lock().await.remove(id);
+                    }
                     return;
                 };
 
@@ -93,7 +96,11 @@ async fn sam_bridge(port: u16) {
                         }
 
                         let destination = fake_destination(&id);
-                        sessions.lock().await.insert(id, destination.clone());
+                        sessions
+                            .lock()
+                            .await
+                            .insert(id.clone(), destination.clone());
+                        control_session = Some(id);
 
                         let reply = format!("SESSION STATUS RESULT=OK DESTINATION={destination}\n");
                         if socket.write_all(reply.as_bytes()).await.is_err() {
@@ -197,11 +204,39 @@ async fn i2p_session_fails_without_bridge() {
 }
 
 #[tokio::test]
+async fn sam_session_keeps_its_control_socket_open_until_drop() {
+    const SAM_PORT: u16 = 49960;
+    let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    tokio::spawn(sam_bridge(SAM_PORT, sessions.clone()));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let session = SamSession::create(&format!("127.0.0.1:{SAM_PORT}"), "lifetime")
+        .await
+        .expect("session creation");
+    assert!(sessions.lock().await.contains_key("lifetime"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        sessions.lock().await.contains_key("lifetime"),
+        "the live session must retain its control connection"
+    );
+
+    drop(session);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while sessions.lock().await.contains_key("lifetime")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!sessions.lock().await.contains_key("lifetime"));
+}
+
+#[tokio::test]
 async fn i2p_end_to_end_over_mock_sam() {
     const SAM_PORT: u16 = 49961;
     let sam_addr = format!("127.0.0.1:{SAM_PORT}");
 
-    tokio::spawn(sam_bridge(SAM_PORT));
+    let sessions: Sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    tokio::spawn(sam_bridge(SAM_PORT, sessions));
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Node A: connectable I2P server.

@@ -222,6 +222,14 @@ pub struct ServeOptions {
     pub udp_loopback: Option<(u16, u16)>,
 }
 
+fn sender_allowed(
+    no_auth: bool,
+    allowed: &HashSet<AddressHash>,
+    sender: Option<&AddressHash>,
+) -> bool {
+    no_auth || sender.is_some_and(|sender| allowed.contains(sender))
+}
+
 impl Default for ServeOptions {
     fn default() -> Self {
         Self {
@@ -270,7 +278,9 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
     let identity = rncp_identity(&config_dir, options.identity_path.as_deref())?;
     let destination_hash = serve_destination_hash(&mut transport, &identity).await;
 
-    let allow_all = options.no_auth || options.allowed.is_empty();
+    // Authentication is opt-out only. An empty allowlist is deliberately
+    // deny-all, rather than silently turning the listener into an open relay.
+    let allow_all = options.no_auth;
     if options.allowed.is_empty() && !options.no_auth {
         log::warn!("No allowed identities configured, rncp will not accept any files! (use --no-auth to accept anyone)");
     }
@@ -327,10 +337,13 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
         let auto_compress = !options.no_compress;
         let handler = move |ctx: RequestContext| -> Option<Vec<u8>> {
             if !allow_fetch_all {
-                let allowed_here = match &ctx.remote_identity {
-                    Some(identity) => fetch_allowed.contains(&identity.address_hash),
-                    None => false,
-                };
+                let allowed_here = sender_allowed(
+                    false,
+                    &fetch_allowed,
+                    ctx.remote_identity
+                        .as_ref()
+                        .map(|identity| &identity.address_hash),
+                );
                 if !allowed_here {
                     log::warn!("Fetch request from unauthenticated sender rejected");
                     return Some(msgpack_fetch_not_allowed());
@@ -449,9 +462,8 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
                             continue;
                         };
                         if !allow_all {
-                            let sender_ok = identified
-                                .get(&event.link_id)
-                                .is_some_and(|sender| allowed.contains(sender));
+                            let sender_ok =
+                                sender_allowed(false, &allowed, identified.get(&event.link_id));
                             if !sender_ok {
                                 log::warn!(
                                     "Resource {} from unauthenticated sender, discarding",
@@ -854,5 +866,20 @@ mod tests {
             FetchResponse::NotAllowed
         );
         assert_eq!(parse_fetch_response(&[0xff, 0xff]), FetchResponse::Unknown);
+    }
+
+    #[test]
+    fn authentication_requires_no_auth_or_an_explicit_match() {
+        let sender = AddressHash::new_from_slice(&[1; 32]);
+        let stranger = AddressHash::new_from_slice(&[2; 32]);
+        let empty = HashSet::new();
+        let allowed = HashSet::from([sender]);
+
+        assert!(!sender_allowed(false, &empty, Some(&sender)));
+        assert!(!sender_allowed(false, &empty, None));
+        assert!(sender_allowed(true, &empty, Some(&stranger)));
+        assert!(sender_allowed(true, &empty, None));
+        assert!(sender_allowed(false, &allowed, Some(&sender)));
+        assert!(!sender_allowed(false, &allowed, Some(&stranger)));
     }
 }

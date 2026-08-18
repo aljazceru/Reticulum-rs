@@ -228,6 +228,9 @@ impl Link {
             let sig = &packet.data.as_slice()[PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
             let value = ((sig[0] as usize) << 16) | ((sig[1] as usize) << 8) | (sig[2] as usize);
             let mtu = value & 0x1F_FFFF;
+            if mtu != 0 && mtu < crate::packet::LINK_MTU_MIN {
+                return Err(RnsError::InvalidArgument);
+            }
             if mtu == 0 { crate::packet::PROTOCOL_MTU } else { mtu }
         } else {
             crate::packet::PROTOCOL_MTU
@@ -486,20 +489,29 @@ impl Link {
 
     /// Set the negotiated link MTU (bounded by the protocol MTU floor rules).
     pub fn set_mtu(&mut self, mtu: usize) {
-        self.mtu = mtu.max(crate::packet::HEADER_MAXSIZE + crate::packet::IFAC_MIN_SIZE + 1);
+        self.mtu = if mtu == 0 {
+            crate::packet::PROTOCOL_MTU
+        } else {
+            mtu.max(crate::packet::LINK_MTU_MIN)
+        };
     }
 
     /// Maximum link-encrypted plaintext size (`RNS.Link.MDU`).
     pub fn mdu(&self) -> usize {
-        let mdu = self.mtu - crate::packet::IFAC_MIN_SIZE - crate::packet::HEADER_MINSIZE
-            - crate::packet::TOKEN_OVERHEAD;
-        mdu / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE - 1
+        let mdu = self.mtu.saturating_sub(
+            crate::packet::IFAC_MIN_SIZE
+                + crate::packet::HEADER_MINSIZE
+                + crate::packet::TOKEN_OVERHEAD,
+        );
+        (mdu / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE)
+            .saturating_sub(1)
     }
 
     /// Maximum size of an unencrypted resource part chunk
     /// (`link.mtu - HEADER_MAXSIZE - IFAC_MIN_SIZE`, Python `Resource.sdu`).
     pub fn sdu(&self) -> usize {
-        self.mtu - crate::packet::HEADER_MAXSIZE - crate::packet::IFAC_MIN_SIZE
+        self.mtu
+            .saturating_sub(crate::packet::HEADER_MAXSIZE + crate::packet::IFAC_MIN_SIZE)
     }
 
     pub fn establishment_cost(&self) -> usize {
@@ -1013,5 +1025,76 @@ fn validate_message_proof(
         Ok(Hash::new(hash_slice.try_into().unwrap()))
     } else {
         Err(RnsError::IncorrectSignature)
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod mtu_tests {
+    use super::*;
+    use crate::destination::{DestinationName, SingleInputDestination};
+    use crate::packet::{LINK_MTU_MIN, PROTOCOL_MTU};
+
+    fn request_with_mtu(mtu: usize) -> (Packet, PrivateIdentity, DestinationDesc) {
+        let peer = PrivateIdentity::new_from_rand(OsRng);
+        let local = PrivateIdentity::new_from_rand(OsRng);
+        let destination = SingleInputDestination::new(
+            local.clone(),
+            DestinationName::new("test", "link.mtu"),
+        );
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(peer.as_identity().public_key.as_bytes());
+        data.safe_write(peer.as_identity().verifying_key.as_bytes());
+        data.safe_write(&Link::signalling_bytes(mtu));
+        (
+            Packet {
+                destination: destination.desc.address_hash,
+                data,
+                ..Default::default()
+            },
+            local,
+            destination.desc,
+        )
+    }
+
+    #[test]
+    fn negotiated_mtu_rejects_unsafe_nonzero_values() {
+        let (packet, local, desc) = request_with_mtu(LINK_MTU_MIN - 1);
+        assert!(matches!(
+            Link::new_from_request(&packet, local.sign_key().clone(), desc),
+            Err(RnsError::InvalidArgument)
+        ));
+
+        let (packet, local, desc) = request_with_mtu(LINK_MTU_MIN);
+        assert_eq!(
+            Link::new_from_request(&packet, local.sign_key().clone(), desc)
+                .expect("minimum MTU")
+                .mtu(),
+            LINK_MTU_MIN
+        );
+
+        let (packet, local, desc) = request_with_mtu(0);
+        assert_eq!(
+            Link::new_from_request(&packet, local.sign_key().clone(), desc)
+                .expect("default MTU signalling")
+                .mtu(),
+            PROTOCOL_MTU
+        );
+    }
+
+    #[test]
+    fn local_mtu_and_size_accessors_are_defensive() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("test", "link.local-mtu"),
+        );
+        let mut link = Link::new(destination.desc);
+
+        link.set_mtu(0);
+        assert_eq!(link.mtu(), PROTOCOL_MTU);
+        link.set_mtu(LINK_MTU_MIN - 1);
+        assert_eq!(link.mtu(), LINK_MTU_MIN);
+        assert!(link.mdu() < link.mtu());
+        assert!(link.sdu() <= link.mtu());
     }
 }

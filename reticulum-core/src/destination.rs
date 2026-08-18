@@ -315,12 +315,12 @@ pub enum DestinationHandleStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProofStrategy {
     /// Never prove packets.
+    #[default]
     None,
     /// Prove packets that carry application data (proof requested via
     /// callback in Python; approximated here by proving non-empty data).
     App,
-    /// Prove all packets (Python default).
-    #[default]
+    /// Prove all packets.
     All,
 }
 
@@ -710,7 +710,20 @@ mod tests {
 
     use super::DestinationAnnounce;
     use super::DestinationName;
-    use super::SingleInputDestination;
+    use super::{ProofStrategy, SingleInputDestination};
+
+    #[test]
+    fn proof_strategy_defaults_to_none_and_can_be_overridden() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut destination = SingleInputDestination::new(
+            identity,
+            DestinationName::new("test", "proof.default"),
+        );
+
+        assert_eq!(destination.proof_strategy(), ProofStrategy::None);
+        destination.set_proof_strategy(ProofStrategy::All);
+        assert_eq!(destination.proof_strategy(), ProofStrategy::All);
+    }
 
     #[test]
     fn create_announce() {

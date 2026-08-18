@@ -33,6 +33,18 @@ pub const LINK_MDU: usize =
     (PROTOCOL_MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES128_BLOCKSIZE
         * AES128_BLOCKSIZE
         - 1;
+/// Minimum nonzero negotiated link MTU that still leaves one full encrypted
+/// block after header, IFAC and token overhead.
+pub const LINK_MTU_MIN: usize =
+    IFAC_MIN_SIZE + HEADER_MINSIZE + TOKEN_OVERHEAD + AES128_BLOCKSIZE;
+/// Maximum plaintext accepted for a SINGLE-destination packet. Besides normal
+/// packet overhead, SINGLE encryption adds an ephemeral public key.
+pub const SINGLE_PLAINTEXT_MDU: usize =
+    (PROTOCOL_MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE - crate::identity::RATCHET_KEY_LENGTH
+        - TOKEN_OVERHEAD)
+        / AES128_BLOCKSIZE
+        * AES128_BLOCKSIZE
+        - 1;
 
 /// Number of bytes in a truncated hash (an address or link id).
 pub const TRUNCATED_HASHLENGTH_BYTES: usize = 16;

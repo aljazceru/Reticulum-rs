@@ -128,13 +128,11 @@ async fn python_writer_rust_reader() {
 
     // Python connects to us: wait for the inbound link, then upgrade to channel.
     let mut in_link_events = transport.in_link_events();
-    let mut channel_rx = None;
-    let _link_arc: Option<()> = None;
     let partner = spawn_buffer("writer", Some(&hash.to_hex_string()), 20_000, 30.0).await;
     let mut lines = partner.lines.resubscribe();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-    loop {
+    let (mut reader, _channel) = loop {
         assert!(tokio::time::Instant::now() < deadline, "no inbound link from python");
         let event = tokio::time::timeout_at(deadline, in_link_events.recv())
             .await
@@ -148,15 +146,12 @@ async fn python_writer_rust_reader() {
                 .expect("channel");
             // Rust is the responder: Python writes to stream 1 (its writer's
             // remote id); Rust reads on stream id 1.
-            let _reader = create_reader(1, rx);
-            channel_rx = Some((_reader, channel));
-            let _ = link;
-            break;
+            let reader = create_reader(1, rx);
+            break (reader, channel);
         }
-    }
+    };
 
     // read until EOF
-    let (mut reader, _channel) = channel_rx.take().expect("reader");
     let mut received = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {

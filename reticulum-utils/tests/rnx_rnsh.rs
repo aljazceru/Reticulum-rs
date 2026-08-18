@@ -92,6 +92,8 @@ async fn rnsh_session_command_roundtrip() {
 
     let server_options = reticulum_utils::rnsh::ServeOptions {
         config_dir: server_dir.clone(),
+        allow_all: true,
+        allowed: Vec::new(),
         udp_loopback: Some((5005, 5006)),
     };
 
@@ -117,6 +119,8 @@ async fn rnsh_session_command_roundtrip() {
 
     let options = reticulum_utils::rnsh::ServeOptions {
         config_dir: client_dir,
+        allow_all: false,
+        allowed: Vec::new(),
         udp_loopback: Some((5006, 5005)),
     };
 

@@ -11,12 +11,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rand_core::OsRng;
 use reticulum::destination::{DestinationName, ProofStrategy};
 use reticulum::hash::AddressHash;
-use reticulum::identity::PrivateIdentity;
 
-use crate::common::{build_tool_transport, resolve_config_dir, ToolTransportOptions};
+use crate::common::{
+    build_tool_transport, load_or_create_private_identity, resolve_config_dir, ToolTransportOptions,
+};
 
 pub const APP_NAME: &str = "rnx";
 
@@ -59,7 +59,8 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
 
     // Identity persisted per-app like Python (`<storage>/identities/rnx`).
     let identity_path = options.config_dir.join("storage/identities/rnx");
-    let identity = load_or_create(&identity_path)?;
+    let (identity, _) = load_or_create_private_identity(&identity_path)
+        .map_err(|err| err.to_string())?;
 
     let destination = transport
         .add_destination(identity, DestinationName::new(APP_NAME, "execute"))
@@ -102,23 +103,6 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
     }
 
     Ok(address)
-}
-
-fn load_or_create(path: &std::path::Path) -> Result<PrivateIdentity, String> {
-    if path.exists() {
-        if let Ok(hex) = std::fs::read_to_string(path) {
-            if let Ok(identity) = PrivateIdentity::new_from_hex_string(hex.trim()) {
-                return Ok(identity);
-            }
-        }
-    }
-
-    let identity = PrivateIdentity::new_from_rand(OsRng);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("request error: {e:?}"))?;
-    }
-    std::fs::write(path, identity.to_hex_string()).map_err(|e| format!("request error: {e:?}"))?;
-    Ok(identity)
 }
 
 /// Decode the request payload and execute the command
@@ -256,11 +240,10 @@ pub async fn execute(
     let _ = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
 
     // Identify so the listener's allow list can match us.
-    let client_identity = load_or_create(
-        &options
-            .config_dir
-            .join("storage/identities/rnx"),
-    )?;
+    let (client_identity, _) = load_or_create_private_identity(
+        &options.config_dir.join("storage/identities/rnx"),
+    )
+    .map_err(|err| err.to_string())?;
     let identify = link.lock().await.identify(&client_identity);
     if let Ok(packet) = identify {
         transport.send_packet(packet).await;

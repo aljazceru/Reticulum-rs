@@ -185,7 +185,7 @@ impl AnnounceEvent {
         }
         let destination = self.destination.lock().await;
         let expected = DestinationName::new(app_name, aspect);
-        expected.desc_hash_matches(&destination.desc.name)
+        expected.address_hash_for(&destination.identity) == destination.desc.address_hash
     }
 }
 
@@ -300,6 +300,8 @@ pub(crate) struct TransportHandler {
 
 pub struct Transport {
     name: String,
+    identity: PrivateIdentity,
+    blackholes: SharedBlackholes,
     link_in_event_tx: BroadcastLinkEventSink,
     link_out_event_tx: BroadcastLinkEventSink,
     received_data_tx: broadcast::Sender<ReceivedData>,
@@ -437,6 +439,10 @@ impl Transport {
         let reroute_eager = config.reroute_eager;
         let blackhole_publish = config.blackhole_publish;
         let storage = config.storage.clone();
+        let identity = config.identity.clone();
+        let blackholes = std::sync::Arc::new(tokio::sync::RwLock::new(
+            blackholes::Blackholes::new(blackhole_publish),
+        ));
         let handler = Arc::new(Mutex::new(TransportHandler {
             config,
             iface_manager: iface_manager.clone(),
@@ -452,9 +458,7 @@ impl Transport {
             in_links: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             resources: ResourceManager::new(),
-            blackholes: std::sync::Arc::new(tokio::sync::RwLock::new(blackholes::Blackholes::new(
-                blackhole_publish,
-            ))),
+            blackholes: blackholes.clone(),
             path_requests,
             tunnels: Tunnels::new(),
             remote_management_allowed: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -486,6 +490,8 @@ impl Transport {
 
         Self {
             name,
+            identity,
+            blackholes,
             iface_manager,
             link_in_event_tx: link_in_event_tx.into(),
             link_out_event_tx: link_out_event_tx.into(),
@@ -527,16 +533,20 @@ impl Transport {
 
     /// Whether an owned destination accepts link requests.
     pub async fn destination_accepts_links(&self, destination: &AddressHash) -> Option<bool> {
-        let handler = self.handler.lock().await;
-        handler
+        let destination = self
+            .handler
+            .lock()
+            .await
             .single_in_destinations
             .get(destination)
-            .map(|d| d.blocking_lock().accepts_links())
+            .cloned()?;
+        let accepts_links = destination.lock().await.accepts_links();
+        Some(accepts_links)
     }
 
     /// Access this transport's blackhole list.
     pub fn blackholes(&self) -> SharedBlackholes {
-        self.handler.blocking_lock().blackholes.clone()
+        self.blackholes.clone()
     }
 
     /// Blackhole an identity: its announces and paths are dropped
@@ -643,6 +653,7 @@ impl Transport {
     /// against the first aspect after the app name).
     pub async fn subscribe_announces(
         &self,
+        app_name: &str,
         aspects: &[&str],
     ) -> broadcast::Receiver<AnnounceEvent> {
         // A filtered receiver is implemented as a forwarding task over the
@@ -650,22 +661,24 @@ impl Transport {
         let (tx, rx) = tokio::sync::broadcast::channel(64);
         let mut source = self.handler.lock().await.announce_tx.subscribe();
 
-        let filters: Vec<String> = aspects.iter().map(|a| a.to_string()).collect();
+        let filters: Vec<DestinationName> = aspects
+            .iter()
+            .map(|aspect| DestinationName::new(app_name, aspect))
+            .collect();
         tokio::spawn(async move {
             loop {
                 match source.recv().await {
                     Ok(event) => {
-                        let destination = event.destination.lock().await;
-                        // The announce carries the name hash only; the aspect
-                        // string travels in the app_data for announce_handler
-                        // parity in Python. Here we filter on the destination
-                        // address only when aspects look like hashes.
-                        let _ = &destination.desc.address_hash;
-                        drop(destination);
-                        let _ = &filters;
-                        // Forward everything; aspect matching is applied by
-                        // consumers via `AnnounceEvent::matches_aspect`.
-                        if tx.send(event).is_err() {
+                        let matches = if filters.is_empty() {
+                            true
+                        } else {
+                            let destination = event.destination.lock().await;
+                            filters.iter().any(|filter| {
+                                filter.address_hash_for(&destination.identity)
+                                    == destination.desc.address_hash
+                            })
+                        };
+                        if matches && tx.send(event).is_err() {
                             break;
                         }
                     }
@@ -716,7 +729,7 @@ impl Transport {
                 if let Err(error) = crate::storage::save_destination_ratchets(
                     &*storage,
                     &path,
-                    &handler.config.identity,
+                    &destination.identity,
                     &ratchets,
                 ) {
                     log::warn!(
@@ -962,11 +975,26 @@ impl Transport {
     }
 
     pub async fn events_for_link(&self, link_id: LinkId) -> broadcast::Receiver<LinkEventData> {
-        if self.handler.lock().await.in_links.contains_key(&link_id) {
+        let mut source = if self.handler.lock().await.in_links.contains_key(&link_id) {
             self.in_link_events()
         } else {
             self.out_link_events()
-        }
+        };
+        let (tx, rx) = broadcast::channel(16);
+        tokio::spawn(async move {
+            loop {
+                match source.recv().await {
+                    Ok(event) if event.id == link_id => {
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        rx
     }
 
     pub fn received_data_events(&self) -> broadcast::Receiver<ReceivedData> {
@@ -1214,6 +1242,9 @@ impl Transport {
         name: DestinationName,
         data: &[u8],
     ) -> Result<AddressHash, RnsError> {
+        if data.len() > crate::packet::PACKET_PROTOCOL_MDU {
+            return Err(RnsError::InvalidArgument);
+        }
         let destination = PlainInputDestination::new(reticulum_core::identity::EmptyIdentity, name);
         let address = destination.desc.address_hash;
 
@@ -1257,6 +1288,9 @@ impl Transport {
         destination_hash: &AddressHash,
         data: &[u8],
     ) -> Result<Hash, RnsError> {
+        if data.len() > crate::packet::SINGLE_PLAINTEXT_MDU {
+            return Err(RnsError::InvalidArgument);
+        }
         let mut handler = self.handler.lock().await;
 
         let destination = handler
@@ -1472,7 +1506,7 @@ impl Transport {
             ..
         } = &mut *handler;
 
-        let stale = known_destinations.clean(now, |hash| path_table.get(hash).is_some());
+        let stale = known_destinations.clean(now, |hash| path_table.contains(hash));
 
         // Python removes the ratchet files of stale destinations.
         for hash in &stale {
@@ -1527,7 +1561,7 @@ impl Transport {
         // Persist an empty ratchet file like Python does on first load.
         if !had_ratchets {
             let destination = destination.lock().await;
-            let private_identity = handler.config.identity.clone();
+            let private_identity = destination.identity.clone();
 
             let mut ratchets = destination
                 .ratchets()
@@ -1779,24 +1813,26 @@ fn validate_single_destination_proof(handler: &mut TransportHandler, packet: &Pa
     };
 
     let proof = packet.data.as_slice();
-    let signature =
-        crate::identity::Signature::from_slice(&proof[proof.len().saturating_sub(64)..])
-            .expect("signature length");
-
     let valid = if proof.len() == 64 {
         // Implicit proof: signature only
-        receipt
-            .identity
-            .verify(receipt.packet_hash.as_slice(), &signature)
-            .is_ok()
+        crate::identity::Signature::from_slice(proof)
+            .is_ok_and(|signature| {
+                receipt
+                    .identity
+                    .verify(receipt.packet_hash.as_slice(), &signature)
+                    .is_ok()
+            })
     } else if proof.len() == 96 {
         // Explicit proof: packet hash + signature
         let proof_hash = &proof[..32];
         proof_hash == receipt.packet_hash.as_slice()
-            && receipt
-                .identity
-                .verify(receipt.packet_hash.as_slice(), &signature)
-                .is_ok()
+            && crate::identity::Signature::from_slice(&proof[32..])
+                .is_ok_and(|signature| {
+                    receipt
+                        .identity
+                        .verify(receipt.packet_hash.as_slice(), &signature)
+                        .is_ok()
+                })
     } else {
         false
     };
@@ -2263,9 +2299,16 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
                     handler.send_packet(packet).await;
                 }
                 LinkHandleResult::MessageReceived(proof) => {
-                    let should_prove = match proof_strategy.unwrap_or_default() {
-                        ProofStrategy::None => false,
-                        ProofStrategy::App => packet.context == PacketContext::None,
+                    let strategy = proof_strategy.unwrap_or_default();
+                    // Python `Link.receive`: CHANNEL-context packets are
+                    // proved unconditionally (channel reliability),
+                    // independent of the destination's proof strategy.
+                    let should_prove = match strategy {
+                        ProofStrategy::None => packet.context == PacketContext::Channel,
+                        ProofStrategy::App => {
+                            packet.context == PacketContext::None
+                                || packet.context == PacketContext::Channel
+                        }
                         ProofStrategy::All => true,
                     };
 
@@ -3650,7 +3693,220 @@ async fn manage_transport(
 mod tests {
     use super::*;
 
+    use rand_core::OsRng;
+    use crate::destination::link::LinkEvent;
     use crate::packet::HeaderType;
+
+    #[tokio::test]
+    async fn synchronous_accessors_are_safe_inside_a_runtime() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let transport = TransportConfig::new("accessors", &identity, false).build();
+
+        assert_eq!(
+            transport.identity_private().to_hex_string(),
+            identity.to_hex_string()
+        );
+        let _blackholes = transport.blackholes();
+        assert_eq!(transport.identity_hash().await, *identity.address_hash());
+        assert_eq!(transport.instance_name().await, "accessors");
+
+        let destination = transport
+            .add_destination(
+                identity,
+                DestinationName::new("test", "accessor.destination"),
+            )
+            .await;
+        let address = destination.lock().await.desc.address_hash;
+        assert_eq!(transport.destination_accepts_links(&address).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn announce_subscriptions_filter_by_complete_destination_name() {
+        let transport = TransportConfig::default().build();
+        let mut filtered = transport
+            .subscribe_announces("example", &["wanted.aspect"])
+            .await;
+
+        let first_identity = PrivateIdentity::new_from_rand(OsRng);
+        let second_identity = PrivateIdentity::new_from_rand(OsRng);
+        let unrelated = SingleOutputDestination::new(
+            *first_identity.as_identity(),
+            DestinationName::new("example", "other.aspect"),
+        );
+        let first_match = SingleOutputDestination::new(
+            *first_identity.as_identity(),
+            DestinationName::new("example", "wanted.aspect"),
+        );
+        let second_match = SingleOutputDestination::new(
+            *second_identity.as_identity(),
+            DestinationName::new("example", "wanted.aspect"),
+        );
+
+        let sender = transport.handler.lock().await.announce_tx.clone();
+        for destination in [unrelated, first_match, second_match] {
+            assert!(sender
+                .send(AnnounceEvent {
+                    destination: Arc::new(Mutex::new(destination)),
+                    app_data: PacketDataBuffer::new(),
+                    ratchet: None,
+                })
+                .is_ok());
+        }
+
+        let first = time::timeout(Duration::from_secs(1), filtered.recv())
+            .await
+            .expect("first matching announce")
+            .unwrap();
+        let second = time::timeout(Duration::from_secs(1), filtered.recv())
+            .await
+            .expect("second matching announce")
+            .unwrap();
+        let addresses = [
+            first.destination.lock().await.desc.address_hash,
+            second.destination.lock().await.desc.address_hash,
+        ];
+        assert!(addresses.contains(&DestinationName::new("example", "wanted.aspect")
+            .address_hash_for(first_identity.as_identity())));
+        assert!(addresses.contains(&DestinationName::new("example", "wanted.aspect")
+            .address_hash_for(second_identity.as_identity())));
+        assert!(time::timeout(Duration::from_millis(50), filtered.recv())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn single_proofs_accept_only_exact_implicit_and_explicit_forms() {
+        let transport = TransportConfig::default().build();
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let destination = AddressHash::new_from_slice(&[7; 32]);
+        let packet_hash = Hash::new_from_slice(b"pending proof");
+        let proof_destination = AddressHash::new_from_hash(&packet_hash);
+        let receipt = PacketReceipt {
+            destination,
+            packet_hash,
+            identity: *identity.as_identity(),
+            created_at: time::Instant::now(),
+        };
+        let handler = transport.get_handler();
+
+        for length in (0..64).chain(65..96).chain(97..100) {
+            let packet = Packet {
+                destination: proof_destination,
+                data: PacketDataBuffer::new_from_slice(&vec![0; length]),
+                ..Default::default()
+            };
+            let mut handler = handler.lock().await;
+            handler.receipts.insert(proof_destination, receipt.clone());
+            assert!(!validate_single_destination_proof(&mut handler, &packet));
+            assert!(handler.receipts.contains_key(&proof_destination));
+        }
+
+        let signature = identity.sign(packet_hash.as_slice());
+        let implicit = Packet {
+            destination: proof_destination,
+            data: PacketDataBuffer::new_from_slice(&signature.to_bytes()),
+            ..Default::default()
+        };
+        let mut handler = handler.lock().await;
+        handler.receipts.insert(proof_destination, receipt.clone());
+        assert!(validate_single_destination_proof(&mut handler, &implicit));
+
+        let mut explicit_data = Vec::with_capacity(96);
+        explicit_data.extend_from_slice(packet_hash.as_slice());
+        explicit_data.extend_from_slice(&signature.to_bytes());
+        let explicit = Packet {
+            destination: proof_destination,
+            data: PacketDataBuffer::new_from_slice(&explicit_data),
+            ..Default::default()
+        };
+        handler.receipts.insert(proof_destination, receipt);
+        assert!(validate_single_destination_proof(&mut handler, &explicit));
+    }
+
+    #[tokio::test]
+    async fn plain_and_single_payload_limits_are_enforced_before_buffering() {
+        let transport = TransportConfig::default().build();
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let output = SingleOutputDestination::new(
+            *identity.as_identity(),
+            DestinationName::new("test", "single.payload-bound"),
+        );
+        let address = output.desc.address_hash;
+        transport
+            .handler
+            .lock()
+            .await
+            .single_out_destinations
+            .insert(address, Arc::new(Mutex::new(output)));
+
+        assert!(transport
+            .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU])
+            .await
+            .is_ok());
+        assert!(matches!(
+            transport
+                .send_to_destination(
+                    &address,
+                    &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU + 1]
+                )
+                .await,
+            Err(RnsError::InvalidArgument)
+        ));
+        assert!(matches!(
+            transport
+                .send_to_destination(&address, &vec![0; crate::packet::PACKET_MDU + 100])
+                .await,
+            Err(RnsError::InvalidArgument)
+        ));
+
+        let plain_name = DestinationName::new("test", "plain.payload-bound");
+        assert!(transport
+            .send_to_plain_destination(
+                plain_name,
+                &vec![0; crate::packet::PACKET_PROTOCOL_MDU]
+            )
+            .await
+            .is_ok());
+        assert!(matches!(
+            transport
+                .send_to_plain_destination(
+                    plain_name,
+                    &vec![0; crate::packet::PACKET_PROTOCOL_MDU + 1]
+                )
+                .await,
+            Err(RnsError::InvalidArgument)
+        ));
+    }
+
+    #[tokio::test]
+    async fn events_for_link_drops_unrelated_link_events() {
+        let transport = TransportConfig::default().build();
+        let wanted = AddressHash::new_from_slice(&[11; 32]);
+        let unrelated = AddressHash::new_from_slice(&[12; 32]);
+        let destination = AddressHash::new_from_slice(&[13; 32]);
+        let mut events = transport.events_for_link(wanted).await;
+
+        transport.link_out_event_tx.send(LinkEventData {
+            id: unrelated,
+            address_hash: destination,
+            event: LinkEvent::Closed,
+        });
+        transport.link_out_event_tx.send(LinkEventData {
+            id: wanted,
+            address_hash: destination,
+            event: LinkEvent::Activated,
+        });
+
+        let event = time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("matching link event")
+            .unwrap();
+        assert_eq!(event.id, wanted);
+        assert!(matches!(event.event, LinkEvent::Activated));
+        assert!(time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err());
+    }
 
     #[tokio::test]
     async fn drop_duplicates() {
@@ -4144,6 +4400,6 @@ impl Transport {
     /// The private identity of this transport instance
     /// (for subsystems that need to announce or sign on its behalf).
     pub fn identity_private(&self) -> PrivateIdentity {
-        self.handler.blocking_lock().config.identity.clone()
+        self.identity.clone()
     }
 }

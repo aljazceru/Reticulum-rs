@@ -202,6 +202,13 @@ async fn python_sends_encrypted_packet_to_rust() {
     let destination = transport
         .add_destination(identity, DestinationName::new("example_utilities", "identity.echo"))
         .await;
+    // Python default is PROVE_NONE (Destination.__init__); a destination
+    // that wants delivery receipts opts in explicitly, like the reference
+    // echo server does.
+    destination
+        .lock()
+        .await
+        .set_proof_strategy(reticulum::destination::ProofStrategy::All);
     let hash = destination.lock().await.desc.address_hash;
 
     transport

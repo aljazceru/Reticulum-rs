@@ -137,6 +137,10 @@ async fn sam_connect(sam_addr: &str) -> Result<TcpStream, RnsError> {
 pub struct SamSession {
     sam_addr: String,
     session_id: String,
+    /// The SAM control connection that created this session. SAM bridges
+    /// invalidate a session when this socket closes, so it must live for the
+    /// entire lifetime of the session handle.
+    _control_socket: TcpStream,
     /// Base64 local destination (from `SESSION STATUS`).
     pub destination: String,
 }
@@ -177,6 +181,7 @@ impl SamSession {
             sam_addr: sam_addr.to_string(),
             session_id: session_id.to_string(),
             destination,
+            _control_socket: socket,
         })
     }
 

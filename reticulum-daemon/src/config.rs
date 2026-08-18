@@ -5,6 +5,28 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringList {
+    List(Vec<String>),
+    CommaSeparated(String),
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = match StringList::deserialize(deserializer)? {
+        StringList::List(values) => values,
+        StringList::CommaSeparated(value) => value.split(',').map(str::to_owned).collect(),
+    };
+    Ok(values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect())
+}
+
 #[derive(Debug, Deserialize, Serialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -19,11 +41,15 @@ pub struct Config {
 pub struct ReticulumConfig {
     /// Enable the remote management destination
     /// (Python `enable_remote_management`).
-    #[serde(default)]
+    #[serde(default, alias = "enable_remote_management")]
     pub remote_management: bool,
     /// Enable the probe destination (Python `enable_remote_probe`).
-    #[serde(default)]
+    #[serde(default, alias = "respond_to_probes", alias = "enable_remote_probe")]
     pub probe_destination: bool,
+    /// Identities permitted to use remote management. Python accepts a
+    /// comma-separated string while native TOML commonly uses an array.
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub remote_management_allowed: Vec<String>,
     #[serde(default)]
     pub enable_transport: bool,
     #[serde(default = "default_true")]
@@ -134,7 +160,7 @@ pub enum InterfaceConfig {
         #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
         /// Published peers to connect to (base64 destinations).
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_string_list")]
         peers: Vec<String>,
         /// Accept inbound streams and publish this instance's
         /// destination (Python `connectable`).
@@ -452,7 +478,14 @@ fn convert_config(content: &str) -> String {
         if let Some(pos) = line.find(&pattern) {
             let value_start = pos + pattern.len();
             let rest = &line[value_start..];
-            let value = rest.split_whitespace().next().unwrap_or(rest).trim();
+            // Python config values are commonly free-form strings. Preserve
+            // their full value and any inline comment instead of keeping only
+            // the first whitespace-delimited token.
+            let (value, comment) = match rest.find(" #") {
+                Some(comment_start) => (&rest[..comment_start], &rest[comment_start..]),
+                None => (rest, ""),
+            };
+            let value = value.trim();
             // Don't quote numbers or booleans
             if value.parse::<i64>().is_ok()
                 || value.parse::<f64>().is_ok()
@@ -462,7 +495,8 @@ fn convert_config(content: &str) -> String {
                 return line.to_string();
             }
             // Quote the value
-            format!("{}{} = \"{}\"", &line[..pos], key, value)
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("{}{} = \"{}\"{}", &line[..pos], key, escaped, comment)
         } else {
             line.to_string()
         }
@@ -525,18 +559,16 @@ fn convert_config(content: &str) -> String {
 
         // Quote unquoted string values (only for non-comments)
         if !converted.starts_with('#') {
-            converted = quote_if_needed(&converted, "type");
-            converted = quote_if_needed(&converted, "remote");
-            converted = quote_if_needed(&converted, "target_host");
-            converted = quote_if_needed(&converted, "bind_host");
-            converted = quote_if_needed(&converted, "listen_ip");
-            converted = quote_if_needed(&converted, "forward_ip");
-            converted = quote_if_needed(&converted, "peers");
-            converted = quote_if_needed(&converted, "instance_name");
-            converted = quote_if_needed(&converted, "port");
-            converted = quote_if_needed(&converted, "callsign");
-            converted = quote_if_needed(&converted, "parity");
-            converted = quote_if_needed(&converted, "loglevel");
+            for key in [
+                "type", "remote", "target_host", "bind_host", "listen_ip", "forward_ip",
+                "peers", "instance_name", "port", "callsign", "parity", "loglevel",
+                "group_id", "discovery_scope", "multicast_address_type", "command",
+                "reachable_on", "sam_address", "tcp", "networkname", "network_name",
+                "passphrase", "pass_phrase", "devices", "ignored_devices",
+                "remote_management_allowed",
+            ] {
+                converted = quote_if_needed(&converted, key);
+            }
         }
         output.push_str(&converted);
         output.push('\n');
@@ -549,6 +581,7 @@ impl Default for ReticulumConfig {
         Self {
             remote_management: false,
             probe_destination: false,
+            remote_management_allowed: Vec::new(),
             enable_transport: false,
             share_instance: false,
             shared_instance_port: 37428,
@@ -658,6 +691,17 @@ impl Config {
                 }
             }
         };
+        for iface in &config.interfaces {
+            if let Some(bits) = iface.ifac_size
+                && bits > 512
+            {
+                return Err(format!(
+                    "interface '{}' configures an IFAC of {bits} bits; the maximum is 512",
+                    iface.name
+                )
+                .into());
+            }
+        }
         if config.reticulum.share_instance {
             let instance_name = config
                 .reticulum
@@ -1107,5 +1151,147 @@ multicast_address_type = "permanent"
             instance_name: "default",
         };
         assert_eq!(format!("{description:?}"), "tcp 127.0.0.1:42840");
+    }
+
+    #[test]
+    fn management_aliases_and_allowlist_forms_parse() {
+        let python: Config = toml::from_str(
+            r#"
+[reticulum]
+enable_remote_management = true
+respond_to_probes = true
+remote_management_allowed = "00112233445566778899aabbccddeeff, fedcba98765432100123456789abcdef"
+"#,
+        )
+        .unwrap();
+        assert!(python.reticulum.remote_management);
+        assert!(python.reticulum.probe_destination);
+        assert_eq!(python.reticulum.remote_management_allowed.len(), 2);
+
+        let native: Config = toml::from_str(
+            r#"
+[reticulum]
+remote_management = true
+probe_destination = true
+remote_management_allowed = ["00112233445566778899aabbccddeeff"]
+"#,
+        )
+        .unwrap();
+        assert!(native.reticulum.remote_management);
+        assert!(native.reticulum.probe_destination);
+        assert_eq!(native.reticulum.remote_management_allowed.len(), 1);
+
+        let empty: Config = toml::from_str(
+            "[reticulum]\nremote_management = true\nremote_management_allowed = []\n",
+        )
+        .unwrap();
+        assert!(empty.reticulum.remote_management_allowed.is_empty());
+    }
+
+    #[test]
+    fn i2p_peers_accept_strings_and_arrays() {
+        for (peers, expected) in [
+            ("\"one, two, ,three\"", vec!["one", "two", "three"]),
+            ("[\"one\", \" two \"]", vec!["one", "two"]),
+        ] {
+            let input = format!(
+                "[[interfaces]]\nname = \"i2p\"\ntype = \"I2PInterface\"\npeers = {peers}\n"
+            );
+            let config: Config = toml::from_str(&input).unwrap();
+            match &config.interfaces[0].config {
+                InterfaceConfig::I2PInterface { peers, .. } => assert_eq!(peers, &expected),
+                other => panic!("unexpected interface: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn python_migration_preserves_complete_string_values_and_lists() {
+        let migrated = convert_config(
+            r#"
+[reticulum]
+enable_remote_management = Yes
+enable_remote_probe = Yes
+remote_management_allowed = 00112233445566778899aabbccddeeff, fedcba98765432100123456789abcdef
+
+[[Pipe With Spaces]]
+type = PipeInterface
+command = socat TCP:example.com:1234 STDIO # keep this
+networkname = private mesh
+passphrase = correct horse battery staple
+reachable_on = gateway.example:4242
+
+[[I2P]]
+type = I2PInterface
+sam_address = 127.0.0.1:7656
+peers = peer one, peer two
+
+[[Auto]]
+type = AutoInterface
+group_id = mesh group
+discovery_scope = site
+multicast_address_type = permanent
+devices = eth0, wlan0
+ignored_devices = docker0, veth0
+
+[[RNode]]
+type = RNodeInterface
+port = tcp://127.0.0.1:7633
+frequency = 867500000
+bandwidth = 125000
+txpower = 13
+spreadingfactor = 9
+codingrate = 5
+"#,
+        );
+
+        assert!(migrated.contains(
+            "command = \"socat TCP:example.com:1234 STDIO\" # keep this"
+        ));
+        let config: Config = toml::from_str(&migrated).expect("migrated Config");
+        assert!(config.reticulum.remote_management);
+        assert!(config.reticulum.probe_destination);
+        assert_eq!(config.reticulum.remote_management_allowed.len(), 2);
+        assert_eq!(config.interfaces.len(), 4);
+
+        match &config.interfaces[0].config {
+            InterfaceConfig::PipeInterface { command, .. } => {
+                assert_eq!(command, "socat TCP:example.com:1234 STDIO")
+            }
+            other => panic!("unexpected interface: {other:?}"),
+        }
+        match &config.interfaces[1].config {
+            InterfaceConfig::I2PInterface { peers, sam_address, .. } => {
+                assert_eq!(peers, &["peer one", "peer two"]);
+                assert_eq!(sam_address.as_deref(), Some("127.0.0.1:7656"));
+            }
+            other => panic!("unexpected interface: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_rejects_ifac_sizes_above_ed25519_signature_length() {
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum-config-ifac-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            r#"
+[[interfaces]]
+name = "too-large"
+type = "UDPInterface"
+listen_ip = "127.0.0.1"
+listen_port = 10001
+forward_ip = "127.0.0.1"
+forward_port = 10002
+ifac_size = 513
+"#,
+        )
+        .unwrap();
+        assert!(Config::from_file(&dir).is_err());
+        let _ = fs::remove_dir_all(dir);
     }
 }

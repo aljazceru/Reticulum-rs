@@ -29,7 +29,8 @@ fn bench_announce_validation(c: &mut Criterion) {
 }
 
 fn bench_ifac_wrap_unwrap(c: &mut Criterion) {
-    let key = IfacKey::derive(Some("bench-network"), Some("bench-passphrase"), 8);
+    let key = IfacKey::derive(Some("bench-network"), Some("bench-passphrase"), 8)
+        .expect("valid IFAC");
     let raw: Vec<u8> = (0..500u16).map(|i| (i % 256) as u8).collect();
 
     c.bench_function("ifac/wrap-500b", |b| {

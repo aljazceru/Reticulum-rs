@@ -505,7 +505,10 @@ impl InterfaceDiscovery {
     }
 
     async fn listen(self: Arc<Self>) {
-        let mut announces = self.transport.subscribe_announces(&["discovery"]).await;
+        let mut announces = self
+            .transport
+            .subscribe_announces("rnstransport", &["discovery.interface"])
+            .await;
 
         loop {
             let Ok(event) = announces.recv().await else { return };
@@ -630,7 +633,7 @@ impl InterfaceDiscovery {
             if let (Some(netname), Some(netkey)) =
                 (entry.info.ifac_netname.clone(), entry.info.ifac_netkey.clone())
             {
-                manager.set_iface_ifac(&ifac_address, Some(&netname), Some(&netkey), 8);
+                let _ = manager.set_iface_ifac(&ifac_address, Some(&netname), Some(&netkey), 8);
             }
 
             log::info!("discovery: auto-connected to {address}");

@@ -122,6 +122,16 @@ async fn remote_management_status_and_path() {
     client.send_packet(identify_packet).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // Management is deny-all until the identity is explicitly configured.
+    let denied = client
+        .request(&link, "/status", &pack_status_request())
+        .await
+        .expect("send denied status request");
+    assert!(client
+        .await_request_response(denied, Duration::from_millis(500))
+        .await
+        .is_none());
+
     server
         .remote_management_allow(*identity_a.address_hash())
         .await;

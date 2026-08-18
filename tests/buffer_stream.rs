@@ -50,6 +50,7 @@ async fn buffer_round_trip() {
     let dest = transport_a
         .add_destination(id_a, DestinationName::new("test", "buffers.stream"))
         .await;
+    dest.lock().await.proof_strategy = reticulum::destination::ProofStrategy::All;
     transport_a.send_announce(&dest, None).await;
     let announce = recv_announces.recv().await.unwrap();
 
@@ -128,4 +129,3 @@ fn mdu_bound() {
     // Stream frames must fit in a link MDU minus the stream overhead.
     assert_eq!(MAX_DATA_LEN, reticulum::packet::LINK_MDU - 8);
 }
-

@@ -162,6 +162,7 @@ async fn message_proof_over_remote_link() {
     let dest_c = transport_c
         .add_destination(id_c, DestinationName::new("test", "link_to"))
         .await;
+    dest_c.lock().await.proof_strategy = reticulum::destination::ProofStrategy::All;
     let dest_c_hash = dest_c.lock().await.desc.address_hash;
     // NOTE: we have to wait before sending announce because if the TCP client has not yet
     // connected, the outgoing packet will be dropped

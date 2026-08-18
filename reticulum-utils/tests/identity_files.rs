@@ -128,3 +128,36 @@ fn rncp_identity_persists_per_config_dir() {
     );
     let _ = std::fs::remove_dir_all(&config_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn private_identity_writes_are_owner_only_even_for_existing_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir("permissions");
+    let paths = [
+        dir.join("identity"),
+        dir.join("storage/identities/rnsh"),
+        dir.join("storage/identities/rnx"),
+        dir.join("storage/identities/rncp"),
+        dir.join("utility.rid"),
+    ];
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+
+    for path in paths {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, b"replace me").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        save_private_identity(&path, &identity).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{} must remain private",
+            path.display()
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}

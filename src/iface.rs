@@ -363,12 +363,12 @@ impl InterfaceManager {
         netname: Option<&str>,
         netkey: Option<&str>,
         size: usize,
-    ) -> bool {
-        let key = ifac::IfacKey::derive(netname, netkey, size);
-        self.with_iface_ifac(address, move |slot| {
+    ) -> Result<bool, crate::error::RnsError> {
+        let key = ifac::IfacKey::derive(netname, netkey, size)?;
+        Ok(self.with_iface_ifac(address, move |slot| {
             *slot.write().expect("ifac lock") = Some(Arc::new(key));
         })
-        .is_some()
+        .is_some())
     }
 
     /// Access the IFAC configuration slot of an interface.

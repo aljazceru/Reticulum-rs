@@ -100,7 +100,25 @@ pub fn save_private_identity(path: &Path, identity: &PrivateIdentity) -> std::io
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, identity.to_hex_string())
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        file.write_all(identity.to_hex_string().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, identity.to_hex_string())
+    }
 }
 
 /// Load a private identity from `path`.

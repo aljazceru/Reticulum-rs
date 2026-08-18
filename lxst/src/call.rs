@@ -251,7 +251,7 @@ impl CallEndpoint {
                 tokio::select! {
                     event = link_events.recv() => {
                         match event {
-                            Ok(LinkEventData { id, event, .. }) => match event {
+                            Ok(LinkEventData { id, event, .. }) if id == link_id => match event {
                                 LinkEvent::Data(payload) => {
                                     source.lock().await.handle_packet(payload.as_slice()).await;
                                 }
@@ -261,6 +261,7 @@ impl CallEndpoint {
                                 }
                                 _ => {}
                             },
+                            Ok(_) => {}
                             Err(_) => break,
                         }
                     }
@@ -340,9 +341,19 @@ impl CallEndpoint {
 
     fn spawn_link_watcher(&self, events: mpsc::Sender<CallEvent>) {
         let transport = self.transport.clone();
+        let destination = self.destination.clone();
         tokio::spawn(async move {
             let mut link_events = transport.in_link_events();
-            while let Ok(LinkEventData { id, event, .. }) = link_events.recv().await {
+            while let Ok(LinkEventData {
+                id,
+                address_hash,
+                event,
+            }) = link_events.recv().await
+            {
+                let destination_hash = destination.lock().await.desc.address_hash;
+                if address_hash != destination_hash {
+                    continue;
+                }
                 match event {
                     LinkEvent::Activated => {
                         let _ = events.send(CallEvent::IncomingCall(id)).await;

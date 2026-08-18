@@ -90,7 +90,13 @@ impl PathTable {
     }
 
     pub fn get(&self, destination: &AddressHash) -> Option<&PathEntry> {
-        self.map.get(destination)
+        self.map.get(destination).filter(|entry| !entry.unresponsive)
+    }
+
+    /// Whether an entry exists, including retained unresponsive entries used
+    /// for diagnostics and equal-hop recovery.
+    pub fn contains(&self, destination: &AddressHash) -> bool {
+        self.map.contains_key(destination)
     }
 
     /// Insert a path restored from a tunnel table entry
@@ -120,6 +126,7 @@ impl PathTable {
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
         self.map
             .get(destination)
+            .filter(|entry| !entry.unresponsive)
             .map(|entry| (entry.received_from, entry.iface))
     }
 
@@ -135,7 +142,7 @@ impl PathTable {
             if hops > existing_entry.hops {
                 return;
             }
-            if !self.reroute_eager && hops == existing_entry.hops {
+            if !existing_entry.unresponsive && !self.reroute_eager && hops == existing_entry.hops {
                 return;
             }
         }
@@ -167,7 +174,7 @@ impl PathTable {
     ) -> (Packet, Option<AddressHash>) {
         let lookup = lookup.unwrap_or(original_packet.destination);
 
-        let entry = match self.map.get(&lookup) {
+        let entry = match self.map.get(&lookup).filter(|entry| !entry.unresponsive) {
             Some(entry) => entry,
             None => return (*original_packet, None),
         };
@@ -212,7 +219,11 @@ impl PathTable {
             return (*original_packet, None);
         }
 
-        let entry = match self.map.get(&original_packet.destination) {
+        let entry = match self
+            .map
+            .get(&original_packet.destination)
+            .filter(|entry| !entry.unresponsive)
+        {
             Some(entry) => entry,
             None => return (*original_packet, None),
         };
@@ -267,5 +278,62 @@ impl PathTable {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packet::{PacketContext, PacketDataBuffer};
+
+    fn address(byte: u8) -> AddressHash {
+        AddressHash::new_from_slice(&[byte; 32])
+    }
+
+    fn announce(destination: AddressHash, hops: u8, marker: u8) -> Packet {
+        Packet {
+            header: Header {
+                packet_type: PacketType::Announce,
+                hops,
+                ..Default::default()
+            },
+            destination,
+            context: PacketContext::None,
+            data: PacketDataBuffer::new_from_slice(&[marker]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unresponsive_paths_are_retained_but_never_routed() {
+        let destination = address(1);
+        let first_iface = address(2);
+        let recovered_iface = address(3);
+        let mut table = PathTable::new(false);
+        table.handle_announce(&announce(destination, 0, 1), None, first_iface);
+        assert!(table.get(&destination).is_some());
+
+        assert!(table.mark_path_unresponsive(&destination));
+        assert!(table.contains(&destination));
+        assert!(table.get(&destination).is_none());
+        assert!(table.next_hop_full(&destination).is_none());
+        assert_eq!(table.iter().count(), 1, "diagnostics retain the entry");
+
+        let packet = Packet {
+            destination,
+            ..Default::default()
+        };
+        assert!(table.handle_packet(&packet).1.is_none());
+        assert!(table.handle_inbound_packet(&packet, None).1.is_none());
+
+        // A fresh equal-hop announce revives the route even without eager
+        // rerouting.
+        table.handle_announce(&announce(destination, 0, 2), None, recovered_iface);
+        assert!(!table.path_is_unresponsive(&destination));
+        assert_eq!(table.get(&destination).unwrap().iface, recovered_iface);
+
+        assert!(table.mark_path_unresponsive(&destination));
+        assert!(table.mark_path_responsive(&destination));
+        assert!(table.get(&destination).is_some());
     }
 }

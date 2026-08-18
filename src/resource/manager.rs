@@ -321,11 +321,17 @@ impl ResourceManager {
         plaintext: &[u8],
     ) -> ResourceTx {
         let mut tx = ResourceTx::default();
-        let resource_hash_prefix = if plaintext.first() == Some(&super::HASHMAP_IS_EXHAUSTED) {
-            &plaintext[1 + super::MAPHASH_LEN..]
+        let prefix_offset = if plaintext.first() == Some(&super::HASHMAP_IS_EXHAUSTED) {
+            1 + super::MAPHASH_LEN
         } else {
-            &plaintext[1..]
+            1
         };
+        // Requests are a flag byte, optionally a map hash, and a full
+        // resource hash. Validate before slicing malformed network input.
+        if plaintext.len() < prefix_offset + 32 {
+            return tx;
+        }
+        let resource_hash_prefix = &plaintext[prefix_offset..];
         if resource_hash_prefix.len() < 32 {
             return tx;
         }
@@ -708,4 +714,55 @@ pub fn pack_response(request_id: &AddressHash, response: &[u8]) -> Vec<u8> {
     rmp::encode::write_bin(&mut out, request_id.as_slice()).unwrap();
     rmp::encode::write_bin(&mut out, response).unwrap();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::destination::{DestinationName, SingleInputDestination};
+    use crate::identity::PrivateIdentity;
+    use rand_core::OsRng;
+
+    fn link() -> Link {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        Link::new(
+            SingleInputDestination::new(
+                identity,
+                DestinationName::new("test", "resource.request"),
+            )
+            .desc,
+        )
+    }
+
+    #[test]
+    fn malformed_part_requests_are_ignored_without_state_changes() {
+        let link = link();
+        let mut manager = ResourceManager::new();
+        let before = (manager.out.len(), manager.incoming.len());
+
+        let malformed = [
+            Vec::new(),
+            vec![0],
+            vec![super::super::HASHMAP_IS_EXHAUSTED],
+            vec![super::super::HASHMAP_IS_EXHAUSTED; 1 + super::super::MAPHASH_LEN],
+            vec![0; 32],
+            vec![super::super::HASHMAP_IS_EXHAUSTED; 1 + super::super::MAPHASH_LEN + 31],
+        ];
+        for request in malformed {
+            assert!(manager.handle_request_data(&link, &request).packets.is_empty());
+            assert_eq!((manager.out.len(), manager.incoming.len()), before);
+        }
+
+        let valid_normal = vec![0; 33];
+        let valid_exhausted =
+            vec![super::super::HASHMAP_IS_EXHAUSTED; 1 + super::super::MAPHASH_LEN + 32];
+        assert!(manager
+            .handle_request_data(&link, &valid_normal)
+            .packets
+            .is_empty());
+        assert!(manager
+            .handle_request_data(&link, &valid_exhausted)
+            .packets
+            .is_empty());
+    }
 }

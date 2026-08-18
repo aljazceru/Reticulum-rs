@@ -17,6 +17,7 @@
 //! [`MemoryStorage`] while `FsStorage` matches the Python directory layout.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use reticulum_core::destination::RATCHET_COUNT;
@@ -36,6 +37,8 @@ pub const KNOWN_DESTINATIONS_FILE: &str = "known_destinations";
 /// Directory of remembered remote ratchets
 /// (Python `RNS.Reticulum.storagepath + "/ratchets"`).
 pub const RATCHETS_DIR: &str = "ratchets";
+
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Minimal file backend used by the persistence layer.
 pub trait Storage: Send + Sync {
@@ -70,6 +73,43 @@ impl FsStorage {
     }
 }
 
+#[cfg(not(windows))]
+fn replace_file(temp: &str, destination: &str) -> std::io::Result<()> {
+    std::fs::rename(temp, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(temp: &str, destination: &str) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temp: Vec<u16> = std::ffi::OsStr::new(temp)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = std::ffi::OsStr::new(destination)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // SAFETY: both pointers reference NUL-terminated UTF-16 buffers that
+    // remain alive for the duration of the call.
+    if unsafe {
+        MoveFileExW(
+            temp.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 impl Storage for FsStorage {
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         std::fs::read(self.full(path)).ok()
@@ -84,9 +124,26 @@ impl Storage for FsStorage {
 
         // Python writes to a temp file and renames it into place, keeping
         // readers from observing partially written files.
-        let temp = format!("{full}.tmp");
-        std::fs::write(&temp, data).map_err(|_| RnsError::Storage)?;
-        std::fs::rename(&temp, &full).map_err(|_| RnsError::Storage)?;
+        let temp = format!(
+            "{full}.{}.{}.tmp",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
+        let write_result = (|| {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)
+                .map_err(|_| RnsError::Storage)?;
+            file.write_all(data).map_err(|_| RnsError::Storage)?;
+            file.sync_all().map_err(|_| RnsError::Storage)?;
+            replace_file(&temp, &full).map_err(|_| RnsError::Storage)
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        write_result?;
 
         Ok(())
     }
@@ -640,4 +697,32 @@ pub fn save_destination_ratchets(
 pub fn clean_destination_ratchets(ratchets: &mut Vec<[u8; RATCHET_KEY_LENGTH]>, retained: usize) {
     let retained = retained.clamp(1, RATCHET_COUNT);
     ratchets.truncate(retained);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filesystem_writes_replace_existing_files_and_clean_temporaries() {
+        let dir = std::env::temp_dir().join(format!(
+            "reticulum-storage-replace-{}-{}",
+            std::process::id(),
+            TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let storage = FsStorage::new(dir.to_string_lossy().into_owned());
+
+        for value in 0u8..32 {
+            storage.write("nested/value", &[value; 64]).unwrap();
+            assert_eq!(storage.read("nested/value"), Some(vec![value; 64]));
+        }
+
+        let entries = std::fs::read_dir(dir.join("nested"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("value")]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

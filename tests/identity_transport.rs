@@ -9,7 +9,7 @@ use reticulum::destination::{DestinationName, ProofStrategy};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
-use reticulum::storage::MemoryStorage;
+use reticulum::storage::{FsStorage, MemoryStorage};
 use reticulum::transport::{ReceivedData, Transport, TransportConfig};
 use tokio::sync::Mutex;
 
@@ -127,6 +127,10 @@ async fn single_destination_encrypted_exchange_with_ratchets() {
     let destination = server
         .add_destination(identity, DestinationName::new(NAME.0, NAME.1))
         .await;
+    destination
+        .lock()
+        .await
+        .set_proof_strategy(ProofStrategy::All);
     let address = destination.lock().await.desc.address_hash;
 
     // Enable ratchets on the destination (persists to the MemoryStorage).
@@ -177,7 +181,7 @@ async fn single_destination_encrypted_exchange_with_ratchets() {
         .expect("encrypted packet received");
     assert_eq!(decrypted, payload);
 
-    // PROVE_ALL (the default) proves the packet.
+    // This destination explicitly opts into PROVE_ALL.
     assert!(
         wait_receipt(&client, &packet_hash, Duration::from_secs(10)).await,
         "delivery proof must arrive"
@@ -262,7 +266,14 @@ async fn proof_strategy_matrix() {
 
 #[tokio::test]
 async fn known_destinations_persist_across_restart() {
-    let storage = Arc::new(MemoryStorage::new());
+    let storage_dir = std::env::temp_dir().join(format!(
+        "reticulum-daemon-storage-restart-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&storage_dir);
+    let storage = Arc::new(FsStorage::new(
+        storage_dir.to_string_lossy().into_owned(),
+    ));
 
     // Build the pair manually so the client shares the storage that the
     // restarted transport reloads from.
@@ -291,12 +302,17 @@ async fn known_destinations_persist_across_restart() {
         .add_destination(identity, DestinationName::new("example_utilities", "persisted"))
         .await;
     let address = destination.lock().await.desc.address_hash;
+    server
+        .enable_destination_ratchets(&address, "server-destination.ratchets")
+        .await
+        .expect("server ratchets");
 
     let mut announces = client.recv_announces().await;
     server.send_announce(&destination, Some(b"persisted app data")).await;
-    wait_announce(&mut announces, &address, Duration::from_secs(10))
+    let announced_ratchet = wait_announce(&mut announces, &address, Duration::from_secs(10))
         .await
-        .expect("announce");
+        .expect("announce")
+        .expect("remote ratchet");
 
     assert_eq!(client.known_destinations_len().await, 1);
     client.save_known_destinations().await.expect("save");
@@ -312,6 +328,73 @@ async fn known_destinations_persist_across_restart() {
     let recalled = restarted.recall(&address).await.expect("recall after restart");
     let expected = destination.lock().await.desc.identity;
     assert_eq!(recalled.to_hex_string(), expected.to_hex_string());
+    assert_eq!(
+        restarted.recall_app_data(&address).await.as_deref(),
+        Some(b"persisted app data".as_ref())
+    );
+    assert_eq!(restarted.get_ratchet(&address).await, Some(announced_ratchet));
+    let _ = std::fs::remove_dir_all(storage_dir);
+}
+
+#[tokio::test]
+async fn destination_ratchets_are_signed_by_the_destination_and_reload() {
+    let storage = Arc::new(MemoryStorage::new());
+    let transport_identity = PrivateIdentity::new_from_rand(OsRng);
+    let destination_identity = PrivateIdentity::new_from_rand(OsRng);
+    assert_ne!(
+        transport_identity.address_hash(),
+        destination_identity.address_hash()
+    );
+    let name = DestinationName::new("test", "destination.ratchet-signature");
+    let path = "local-destination.ratchets";
+
+    let transport = TransportConfig::new("ratchet-writer", &transport_identity, false)
+        .set_storage(storage.clone())
+        .build();
+    let destination = transport
+        .add_destination(destination_identity.clone(), name)
+        .await;
+    let address = destination.lock().await.desc.address_hash;
+    transport
+        .enable_destination_ratchets(&address, path)
+        .await
+        .expect("initial empty ratchet persistence");
+
+    // The empty file and the rotated file both verify with the destination,
+    // never with the transport identity.
+    assert!(reticulum::storage::load_destination_ratchets(
+        &*storage,
+        path,
+        destination_identity.as_identity()
+    )
+    .is_ok());
+    assert!(reticulum::storage::load_destination_ratchets(
+        &*storage,
+        path,
+        transport_identity.as_identity()
+    )
+    .is_err());
+
+    transport.send_announce(&destination, None).await;
+    let persisted = reticulum::storage::load_destination_ratchets(
+        &*storage,
+        path,
+        destination_identity.as_identity(),
+    )
+    .expect("rotated ratchets verify");
+    assert_eq!(persisted.len(), 1);
+
+    let restarted = TransportConfig::new("ratchet-reader", &transport_identity, false)
+        .set_storage(storage)
+        .build();
+    let reloaded = restarted
+        .add_destination(destination_identity, name)
+        .await;
+    restarted
+        .enable_destination_ratchets(&address, path)
+        .await
+        .expect("ratchet reload");
+    assert_eq!(reloaded.lock().await.ratchets().unwrap().len(), 1);
 }
 
 /// Ratchets expire after `RATCHET_EXPIRY` (30 days) and are dropped by

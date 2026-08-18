@@ -1,14 +1,14 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use rand_core::OsRng;
-use reticulum::identity::PrivateIdentity;
+use reticulum::hash::AddressHash;
 use reticulum::iface::local::LocalServer;
 use reticulum::iface::local::SharedInstanceAddress;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::TransportConfig;
+use reticulum::storage::FsStorage;
 use tokio::signal;
 
 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
@@ -39,6 +39,37 @@ use reticulum_daemon::config::{Config, InterfaceConfig};
 /// the config-dir root in hex so `rn id -i <configdir>/identity` can inspect
 /// it.
 const IDENTITY_FILE: &str = "identity";
+
+fn parse_management_allowed(values: &[String]) -> Result<Vec<AddressHash>, String> {
+    values
+        .iter()
+        .map(|value| {
+            if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("invalid remote management identity hash: {value}"));
+            }
+            AddressHash::new_from_hex_string(value)
+                .map_err(|_| format!("invalid remote management identity hash: {value}"))
+        })
+        .collect()
+}
+
+/// Resolve Python and native RNode endpoints consistently: an explicit TCP
+/// setting wins; otherwise a port with a tcp:// prefix is a TCP target and
+/// every other port value is a serial path.
+#[cfg(feature = "iface-rnode")]
+fn rnode_endpoint<'a>(
+    tcp: &'a Option<String>,
+    port: &'a Option<String>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(tcp) = tcp.as_deref() {
+        return (Some(tcp), None);
+    }
+    match port.as_deref() {
+        Some(port) if port.starts_with("tcp://") => (Some(&port[6..]), None),
+        Some(port) => (None, Some(port)),
+        None => (None, None),
+    }
+}
 
 /// Reticulum-rs daemon
 #[derive(Parser)]
@@ -85,27 +116,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every destination derived from it — stays stable across restarts
     // (Phase 7.4). The daemon announces nothing by default.
     let identity_path = config_path.join(IDENTITY_FILE);
-    let identity = match reticulum_utils::common::load_private_identity(&identity_path) {
-        Ok(identity) => {
-            log::info!(
-                "Loaded daemon identity {} from {}",
-                reticulum_utils::common::prettyhexrep(identity.address_hash().as_slice()),
-                identity_path.display()
-            );
-            identity
-        }
-        Err(_err) if !identity_path.exists() => {
-            let identity = PrivateIdentity::new_from_rand(OsRng);
-            reticulum_utils::common::save_private_identity(&identity_path, &identity)?;
-            log::info!(
-                "Generated new daemon identity {} and persisted it to {}",
-                reticulum_utils::common::prettyhexrep(identity.address_hash().as_slice()),
-                identity_path.display()
-            );
-            identity
-        }
-        Err(err) => return Err(format!("could not load daemon identity: {err}").into()),
-    };
+    let (identity, created) = reticulum_utils::common::load_or_create_private_identity(&identity_path)
+        .map_err(|err| format!("could not load daemon identity: {err}"))?;
+    log::info!(
+        "{} daemon identity {} at {}",
+        if created { "Generated" } else { "Loaded" },
+        reticulum_utils::common::prettyhexrep(identity.address_hash().as_slice()),
+        identity_path.display()
+    );
 
     let instance_name = config
         .reticulum
@@ -117,8 +135,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = std::sync::Arc::new(
         TransportConfig::new(&instance_name, &identity, config.reticulum.enable_transport)
             .set_retransmit(config.reticulum.enable_transport)
+            .set_storage(std::sync::Arc::new(FsStorage::new(
+                config_path.join("storage").to_string_lossy().into_owned(),
+            )))
             .build(),
     );
+    transport
+        .load_known_destinations()
+        .await
+        .map_err(|error| format!("could not load known destinations: {error:?}"))?;
 
     let iface_manager = transport.iface_manager();
 
@@ -409,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 configure_iface(&iface_manager, &address, iface).await;
             }
-            InterfaceConfig::RNodeInterface { port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock, .. } => {
+            InterfaceConfig::RNodeInterface { port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock, flow_control, .. } => {
                 #[cfg(feature = "iface-rnode")]
                 {
                     let config = reticulum::iface::rnode::RnodeRadioConfig {
@@ -422,12 +447,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         lt_alock: *lt_alock,
                     };
 
+                    let (tcp, port) = rnode_endpoint(tcp, port);
                     let interface = if let Some(tcp) = tcp {
                         log::info!(
                             "Enabling interface '{}': RNode over TCP {tcp} at {frequency} Hz",
                             iface.name
                         );
-                        Some(reticulum::iface::rnode::RnodeInterface::tcp(tcp.clone(), config))
+                        Some(reticulum::iface::rnode::RnodeInterface::tcp(tcp, config))
                     } else if let Some(port) = port {
                         log::info!(
                             "Enabling interface '{}': RNode on {port} at {speed} baud, {frequency} Hz",
@@ -435,7 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         #[cfg(feature = "iface-serial")]
                         {
-                            Some(reticulum::iface::rnode::RnodeInterface::serial(port.clone(), *speed, config))
+                            Some(reticulum::iface::rnode::RnodeInterface::serial(port, *speed, config))
                         }
                         #[cfg(not(feature = "iface-serial"))]
                         {
@@ -453,7 +479,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(interface) = interface {
                         let address = iface_manager.lock().await.spawn_named(
                             &iface.name,
-                            interface.with_manager(iface_manager.clone()),
+                            interface
+                                .with_flow_control(*flow_control)
+                                .with_manager(iface_manager.clone()),
                             reticulum::iface::rnode::RnodeInterface::spawn,
                         );
                         configure_iface(&iface_manager, &address, iface).await;
@@ -462,7 +490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(not(feature = "iface-rnode"))]
                 {
-                    let _ = (port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock);
+                    let _ = (port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock, flow_control);
                     log::warn!(
                         "Interface '{}' type 'RNodeInterface' requires building the daemon with --features iface-rnode",
                         iface.name
@@ -490,13 +518,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .collect();
 
+                    let (tcp, port) = rnode_endpoint(tcp, port);
                     let interface = if let Some(tcp) = tcp {
                         log::info!(
                             "Enabling interface '{}': RNodeMulti over TCP {tcp} with {} virtual ports",
                             iface.name,
                             vports.len()
                         );
-                        Some(RnodeMultiInterface::tcp(tcp.clone(), vports, iface_manager.clone()))
+                        Some(RnodeMultiInterface::tcp(tcp, vports, iface_manager.clone()))
                     } else if let Some(port) = port {
                         log::info!(
                             "Enabling interface '{}': RNodeMulti on {port} at {speed} baud with {} virtual ports",
@@ -505,7 +534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         #[cfg(feature = "iface-serial")]
                         {
-                            Some(RnodeMultiInterface::serial(port.clone(), *speed, vports, iface_manager.clone()))
+                            Some(RnodeMultiInterface::serial(port, *speed, vports, iface_manager.clone()))
                         }
                         #[cfg(not(feature = "iface-serial"))]
                         {
@@ -824,6 +853,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if config.reticulum.remote_management {
+        let allowed = parse_management_allowed(&config.reticulum.remote_management_allowed)?;
+        for allowed in allowed {
+            transport.remote_management_allow(allowed).await;
+        }
         let destination = transport.enable_remote_management().await;
         log::info!(
             "Remote management enabled on {}",
@@ -885,12 +918,17 @@ async fn configure_iface(
             .map(|bits| (bits / 8).max(reticulum::iface::ifac::IFAC_MIN_SIZE))
             .unwrap_or(reticulum::iface::ifac::DEFAULT_IFAC_SIZE);
 
-        manager.set_iface_ifac(
+        if let Err(error) = manager.set_iface_ifac(
             address,
             iface.networkname.as_deref(),
             iface.passphrase.as_deref(),
             size,
-        );
+        ) {
+            log::error!(
+                "Interface '{}' has an invalid IFAC configuration: {error:?}",
+                iface.name
+            );
+        }
 
         log::info!(
             "Interface '{}' is access-code protected (ifac size {size} bytes)",
@@ -898,7 +936,6 @@ async fn configure_iface(
         );
     }
 }
-
 
 /// Build the discovery description of a discoverable interface
 /// (Python `InterfaceAnnouncer.get_interface_announce_data`).
@@ -943,4 +980,44 @@ fn discovery_info_for(
         ifac_netname: None,
         ifac_netkey: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_management_allowed;
+
+    #[test]
+    fn management_hashes_are_all_validated_before_use() {
+        let valid = vec!["00112233445566778899aabbccddeeff".to_string()];
+        assert_eq!(parse_management_allowed(&valid).unwrap().len(), 1);
+        assert!(parse_management_allowed(&[]).unwrap().is_empty());
+        assert!(parse_management_allowed(&[
+            valid[0].clone(),
+            "not-a-valid-hash".to_string(),
+        ])
+        .is_err());
+    }
+
+    #[cfg(feature = "iface-rnode")]
+    #[test]
+    fn rnode_endpoints_normalize_python_and_native_forms() {
+        use super::rnode_endpoint;
+
+        let tcp = Some("native.example:7633".to_string());
+        let serial = Some("/dev/ttyUSB0".to_string());
+        assert_eq!(
+            rnode_endpoint(&tcp, &serial),
+            (Some("native.example:7633"), None)
+        );
+
+        let tcp = None;
+        let migrated = Some("tcp://127.0.0.1:7633".to_string());
+        assert_eq!(
+            rnode_endpoint(&tcp, &migrated),
+            (Some("127.0.0.1:7633"), None)
+        );
+
+        let serial = Some("/dev/ttyACM0".to_string());
+        assert_eq!(rnode_endpoint(&tcp, &serial), (None, Some("/dev/ttyACM0")));
+    }
 }

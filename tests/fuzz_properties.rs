@@ -102,7 +102,7 @@ fn tunnel_synthesis_decode_never_panics() {
 
 #[test]
 fn ifac_strip_never_panics() {
-    let key = IfacKey::derive(Some("fuzz"), Some("net"), 8);
+    let key = IfacKey::derive(Some("fuzz"), Some("net"), 8).expect("valid IFAC");
     let mut corpus = Corpus(0xbeef);
 
     for _ in 0..256 {
