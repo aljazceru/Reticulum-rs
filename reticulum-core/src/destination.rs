@@ -94,6 +94,15 @@ impl DestinationName {
         }
     }
 
+    /// The destination address hash for this name and an announcing
+    /// identity (Python `Destination.hash_from_name_and_identity`).
+    pub fn address_hash_for<I: crate::identity::HashIdentity>(
+        &self,
+        identity: &I,
+    ) -> AddressHash {
+        create_address_hash(identity, self)
+    }
+
     pub fn as_name_hash_slice(&self) -> &[u8] {
         &self.hash.as_slice()[..NAME_HASH_LENGTH]
     }

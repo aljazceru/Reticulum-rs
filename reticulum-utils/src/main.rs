@@ -30,6 +30,16 @@ enum Command {
     Cp(CpArgs),
     /// Probe transport instances (rnprobe)
     Probe(ProbeArgs),
+    /// Remote command execution (rnx)
+    X(XArgs),
+    /// Remote shell sessions (rnsh)
+    Sh(ShArgs),
+    /// RNode diagnostics and validation (rnodeconf)
+    Nodeconf(NodeconfArgs),
+    /// Identity resolver stub (rnir)
+    Ir(CommonArgs),
+    /// Package manager stub (rnpkg)
+    Pkg(CommonArgs),
 }
 
 #[derive(Args)]
@@ -84,6 +94,90 @@ struct StatusArgs {
     /// Increase verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+}
+
+#[derive(Args)]
+struct CommonArgs {
+    /// Path to alternative Reticulum config directory
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct XArgs {
+    /// Path to alternative Reticulum config directory
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Run a command listener
+    #[arg(short, long)]
+    serve: bool,
+    /// Accept commands from anyone
+    #[arg(short = 'A', long)]
+    allow_all: bool,
+    /// Allow this identity hash (repeatable)
+    #[arg(short = 'a', long = "allowed")]
+    allowed: Vec<String>,
+    /// Command to execute remotely
+    command: Option<String>,
+    /// Hexadecimal hash of the listener (execute mode)
+    #[arg(short, long)]
+    destination: Option<String>,
+    /// Timeout in seconds
+    #[arg(short = 'w', long)]
+    timeout: Option<f64>,
+    /// Debug helper: bind a UDP loopback interface LISTEN:FORWARD
+    #[arg(long)]
+    udp_loopback: Option<String>,
+}
+
+#[derive(Args)]
+struct ShArgs {
+    /// Path to alternative Reticulum config directory
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+    /// Run a session listener
+    #[arg(short, long)]
+    serve: bool,
+    /// Run one command in a session
+    #[arg(short, long)]
+    command: Option<String>,
+    /// Hexadecimal hash of the listener
+    #[arg(short, long)]
+    destination: Option<String>,
+    /// Debug helper: bind a UDP loopback interface LISTEN:FORWARD
+    #[arg(long)]
+    udp_loopback: Option<String>,
+}
+
+#[derive(Args)]
+struct NodeconfArgs {
+    /// Serial port of the device
+    #[arg(short, long)]
+    port: Option<String>,
+    /// TCP address of the device
+    #[arg(short, long)]
+    tcp: Option<String>,
+    /// Serial baudrate
+    #[arg(short = 'B', long, default_value_t = 115200)]
+    baudrate: u32,
+    /// Validate the device's radio configuration
+    #[arg(long)]
+    validate: bool,
+    /// Radio frequency in Hz
+    #[arg(short, long)]
+    frequency: Option<u64>,
+    /// Radio bandwidth in Hz
+    #[arg(short, long)]
+    bandwidth: Option<u32>,
+    /// TX power in dBm
+    #[arg(short = 'T', long)]
+    txpower: Option<u8>,
+    /// LoRa spreading factor
+    #[arg(short, long)]
+    spreadingfactor: Option<u8>,
+    /// LoRa coding rate
+    #[arg(short, long)]
+    codingrate: Option<u8>,
 }
 
 #[derive(Args)]
@@ -212,6 +306,34 @@ async fn main() -> ExitCode {
         Command::Status(args) => exit_code(run_status(args).await),
         Command::Cp(args) => exit_code(run_cp(args).await),
         Command::Probe(args) => exit_code(run_probe(args).await),
+        Command::X(args) => exit_code(run_x(args).await),
+        Command::Sh(args) => exit_code(run_sh(args).await),
+        Command::Nodeconf(args) => {
+            #[cfg(feature = "iface-rnode")]
+            {
+                exit_code(run_nodeconf(args).await)
+            }
+            #[cfg(not(feature = "iface-rnode"))]
+            {
+                let _ = args;
+                eprintln!("rnodeconf requires building with --features iface-rnode");
+                ExitCode::FAILURE
+            }
+        }
+        Command::Ir(args) => {
+            init_logging(0);
+            let options = reticulum_utils::rnir::Options {
+                config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+            };
+            exit_code(reticulum_utils::rnir::run(&options).await)
+        }
+        Command::Pkg(args) => {
+            init_logging(0);
+            let options = reticulum_utils::rnpkg::Options {
+                config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+            };
+            exit_code(reticulum_utils::rnpkg::run(&options).await)
+        }
     }
 }
 
@@ -415,10 +537,7 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
         .map_err(|err| err.to_string())?
         .ok_or("a destination hash is required (or use --loopback)")?;
 
-    let udp_loopback = args
-        .udp_loopback
-        .as_deref()
-        .and_then(parse_udp_pair);
+    let udp_loopback = parse_udp_pair(args.udp_loopback.as_deref());
 
     let options = reticulum_utils::rnprobe::ProbeOptions {
         config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
@@ -436,7 +555,144 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_udp_pair(spec: &str) -> Option<(u16, u16)> {
+
+fn parse_udp_pair(spec: Option<&str>) -> Option<(u16, u16)> {
+    let spec = spec?;
     let (listen, forward) = spec.split_once(':')?;
     Some((listen.parse().ok()?, forward.parse().ok()?))
+}
+
+async fn run_x(args: XArgs) -> Result<(), String> {
+    init_logging(1);
+
+    let udp_loopback = parse_udp_pair(args.udp_loopback.as_deref());
+
+    if args.serve {
+        let options = reticulum_utils::rnx::ServeOptions {
+            config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+            allow_all: args.allow_all,
+            allowed: args
+                .allowed
+                .iter()
+                .map(|hash| parse_hash(hash))
+                .collect::<Result<_, _>>()?,
+            udp_loopback,
+            idle_timeout: None,
+        };
+
+        let address = reticulum_utils::rnx::serve(&options).await?;
+        println!("rnx listening on {address}");
+        return Ok(());
+    }
+
+    let command = args
+        .command
+        .ok_or("a command is required (or use --serve)")?;
+    let destination = args
+        .destination
+        .as_deref()
+        .map(parse_hash)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .ok_or("a destination hash is required")?;
+
+    let options = reticulum_utils::rnx::ExecOptions {
+        config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+        timeout: duration_arg(args.timeout, std::time::Duration::from_secs(30)),
+        udp_loopback,
+    };
+
+    let result = reticulum_utils::rnx::execute(&destination, &command, &options).await?;
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+    if !result.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&result.stderr));
+    }
+
+    if !result.executed {
+        return Err("remote did not execute the command".to_string());
+    }
+
+    Ok(())
+}
+
+async fn run_sh(args: ShArgs) -> Result<(), String> {
+    init_logging(1);
+
+    let udp_loopback = parse_udp_pair(args.udp_loopback.as_deref());
+
+    if args.serve {
+        let options = reticulum_utils::rnsh::ServeOptions {
+            config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+            udp_loopback,
+        };
+
+        let address = reticulum_utils::rnsh::serve(&options).await?;
+        println!("rnsh listening on {address}");
+        return Ok(());
+    }
+
+    let command = args
+        .command
+        .ok_or("a command is required (or use --serve)")?;
+    let destination = args
+        .destination
+        .as_deref()
+        .map(parse_hash)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .ok_or("a destination hash is required")?;
+
+    let options = reticulum_utils::rnsh::ServeOptions {
+        config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
+        udp_loopback,
+    };
+
+    let output = reticulum_utils::rnsh::run_command(&destination, &command, &options).await?;
+    print!("{}", String::from_utf8_lossy(&output));
+    Ok(())
+}
+
+#[cfg(feature = "iface-rnode")]
+async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
+    init_logging(1);
+
+    let target = if let Some(tcp) = args.tcp.as_deref() {
+        reticulum_utils::rnodeconf::DeviceTarget::Tcp {
+            addr: tcp.to_string(),
+        }
+    } else if let Some(port) = args.port.as_deref() {
+        reticulum_utils::rnodeconf::DeviceTarget::Serial {
+            port: port.to_string(),
+            baudrate: args.baudrate,
+        }
+    } else {
+        return Err("a --port or --tcp target is required".to_string());
+    };
+
+    if args.validate {
+        let frequency = args.frequency.ok_or("--frequency is required for validation")?;
+        let config = reticulum::iface::rnode::RnodeRadioConfig {
+            frequency,
+            bandwidth: args.bandwidth.ok_or("--bandwidth is required")?,
+            txpower: args.txpower.ok_or("--txpower is required")?,
+            spreadingfactor: args.spreadingfactor.ok_or("--spreadingfactor is required")?,
+            codingrate: args.codingrate.ok_or("--codingrate is required")?,
+            st_alock: None,
+            lt_alock: None,
+        };
+
+        match reticulum_utils::rnodeconf::validate_config(&target, &config).await {
+            Ok(_) => {
+                println!("Radio configuration validated");
+                Ok(())
+            }
+            Err(err) => Err(format!("validation failed: {err:?}")),
+        }
+    } else {
+        let info = reticulum_utils::rnodeconf::device_info(&target)
+            .await
+            .map_err(|e| format!("device probe failed: {e:?}"))?;
+        print!("{}", reticulum_utils::rnodeconf::render_info(&info));
+        Ok(())
+    }
 }

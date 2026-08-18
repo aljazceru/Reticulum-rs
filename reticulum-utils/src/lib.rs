@@ -7,6 +7,10 @@
 //! * [`rnpath`] — path lookup / path table (`Utilities/rnpath.py`)
 //! * [`rnstatus`] — instance status (`Utilities/rnstatus.py`)
 //! * [`rnprobe`] — round-trip probes (`Utilities/rnprobe.py`)
+//! * [`rnx`] — remote command execution (`Utilities/rnx.py`)
+//! * [`rnsh`] — remote shell sessions (`Utilities/rnsh/`)
+//! * [`rnodeconf`] — RNode diagnostics/config validation
+//! * [`rnir`] / [`rnpkg`] — reference stub utilities
 //! * [`rncp`] — file transfer over resources (`Utilities/rncp.py`)
 //!
 //! The tools are exposed both as a library (used by the integration tests
@@ -23,5 +27,11 @@ pub mod common;
 pub mod rncp;
 pub mod rnid;
 pub mod rnpath;
+pub mod rnir;
+#[cfg(feature = "iface-rnode")]
+pub mod rnodeconf;
 pub mod rnprobe;
+pub mod rnpkg;
+pub mod rnsh;
+pub mod rnx;
 pub mod rnstatus;

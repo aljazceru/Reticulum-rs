@@ -1251,7 +1251,8 @@ buffer streams) are still open; see the phase descriptions above.
 | 6.4 Tunnels | ✅ `transport/tunnels.rs`: signed synthesize packets on fixed PLAIN dest `rnstransport.tunnel.synthesize` (176-byte wire format, remote transport identity signature validation), tunnel table with path association, void/restore on re-appearance (Python restore rules: unknown/expired/worse-path checks), `TUNNEL_TIMEOUT` expiry, `Transport::synthesize_tunnel`/`void_tunnel`/`tunnel_table_snapshot`, iface `tunnel_id`/`wants_tunnel` |
 | 6.5 Blackholes | ✅ `transport/blackholes.rs`, identity-hash announce filtering, pack/merge lists |
 | 7.2/7.4 Daemon config & lifecycle | ✅ config parity for new interfaces + shared-instance keys, identity persistence |
-| 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp/rnprobe (`rn probe --loopback` measures proof RTTs) |
+| 8 `rn*` utilities | ✅ `reticulum-utils` crate: rnid/rnpath/rnstatus/rncp/rnprobe/rnx/rnsh/rnodeconf/rnir/rnpkg (`rn probe --loopback` measures proof RTTs; rnx serves Python-shaped `[command,timeout,o_limit,e_limit,stdin] -> [executed,retval,stdout,...]` requests over links; rnsh runs channel-based exec sessions; rnodeconf probes device info + validates radio config; rnir/rnpkg match the reference stubs) |
+| 7.3 shared-instance RPC | ✅ resolved: the reference's local RPC is the plain HDLC-framed packet exchange (implemented, 5.3) plus the link-based `/status`/`/path`/`/list` management handlers (6.7) — no pickle protocol exists in the current reference to port |
 | 9.2 Fuzz/property tests | ✅ `fuzz/` cargo-fuzz targets (packet deserialize, announce validation, tunnel synthesis, IFAC strip, HDLC decode — nightly/cargo-fuzz) + stable-runnable `tests/fuzz_properties.rs` driving the same decoders with deterministic pseudo-random corpora; found and fixed a real panic: `Packet::deserialize` sliced beyond the 2 KiB payload buffer for oversized hostile inputs (now `RnsError::OutOfMemory`) |
 | 9.3 Benchmarks | ✅ criterion `benches/hot_paths.rs`: announce validation, IFAC wrap/unwrap, packet serialize, announce emission timestamp, HDLC framing |
 | LXMF crate | ✅ byte-exact message format, stamps, peers, router + resource-backed delivery |
@@ -1259,8 +1260,11 @@ buffer streams) are still open; see the phase descriptions above.
 
 ## Remaining open (documented, lower priority)
 
-* WeaveInterface — requires WeaveMesh radio hardware; WDCL device protocol untestable without the device
+* WeaveInterface — requires WeaveMesh radio hardware; the WDCL device
+  protocol (discover/handshake over the radio's serial link) has no
+  wire surface testable without the device; keep using the Python
+  stack or upstream tooling for Weave radios
 * Blackhole discovery persistence to storage (in-memory table today)
-* 7.1 `reticulum::Reticulum` facade + 7.3 shared-instance RPC (pickle protocol) — the daemon serves
-  local clients directly via `LocalServer` instead
-* (none — all tracked phases implemented; see remaining-open notes)
+* rnodeconf firmware flashing / EEPROM provisioning — device bootstrap
+  and esptool-class flashing stay with the upstream `rnodeconf`
+  (device-info probing and radio config validation are ported)
