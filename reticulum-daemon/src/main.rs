@@ -162,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             InterfaceConfig::BackboneInterface { enabled, .. } => *enabled,
             InterfaceConfig::BackboneClientInterface { enabled, .. } => *enabled,
             InterfaceConfig::RNodeInterface { enabled, .. } => *enabled,
+            InterfaceConfig::RNodeMultiInterface { enabled, .. } => *enabled,
             InterfaceConfig::BLEInterface { enabled, .. } => *enabled,
             InterfaceConfig::KISSInterface { enabled, .. } => *enabled,
             InterfaceConfig::AX25KISSInterface { enabled, .. } => *enabled,
@@ -408,11 +409,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 configure_iface(&iface_manager, &address, iface).await;
             }
-            InterfaceConfig::RNodeInterface { .. } => {
-                log::warn!(
-                    "Interface '{}' type 'RNodeInterface' is not yet supported",
-                    iface.name
-                );
+            InterfaceConfig::RNodeInterface { port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock, .. } => {
+                #[cfg(feature = "iface-rnode")]
+                {
+                    let config = reticulum::iface::rnode::RnodeRadioConfig {
+                        frequency: *frequency,
+                        bandwidth: *bandwidth,
+                        txpower: *txpower,
+                        spreadingfactor: *spreadingfactor,
+                        codingrate: *codingrate,
+                        st_alock: *st_alock,
+                        lt_alock: *lt_alock,
+                    };
+
+                    let interface = if let Some(tcp) = tcp {
+                        log::info!(
+                            "Enabling interface '{}': RNode over TCP {tcp} at {frequency} Hz",
+                            iface.name
+                        );
+                        Some(reticulum::iface::rnode::RnodeInterface::tcp(tcp.clone(), config))
+                    } else if let Some(port) = port {
+                        log::info!(
+                            "Enabling interface '{}': RNode on {port} at {speed} baud, {frequency} Hz",
+                            iface.name
+                        );
+                        #[cfg(feature = "iface-serial")]
+                        {
+                            Some(reticulum::iface::rnode::RnodeInterface::serial(port.clone(), *speed, config))
+                        }
+                        #[cfg(not(feature = "iface-serial"))]
+                        {
+                            log::warn!(
+                                "Interface '{}' RNode serial mode requires building with --features iface-serial",
+                                iface.name
+                            );
+                            None
+                        }
+                    } else {
+                        log::error!("Interface '{}' (RNode) needs a port or tcp target", iface.name);
+                        None
+                    };
+
+                    if let Some(interface) = interface {
+                        let address = iface_manager.lock().await.spawn_named(
+                            &iface.name,
+                            interface.with_manager(iface_manager.clone()),
+                            reticulum::iface::rnode::RnodeInterface::spawn,
+                        );
+                        configure_iface(&iface_manager, &address, iface).await;
+                    }
+                }
+
+                #[cfg(not(feature = "iface-rnode"))]
+                {
+                    let _ = (port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock);
+                    log::warn!(
+                        "Interface '{}' type 'RNodeInterface' requires building the daemon with --features iface-rnode",
+                        iface.name
+                    );
+                }
+            }
+            InterfaceConfig::RNodeMultiInterface { port, tcp, speed, subinterfaces, .. } => {
+                #[cfg(feature = "iface-rnode")]
+                {
+                    use reticulum::iface::rnode::{RnodeMultiInterface, RnodeVport};
+
+                    let vports: Vec<RnodeVport> = subinterfaces
+                        .iter()
+                        .map(|sub| RnodeVport {
+                            index: sub.vport,
+                            config: reticulum::iface::rnode::RnodeRadioConfig {
+                                frequency: sub.frequency,
+                                bandwidth: sub.bandwidth,
+                                txpower: sub.txpower,
+                                spreadingfactor: sub.spreadingfactor,
+                                codingrate: sub.codingrate,
+                                st_alock: sub.st_alock,
+                                lt_alock: sub.lt_alock,
+                            },
+                        })
+                        .collect();
+
+                    let interface = if let Some(tcp) = tcp {
+                        log::info!(
+                            "Enabling interface '{}': RNodeMulti over TCP {tcp} with {} virtual ports",
+                            iface.name,
+                            vports.len()
+                        );
+                        Some(RnodeMultiInterface::tcp(tcp.clone(), vports, iface_manager.clone()))
+                    } else if let Some(port) = port {
+                        log::info!(
+                            "Enabling interface '{}': RNodeMulti on {port} at {speed} baud with {} virtual ports",
+                            iface.name,
+                            vports.len()
+                        );
+                        #[cfg(feature = "iface-serial")]
+                        {
+                            Some(RnodeMultiInterface::serial(port.clone(), *speed, vports, iface_manager.clone()))
+                        }
+                        #[cfg(not(feature = "iface-serial"))]
+                        {
+                            log::warn!(
+                                "Interface '{}' RNodeMulti serial mode requires building with --features iface-serial",
+                                iface.name
+                            );
+                            None
+                        }
+                    } else {
+                        log::error!("Interface '{}' (RNodeMulti) needs a port or tcp target", iface.name);
+                        None
+                    };
+
+                    if let Some(interface) = interface {
+                        let address = iface_manager.lock().await.spawn_named(
+                            &iface.name,
+                            interface,
+                            RnodeMultiInterface::spawn,
+                        );
+                        configure_iface(&iface_manager, &address, iface).await;
+                    }
+                }
+
+                #[cfg(not(feature = "iface-rnode"))]
+                {
+                    let _ = (port, tcp, speed, subinterfaces);
+                    log::warn!(
+                        "Interface '{}' type 'RNodeMultiInterface' requires building the daemon with --features iface-rnode",
+                        iface.name
+                    );
+                }
             }
             InterfaceConfig::BLEInterface { .. } => {
                 log::warn!(

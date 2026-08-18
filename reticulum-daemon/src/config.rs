@@ -48,6 +48,22 @@ pub struct LoggingConfig {
     pub loglevel: log::LevelFilter,
 }
 
+/// One RNodeMulti virtual port (Python `[[subinterfaces]]` entry).
+#[derive(Debug, Deserialize, Serialize)]
+pub struct RnodeSubinterface {
+    /// Virtual port index.
+    pub vport: u8,
+    pub frequency: u64,
+    pub bandwidth: u32,
+    pub txpower: u8,
+    pub spreadingfactor: u8,
+    pub codingrate: u8,
+    #[serde(default)]
+    pub st_alock: Option<f32>,
+    #[serde(default)]
+    pub lt_alock: Option<f32>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct NamedInterface {
     pub name: String,
@@ -182,14 +198,38 @@ pub enum InterfaceConfig {
     RNodeInterface {
         #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
-        port: String,
+        #[serde(alias = "target")]
+        port: Option<String>,
+        /// TCP device link (Python `tcp` mode).
+        tcp: Option<String>,
+        #[serde(default = "default_baudrate")]
+        speed: u32,
         frequency: u64,
         bandwidth: u32,
         txpower: u8,
         spreadingfactor: u8,
         codingrate: u8,
+        /// Short-term airtime lock in percent
+        /// (Python `airtime_limit_short_term`).
+        #[serde(default)]
+        st_alock: Option<f32>,
+        /// Long-term airtime lock (Python `airtime_limit_long_term`).
+        #[serde(default)]
+        lt_alock: Option<f32>,
         #[serde(default)]
         flow_control: bool,
+    },
+    RNodeMultiInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        #[serde(alias = "target")]
+        port: Option<String>,
+        tcp: Option<String>,
+        #[serde(default = "default_baudrate")]
+        speed: u32,
+        /// Virtual port sub-interfaces (Python `[[subinterfaces]]`).
+        #[serde(default)]
+        subinterfaces: Vec<RnodeSubinterface>,
     },
     BLEInterface {
         #[serde(default = "default_true")]
@@ -287,6 +327,10 @@ fn default_true() -> bool {
 
 fn default_backbone_flap_block() -> bool {
     true
+}
+
+fn default_baudrate() -> u32 {
+    115200
 }
 fn default_serial_speed() -> u32 {
     9600

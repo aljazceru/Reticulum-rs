@@ -14,6 +14,8 @@ pub mod backbone;
 pub mod i2p;
 #[cfg(feature = "iface-serial")]
 pub mod ax25;
+#[cfg(feature = "iface-rnode")]
+pub mod rnode;
 #[cfg(feature = "iface-serial")]
 pub mod kiss;
 #[cfg(feature = "iface-pipe")]

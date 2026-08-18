@@ -63,6 +63,8 @@ iface-pipe = []
 iface-auto = ["dep:socket2"]
 # I2PInterface (SAMv3 bridge sessions and streams)
 iface-i2p = []
+# RNodeInterface + RNodeMultiInterface (serial mode needs iface-serial)
+iface-rnode = []
 
 [build-dependencies]
 tonic-build = "0.13.0"

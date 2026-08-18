@@ -24,6 +24,7 @@ iface-serial = ["reticulum/iface-serial"]
 iface-pipe = ["reticulum/iface-pipe"]
 iface-auto = ["reticulum/iface-auto"]
 iface-i2p = ["reticulum/iface-i2p"]
+iface-rnode = ["reticulum/iface-rnode"]
 
 [[bin]]
 name = "rs-rnsd"
