@@ -37,6 +37,9 @@ jobs:
           cargo clippy -p reticulum --all-targets --all-features
           cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
 
+          cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
+      cargo check -p reticulum-core --no-default-features --features no_std --target thumbv7em-none-eabihf
+
   test:
     runs-on: ubuntu-latest
     container: rust:1.95

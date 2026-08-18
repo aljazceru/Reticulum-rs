@@ -1,6 +1,12 @@
 use alloc::{fmt::Write, string::String, vec::Vec};
 use hkdf::Hkdf;
-use rand_core::{CryptoRngCore, OsRng};
+use rand_core::CryptoRngCore;
+
+/// Entropy source for operations that generate keys non-deterministically
+/// on hosted targets. Bare-metal users bring their own RNG and pass it via
+/// the `_with_rng` / generic-RNG APIs.
+#[cfg(feature = "std")]
+pub use rand_core::OsRng;
 
 use ed25519_dalek::{VerifyingKey, SIGNATURE_LENGTH};
 
@@ -499,10 +505,10 @@ impl PrivateIdentity {
         data: &[u8],
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
-        let fernet = Fernet::new_from_slices(
+        let fernet = Fernet::<crate::crypt::fernet::ZeroRng>::new_from_slices(
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
-            OsRng,
+            crate::crypt::fernet::ZeroRng,
         );
 
         let token = fernet.verify(Token::from(data))?;
@@ -1177,7 +1183,8 @@ enum Num {
 
 #[cfg(test)]
 mod tests {
-    use rand_core::OsRng;
+    #[cfg(feature = "std")]
+use rand_core::OsRng;
 
     use super::PrivateIdentity;
 

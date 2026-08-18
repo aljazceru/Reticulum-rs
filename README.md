@@ -16,6 +16,10 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
   large responses (Python `Link.request` compatible)
 - 🧱 Support for multiple transport layers (TCP, UDP, serial)
 - 🔌 Easily embeddable in embedded devices and tactical radios
+- 🎯 `reticulum-core` is fully `no_std`: verified linking for Cortex-M4
+  (`thumbv7em-none-eabihf`) with an external heap — bring your own RNG via
+  the `_with_rng` APIs on bare metal; the tokio-based `reticulum` crate and
+  the `lxmf`/`lxst` layers stay std-only
 - ✅ Python interop test-suite: resources, requests, links, announces
 - 🧪 Example clients for testnets and real deployments
 - 📨 `lxmf` crate: the LXMF messaging layer (byte-exact Python LXMF format)

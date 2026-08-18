@@ -1,8 +1,9 @@
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
 
 use core::{cmp::min, time::Duration};
 
 use ed25519_dalek::{Signature, SigningKey, Verifier, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+#[cfg(feature = "std")]
 use rand_core::OsRng;
 use sha2::Digest;
 use x25519_dalek::StaticSecret;
@@ -181,6 +182,7 @@ impl Link {
         [packed[1], packed[2], packed[3]]
     }
 
+    #[cfg(feature = "std")]
     pub fn new(destination: DestinationDesc) -> Self {
         Self {
             id: AddressHash::new_empty(),
@@ -205,10 +207,20 @@ impl Link {
         self.proves_messages = setting;
     }
 
+    #[cfg(feature = "std")]
     pub fn new_from_request(
         packet: &Packet,
         signing_key: SigningKey,
-        destination: DestinationDesc
+        destination: DestinationDesc,
+    ) -> Result<Self, RnsError> {
+        Self::new_from_request_with_rng(packet, signing_key, destination, OsRng)
+    }
+
+    pub fn new_from_request_with_rng<R: rand_core::CryptoRngCore + Copy>(
+        packet: &Packet,
+        signing_key: SigningKey,
+        destination: DestinationDesc,
+        rng: R,
     ) -> Result<Self, RnsError> {
         if packet.data.len() < PUBLIC_KEY_LENGTH * 2 {
             return Err(RnsError::InvalidArgument);
@@ -239,7 +251,7 @@ impl Link {
         let mut link = Self {
             id: link_id,
             destination,
-            priv_identity: PrivateIdentity::new(StaticSecret::random_from_rng(OsRng), signing_key),
+            priv_identity: PrivateIdentity::new(StaticSecret::random_from_rng(rng), signing_key),
             peer_identity,
             remote_identity: None,
             derived_key: DerivedKey::new_empty(),
@@ -290,7 +302,16 @@ impl Link {
         self.request_time = now();
     }
 
+    #[cfg(feature = "std")]
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        self.data_packet_with_rng(data, OsRng)
+    }
+
+    pub fn data_packet_with_rng<R: rand_core::CryptoRngCore + Copy>(
+        &self,
+        data: &[u8],
+        rng: R,
+    ) -> Result<Packet, RnsError> {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create data packet for pending link");
@@ -306,7 +327,7 @@ impl Link {
         let mut packet_data = PacketDataBuffer::new();
 
         let cipher_text_len = {
-            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            let cipher_text = self.encrypt_with_rng(rng, data, packet_data.accuire_buf_max())?;
             cipher_text.len()
         };
 
@@ -327,7 +348,16 @@ impl Link {
     }
 
     /// Identifies the initiator of the link to the remote peer
+    #[cfg(feature = "std")]
     pub fn identify(&self, identity: &PrivateIdentity) -> Result<Packet, RnsError> {
+        self.identify_with_rng(identity, OsRng)
+    }
+
+    pub fn identify_with_rng<R: rand_core::CryptoRngCore + Copy>(
+        &self,
+        identity: &PrivateIdentity,
+        rng: R,
+    ) -> Result<Packet, RnsError> {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create identify packet for pending link");
@@ -351,7 +381,7 @@ impl Link {
         ].concat();
         let mut data = PacketDataBuffer::new();
         let cipher_text_len = {
-            let cipher_text = self.encrypt(&proof_data, data.accuire_buf_max())?;
+            let cipher_text = self.encrypt_with_rng(rng, &proof_data, data.accuire_buf_max())?;
             cipher_text.len()
         };
         data.resize(cipher_text_len);
@@ -393,7 +423,17 @@ impl Link {
     /// Python `RNS.Packet(link, data, context=...)` for payloads that are
     /// encrypted with the link token (resource advertisements, requests,
     /// hashmap updates and cancel messages).
+    #[cfg(feature = "std")]
     pub fn context_packet(&self, data: &[u8], context: PacketContext) -> Result<Packet, RnsError> {
+        self.context_packet_with_rng(data, context, OsRng)
+    }
+
+    pub fn context_packet_with_rng<R: rand_core::CryptoRngCore + Copy>(
+        &self,
+        data: &[u8],
+        context: PacketContext,
+        rng: R,
+    ) -> Result<Packet, RnsError> {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create data packet for pending link");
@@ -409,7 +449,7 @@ impl Link {
         let mut packet_data = PacketDataBuffer::new();
 
         let cipher_text_len = {
-            let cipher_text = self.encrypt(data, packet_data.accuire_buf_max())?;
+            let cipher_text = self.encrypt_with_rng(rng, data, packet_data.accuire_buf_max())?;
             cipher_text.len()
         };
 
@@ -471,13 +511,14 @@ impl Link {
     /// the resource engine which encrypts the whole resource stream once
     /// (Python `link.encrypt`). The Fernet token grows the data by
     /// `TOKEN_OVERHEAD` bytes plus block padding.
-    pub fn encrypt_alloc(&self, text: &[u8], out_buf: &mut Vec<u8>) -> Result<usize, RnsError> {
+    #[cfg(feature = "std")]
+    pub fn encrypt_alloc(&self, text: &[u8], out_buf: &mut alloc::vec::Vec<u8>) -> Result<usize, RnsError> {
         let start = out_buf.len();
         out_buf.resize(
             start + text.len() + crate::packet::TOKEN_OVERHEAD + 64,
             0,
         );
-        let chunk = self.encrypt(text, &mut out_buf[start..])?;
+        let chunk = self.encrypt_with_rng(OsRng, text, &mut out_buf[start..])?;
         let written = chunk.len();
         out_buf.truncate(start + written);
         Ok(out_buf.len())
@@ -569,19 +610,39 @@ impl Link {
         }
     }
 
-    pub fn encrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+    pub fn encrypt_with_rng<'a, R: rand_core::CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        text: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], RnsError> {
         self.priv_identity
-            .encrypt(OsRng, text, &self.derived_key, out_buf)
+            .encrypt(rng, text, &self.derived_key, out_buf)
     }
 
-    pub fn decrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+    #[cfg(feature = "std")]
+    pub fn encrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        self.encrypt_with_rng(OsRng, text, out_buf)
+    }
+
+    pub fn decrypt_with_rng<'a, R: rand_core::CryptoRngCore + Copy>(
+        &self,
+        rng: R,
+        text: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], RnsError> {
         <PrivateIdentity as DecryptIdentity>::decrypt(
             &self.priv_identity,
-            OsRng,
+            rng,
             text,
             &self.derived_key,
             out_buf,
         )
+    }
+
+    #[cfg(feature = "std")]
+    pub fn decrypt<'a>(&self, text: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        self.decrypt_with_rng(OsRng, text, out_buf)
     }
 
     pub fn destination(&self) -> &DestinationDesc {
@@ -595,16 +656,17 @@ impl Link {
         self.remote_identity
     }
 
+    #[cfg(feature = "std")]
     pub fn create_rtt(&self) -> Packet {
         let rtt = self.rtt.as_secs_f64();
-        let mut buf = Vec::with_capacity(9);
+        let mut buf = alloc::vec::Vec::with_capacity(9);
         rmp::encode::write_f64(&mut buf, rtt).unwrap();
 
         let mut packet_data = PacketDataBuffer::new();
 
         let token_len = {
             let token = self
-                .encrypt(buf.as_slice(), packet_data.accuire_buf_max())
+                .encrypt_with_rng(OsRng, buf.as_slice(), packet_data.accuire_buf_max())
                 .expect("encrypted data");
             token.len()
         };
@@ -699,7 +761,9 @@ impl Link {
         match packet.context {
             PacketContext::None => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) =
+                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
+                {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.touch();
                     self.post_event(event_tx,
@@ -718,7 +782,9 @@ impl Link {
             }
             PacketContext::LinkIdentify => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) =
+                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
+                {
                     log::trace!("link({}): link identify data {}B", self.id, plain_text.len());
                     self.touch();
                     if !out_link && plain_text.len() == PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH {
@@ -771,7 +837,9 @@ impl Link {
             }
             PacketContext::LinkRTT if !out_link => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) =
+                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
+                {
                     if let Ok(rtt) = rmp::decode::read_f64(&mut &plain_text[..]) {
                         self.rtt = Duration::from_secs_f64(rtt);
                     } else {
@@ -783,7 +851,9 @@ impl Link {
             }
             PacketContext::LinkClose => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                if let Ok(plain_text) =
+                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
+                {
                     match plain_text[..].try_into() {
                         Err(err) => {
                             log::error!("link({}): invalid decode link close payload: {err}",
@@ -803,7 +873,9 @@ impl Link {
             PacketContext::Channel => {
                 if let Some(channel_tx) = channel_tx {
                     let mut buffer = [0u8; PACKET_MDU];
-                    if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer) {
+                    if let Ok(plain_text) =
+                        self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer)
+                    {
                         log::trace!("link({}): data over channel {}B", self.id, plain_text.len());
                         self.request_time = now();
 
@@ -920,7 +992,10 @@ impl <E: LinkEventSink> LinkExt<E> for Link {
 
     fn teardown(&mut self, event_tx: &E) -> Result<Option<Packet>, RnsError> {
         let packet = if self.status != LinkStatus::Pending && self.status != LinkStatus::Closed {
-            let mut packet = self.data_packet(self.id.as_slice())?;
+            let mut packet = self.data_packet_with_rng(
+                self.id.as_slice(),
+                crate::crypt::fernet::ZeroRng,
+            )?;
             packet.context = PacketContext::LinkClose;
             Some(packet)
         } else {

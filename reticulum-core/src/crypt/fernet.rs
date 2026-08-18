@@ -1,7 +1,7 @@
 use core::cmp;
 use core::convert::From;
 
-use aes::cipher::block_padding::Pkcs7;
+use cipher::block_padding::Pkcs7;
 use aes::cipher::BlockDecryptMut;
 use aes::cipher::Key;
 use aes::cipher::Unsigned;
@@ -104,6 +104,13 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
             sign_key: sign_key_bytes,
             enc_key: enc_key_bytes.into(),
         }
+    }
+
+    /// A no-op RNG for decrypt-only usage: the decrypt/verify paths never
+    /// consume randomness (only IV generation does), so constructions used
+    /// solely for decryption can avoid supplying real entropy.
+    pub fn new_decrypt_only(sign_key: &[u8], enc_key: &[u8]) -> Fernet<ZeroRng> {
+        Fernet::<ZeroRng>::new_from_slices(sign_key, enc_key, ZeroRng)
     }
 
     pub fn new_rand(mut rng: R) -> Self {
@@ -250,3 +257,27 @@ mod tests {
         assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
     }
 }
+
+
+/// Deterministic no-op RNG: fills with zeroes. Only valid where no
+/// randomness is actually consumed (decrypt/verify paths).
+#[derive(Clone, Copy, Default)]
+pub struct ZeroRng;
+
+impl rand_core::RngCore for ZeroRng {
+    fn next_u32(&mut self) -> u32 {
+        0
+    }
+    fn next_u64(&mut self) -> u64 {
+        0
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        dest.fill(0);
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rand_core::CryptoRng for ZeroRng {}
