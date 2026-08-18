@@ -20,6 +20,13 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
 - 🧪 Example clients for testnets and real deployments
 - 📨 `lxmf` crate: the LXMF messaging layer (byte-exact Python LXMF format)
 - 🎙 `lxst` crate: LXST audio streaming, codecs and calls
+- 📻 RNode + RNodeMulti: the full RNode KISS command protocol (detect,
+  firmware gate, radio config with echo validation, RSSI/SNR telemetry,
+  READY flow control) over serial or TCP, virtual-port multi-radios
+- 🕸 I2P (SAMv3): direct bridge sessions and streams, connectable
+  servers and autoconnecting peers
+- 🧵 Backbone links: high-throughput TCP backbones with fast-flapping
+  connection suppression
 - 🛡 Interface access codes (IFAC): access-code-protected interfaces with
   HKDF masking, byte-exact against Python
 - 🚦 Transport control parity: per-interface ingress limiting (burst
@@ -31,7 +38,10 @@ This project brings Reticulum's capabilities to the Rust ecosystem, enabling emb
   work-function-stamped announces, discovered-interface tracking and TCP
   autoconnect
 - 🛠 Remote management & probe destinations (`rnstransport.remote.management`,
-  `rnstransport.probe`), remote-management allow lists
+  `rnstransport.probe`), remote-management allow lists, blackhole `/list`
+  publishing and discovery-side list updates
+- 🧰 `rn` utilities: id, path, status, cp, probe, x (remote exec),
+  sh (remote shell sessions), nodeconf (RNode diagnostics)
 - 🏗 `Reticulum` facade: the Python `RNS.Reticulum` entrypoint surface for
   embedding
 - 🔍 Fuzz/property tests for all wire decoders and criterion benchmarks
