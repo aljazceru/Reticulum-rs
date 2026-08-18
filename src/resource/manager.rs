@@ -59,6 +59,9 @@ pub(crate) struct ResourceManager {
     pub request_handlers: HashMap<AddressHash, HashMap<AddressHash, RequestHandler>>,
     /// Pending outbound requests: request id -> link.
     pub pending_requests: HashMap<AddressHash, LinkId>,
+    /// Responses that completed before the caller began awaiting them,
+    /// retained until collected (broadcast retains no history).
+    pub completed_responses: HashMap<AddressHash, Option<Vec<u8>>>,
     pub events: broadcast::Sender<ResourceEvent>,
     pub request_events: broadcast::Sender<RequestEventData>,
     pub max_decompressed_size: usize,
@@ -99,6 +102,7 @@ impl ResourceManager {
             started_callbacks: HashMap::new(),
             request_handlers: HashMap::new(),
             pending_requests: HashMap::new(),
+            completed_responses: HashMap::new(),
             events,
             request_events,
             max_decompressed_size: DEFAULT_MAX_DECOMPRESSED_SIZE,
@@ -197,15 +201,22 @@ impl ResourceManager {
             }
         };
 
-        // Request or response resources are always accepted if a matching
-        // pending request exists or handlers are registered.
+        // Request resources: like responses, they must correspond to an
+        // actually pending local request (a registered request handler on
+        // the link's destination). Without one, the resource can never be
+        // serviced — reject instead of allocating state
+        // (Python `Link.receive` only accepts advertised resources whose
+        // `is_request` matches a live `waiting_requests` entry).
         if adv.is_request() {
             let size_ok = self
                 .max_request_size
                 .map(|max| adv.data_size <= max)
                 .unwrap_or(true);
-            if !size_ok {
-                log::debug!("resource: rejecting oversized request");
+            if !size_ok || !self.has_request_handlers(link) {
+                log::debug!(
+                    "resource: rejecting request advertisement ({} handlers for this destination)",
+                    if self.has_request_handlers(link) { "oversized / no" } else { "no" }
+                );
                 let mut reject = IncomingResource::reject_packet_for(&adv, link);
                 tx.packets.append(&mut reject);
                 return tx;
@@ -314,6 +325,13 @@ impl ResourceManager {
         tx.packets.extend(part_tx.packets);
     }
 
+    /// Whether any request handler is registered for the link's
+    /// destination (requests without a handler can never be serviced).
+    fn has_request_handlers(&self, link: &Link) -> bool {
+        self.request_handlers
+            .contains_key(&link.destination().address_hash)
+    }
+
     /// Handle RESOURCE_REQ plaintext for a link.
     pub fn handle_request_data(
         &mut self,
@@ -420,6 +438,15 @@ impl ResourceManager {
                     let response_rid = if is_response && is_final { request_id } else { None };
                     if let Some(request_id) = response_rid {
                         let event = match unpack_response(&data) {
+                            Some((rid, response)) if rid == request_id => {
+                                // Retain for late awaiters before emitting.
+                                self.completed_responses.insert(rid, Some(response.clone()));
+                                RequestEvent::Response {
+                                    request_id: rid,
+                                    data: response,
+                                    metadata: None,
+                                }
+                            }
                             Some((rid, response)) => RequestEvent::Response {
                                 request_id: rid,
                                 data: response,
@@ -475,8 +502,10 @@ impl ResourceManager {
         ResourceTx::default()
     }
 
-    /// Handle RESOURCE_PRF payload for outgoing resources.
-    pub fn handle_proof(&mut self, link: &Link, proof_data: &[u8]) {
+    /// Handle RESOURCE_PRF payload for outgoing resources. When a split
+    /// segment completes, the prepared next segment is advertised
+    /// immediately (Python `validate_proof` -> `next_segment.advertise()`).
+    pub fn handle_proof(&mut self, link: &Link, proof_data: &[u8], tx: &mut ResourceTx) {
         if proof_data.len() != 64 {
             return;
         }
@@ -484,20 +513,60 @@ impl ResourceManager {
         hash_bytes.copy_from_slice(&proof_data[..32]);
         let resource_hash = crate::hash::Hash::new(hash_bytes);
 
+        let mut next_to_advertise: Option<OutgoingResource> = None;
+        let mut completed_hashes: Vec<(crate::hash::Hash, ResourceAdvertisement)> = Vec::new();
+
         if let Some(resources) = self.out.get_mut(link.id()) {
             for resource in resources.iter_mut() {
-                if resource.hash == resource_hash && resource.validate_proof(proof_data) {
-                    let _ = self.events.send(ResourceEvent {
-                        link_id: *link.id(),
-                        hash: resource.hash,
-                        status: ResourceStatus::Complete,
-                        progress: 1.0,
-                        data: None,
-                        metadata: None,
-                        advertisement: Some(resource.advertisement()),
-                    });
+                if resource.hash != resource_hash
+                    || resource.status == ResourceStatus::Complete
+                {
+                    continue;
+                }
+                if resource.validate_proof(proof_data) {
+                    completed_hashes.push((resource.hash, resource.advertisement()));
+
+                    // Advertise the next segment of a split resource.
+                    if resource.split && resource.segment_index < resource.total_segments {
+                        // Prepare lazily if not pre-built.
+                        if resource.next_segment.is_none() {
+                            let opts = ResourceOptions::default();
+                            match resource.prepare_next_segment(link, opts) {
+                                Ok(next) => resource.next_segment = next,
+                                Err(error) => {
+                                    log::debug!("resource: next-segment prep failed: {error:?}")
+                                }
+                            }
+                        }
+                        if let Some(mut next) = resource.take_next_segment() {
+                            let _ = next.advertise(link, tx);
+                            next_to_advertise = Some(*next);
+                        }
+                    }
                 }
             }
+        }
+
+        for (hash, advertisement) in completed_hashes {
+            let _ = self.events.send(ResourceEvent {
+                link_id: *link.id(),
+                hash,
+                status: ResourceStatus::Complete,
+                progress: 1.0,
+                data: None,
+                metadata: None,
+                advertisement: Some(advertisement),
+            });
+        }
+
+        if let Some(next) = next_to_advertise {
+            log::debug!(
+                "resource: advertising segment {}/{} of {}",
+                next.segment_index,
+                next.total_segments,
+                next.original_hash
+            );
+            self.out.entry(*link.id()).or_default().push(next);
         }
     }
 
@@ -567,10 +636,13 @@ impl ResourceManager {
             };
             let Ok(link) = link.try_lock() else { continue };
             if let Some(resources) = self.out.get_mut(&link_id) {
-                let any_active = resources.iter().any(|r| !r.status.is_concluded()
-                    && r.status != ResourceStatus::Queued);
+                let any_active_snapshot = resources.iter().any(|r| {
+                    !r.status.is_concluded() && r.status != ResourceStatus::Queued
+                });
+                let mut advertised_any = false;
                 let mut i = 0;
                 while i < resources.len() {
+                    let tx_advertised_this_sweep = advertised_any;
                     let (hash, failed) = {
                         let resource = &mut resources[i];
                         if resource.status.is_concluded() {
@@ -579,9 +651,15 @@ impl ResourceManager {
                         }
                         if resource.status == ResourceStatus::Queued {
                             // Python queues new resources until the current
-                            // transfer on the link concluded.
-                            if !any_active {
+                            // transfer on the link concluded: advertise at
+                            // most ONE queued resource per link per sweep
+                            // (the oldest first), so concurrent transfers
+                            // never compete on the same link. The
+                            // any-active snapshot is taken before the
+                            // mutable borrow of this element.
+                            if !any_active_snapshot && !tx_advertised_this_sweep {
                                 let _ = resource.advertise(&link, &mut tx);
+                                advertised_any = true;
                             }
                             i += 1;
                             continue;
@@ -592,6 +670,7 @@ impl ResourceManager {
                     if failed {
                         failed_events.push((link_id, hash, ResourceStatus::Failed));
                     }
+                    advertised_any |= tx_advertised_this_sweep;
                     i += 1;
                 }
             }

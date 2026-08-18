@@ -229,23 +229,31 @@ impl OutgoingResource {
         }
 
         let random_hash = random_hash_bytes;
-        // Hash is computed over the full uncompressed stream + random hash
-        // (Python: `Identity.full_hash(data + self.random_hash)`).
+        // Hash is computed over this SEGMENT's uncompressed data + random
+        // hash (Python: `Identity.full_hash(data + self.random_hash)`
+        // where `data` is the segment's bytes — receivers assemble and
+        // hash the segment, not the whole stream).
         let hash = Hash::new(
             Hash::generator()
-                .chain_update(&stream)
+                .chain_update(&segment_data)
                 .chain_update(random_hash)
                 .finalize()
                 .into(),
         );
         let truncated_hash = AddressHash::new_from_hash(&hash);
+        // Proof over the segment data + hash (Python
+        // `full_hash(self.data + self.hash)`).
         let expected_proof = Hash::new(
             Hash::generator()
-                .chain_update(&stream)
+                .chain_update(&segment_data)
                 .chain_update(hash.as_slice())
                 .finalize()
                 .into(),
         );
+        // `original_hash` correlates the segments of one logical resource:
+        // segment 1 uses its own (segment) hash, later segments receive
+        // segment 1's hash (Python `original_hash = self.hash` /
+        // advertisement field `o`).
         let original_hash = original_hash.unwrap_or(hash);
 
         let rtt = link.rtt().as_secs_f64();
@@ -478,6 +486,56 @@ impl OutgoingResource {
     }
 
     /// Validate a RESOURCE_PRF proof payload (`hash + proof_hash`).
+    /// Build the next segment of a split resource
+    /// (Python `__prepare_next_segment`). Returns `None` for the last
+    /// segment or non-split resources.
+    pub(super) fn prepare_next_segment(
+        &self,
+        link: &Link,
+        opts: ResourceOptions,
+    ) -> Result<Option<Box<OutgoingResource>>, RnsError> {
+        if !self.split || self.segment_index >= self.total_segments {
+            return Ok(None);
+        }
+
+        let Some(ref stream) = self.original_stream else {
+            return Ok(None);
+        };
+
+        let seek_index = self.segment_index; // next segment index - 1
+        let first_read_size = MAX_EFFICIENT_SIZE - self.metadata_size;
+        let (start, end) = if self.segment_index == 1 {
+            (0, core::cmp::min(first_read_size, stream.len()))
+        } else {
+            let start = first_read_size + (seek_index - 1) * MAX_EFFICIENT_SIZE;
+            let end = core::cmp::min(start + MAX_EFFICIENT_SIZE, stream.len());
+            (start, end)
+        };
+
+        if start >= stream.len() {
+            return Ok(None);
+        }
+
+        Ok(Some(Box::new(Self::new_segment(
+            stream.clone(),
+            start..end,
+            stream.len(),
+            self.total_segments,
+            self.segment_index + 1,
+            Some(self.original_hash),
+            link,
+            opts,
+            self.has_metadata,
+            self.metadata_size,
+        )?)))
+    }
+
+    /// Take the prepared next segment for advertisement when this segment
+    /// completes (Python advertises `next_segment` on proof).
+    pub fn take_next_segment(&mut self) -> Option<Box<OutgoingResource>> {
+        self.next_segment.take()
+    }
+
     pub fn validate_proof(&mut self, proof_data: &[u8]) -> bool {
         if proof_data.len() == 64 {
             let proof_hash = &proof_data[32..];

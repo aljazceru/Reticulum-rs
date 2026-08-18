@@ -16,7 +16,8 @@ use crate::destination::link::{
 };
 use crate::destination::{
     DestinationAnnounce, DestinationDesc, DestinationHandleStatus, DestinationName,
-    PlainInputDestination, ProofStrategy, SingleInputDestination, SingleOutputDestination,
+    GroupInputDestination, GroupOutputDestination, PlainInputDestination, ProofStrategy,
+    SingleInputDestination, SingleOutputDestination,
 };
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
@@ -29,7 +30,7 @@ use crate::packet::{
     PACKET_MDU,
 };
 use crate::resource::{
-    self,
+    self, ResourceTx,
     manager::{
         pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
         RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
@@ -250,6 +251,9 @@ pub(crate) struct TransportHandler {
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
     plain_in_destinations: HashMap<AddressHash, Arc<Mutex<PlainInputDestination>>>,
+    /// Inbound GROUP destinations with their symmetric keys
+    /// (Python `Destination` GROUP with `prv`).
+    group_in_destinations: HashMap<AddressHash, Arc<Mutex<GroupInputDestination>>>,
 
     announce_limits: AnnounceLimits,
 
@@ -453,6 +457,7 @@ impl Transport {
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
             plain_in_destinations: HashMap::new(),
+            group_in_destinations: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
@@ -1186,11 +1191,21 @@ impl Transport {
     }
 
     /// Await a response for a previously sent request.
+    ///
+    /// A response that arrived between `request()` returning and this
+    /// call subscribing is still delivered: completed responses are
+    /// retained per request id by the transport until collected here
+    /// (broadcast channels retain no history).
     pub async fn await_request_response(
         &self,
         request_id: AddressHash,
         timeout: core::time::Duration,
     ) -> Option<Vec<u8>> {
+        // A response may already have completed.
+        if let Some(result) = self.take_completed_response(request_id).await {
+            return result;
+        }
+
         let mut rx = self.request_events().await;
         let deadline = time::Instant::now() + timeout;
         loop {
@@ -1213,6 +1228,18 @@ impl Transport {
         }
     }
 
+    /// Take a completed (arrived-before-awaiting) response for a request.
+    async fn take_completed_response(
+        &self,
+        request_id: AddressHash,
+    ) -> Option<Option<Vec<u8>>> {
+        let mut handler = self.handler.lock().await;
+        handler
+            .resources
+            .completed_responses
+            .remove(&request_id)
+    }
+
     /// Register a PLAIN (unencrypted broadcast) input destination
     /// (Python `RNS.Destination(None, IN, PLAIN, app, *aspects)`).
     pub async fn add_plain_destination(
@@ -1233,6 +1260,80 @@ impl Transport {
             .insert(address_hash, destination.clone());
 
         destination
+    }
+
+    /// Register an inbound GROUP destination
+    /// (Python `RNS.Destination(..., GROUP, ...)`).
+    pub async fn add_group_destination(
+        &mut self,
+        name: DestinationName,
+    ) -> Arc<Mutex<GroupInputDestination>> {
+        let destination =
+            GroupInputDestination::new(reticulum_core::identity::EmptyIdentity, name);
+        let address_hash = destination.desc.address_hash;
+
+        log::debug!("tp({}): add group destination {}", self.name, address_hash);
+
+        let destination = Arc::new(Mutex::new(destination));
+
+        self.handler
+            .lock()
+            .await
+            .group_in_destinations
+            .insert(address_hash, destination.clone());
+
+        destination
+    }
+
+    /// Send a packet to a GROUP destination: encrypted with the group's
+    /// symmetric key when `group_key` is provided, plaintext otherwise
+    /// (Python `RNS.Packet(group_destination, data).send()`).
+    pub async fn send_to_group_destination(
+        &self,
+        name: DestinationName,
+        data: &[u8],
+        group_key: Option<&[u8; reticulum_core::destination::GROUP_KEY_SIZE]>,
+    ) -> Result<AddressHash, RnsError> {
+        if data.len() > crate::packet::PACKET_PROTOCOL_MDU {
+            return Err(RnsError::InvalidArgument);
+        }
+
+        let mut destination =
+            GroupOutputDestination::new(reticulum_core::identity::EmptyIdentity, name);
+        if let Some(key) = group_key {
+            destination.load_group_key(*key);
+        }
+        let address = destination.desc.address_hash;
+
+        let mut packet_data = PacketDataBuffer::new();
+
+        let mut buffer = [0u8; PACKET_MDU];
+        match destination.encrypt_group(data, &mut buffer[..]) {
+            Ok(token) => {
+                let _ = packet_data.safe_write(token);
+            }
+            Err(_) => {
+                // No group key loaded: plaintext (parity with Python
+                // GROUP destinations that never load `prv`).
+                let _ = packet_data.safe_write(data);
+            }
+        }
+
+        let packet = Packet {
+            header: Header {
+                header_type: HeaderType::Type1,
+                destination_type: DestinationType::Group,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            destination: address,
+            data: packet_data,
+            ..Default::default()
+        };
+
+        self.send_broadcast(packet, None).await;
+
+        Ok(address)
     }
 
     /// Send an unencrypted packet to a PLAIN destination
@@ -1871,9 +1972,13 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         let link = link.or_else(|| handler.in_links.get(&packet.destination).cloned());
         if let Some(link) = link {
             let link_guard = link.lock().await;
+            let mut tx = ResourceTx::default();
             handler
                 .resources
-                .handle_proof(&link_guard, packet.data.as_slice());
+                .handle_proof(&link_guard, packet.data.as_slice(), &mut tx);
+            for packet in tx.packets {
+                handler.send_packet(packet).await;
+            }
             drop(link_guard);
             handler.resources.cleanup();
         }
@@ -2065,9 +2170,13 @@ async fn handle_resource_packet<'a>(
             true
         }
         Ctx::ResourceProof => {
+            let mut tx = ResourceTx::default();
             handler
                 .resources
-                .handle_proof(&link, packet.data.as_slice());
+                .handle_proof(&link, packet.data.as_slice(), &mut tx);
+            for packet in tx.packets {
+                handler.send_packet(packet).await;
+            }
             handler.resources.cleanup();
             true
         }
@@ -2175,6 +2284,12 @@ async fn handle_request_or_response_packet<'a>(
             let Some((rid, response)) = crate::resource::manager::unpack_response(plaintext) else {
                 return false;
             };
+            // Retain the completed response so an `await_request_response`
+            // call that has not subscribed yet still observes it.
+            handler
+                .resources
+                .completed_responses
+                .insert(rid, Some(response.clone()));
             handler
                 .resources
                 .request_events
@@ -2387,18 +2502,39 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
     }
 
     if packet.header.destination_type == DestinationType::Group {
-        // GROUP destinations are addressed by name hash exactly like PLAIN
-        // ones; Python ships no group crypto, so payloads pass through
-        // unencrypted (parity).
-        if let Some(_destination) = handler.plain_in_destinations.get(&packet.destination) {
+        // GROUP destinations are addressed by name hash like PLAIN ones;
+        // payloads are encrypted with the destination's symmetric group
+        // key when one is loaded (Python `Destination.prv`).
+        if let Some(destination) = handler.group_in_destinations.get(&packet.destination) {
+            let destination = destination.lock().await;
+            let mut buffer = [0u8; PACKET_MDU];
+
+            let data = if destination.group_encrypted() {
+                match destination.decrypt_group(packet.data.as_slice(), &mut buffer[..]) {
+                    Ok(plain) => PacketDataBuffer::new_from_slice(plain),
+                    Err(error) => {
+                        log::debug!(
+                            "tp({}): could not decrypt group packet for {}: {error:?}",
+                            handler.config.name,
+                            packet.destination
+                        );
+                        return;
+                    }
+                }
+            } else {
+                packet.data
+            };
+
             data_handled = true;
 
             handler
                 .received_data_tx
                 .send(ReceivedData {
                     destination: packet.destination,
-                    data: packet.data,
-                    decrypted: false,
+                    data,
+                    // Group payloads were decrypted when a key is loaded;
+                    // receivers must not decrypt again.
+                    decrypted: destination.group_encrypted(),
                 })
                 .ok();
         }

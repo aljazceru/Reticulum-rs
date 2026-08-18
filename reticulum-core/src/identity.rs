@@ -1184,7 +1184,7 @@ enum Num {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "std")]
-use rand_core::OsRng;
+    use rand_core::OsRng;
 
     use super::PrivateIdentity;
 

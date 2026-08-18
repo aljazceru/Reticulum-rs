@@ -1369,6 +1369,23 @@ impl LxmRouter {
         let mut message =
             LXMessage::unpack_from_bytes_with(lxmf_data, &|hash| known.get(hash).copied())?;
 
+        // A connected sender could address a valid LXMF message to a
+        // third party; only messages addressed to this router's delivery
+        // destination are emitted locally (everything else would be a
+        // cross-destination injection).
+        {
+            let delivery = self.delivery.lock().await;
+            if let Some(destination) = delivery.as_ref() {
+                if message.destination_hash != destination.address_hash {
+                    log::warn!(
+                        "lxmf: ignoring message for foreign destination {}",
+                        message.destination_hash
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
         if let Some(ratchet_id) = ratchet_id {
             message.ratchet_id = Some(ratchet_id);
         }

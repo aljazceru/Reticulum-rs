@@ -25,4 +25,7 @@ x25519-dalek = { version = "2.0.1", default-features = false, features = ["stati
 default = ["std"]
 fernet-aes128 = []
 std = ["rand_core/getrandom"]
+# Alias kept for the existing CI invocations (`--features embassy-time`)
+# and for callers predating the no_std naming.
+embassy-time = ["no_std"]
 no_std = ["dep:embassy-time"]

@@ -30,7 +30,7 @@ const AES_KEY_SIZE: usize = <<AesAlgo as KeySizeUser>::KeySize as Unsigned>::USI
 const IV_KEY_SIZE: usize = <<AesCbcEnc as IvSizeUser>::IvSize as Unsigned>::USIZE;
 const FERNET_OVERHEAD_SIZE: usize = IV_KEY_SIZE + HMAC_OUT_SIZE;
 
-pub struct PlainText<'a>(&'a [u8]);
+pub struct PlainText<'a>(pub &'a [u8]);
 pub struct VerifiedToken<'a>(&'a [u8]);
 pub struct Token<'a>(&'a [u8]);
 

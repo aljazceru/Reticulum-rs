@@ -113,45 +113,70 @@ impl BufferReader {
         let (client, mut peer) = tokio::io::duplex(DUPLEX_BUFFER);
         let (duplex, _) = tokio::io::split(client);
 
+        // Lossless hand-off queue: when the 64 KiB duplex backpressures
+        // the pump, channel frames accumulate here instead of being
+        // dropped by the broadcast channel's ring (reliable channel
+        // frames must never be lost — a lost EOF frame would truncate
+        // ordinary large streams).
+        let (queue_tx, mut queue_rx) = tokio::sync::mpsc::unbounded_channel::<StreamDataMessage>();
+
+        // Drain the broadcast stream into the queue; the pump consumes
+        // the queue. On Lagged the position is advanced and the missed
+        // frames are re-requested is impossible — so instead the ring
+        // capacity must never be the bottleneck: the queue is unbounded
+        // and the pump drains it as fast as the duplex accepts.
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
             loop {
                 match incoming.recv().await {
                     Ok(message) => {
-                        log::debug!(
-                            "buffer_stream: reader got frame stream_id={} eof={} {} bytes",
-                            message.stream_id,
-                            message.eof,
-                            message.data.len()
-                        );
-                        if message.stream_id != stream_id {
-                            continue;
-                        }
-                        let eof = message.eof;
-                        if !message.data.is_empty() {
-                            let mut data = message.data;
-                            while !data.is_empty() {
-                                let take = data.len().min(4096);
-                                let slice: Vec<u8> = data.drain(..take).collect();
-                                if peer.write_all(&slice).await.is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        if eof {
-                            // half-close the pump so the reader sees EOF
-                            let _ = peer.shutdown().await;
+                        if queue_tx.send(message).is_err() {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        log::warn!("buffer_stream: reader lagged, {n} frames lost");
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // Should not happen while the drain task stays
+                        // scheduled; if it does, keep draining.
                         continue;
                     }
-                    Err(broadcast::error::RecvError::Closed) => {
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            loop {
+                let message = match queue_rx.recv().await {
+                    Some(message) => message,
+                    None => {
                         let _ = peer.shutdown().await;
                         return;
                     }
+                };
+                log::debug!(
+                    "buffer_stream: reader got frame stream_id={} eof={} {} bytes",
+                    message.stream_id,
+                    message.eof,
+                    message.data.len()
+                );
+                if message.stream_id != stream_id {
+                    continue;
+                }
+                let eof = message.eof;
+                if !message.data.is_empty() {
+                    let mut data = message.data;
+                    while !data.is_empty() {
+                        let take = data.len().min(4096);
+                        let slice: Vec<u8> = data.drain(..take).collect();
+                        if peer.write_all(&slice).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                if eof {
+                    // half-close the pump so the reader sees EOF
+                    let _ = peer.shutdown().await;
+                    return;
                 }
             }
         });

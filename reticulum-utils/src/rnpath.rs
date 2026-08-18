@@ -129,14 +129,27 @@ pub async fn wait_for_destination(
     if let Some(dest) = transport.get_out_destination(destination).await {
         return Some(dest.lock().await.desc);
     }
-    transport.request_path(destination, None, None).await;
+
+    // Subscribe BEFORE issuing the path request: on a fast local or
+    // shared-instance path, the response announce can be processed
+    // before a receiver created after the request would exist.
     let mut announces = transport.recv_announces().await;
+
+    transport.request_path(destination, None, None).await;
+
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return None;
         }
+
+        // Re-check in case the announce was processed between the
+        // request and the first poll (and thus never emitted to us).
+        if let Some(dest) = transport.get_out_destination(destination).await {
+            return Some(dest.lock().await.desc);
+        }
+
         let Ok(Ok(event)) = tokio::time::timeout(remaining, announces.recv()).await else {
             return None;
         };

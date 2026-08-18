@@ -272,6 +272,10 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     /// Retained *private* ratchet keys, newest first. `None` while ratchets
     /// are disabled (Python `Destination.ratchets`).
     pub ratchets: Option<Vec<[u8; RATCHET_KEY_LENGTH]>>,
+
+    /// Symmetric group key for GROUP destinations
+    /// (Python `Destination.prv`).
+    pub group_key: Option<GroupKey>,
     /// Unix timestamp of the last ratchet rotation
     /// (Python `Destination.latest_ratchet_time`).
     pub latest_ratchet_time: u64,
@@ -448,6 +452,7 @@ impl Destination<PrivateIdentity, Input, Single> {
             proof_strategy: ProofStrategy::default(),
             accepts_links: true,
             ratchets: None,
+            group_key: None,
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
@@ -618,6 +623,7 @@ impl Destination<Identity, Output, Single> {
             proof_strategy: ProofStrategy::default(),
             accepts_links: true,
             ratchets: None,
+            group_key: None,
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
@@ -640,6 +646,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             proof_strategy: ProofStrategy::default(),
             accepts_links: true,
             ratchets: None,
+            group_key: None,
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
@@ -652,12 +659,82 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
     }
 }
 
-/// GROUP destinations are parsed and addressed exactly like PLAIN ones:
-/// name-hash addressing without an identity. The Python reference ships
-/// GROUP symmetric crypto as a placeholder (`Destination.prv` /
-/// `load_private_key`), so no crypto is invented here — packets to GROUP
-/// destinations are sent unencrypted, mirroring the current Python state
-/// for destinations that never load a symmetric key.
+/// Symmetric group key (Python `RNS.Cryptography.Token`): the raw key is
+/// split into an HMAC signing key and an AES-CBC encryption key. The
+/// default build uses AES-256 (64-byte keys, Python
+/// `Token.generate_key()` default `AES_256_CBC`); with the
+/// `fernet-aes128` feature 32-byte keys (Python `AES_128_CBC`) are used
+/// instead. Token format `iv || ciphertext || hmac` is byte-compatible
+/// with the reference `Destination.prv`.
+pub struct GroupKey {
+    fernet: crate::crypt::fernet::Fernet<crate::crypt::fernet::ZeroRng>,
+    raw: [u8; GROUP_KEY_SIZE],
+}
+
+/// Group key size for the compiled AES mode.
+#[cfg(feature = "fernet-aes128")]
+pub const GROUP_KEY_SIZE: usize = 32;
+#[cfg(not(feature = "fernet-aes128"))]
+pub const GROUP_KEY_SIZE: usize = 64;
+
+impl GroupKey {
+    /// Generate a new random group key
+    /// (Python `Destination.create_keys` -> `Token.generate_key`).
+    pub fn generate<R: CryptoRngCore>(mut rng: R) -> Self {
+        let mut raw = [0u8; GROUP_KEY_SIZE];
+        rng.fill_bytes(&mut raw);
+        Self::from_bytes(raw)
+    }
+
+    /// Wrap an existing group key
+    /// (Python `Destination.load_private_key`).
+    pub fn from_bytes(raw: [u8; GROUP_KEY_SIZE]) -> Self {
+        let half = GROUP_KEY_SIZE / 2;
+        Self {
+            fernet: crate::crypt::fernet::Fernet::<crate::crypt::fernet::ZeroRng>::new_from_slices(
+                &raw[..half],
+                &raw[half..],
+                crate::crypt::fernet::ZeroRng,
+            ),
+            raw,
+        }
+    }
+
+    /// The raw private key bytes (Python `Destination.get_private_key`).
+    pub fn as_bytes(&self) -> &[u8; GROUP_KEY_SIZE] {
+        &self.raw
+    }
+
+    /// Encrypt a payload into `out_buf`, returning the token bytes
+    /// (Python `Token.encrypt`).
+    pub fn encrypt<'a>(
+        &self,
+        plaintext: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], crate::error::RnsError> {
+        let plain = crate::crypt::fernet::PlainText(plaintext);
+        self.fernet
+            .encrypt(plain, out_buf)
+            .map(|token| token.as_bytes())
+    }
+
+    /// Verify and decrypt a token into `out_buf`
+    /// (Python `Token.decrypt`).
+    pub fn decrypt<'a>(
+        &self,
+        token: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], crate::error::RnsError> {
+        let verified = self.fernet.verify(crate::crypt::fernet::Token::from(token))?;
+        self.fernet.decrypt(verified, out_buf).map(|p| p.as_slice())
+    }
+}
+
+/// GROUP destinations use name-hash addressing like PLAIN ones, with
+/// symmetric-key payload encryption (Python `Destination.prv` /
+/// `create_keys` / `load_private_key`). Without a loaded group key the
+/// payloads pass unencrypted, matching the reference for destinations
+/// that never load one.
 impl<D: Direction> Destination<EmptyIdentity, D, Group> {
     pub fn new(identity: EmptyIdentity, name: DestinationName) -> Self {
         let address_hash = create_address_hash(&identity, &name);
@@ -668,6 +745,7 @@ impl<D: Direction> Destination<EmptyIdentity, D, Group> {
             proof_strategy: ProofStrategy::default(),
             accepts_links: true,
             ratchets: None,
+            group_key: None,
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
@@ -676,6 +754,57 @@ impl<D: Direction> Destination<EmptyIdentity, D, Group> {
                 name,
                 address_hash,
             },
+        }
+    }
+
+    /// Generate a new symmetric group key for this destination
+    /// (Python `Destination.create_keys`).
+    pub fn create_group_key<R: CryptoRngCore>(&mut self, rng: R) -> [u8; GROUP_KEY_SIZE] {
+        let key = GroupKey::generate(rng);
+        let raw = *key.as_bytes();
+        self.group_key = Some(key);
+        raw
+    }
+
+    /// Load an existing symmetric group key
+    /// (Python `Destination.load_private_key`).
+    pub fn load_group_key(&mut self, key: [u8; GROUP_KEY_SIZE]) {
+        self.group_key = Some(GroupKey::from_bytes(key));
+    }
+
+    /// The loaded group key, if any (Python `Destination.get_private_key`).
+    pub fn group_key(&self) -> Option<&[u8; GROUP_KEY_SIZE]> {
+        self.group_key.as_ref().map(|key| key.as_bytes())
+    }
+
+    /// Whether payloads on this destination are encrypted.
+    pub fn group_encrypted(&self) -> bool {
+        self.group_key.is_some()
+    }
+
+    /// Encrypt a payload with the destination's group key
+    /// (Python `Destination.encrypt` for GROUP).
+    pub fn encrypt_group<'a>(
+        &self,
+        plaintext: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], crate::error::RnsError> {
+        match &self.group_key {
+            Some(key) => key.encrypt(plaintext, out_buf),
+            None => Err(crate::error::RnsError::CryptoError),
+        }
+    }
+
+    /// Decrypt a payload with the destination's group key
+    /// (Python `Destination.decrypt` for GROUP).
+    pub fn decrypt_group<'a>(
+        &self,
+        ciphertext: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<&'a [u8], crate::error::RnsError> {
+        match &self.group_key {
+            Some(key) => key.decrypt(ciphertext, out_buf),
+            None => Err(crate::error::RnsError::CryptoError),
         }
     }
 }
