@@ -2124,7 +2124,7 @@ async fn handle_keepalive_response<'a>(
     handler: &MutexGuard<'a, TransportHandler>,
 ) -> bool {
     if packet.context == PacketContext::KeepAlive
-        && packet.data.as_slice()[0] == KEEP_ALIVE_RESPONSE
+        && packet.data.as_slice().first() == Some(&KEEP_ALIVE_RESPONSE)
     {
         let lookup = handler.link_table.handle_keepalive(packet);
 
@@ -2854,7 +2854,7 @@ async fn handle_announce<'a>(
         // (Python `Transport.cache(force_cache=True, packet_type="announce")`).
         handler.packet_cache.lock().await.cache_announce(packet);
 
-        handler.announce_table.add(packet, dest_hash, iface);
+        handler.announce_table.add(packet, packet.destination, dest_hash);
 
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
@@ -2900,7 +2900,12 @@ async fn handle_announce<'a>(
         let retransmit = handler.config.retransmit;
         if retransmit {
             let transport_id = *handler.config.identity.address_hash();
-            if let Some(message) = handler.announce_table.new_packet(&dest_hash, &transport_id) {
+            // Keyed by the announced destination hash (identity hash is
+            // the received_from/routing value).
+            if let Some(message) = handler
+                .announce_table
+                .new_packet(&packet.destination, &transport_id)
+            {
                 handler.send(message).await;
             }
         }

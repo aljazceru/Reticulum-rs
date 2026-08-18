@@ -32,6 +32,11 @@ pub fn create_path_request_destination() -> PlainInputDestination {
 
 pub type TagBytes = Vec<u8>;
 
+/// Maximum remembered (destination, tag) pairs: control packets arrive
+/// before the general packet-cache filter, so an unbounded set is a
+/// remote OOM vector (Python bounds its remembered request tags).
+const MAX_REMEMBERED_TAGS: usize = 4096;
+
 pub fn create_random_tag() -> TagBytes {
     AddressHash::new_from_rand(OsRng).as_slice().into()
 }
@@ -120,6 +125,16 @@ impl PathRequests {
         let path_request = PathRequest::decode(data, &self.name);
 
         if let Some(ref request) = path_request {
+            // Bound the remembered tags: control packets arrive before
+            // the general packet-cache filter, so an unbounded set is a
+            // remote OOM vector (Python bounds its request tags).
+            while self.cache.len() >= MAX_REMEMBERED_TAGS {
+                let Some(oldest) = self.cache.iter().next().cloned() else {
+                    break;
+                };
+                self.cache.remove(&oldest);
+            }
+
             let is_new = self
                 .cache
                 .insert((request.destination, request.tag_bytes.clone()));

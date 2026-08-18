@@ -120,7 +120,10 @@ impl AnnounceTable {
 
     pub fn add(&mut self, announce: &Packet, destination: AddressHash, received_from: AddressHash) {
         let now = Instant::now();
-        let hops = announce.header.hops + 1;
+        // Hops are attacker-controlled (not covered by the announce
+        // signature): saturate instead of wrapping — a replayed
+        // hops=255 announce must not wrap to 0 and poison routes.
+        let hops = announce.header.hops.saturating_add(1);
 
         // Retransmit within a small random window
         // (Python: `retransmit_timeout = now + rand()*PATHFINDER_RW`,

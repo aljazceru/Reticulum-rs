@@ -130,7 +130,12 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         text: PlainText,
         out_buf: &'a mut [u8],
     ) -> Result<Token<'a>, RnsError> {
-        if out_buf.len() <= FERNET_OVERHEAD_SIZE {
+        // Required size: IV + padded ciphertext + HMAC. Checking only
+        // against the fixed overhead let Channel-sized payloads expand
+        // past the buffer and panic in the padding/slicing.
+        let padded_len = text.0.len().div_ceil(crate::packet::AES128_BLOCKSIZE) * crate::packet::AES128_BLOCKSIZE + IV_KEY_SIZE;
+        let required = padded_len + HMAC_OUT_SIZE;
+        if out_buf.len() < required {
             return Err(RnsError::InvalidArgument);
         }
 
@@ -144,7 +149,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let chiper_len = AesCbcEnc::new(&self.enc_key, &iv)
             .encrypt_padded_b2b_mut::<Pkcs7>(text.0, &mut out_buf[out_len..])
-            .unwrap()
+            .map_err(|_| RnsError::InvalidArgument)?
             .len();
 
         out_len += chiper_len;

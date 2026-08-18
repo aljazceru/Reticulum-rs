@@ -755,6 +755,18 @@ impl Link {
         out_link: bool
     ) -> LinkHandleResult {
         if self.status != LinkStatus::Active {
+            // Pending/handshaking links have an all-zero derived key until
+            // the handshake proof validates: anyone observing the public
+            // link request could encrypt with that known key and inject
+            // data or close the link. Reject data until Active
+            // (Python ignores packets on un-activated links).
+            if matches!(self.status, LinkStatus::Pending | LinkStatus::Handshake) {
+                log::warn!(
+                    "link({}): dropping data packet on un-activated link",
+                    self.id
+                );
+                return LinkHandleResult::None;
+            }
             log::warn!("link({}): handling data packet in inactive state", self.id);
         }
 
@@ -841,7 +853,14 @@ impl Link {
                     self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
                 {
                     if let Ok(rtt) = rmp::decode::read_f64(&mut &plain_text[..]) {
-                        self.rtt = Duration::from_secs_f64(rtt);
+                        // A hostile peer can encode NaN/infinite or
+                        // enormous RTT values; clamp to a sane range
+                        // instead of panicking in Duration construction.
+                        if rtt.is_finite() && (0.0..86_400.0).contains(&rtt) {
+                            self.rtt = Duration::from_secs_f64(rtt);
+                        } else {
+                            log::debug!("link: ignoring invalid rtt packet ({rtt})");
+                        }
                     } else {
                         log::error!("link({}): failed to decode rtt", self.id);
                     }

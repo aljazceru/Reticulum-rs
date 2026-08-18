@@ -130,9 +130,11 @@ impl TcpClient {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => {
+                                    stop.cancel();
                                     break;
                             }
                             _ = stop.cancelled() => {
+                                    stop.cancel();
                                     break;
                             }
                             result = stream.read(&mut tcp_buffer[..]) => {
@@ -194,6 +196,7 @@ impl TcpClient {
                                         }
                                         Err(e) => {
                                             log::warn!("tcp_client: connection error {}", e);
+                                            stop.cancel();
                                             break;
                                         }
                                     }
