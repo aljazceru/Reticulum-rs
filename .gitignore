@@ -5,3 +5,6 @@
 tests/rns-py-configs/**/interfaces
 tests/rns-py-configs/**/storage
 rust-analyzer.log
+
+# hardware test artifacts: flash backups, firmware images (keep on disk)
+hw-backup/

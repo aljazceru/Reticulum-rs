@@ -36,6 +36,9 @@ enum Command {
     Sh(ShArgs),
     /// RNode diagnostics and validation (rnodeconf)
     Nodeconf(NodeconfArgs),
+    /// RNode device emulator for interface testing
+    #[cfg(feature = "iface-rnode")]
+    NodeSim(reticulum_utils::rnode_sim::Args),
     /// Identity resolver stub (rnir)
     Ir(CommonArgs),
     /// Package manager stub (rnpkg)
@@ -308,6 +311,16 @@ async fn main() -> ExitCode {
         Command::Probe(args) => exit_code(run_probe(args).await),
         Command::X(args) => exit_code(run_x(args).await),
         Command::Sh(args) => exit_code(run_sh(args).await),
+        #[cfg(feature = "iface-rnode")]
+        Command::NodeSim(args) => {
+            init_logging(1);
+            if let Err(err) = reticulum_utils::rnode_sim::run(args).await {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+
         Command::Nodeconf(args) => {
             #[cfg(feature = "iface-rnode")]
             {

@@ -50,12 +50,30 @@ impl Drop for PyPartner {
     }
 }
 
+/// Copy the fixture config into a fresh temp directory so each test owns
+/// its storage (identities, ratchets) and concurrent suites never share
+/// state (same isolation as the rncp python tests).
+fn isolated_config(name: &str) -> String {
+    let fixture = format!(
+        "{}/tests/rns-py-configs/udp",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "rn-pyid-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(format!("{fixture}/config"), dir.join("config")).unwrap();
+    dir.to_str().unwrap().to_string()
+}
+
 async fn spawn_partner(mode: &str, destination: Option<&str>, size: usize) -> PyPartner {
     let mut child = Command::new("python3")
         .arg("-u")
         .arg("tests/py-interop/identity.py")
         .arg("--config")
-        .arg("tests/rns-py-configs/udp")
+        .arg(isolated_config(mode))
         .arg("--mode")
         .arg(mode)
         .arg("--size")

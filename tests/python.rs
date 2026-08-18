@@ -4,6 +4,21 @@ use std::process::Stdio;
 use std::sync::{atomic, Arc, LazyLock, Once};
 
 use tokio::process::Command;
+
+/// Copy the fixture config into a fresh temp directory per test so
+/// concurrent suites never share Python-side storage (identities,
+/// ratchets) or corrupt each other.
+fn isolated_config(name: &str) -> String {
+    let fixture = format!(
+        "{}/tests/rns-py-configs/udp",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let dir = std::env::temp_dir().join(format!("rn-pyex-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(format!("{fixture}/config"), dir.join("config")).unwrap();
+    dir.to_str().unwrap().to_string()
+}
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -56,10 +71,7 @@ async fn python_announce() {
         .arg("-u") // make sure output is not buffered
         .arg(script_path)
         .arg("--config")
-        .arg(format!(
-            "{}/tests/rns-py-configs/udp",
-            env!("CARGO_MANIFEST_DIR")
-        ))
+        .arg(isolated_config("announce"))
         .stdin(Stdio::piped()) // to be able to send to stdin
         .env("PYTHONPATH", RETICULUM_PYTHON_DIR.as_str())
         .spawn()
@@ -137,10 +149,7 @@ async fn python_link_client() {
         .arg(script_path)
         .arg("--server")
         .arg("--config")
-        .arg(format!(
-            "{}/tests/rns-py-configs/udp",
-            env!("CARGO_MANIFEST_DIR")
-        ))
+        .arg(isolated_config("link-client"))
         .stdin(Stdio::piped()) // we do not send to stdin in this example but to prevent EOF error
         .stdout(Stdio::piped()) // to be able to process stdout lines
         .env("PYTHONPATH", RETICULUM_PYTHON_DIR.as_str())
@@ -277,10 +286,7 @@ async fn python_link_server() {
         .arg("-u") // make sure output is not buffered
         .arg(script_path)
         .arg("--config")
-        .arg(format!(
-            "{}/tests/rns-py-configs/udp",
-            env!("CARGO_MANIFEST_DIR")
-        ))
+        .arg(isolated_config("link-server"))
         .arg(destination_hash.to_string().trim_matches('/'))
         .stdin(Stdio::piped()) // to be able to send to stdin
         .stdout(Stdio::piped()) // to be able to process stdout lines
@@ -404,10 +410,7 @@ async fn python_identify_client() {
         .arg(script_path)
         .arg("--server")
         .arg("--config")
-        .arg(format!(
-            "{}/tests/rns-py-configs/udp",
-            env!("CARGO_MANIFEST_DIR")
-        ))
+        .arg(isolated_config("identify-client"))
         .stdin(Stdio::piped()) // we do not send to stdin in this example but to prevent EOF error
         .stdout(Stdio::piped()) // to be able to process stdout lines
         .env("PYTHONPATH", RETICULUM_PYTHON_DIR.as_str())
@@ -580,10 +583,7 @@ async fn python_identify_server() {
         .arg("-u") // make sure output is not buffered
         .arg(script_path)
         .arg("--config")
-        .arg(format!(
-            "{}/tests/rns-py-configs/udp",
-            env!("CARGO_MANIFEST_DIR")
-        ))
+        .arg(isolated_config("identify-server"))
         .arg(destination_hash.to_string().trim_matches('/'))
         .stdin(Stdio::piped()) // to be able to send to stdin
         .stdout(Stdio::piped()) // to be able to process stdout lines

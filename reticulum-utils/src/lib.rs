@@ -33,5 +33,7 @@ pub mod rnodeconf;
 pub mod rnprobe;
 pub mod rnpkg;
 pub mod rnsh;
+#[cfg(feature = "iface-rnode")]
+pub mod rnode_sim;
 pub mod rnx;
 pub mod rnstatus;
