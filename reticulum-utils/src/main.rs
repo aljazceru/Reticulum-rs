@@ -649,6 +649,8 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
             config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
             allow_all: args.allow_all,
             allowed,
+            default_command: None,
+            allow_remote_command: true,
             udp_loopback,
         };
 
@@ -672,11 +674,22 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
         config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
         allow_all: false,
         allowed: Vec::new(),
+        default_command: None,
+        allow_remote_command: true,
         udp_loopback,
     };
 
-    let output = reticulum_utils::rnsh::run_command(&destination, &command, &options).await?;
-    print!("{}", String::from_utf8_lossy(&output));
+    let outcome = reticulum_utils::rnsh::run_command(&destination, &command, &options).await?;
+    {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&outcome.stdout);
+        let mut stderr = std::io::stderr().lock();
+        let _ = stderr.write_all(&outcome.stderr);
+    }
+    if let Some(code) = outcome.exit_code {
+        std::process::exit(code);
+    }
     Ok(())
 }
 

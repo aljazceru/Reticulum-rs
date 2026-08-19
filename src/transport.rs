@@ -3889,6 +3889,7 @@ async fn manage_transport(
                             continue;
                         }
 
+
                         // NOTE: Python transport nodes never blindly repeat
                         // received packets. Every relayed packet class is
                         // handled explicitly with re-addressing and hop

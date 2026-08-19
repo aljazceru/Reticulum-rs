@@ -94,6 +94,8 @@ async fn rnsh_session_command_roundtrip() {
         config_dir: server_dir.clone(),
         allow_all: true,
         allowed: Vec::new(),
+        default_command: None,
+        allow_remote_command: true,
         udp_loopback: Some((5005, 5006)),
     };
 
@@ -121,10 +123,12 @@ async fn rnsh_session_command_roundtrip() {
         config_dir: client_dir,
         allow_all: false,
         allowed: Vec::new(),
+        default_command: None,
+        allow_remote_command: true,
         udp_loopback: Some((5006, 5005)),
     };
 
-    let output = reticulum_utils::rnsh::run_command(
+    let outcome = reticulum_utils::rnsh::run_command(
         &destination,
         "printf shell-output",
         &options,
@@ -132,7 +136,7 @@ async fn rnsh_session_command_roundtrip() {
     .await
     .expect("session command");
 
-    assert_eq!(output, b"shell-output");
+    assert_eq!(outcome.stdout, b"shell-output");
 
     listener.abort();
 }
