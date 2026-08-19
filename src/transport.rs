@@ -4,7 +4,7 @@ use std::time::Duration;
 use alloc::sync::Arc;
 use rand_core::OsRng;
 use reticulum_core::identity::Signer;
-use tokio::sync::{broadcast, Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -26,16 +26,15 @@ use crate::iface::{
     InterfaceManager, InterfaceMode, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType,
 };
 use crate::packet::{
-    DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
-    PACKET_MDU,
+    DestinationType, Header, HeaderType, PACKET_MDU, Packet, PacketContext, PacketDataBuffer,
+    PacketType,
 };
 use crate::resource::{
-    self, ResourceTx,
+    self, ResourceEvent, ResourceOptions, ResourceTx,
     manager::{
-        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
-        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
+        RequestContext as RequestCtx, RequestEvent, RequestEventData, ResourceManager,
+        ResourceStrategy, pack_request, pack_response, request_id as make_request_id,
     },
-    ResourceEvent, ResourceOptions,
 };
 use crate::storage::{KnownDestinations, KnownRatchets, Storage};
 
@@ -49,19 +48,18 @@ mod path_requests;
 mod path_table;
 mod tunnels;
 
-pub use blackholes::{Blackholes, SharedBlackholes, BLACKHOLE_TIMEOUT};
+pub use blackholes::{BLACKHOLE_TIMEOUT, Blackholes, SharedBlackholes};
 
 use self::announce_limits::AnnounceLimits;
 use self::announce_table::AnnounceTable;
 use self::link_table::LinkTable;
 use self::packet_cache::PacketCache;
-use self::path_requests::{create_path_request_destination, PathRequests, TagBytes};
+use self::path_requests::{PathRequests, TagBytes, create_path_request_destination};
 use self::path_table::PathTable;
 use self::tunnels::{TunnelPath, Tunnels};
 
 pub use self::tunnels::{
-    decode_tunnel_synthesize as decode_tunnel_synthesis, TUNNEL_SYNTHESIZE_LENGTH,
-    TUNNEL_TIMEOUT,
+    TUNNEL_SYNTHESIZE_LENGTH, TUNNEL_TIMEOUT, decode_tunnel_synthesize as decode_tunnel_synthesis,
 };
 
 // TODO: Configure via features
@@ -509,7 +507,12 @@ impl Transport {
     }
 
     pub async fn outbound(&self, packet: &Packet) {
-        let (packet, maybe_iface) = self.handler.lock().await.path_table.handle_packet(packet);
+        let (packet, maybe_iface) = self
+            .handler
+            .lock()
+            .await
+            .path_table
+            .handle_local_packet(packet);
 
         if let Some(iface) = maybe_iface {
             self.send_direct(iface, packet).await;
@@ -886,7 +889,25 @@ impl Transport {
             .out_links
             .insert(destination.address_hash, link.clone());
 
-        self.send_packet(packet).await;
+        // Python `Transport.outbound` addresses packets for destinations
+        // with a known path as HEADER_2 carrying the next hop's transport
+        // id; intermediary (transport-mode) nodes ONLY relay addressed
+        // packets. Direct peers (announce without transport id) keep the
+        // broadcast form.
+        let via_transport = {
+            let handler = self.handler.lock().await;
+            handler
+                .path_table
+                .get(&destination.address_hash)
+                .map(|entry| entry.received_from != destination.address_hash)
+                .unwrap_or(false)
+        };
+
+        if via_transport {
+            self.outbound(&packet).await;
+        } else {
+            self.send_packet(packet).await;
+        }
 
         link
     }
@@ -909,7 +930,7 @@ impl Transport {
     }
 
     #[allow(unused)] // mocked out in the test build, so the linter
-                     // would complain about dead code
+    // would complain about dead code
     pub(crate) async fn bind_link_to_channel(
         &self,
         id: LinkId,
@@ -1277,15 +1298,9 @@ impl Transport {
     }
 
     /// Take a completed (arrived-before-awaiting) response for a request.
-    async fn take_completed_response(
-        &self,
-        request_id: AddressHash,
-    ) -> Option<Option<Vec<u8>>> {
+    async fn take_completed_response(&self, request_id: AddressHash) -> Option<Option<Vec<u8>>> {
         let mut handler = self.handler.lock().await;
-        handler
-            .resources
-            .completed_responses
-            .remove(&request_id)
+        handler.resources.completed_responses.remove(&request_id)
     }
 
     /// Drop a retained response that was consumed through the event
@@ -1323,8 +1338,7 @@ impl Transport {
         &mut self,
         name: DestinationName,
     ) -> Arc<Mutex<GroupInputDestination>> {
-        let destination =
-            GroupInputDestination::new(reticulum_core::identity::EmptyIdentity, name);
+        let destination = GroupInputDestination::new(reticulum_core::identity::EmptyIdentity, name);
         let address_hash = destination.desc.address_hash;
 
         log::debug!("tp({}): add group destination {}", self.name, address_hash);
@@ -1981,24 +1995,22 @@ fn validate_single_destination_proof(handler: &mut TransportHandler, packet: &Pa
     let proof = packet.data.as_slice();
     let valid = if proof.len() == 64 {
         // Implicit proof: signature only
-        crate::identity::Signature::from_slice(proof)
-            .is_ok_and(|signature| {
+        crate::identity::Signature::from_slice(proof).is_ok_and(|signature| {
+            receipt
+                .identity
+                .verify(receipt.packet_hash.as_slice(), &signature)
+                .is_ok()
+        })
+    } else if proof.len() == 96 {
+        // Explicit proof: packet hash + signature
+        let proof_hash = &proof[..32];
+        proof_hash == receipt.packet_hash.as_slice()
+            && crate::identity::Signature::from_slice(&proof[32..]).is_ok_and(|signature| {
                 receipt
                     .identity
                     .verify(receipt.packet_hash.as_slice(), &signature)
                     .is_ok()
             })
-    } else if proof.len() == 96 {
-        // Explicit proof: packet hash + signature
-        let proof_hash = &proof[..32];
-        proof_hash == receipt.packet_hash.as_slice()
-            && crate::identity::Signature::from_slice(&proof[32..])
-                .is_ok_and(|signature| {
-                    receipt
-                        .identity
-                        .verify(receipt.packet_hash.as_slice(), &signature)
-                        .is_ok()
-                })
     } else {
         false
     };
@@ -2014,7 +2026,11 @@ fn validate_single_destination_proof(handler: &mut TransportHandler, packet: &Pa
     valid
 }
 
-async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_proof<'a>(
+    packet: &Packet,
+    ingress_iface: AddressHash,
+    mut handler: MutexGuard<'a, TransportHandler>,
+) {
     log::trace!(
         "tp({}): handle proof for {}",
         handler.config.name,
@@ -2064,9 +2080,12 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         return;
     }
 
+    let mut local_proof_handled = false;
     for link in handler.out_links.values() {
         let mut link = link.lock().await;
         let link_id = *link.id();
+
+        local_proof_handled = true;
 
         if let LinkHandleResult::Activated = link.handle_packet(
             &handler.link_out_event_tx,
@@ -2083,6 +2102,8 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         let mut link = link.lock().await;
         let link_id = *link.id();
 
+        local_proof_handled = true;
+
         link.handle_packet(
             &handler.link_in_event_tx,
             handler.channel_table.get(&link_id),
@@ -2091,15 +2112,59 @@ async fn handle_proof<'a>(packet: &Packet, mut handler: MutexGuard<'a, Transport
         );
     }
 
-    let maybe_packet = handler.link_table.handle_proof(packet);
+    // Intermediary relay of link-message proofs (Python link-transport
+    // handling covers every packet addressed to a link-table entry
+    // except ANNOUNCE, LINKREQUEST and LRPROOF-context packets).
+    if !local_proof_handled && packet.context != PacketContext::LinkRequestProof {
+        if let Some((packet, iface)) = handler.link_table.route_link_packet(packet, ingress_iface) {
+            log::trace!(
+                "tp({}): forwarded link proof {}",
+                handler.config.name,
+                packet.destination
+            );
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(iface),
+                    packet,
+                })
+                .await;
+        }
+    }
 
-    if let Some((packet, iface)) = maybe_packet {
-        handler
-            .send(TxMessage {
-                tx_type: TxMessageType::Direct(iface),
-                packet,
-            })
-            .await;
+    // Link-request proofs for intermediary (relayed) links: validate the
+    // destination's signature via the recalled identity and relay toward
+    // the initiator (Python Transport.inbound LRPROOF handling).
+    if packet.context == PacketContext::LinkRequestProof {
+        let now = unix_time_now();
+        let recalled = handler
+            .known_destinations
+            .recall(&packet.destination, now)
+            .or_else(|| {
+                // Fall back to the link entry's original destination when
+                // the proof address (link id) has no known-destinations
+                // entry.
+                handler
+                    .link_table
+                    .original_destination_of(&packet.destination)
+                    .and_then(|destination| handler.known_destinations.recall(&destination, now))
+            });
+
+        let outcome = handler
+            .link_table
+            .handle_lr_proof(packet, ingress_iface, recalled.as_ref());
+
+        if let Some((destination, hops)) = outcome.path_hops_update {
+            handler.path_table.rebalance_hops(&destination, hops);
+        }
+
+        if let Some((packet, iface)) = outcome.relay {
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(iface),
+                    packet,
+                })
+                .await;
+        }
     }
 }
 
@@ -2124,12 +2189,13 @@ async fn send_to_next_hop<'a>(
 
 async fn handle_keepalive_response<'a>(
     packet: &Packet,
+    ingress_iface: AddressHash,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     if packet.context == PacketContext::KeepAlive
         && packet.data.as_slice().first() == Some(&KEEP_ALIVE_RESPONSE)
     {
-        let lookup = handler.link_table.handle_keepalive(packet);
+        let lookup = handler.link_table.handle_keepalive(packet, ingress_iface);
 
         if let Some((propagated, iface)) = lookup {
             handler
@@ -2456,7 +2522,11 @@ async fn handle_cache_request<'a>(
     }
 }
 
-async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_data<'a>(
+    packet: &Packet,
+    ingress_iface: AddressHash,
+    mut handler: MutexGuard<'a, TransportHandler>,
+) {
     let mut data_handled = false;
 
     // Cache requests: if this instance can fulfill the request from its
@@ -2473,6 +2543,10 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
         let mut local_out_link_handled = false;
 
         if let Some(link) = handler.in_links.get(&packet.destination).cloned() {
+            // Local responder link: fully handled below; intermediary
+            // link-table routing must not also try to forward it
+            // (Python delivers endpoint link data to the local link).
+            local_out_link_handled = true;
             if handle_resource_packet(packet, &link, &mut handler).await {
                 return;
             }
@@ -2585,23 +2659,34 @@ async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportH
             }
         }
 
-        if !local_out_link_handled && handle_keepalive_response(packet, &mut handler).await {
+        if !local_out_link_handled
+            && handle_keepalive_response(packet, ingress_iface, &mut handler).await
+        {
             return;
         }
 
         if !local_out_link_handled {
-            let lookup = handler.link_table.original_destination(&packet.destination);
-            if lookup.is_some() {
-                let sent = send_to_next_hop(packet, &handler, lookup).await;
-
+            // Intermediary link-data routing (Python "Link transport
+            // handling"): direction + hop-count aware, using the link
+            // table, not the path table.
+            if let Some((packet, iface)) =
+                handler.link_table.route_link_packet(packet, ingress_iface)
+            {
                 log::trace!(
-                    "tp({}): {} packet to remote link {}",
+                    "tp({}): forwarded link packet {}",
                     handler.config.name,
-                    if sent {
-                        "forwarded"
-                    } else {
-                        "could not forward"
-                    },
+                    packet.destination
+                );
+                handler
+                    .send(TxMessage {
+                        tx_type: TxMessageType::Direct(iface),
+                        packet,
+                    })
+                    .await;
+            } else {
+                log::trace!(
+                    "tp({}): could not route link packet {}",
+                    handler.config.name,
                     packet.destination
                 );
             }
@@ -2868,7 +2953,9 @@ async fn handle_announce<'a>(
         // (Python `Transport.cache(force_cache=True, packet_type="announce")`).
         handler.packet_cache.lock().await.cache_announce(packet);
 
-        handler.announce_table.add(packet, packet.destination, dest_hash);
+        handler
+            .announce_table
+            .add(packet, packet.destination, dest_hash);
 
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
@@ -3379,12 +3466,19 @@ async fn handle_link_request_as_destination<'a>(
 async fn handle_link_request_as_intermediate<'a>(
     received_from: AddressHash,
     next_hop: AddressHash,
+    next_hop_iface: AddressHash,
+    remaining_hops: u8,
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
-    handler
-        .link_table
-        .add(packet, packet.destination, received_from, next_hop);
+    handler.link_table.add(
+        packet,
+        packet.destination,
+        received_from,
+        next_hop,
+        next_hop_iface,
+        remaining_hops,
+    );
 
     send_to_next_hop(packet, &handler, None).await;
 }
@@ -3413,8 +3507,21 @@ async fn handle_link_request<'a>(
             packet.destination
         );
 
-        let (next_hop, _) = entry;
-        handle_link_request_as_intermediate(iface, next_hop, packet, handler).await;
+        let (next_hop, next_hop_iface) = entry;
+        let remaining_hops = handler
+            .path_table
+            .get(&packet.destination)
+            .map(|e| e.hops)
+            .unwrap_or(1);
+        handle_link_request_as_intermediate(
+            iface,
+            next_hop,
+            next_hop_iface,
+            remaining_hops,
+            packet,
+            handler,
+        )
+        .await;
     } else {
         log::trace!(
             "tp({}): dropping link request to unknown destination {}",
@@ -3649,11 +3756,12 @@ async fn manage_transport(
                             continue;
                         }
 
-                        if handler.config.broadcast && packet.header.packet_type != PacketType::Announce {
-                            // TODO: remove seperate handling for announces in handle_announce.
-                            // Send broadcast message expect current iface address
-                            handler.send(TxMessage { tx_type: TxMessageType::Broadcast(Some(message.address)), packet }).await;
-                        }
+                        // NOTE: Python transport nodes never blindly repeat
+                        // received packets. Every relayed packet class is
+                        // handled explicitly with re-addressing and hop
+                        // accounting (announces via the announce table,
+                        // link requests/proofs/link data via the link
+                        // table, addressed data via the path table).
 
                         match packet.header.packet_type {
                             PacketType::Announce => handle_announce(
@@ -3666,8 +3774,8 @@ async fn manage_transport(
                                 message.address,
                                 handler
                             ).await,
-                            PacketType::Proof => handle_proof(&packet, handler).await,
-                            PacketType::Data => handle_data(&packet, handler).await,
+                            PacketType::Proof => handle_proof(&packet, message.address, handler).await,
+                            PacketType::Data => handle_data(&packet, message.address, handler).await,
                         }
                     }
                 };
@@ -3961,9 +4069,9 @@ async fn manage_transport(
 mod tests {
     use super::*;
 
-    use rand_core::OsRng;
     use crate::destination::link::LinkEvent;
     use crate::packet::HeaderType;
+    use rand_core::OsRng;
 
     #[tokio::test]
     async fn synchronous_accessors_are_safe_inside_a_runtime() {
@@ -3985,7 +4093,10 @@ mod tests {
             )
             .await;
         let address = destination.lock().await.desc.address_hash;
-        assert_eq!(transport.destination_accepts_links(&address).await, Some(true));
+        assert_eq!(
+            transport.destination_accepts_links(&address).await,
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -4012,13 +4123,15 @@ mod tests {
 
         let sender = transport.handler.lock().await.announce_tx.clone();
         for destination in [unrelated, first_match, second_match] {
-            assert!(sender
-                .send(AnnounceEvent {
-                    destination: Arc::new(Mutex::new(destination)),
-                    app_data: PacketDataBuffer::new(),
-                    ratchet: None,
-                })
-                .is_ok());
+            assert!(
+                sender
+                    .send(AnnounceEvent {
+                        destination: Arc::new(Mutex::new(destination)),
+                        app_data: PacketDataBuffer::new(),
+                        ratchet: None,
+                    })
+                    .is_ok()
+            );
         }
 
         let first = time::timeout(Duration::from_secs(1), filtered.recv())
@@ -4033,13 +4146,23 @@ mod tests {
             first.destination.lock().await.desc.address_hash,
             second.destination.lock().await.desc.address_hash,
         ];
-        assert!(addresses.contains(&DestinationName::new("example", "wanted.aspect")
-            .address_hash_for(first_identity.as_identity())));
-        assert!(addresses.contains(&DestinationName::new("example", "wanted.aspect")
-            .address_hash_for(second_identity.as_identity())));
-        assert!(time::timeout(Duration::from_millis(50), filtered.recv())
-            .await
-            .is_err());
+        assert!(
+            addresses.contains(
+                &DestinationName::new("example", "wanted.aspect")
+                    .address_hash_for(first_identity.as_identity())
+            )
+        );
+        assert!(
+            addresses.contains(
+                &DestinationName::new("example", "wanted.aspect")
+                    .address_hash_for(second_identity.as_identity())
+            )
+        );
+        assert!(
+            time::timeout(Duration::from_millis(50), filtered.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -4107,16 +4230,15 @@ mod tests {
             .single_out_destinations
             .insert(address, Arc::new(Mutex::new(output)));
 
-        assert!(transport
-            .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU])
-            .await
-            .is_ok());
+        assert!(
+            transport
+                .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU])
+                .await
+                .is_ok()
+        );
         assert!(matches!(
             transport
-                .send_to_destination(
-                    &address,
-                    &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU + 1]
-                )
+                .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU + 1])
                 .await,
             Err(RnsError::InvalidArgument)
         ));
@@ -4128,13 +4250,12 @@ mod tests {
         ));
 
         let plain_name = DestinationName::new("test", "plain.payload-bound");
-        assert!(transport
-            .send_to_plain_destination(
-                plain_name,
-                &vec![0; crate::packet::PACKET_PROTOCOL_MDU]
-            )
-            .await
-            .is_ok());
+        assert!(
+            transport
+                .send_to_plain_destination(plain_name, &vec![0; crate::packet::PACKET_PROTOCOL_MDU])
+                .await
+                .is_ok()
+        );
         assert!(matches!(
             transport
                 .send_to_plain_destination(
@@ -4171,9 +4292,11 @@ mod tests {
             .unwrap();
         assert_eq!(event.id, wanted);
         assert!(matches!(event.event, LinkEvent::Activated));
-        assert!(time::timeout(Duration::from_millis(50), events.recv())
-            .await
-            .is_err());
+        assert!(
+            time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -90,7 +90,9 @@ impl PathTable {
     }
 
     pub fn get(&self, destination: &AddressHash) -> Option<&PathEntry> {
-        self.map.get(destination).filter(|entry| !entry.unresponsive)
+        self.map
+            .get(destination)
+            .filter(|entry| !entry.unresponsive)
     }
 
     /// Whether an entry exists, including retained unresponsive entries used
@@ -179,17 +181,32 @@ impl PathTable {
             None => return (*original_packet, None),
         };
 
+        // Python `Transport.inbound` path-forwarding: with more than one
+        // hop to go the packet stays addressed (HEADER_2) to the next
+        // transport node; when the destination itself is the next hop
+        // (single hop left) the transport headers are stripped so the
+        // endpoint receives a plain HEADER_1 packet.
+        let last_hop = entry.hops <= 1;
+
         (
             Packet {
                 header: Header {
                     ifac_flag: IfacFlag::Open,
-                    header_type: HeaderType::Type2,
+                    header_type: if last_hop {
+                        HeaderType::Type1
+                    } else {
+                        HeaderType::Type2
+                    },
                     hops: original_packet.header.hops + 1,
                     ..original_packet.header
                 },
                 ifac: None,
                 destination: original_packet.destination,
-                transport: Some(entry.received_from),
+                transport: if last_hop {
+                    None
+                } else {
+                    Some(entry.received_from)
+                },
                 context: original_packet.context,
                 data: original_packet.data,
             },
@@ -204,6 +221,47 @@ impl PathTable {
     /// directly reachable destinations are transmitted as-is. Python drops
     /// data packets carrying a transport id that is not its own, so
     /// wrapping single-hop packets would never be delivered.
+    /// Update the hop count of a known path (link-request proof
+    /// rebalancing, Python `IDX_PT_HOPS` update).
+    pub fn rebalance_hops(&mut self, destination: &AddressHash, hops: u8) -> bool {
+        match self.map.get_mut(destination) {
+            Some(entry) if hops < entry.hops => {
+                entry.hops = hops;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Route a locally-originated packet toward its destination.
+    /// Python `Transport.outbound` writes the packet's own hop count
+    /// (0 for freshly created packets); relays add hops on receive.
+    pub fn handle_local_packet(&self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
+        let lookup = original_packet.destination;
+
+        let entry = match self.map.get(&lookup).filter(|entry| !entry.unresponsive) {
+            Some(entry) => entry,
+            None => return (*original_packet, None),
+        };
+
+        (
+            Packet {
+                header: Header {
+                    ifac_flag: IfacFlag::Open,
+                    header_type: HeaderType::Type2,
+                    hops: original_packet.header.hops,
+                    ..original_packet.header
+                },
+                ifac: None,
+                destination: original_packet.destination,
+                transport: Some(entry.received_from),
+                context: original_packet.context,
+                data: original_packet.data,
+            },
+            Some(entry.iface),
+        )
+    }
+
     pub fn handle_packet(&mut self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
         if original_packet.header.header_type == HeaderType::Type2 {
             return (*original_packet, None);

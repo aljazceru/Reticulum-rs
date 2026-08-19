@@ -9,27 +9,28 @@ pub mod udp;
 
 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
 pub mod auto;
+#[cfg(feature = "iface-serial")]
+pub mod ax25;
 pub mod backbone;
 #[cfg(feature = "iface-i2p")]
 pub mod i2p;
 #[cfg(feature = "iface-serial")]
-pub mod ax25;
-#[cfg(feature = "iface-rnode")]
-pub mod rnode;
-#[cfg(feature = "iface-serial")]
 pub mod kiss;
 #[cfg(feature = "iface-pipe")]
 pub mod pipe;
+#[cfg(feature = "iface-rnode")]
+pub mod rnode;
 #[cfg(feature = "iface-serial")]
 pub mod serial;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::sync::Mutex;
 
+use rand_core::RngCore;
 use tokio::sync::mpsc;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -242,7 +243,10 @@ impl InterfaceManager {
         self.counter += 1;
 
         let counter_bytes = self.counter.to_le_bytes();
-        let address = AddressHash::new_from_hash(&Hash::new_from_slice(&counter_bytes[..]));
+        let mut address_seed = [0u8; 16];
+        rand_core::OsRng.fill_bytes(&mut address_seed);
+        address_seed[..8].copy_from_slice(&counter_bytes[..8]);
+        let address = AddressHash::new_from_hash(&Hash::new_from_slice(&address_seed));
 
         let (tx_send, tx_recv) = InterfaceChannel::make_tx_channel(tx_cap);
 
@@ -365,10 +369,11 @@ impl InterfaceManager {
         size: usize,
     ) -> Result<bool, crate::error::RnsError> {
         let key = ifac::IfacKey::derive(netname, netkey, size)?;
-        Ok(self.with_iface_ifac(address, move |slot| {
-            *slot.write().expect("ifac lock") = Some(Arc::new(key));
-        })
-        .is_some())
+        Ok(self
+            .with_iface_ifac(address, move |slot| {
+                *slot.write().expect("ifac lock") = Some(Arc::new(key));
+            })
+            .is_some())
     }
 
     /// Spawn an interface worker with its IFAC slot already populated,
