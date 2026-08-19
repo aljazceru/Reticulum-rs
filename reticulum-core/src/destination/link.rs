@@ -21,7 +21,7 @@ use crate::{
 
 use super::DestinationDesc;
 
-const LINK_MTU_SIZE: usize = 3;
+pub const LINK_MTU_SIZE: usize = 3;
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum LinkStatus {

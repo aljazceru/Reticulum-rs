@@ -308,3 +308,270 @@ async fn python_endpoint_through_rust_middle() {
     let _ = a_child.wait().await;
     let _ = c_child.wait().await;
 }
+
+/// Resources and requests over a relayed link (Rust endpoints, Python
+/// transport middle). The resource engine's advertisements, requests,
+/// segments and proofs are all link packets the middle must route in
+/// both directions.
+#[tokio::test]
+async fn resource_and_request_through_python_middle() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
+
+    let mut middle = spawn_middle(4751, 4752, 4753, 4754).await;
+    let a = rust_endpoint("rust-a", 4752, 4751).await;
+    let c = rust_endpoint("rust-c", 4754, 4753).await;
+
+    let destination = c
+        .add_destination(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("example_utilities", "interop.resource"),
+        )
+        .await;
+    let dest_hash = destination.lock().await.desc.address_hash;
+
+    c.register_request_handler(&dest_hash, "echo", |ctx| Some(ctx.data.clone()))
+        .await;
+
+    // Accept resources on inbound links as they appear.
+    tokio::spawn({
+        let c = unsafe { &*(&c as *const Transport) };
+        async move {
+            let mut events = c.in_link_events();
+            while let Ok(event) = events.recv().await {
+                if let LinkEvent::Activated = event.event {
+                    c.set_resource_strategy(event.id, reticulum::resource::ResourceStrategy::All)
+                        .await;
+                }
+            }
+        }
+    });
+
+    c.send_announce(&destination, None).await;
+
+    let mut announces = a.recv_announces().await;
+    let announce = tokio::time::timeout(Duration::from_secs(30), announces.recv())
+        .await
+        .expect("announce through python middle")
+        .expect("channel");
+    let desc = announce.destination.lock().await.desc;
+    assert_eq!(desc.address_hash, dest_hash);
+
+    let link = a.link(desc).await;
+    let mut events = a.out_link_events();
+    let activated = tokio::time::timeout(Duration::from_secs(30), events.recv())
+        .await
+        .expect("link must activate through the middle")
+        .expect("channel");
+    assert!(matches!(activated.event, LinkEvent::Activated));
+
+    // Request/response through the relayed link.
+    let payload: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+    let response = a
+        .request(&link, "echo", payload.as_slice())
+        .await
+        .expect("request sent");
+    let response_data = a
+        .await_request_response(response, Duration::from_secs(30))
+        .await
+        .expect("response through python middle");
+    assert_eq!(response_data.as_slice(), payload.as_slice());
+
+    // Resource transfer through the relayed link.
+    let resource_payload: Vec<u8> = (0..80_000u32).map(|i| (i % 249) as u8).collect();
+    let expected_sha = {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(&resource_payload);
+        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+
+    a.send_resource_with_options(
+        &link,
+        resource_payload,
+        reticulum::resource::ResourceOptions {
+            auto_compress: false,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("send resource");
+
+    let mut resource_events = c.resource_events().await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let mut received = None;
+    while tokio::time::Instant::now() < deadline {
+        let event = tokio::time::timeout_at(deadline, resource_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.status == reticulum::resource::ResourceStatus::Complete {
+            if let Some(data) = event.data {
+                received = Some(data);
+                break;
+            }
+        }
+    }
+    let received = received.expect("resource through python middle");
+    let received_sha = {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(&received);
+        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    assert_eq!(received_sha, expected_sha);
+
+    let _ = &mut middle;
+    let _ = middle.start_kill();
+    let _ = middle.wait().await;
+}
+
+/// Python request endpoints through a Rust transport middle: path
+/// request, link request, request and response all relayed by Rust.
+#[tokio::test]
+async fn python_request_through_rust_middle() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
+
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let middle = TransportConfig::new("rust-middle", &identity, true)
+        .set_retransmit(true)
+        .build();
+
+    {
+        let manager = middle.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:4772", Some("127.0.0.1:4771"), true),
+            UdpInterface::spawn,
+        );
+    }
+    {
+        let manager = middle.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:4774", Some("127.0.0.1:4773"), true),
+            UdpInterface::spawn,
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let script = format!("{}/tests/py-interop/partner.py", env!("CARGO_MANIFEST_DIR"));
+    let python_dir = python_dir();
+
+    let mut c_child = tokio::process::Command::new("python3")
+        .arg("-u")
+        .arg(&script)
+        .arg("--config")
+        .arg(partner_config(4773, 4774).to_str().unwrap())
+        .arg("--mode")
+        .arg("request-server")
+        .arg("--size")
+        .arg("0")
+        .arg("--timeout")
+        .arg("60")
+        .env("PYTHONPATH", &python_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn python request server");
+
+    let (c_tx, mut c_rx) = tokio::sync::mpsc::channel(16);
+    let c_stdout = c_child.stdout.take().expect("c stdout");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(c_stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            log::debug!("py-c: {line}");
+            let _ = c_tx.send(line).await;
+        }
+    });
+
+    let dest_line = wait_for(&mut c_rx, "destination ", Duration::from_secs(20))
+        .await
+        .expect("python request server announced");
+    let hex: String = dest_line
+        .split_whitespace()
+ .rev()
+        .find(|w| w.len() == 32 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("destination hash")
+        .to_string();
+
+    let mut a_child = tokio::process::Command::new("python3")
+        .arg("-u")
+        .arg(&script)
+        .arg("--config")
+        .arg(partner_config(4771, 4772).to_str().unwrap())
+        .arg("--mode")
+        .arg("request-client")
+        .arg("--size")
+        .arg("5000")
+        .arg("--destination")
+        .arg(&hex)
+        .arg("--timeout")
+        .arg("60")
+        .env("PYTHONPATH", &python_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn python request client");
+
+    let (a_tx, mut a_rx) = tokio::sync::mpsc::channel(16);
+    let a_stdout = a_child.stdout.take().expect("a stdout");
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(a_stdout).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            log::debug!("py-a: {line}");
+            let _ = a_tx.send(line).await;
+        }
+    });
+
+    let requesting = wait_for(&mut a_rx, "requesting sha ", Duration::from_secs(30))
+        .await
+        .expect("python client requested through the rust middle");
+    let expected: String = requesting.split_whitespace().last().expect("sha").to_string();
+
+    let response = wait_for(&mut a_rx, "response sha ", Duration::from_secs(30))
+        .await
+        .expect("python client received response through the rust middle");
+    let actual: String = response.split_whitespace().last().expect("sha").to_string();
+    assert_eq!(expected, actual);
+
+    let _ = a_child.start_kill();
+    let _ = c_child.start_kill();
+    let _ = a_child.wait().await;
+    let _ = c_child.wait().await;
+}
+
+async fn wait_for(
+    rx: &mut tokio::sync::mpsc::Receiver<String>,
+    needle: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(line) = tokio::time::timeout_at(deadline, rx.recv()).await {
+            match line {
+                Some(line) if line.contains(needle) => return Some(line),
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+    None
+}
+
+/// Write a partner config directory whose UDP interface forwards to the
+/// given port.
+fn partner_config(listen: u16, forward: u16) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("rns-partner-{listen}-{forward}"));
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(config_dir.join("storage")).expect("config dirs");
+    std::fs::write(
+        config_dir.join("config"),
+        format!(
+            "[reticulum]\n  enable_transport = No\n  share_instance = No\n\n[interfaces]\n  [[Endpoint]]\n    type = UDPInterface\n    enabled = yes\n    listen_ip = 127.0.0.1\n    listen_port = {listen}\n    forward_ip = 127.0.0.1\n    forward_port = {forward}\n"
+        ),
+    )
+    .expect("write config");
+    config_dir
+}

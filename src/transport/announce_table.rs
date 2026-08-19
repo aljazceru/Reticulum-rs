@@ -22,7 +22,20 @@ pub struct AnnounceEntry {
 
 impl AnnounceEntry {
     pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
-        if self.retries == 0 || Instant::now() >= self.timeout {
+        if self.retries == 0 {
+            return None;
+        }
+
+        let deadline_passed = Instant::now() >= self.timeout;
+
+        // Path responses wait out their grace period before they are sent
+        // (directly reachable peers answer first); regular announce
+        // rebroadcasts retransmit until their random window closes.
+        if self.response_to_iface.is_some() {
+            if !deadline_passed {
+                return None;
+            }
+        } else if deadline_passed {
             return None;
         }
 
@@ -211,15 +224,22 @@ impl AnnounceTable {
 
         let n_announces = messages.len();
 
-        for entry in self.responses.values_mut() {
+        // Responses within their grace period stay queued until a later
+        // tick actually retransmits them (Python keeps the announce-table
+        // entry until `IDX_AT_RTRNS_TMO` passes and it is sent).
+        let mut sent = vec![];
+        for (destination, entry) in self.responses.iter_mut() {
             if let Some(message) = entry.retransmit(transport_id) {
                 messages.push(message);
+                sent.push(*destination);
             }
         }
 
         let n_responses = messages.len() - n_announces;
 
-        self.responses.clear(); // every response is only retransmitted once
+        for destination in sent {
+            self.responses.remove(&destination); // each response is retransmitted once
+        }
 
         if !(messages.is_empty() && completed.is_empty()) {
             log::trace!(

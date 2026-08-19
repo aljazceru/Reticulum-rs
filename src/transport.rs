@@ -517,9 +517,11 @@ impl Transport {
         if let Some(iface) = maybe_iface {
             self.send_direct(iface, packet).await;
             log::trace!("Sent outbound packet to {}", iface);
+        } else {
+            // No known path: broadcast on every outgoing interface
+            // (Python `Transport.outbound` else-branch).
+            self.send_packet(packet).await;
         }
-
-        // TODO handle other cases
     }
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
@@ -890,20 +892,17 @@ impl Transport {
             .insert(destination.address_hash, link.clone());
 
         // Python `Transport.outbound` addresses packets for destinations
-        // with a known path as HEADER_2 carrying the next hop's transport
-        // id; intermediary (transport-mode) nodes ONLY relay addressed
-        // packets. Direct peers (announce without transport id) keep the
-        // broadcast form.
-        let via_transport = {
-            let handler = self.handler.lock().await;
-            handler
-                .path_table
-                .get(&destination.address_hash)
-                .map(|entry| entry.received_from != destination.address_hash)
-                .unwrap_or(false)
-        };
-
-        if via_transport {
+        // more than one hop away as HEADER_2 carrying the next hop's
+        // transport id (intermediary nodes only relay addressed packets),
+        // and transmits single-hop paths unchanged. Unknown paths are
+        // broadcast.
+        if self
+            .handler
+            .lock()
+            .await
+            .path_table
+            .contains(&destination.address_hash)
+        {
             self.outbound(&packet).await;
         } else {
             self.send_packet(packet).await;
@@ -1870,6 +1869,18 @@ impl TransportHandler {
     async fn filter_duplicate_packets(&self, packet: &Packet) -> bool {
         let mut allow_duplicate = false;
 
+        // Python defers hash insertion for packets belonging to a
+        // link-table entry, and for every link-request proof: on shared
+        // media the same packet can legitimately be heard (and relayed)
+        // more than once, and premature insertion would break link
+        // transport.
+        if self.link_table.contains_destination(&packet.destination)
+            || (packet.header.packet_type == PacketType::Proof
+                && packet.context == PacketContext::LinkRequestProof)
+        {
+            allow_duplicate = true;
+        }
+
         match packet.header.packet_type {
             PacketType::Announce => {
                 return true;
@@ -2062,8 +2073,11 @@ async fn handle_proof<'a>(
             }
             drop(link_guard);
             handler.resources.cleanup();
+            // Locally terminated: no intermediary relay for this proof.
+            return;
         }
-        return;
+        // No local link owns this proof: fall through to the link-table
+        // relay below (Python routes every non-LRPROOF link packet).
     }
 
     // Proofs for our own outbound SINGLE-destination packets are addressed
@@ -2081,11 +2095,15 @@ async fn handle_proof<'a>(
     }
 
     let mut local_proof_handled = false;
+    let mut rebalanced_path: Option<(AddressHash, u8)> = None;
     for link in handler.out_links.values() {
-        let mut link = link.lock().await;
-        let link_id = *link.id();
+        let link_id = *link.lock().await.id();
+        if link_id != packet.destination {
+            continue;
+        }
 
         local_proof_handled = true;
+        let mut link = link.lock().await;
 
         if let LinkHandleResult::Activated = link.handle_packet(
             &handler.link_out_event_tx,
@@ -2093,16 +2111,40 @@ async fn handle_proof<'a>(
             packet,
             true,
         ) {
+            // Initiator-side path rebalancing (Python updates
+            // `link.expected_hops` and `IDX_PT_HOPS` when a validated
+            // proof arrives with a different hop count than expected).
+            let observed = packet.header.hops.saturating_add(1);
+            rebalanced_path = Some((link.destination().address_hash, observed));
+
             let rtt_packet = link.create_rtt();
             handler.send_packet(rtt_packet).await;
         }
     }
 
+    if let Some((destination, observed)) = rebalanced_path {
+        if let Some(previous) = handler.path_table.get(&destination).map(|e| e.hops) {
+            if previous != observed {
+                log::debug!(
+                    "tp({}): re-balancing path to {} from link proof ({} -> {})",
+                    handler.config.name,
+                    destination,
+                    previous,
+                    observed
+                );
+                handler.path_table.rebalance_hops(&destination, observed);
+            }
+        }
+    }
+
     for link in handler.in_links.values() {
-        let mut link = link.lock().await;
-        let link_id = *link.id();
+        let link_id = *link.lock().await.id();
+        if link_id != packet.destination {
+            continue;
+        }
 
         local_proof_handled = true;
+        let mut link = link.lock().await;
 
         link.handle_packet(
             &handler.link_in_event_tx,
@@ -2170,12 +2212,45 @@ async fn handle_proof<'a>(
 
 async fn send_to_next_hop<'a>(
     packet: &Packet,
-    handler: &MutexGuard<'a, TransportHandler>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
     lookup: Option<AddressHash>,
 ) -> bool {
-    let (packet, maybe_iface) = handler.path_table.handle_inbound_packet(packet, lookup);
+    let (mut packet, maybe_iface) = handler.path_table.handle_inbound_packet(packet, lookup);
 
     if let Some(iface) = maybe_iface {
+        // Python clamps or removes the link-request MTU signalling
+        // bytes when relaying onto interfaces that cannot negotiate a
+        // path MTU (no AUTOCONFIGURE_MTU/FIXED_MTU, e.g. UDP, serial,
+        // RNode, I2P: "disabling link MTU upgrade").
+        if packet.header.packet_type == PacketType::LinkRequest {
+            let supports_mtu = handler
+                .iface_manager
+                .lock()
+                .await
+                .iface_kind(&iface)
+                .map(|kind| {
+                    // Python AUTOCONFIGURE_MTU/FIXED_MTU interfaces:
+                    // TCP, Backbone, local shared-instance links and
+                    // AutoInterface. Everything else (UDP, serial, KISS,
+                    // RNode, I2P, AX.25, pipes) disables the upgrade.
+                    matches!(
+                        kind.as_str(),
+                        "TcpClient" | "TcpServer" | "BackboneClient" | "BackboneServer" | "AutoInterface" | "LocalServer" | "LocalClient"
+                    )
+                })
+                .unwrap_or(false);
+
+            if !supports_mtu {
+                let len = packet.data.as_slice().len();
+                // LR data = pub(32) + verify(32) [|| signalling(3)]
+                if len == 32 + 32 + crate::destination::link::LINK_MTU_SIZE {
+                    let mut data = PacketDataBuffer::new();
+                    let _ = data.chain_write(&packet.data.as_slice()[..len - 3]);
+                    packet.data = data;
+                }
+            }
+        }
+
         handler
             .send(TxMessage {
                 tx_type: TxMessageType::Direct(iface),
@@ -2793,8 +2868,10 @@ async fn handle_data<'a>(
                     );
                 }
             }
-        } else {
-            data_handled = send_to_next_hop(packet, &handler, None).await;
+        } else if packet.transport == Some(*handler.config.identity.address_hash()) {
+            // Path forwarding only applies to packets addressed to this
+            // instance (Python `transport_id == Transport.identity.hash`).
+            data_handled = send_to_next_hop(packet, &mut handler, None).await;
         }
     }
 
@@ -3480,7 +3557,7 @@ async fn handle_link_request_as_intermediate<'a>(
         remaining_hops,
     );
 
-    send_to_next_hop(packet, &handler, None).await;
+    send_to_next_hop(packet, &mut handler, None).await;
 }
 
 async fn handle_link_request<'a>(
@@ -3501,6 +3578,20 @@ async fn handle_link_request<'a>(
 
         handle_link_request_as_destination(destination, packet, handler).await;
     } else if let Some(entry) = handler.path_table.next_hop_full(&packet.destination) {
+        // Python relays link requests only when the packet is addressed
+        // to this instance (the `transport_id == Transport.identity.hash`
+        // gate); unaddressed requests for remote destinations are
+        // dropped so shared media does not produce duplicate relays.
+        let addressed_to_us = packet.transport == Some(*handler.config.identity.address_hash());
+        if !addressed_to_us {
+            log::trace!(
+                "tp({}): dropping unaddressed link request for remote destination {}",
+                handler.config.name,
+                packet.destination
+            );
+            return;
+        }
+
         log::trace!(
             "tp({}): handle link request for remote destination {}",
             handler.config.name,
@@ -3569,6 +3660,8 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     links_to_remove.clear();
 
+    let mut expired_links: Vec<(AddressHash, bool)> = Vec::new();
+
     for link_entry in &handler.out_links {
         let mut link = link_entry.1.lock().await;
 
@@ -3599,12 +3692,39 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                 }
             }
             LinkStatus::Pending if link.elapsed() > timer_config.out_link_repeat => {
-                log::warn!(
-                    "tp({}): repeat link request {}",
-                    handler.config.name,
-                    link.id()
-                );
-                handler.send_packet(link.request()).await;
+                // Establishment timeout (Python closes the pending link
+                // after `establishment_timeout` = per-hop timeout * hops,
+                // expires the failed path on client instances and queues
+                // a new path request for rediscovery).
+                let link_destination = link.destination().address_hash;
+                let hops = handler
+                    .path_table
+                    .get(&link_destination)
+                    .map(|entry| entry.hops)
+                    .unwrap_or(1);
+                let establishment_timeout =
+                    timer_config.out_link_repeat * hops.max(1) as u32 + timer_config.out_link_repeat;
+
+                if link.elapsed() > establishment_timeout {
+                    log::warn!(
+                        "tp({}): link establishment timed out for {}, closing and rediscovering path",
+                        handler.config.name,
+                        link.id()
+                    );
+                    let rediscover = !handler.config.transport_enabled();
+                    if let Some(packet) = link.teardown(&handler.link_out_event_tx).ok().flatten() {
+                        handler.send_packet(packet).await;
+                    }
+                    expired_links.push((link_destination, rediscover));
+                    links_to_remove.push(*link_entry.0);
+                } else {
+                    log::warn!(
+                        "tp({}): repeat link request {}",
+                        handler.config.name,
+                        link.id()
+                    );
+                    handler.send_packet(link.request()).await;
+                }
             }
             LinkStatus::Closed => {
                 link.close(&handler.link_out_event_tx);
@@ -3616,6 +3736,19 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     for addr in &links_to_remove {
         handler.out_links.remove(addr);
+    }
+
+    for (destination, rediscover) in expired_links {
+        if rediscover {
+            handler.path_table.expire_path(&destination);
+            let packet = handler.path_requests.generate(&destination, None);
+            handler
+                .send(TxMessage {
+                    tx_type: TxMessageType::Broadcast(None),
+                    packet,
+                })
+                .await;
+        }
     }
 }
 
@@ -3947,6 +4080,44 @@ async fn manage_transport(
         });
     }
 
+    // Table culling (Python `Transport.jobs` runs every
+    // `tables_cull_interval` = 5 s): link-table entries past their proof
+    // timeout or idle lifetime, and stale paths, are removed promptly so
+    // topology changes converge.
+    {
+        let handler = handler.clone();
+        let cancel = cancel.clone();
+
+        tokio::spawn(async move {
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        break;
+                    },
+                    _ = time::sleep(Duration::from_secs(5)) => {
+                        let mut handler = handler.lock().await;
+
+                        handler.link_table.remove_stale();
+
+                        // Expire stale paths (Python `Transport.expire_paths`).
+                        let expired = handler.path_table.expire_paths();
+                        if expired > 0 {
+                            log::info!(
+                                "tp({}): expired {} stale path(s)",
+                                handler.config.name,
+                                expired
+                            );
+                        }
+                    },
+                }
+            }
+        });
+    }
+
     {
         let handler = handler.clone();
         let cancel = cancel.clone();
@@ -3962,25 +4133,13 @@ async fn manage_transport(
                         break;
                     },
                     _ = time::sleep(timer_config.packet_cache_cleanup) => {
-                        let mut handler = handler.lock().await;
+                        let handler = handler.lock().await;
 
                         handler
                             .packet_cache
                             .lock()
                             .await
                             .release(timer_config.keep_packet_cached);
-
-                        handler.link_table.remove_stale();
-
-                        // Expire stale paths (Python `Transport.expire_paths`).
-                        let expired = handler.path_table.expire_paths();
-                        if expired > 0 {
-                            log::info!(
-                                "tp({}): expired {} stale path(s)",
-                                handler.config.name,
-                                expired
-                            );
-                        }
 
                         // Clean expired blackhole entries.
                         let own = *handler.config.identity.address_hash();

@@ -7,12 +7,13 @@ use crate::identity::{Identity, Signature};
 use crate::packet::{Header, IfacFlag, Packet};
 
 /// Idle lifetime of a validated intermediary link
-/// (Python `LINK_TIMEOUT` = `STALE_TIME * 1.25` = 30 min).
-const LINK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// (Python `LINK_TIMEOUT` = `Link.STALE_TIME * 1.25` = 900 s).
+const LINK_TIMEOUT: Duration = Duration::from_secs(900);
 
-/// Establishments timeout per hop for intermediary link proofs
-/// (Python `Link.ESTABLISHMENT_TIMEOUT_PER_HOP`).
-const ESTABLISHMENT_TIMEOUT_PER_HOP: Duration = Duration::from_secs(5);
+/// Establishment timeout per hop for intermediary link proofs
+/// (Python `Link.ESTABLISHMENT_TIMEOUT_PER_HOP` =
+/// `RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT` = 6 s).
+const ESTABLISHMENT_TIMEOUT_PER_HOP: Duration = Duration::from_secs(6);
 
 pub struct LinkEntry {
     /// Transport instance ID of the next hop toward the destination
@@ -114,14 +115,15 @@ impl LinkTable {
     ) {
         let link_id = LinkId::from(link_request);
 
-        if self.0.contains_key(&link_id) {
-            return;
-        }
-
+        // Python overwrites the link-table entry on every transported
+        // link request, so a retried LR after a route or interface
+        // change refreshes the forwarding state.
         let now = Instant::now();
-        let proof_timeout = now
-            + Duration::from_secs(600)
-            + ESTABLISHMENT_TIMEOUT_PER_HOP * remaining_hops.max(1) as u32;
+        // Python: `extra_link_proof_timeout(ingress)` (an MTU-sized
+        // transmission on slow interfaces; zero for typical IP links)
+        // plus `ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, remaining_hops)`.
+        let proof_timeout =
+            now + ESTABLISHMENT_TIMEOUT_PER_HOP * remaining_hops.max(1) as u32;
 
         let entry = LinkEntry {
             next_hop,
@@ -146,6 +148,13 @@ impl LinkTable {
         self.0.get(link_id).map(|e| e.original_destination)
     }
 
+    /// Whether the given address is a link-table entry (Python defers
+    /// packet-hash insertion for these to keep shared-medium link
+    /// transport working).
+    pub fn contains_destination(&self, destination: &AddressHash) -> bool {
+        self.0.contains_key(destination)
+    }
+
     /// Route a keepalive (request or response) on an intermediary link.
     pub fn handle_keepalive(
         &mut self,
@@ -153,13 +162,15 @@ impl LinkTable {
         ingress_iface: AddressHash,
     ) -> Option<(Packet, AddressHash)> {
         let entry = self.0.get_mut(&packet.destination)?;
-        entry.last_activity = Instant::now();
 
         // Keepalives are link data with Python-internal hop semantics:
         // requests come from the initiator (taken hops), responses from
-        // the destination (remaining hops).
+        // the destination (remaining hops). The activity timestamp is
+        // only refreshed once a valid direction was selected (Python
+        // updates `IDX_LT_TIMESTAMP` after transmitting).
         let observed = packet.header.hops.saturating_add(1);
         let iface = entry.outbound_iface_for(ingress_iface, observed)?;
+        entry.last_activity = Instant::now();
 
         Some((
             forwarded(packet, packet.transport, packet.header.hops + 1),
@@ -265,6 +276,21 @@ impl LinkTable {
 
         let observed = proof.header.hops.saturating_add(1);
 
+        // Path rebalancing (Python `ALLOW_LINK_PATH_REBALANCE`): an
+        // authenticated proof with a mismatched hop count first updates
+        // the expected hops; the equality check below then still
+        // validates and relays the very same proof.
+        if observed != entry.remaining_hops && ingress_iface == entry.next_hop_iface {
+            log::debug!(
+                "link_table: re-balancing path to {} from link-request proof ({} -> {})",
+                entry.original_destination,
+                entry.remaining_hops,
+                observed
+            );
+            entry.remaining_hops = observed;
+            outcome.path_hops_update = Some((entry.original_destination, observed));
+        }
+
         if observed == entry.remaining_hops {
             if ingress_iface == entry.next_hop_iface {
                 log::trace!(
@@ -272,7 +298,6 @@ impl LinkTable {
                     entry.receiving_iface
                 );
                 entry.validated = true;
-                entry.remaining_hops = observed;
                 outcome.relay = Some((
                     forwarded(proof, proof.transport, proof.header.hops + 1),
                     entry.receiving_iface,
@@ -281,28 +306,11 @@ impl LinkTable {
                 log::debug!("link_table: proof received on wrong interface, not transporting");
             }
         } else {
-            // Path rebalancing (Python ALLOW_LINK_PATH_REBALANCE): a
-            // better (lower-hop) proof can update the link and path
-            // tables without relaying.
-            if ingress_iface == entry.next_hop_iface
-                && !entry.validated
-                && observed < entry.remaining_hops
-            {
-                log::debug!(
-                    "link_table: re-balancing path to {} from link-request proof ({} -> {})",
-                    entry.original_destination,
-                    entry.remaining_hops,
-                    observed
-                );
-                entry.remaining_hops = observed;
-                outcome.path_hops_update = Some((entry.original_destination, observed));
-            } else {
-                log::debug!(
-                    "link_table: proof hop mismatch ({}/{}) not transporting",
-                    observed,
-                    entry.remaining_hops
-                );
-            }
+            log::debug!(
+                "link_table: proof hop mismatch ({}/{}) not transporting",
+                observed,
+                entry.remaining_hops
+            );
         }
 
         outcome

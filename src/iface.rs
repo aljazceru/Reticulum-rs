@@ -550,6 +550,15 @@ impl InterfaceManager {
             .collect()
     }
 
+    /// Kind string of a live interface (used for Python-parity
+    /// per-interface capabilities such as link MTU negotiation).
+    pub fn iface_kind(&self, address: &AddressHash) -> Option<String> {
+        self.ifaces
+            .iter()
+            .find(|iface| &iface.address == address && !iface.stop.is_cancelled())
+            .map(|iface| iface.kind.clone())
+    }
+
     /// Snapshot of the statistics of all live interfaces.
     pub fn stats(&self) -> Vec<InterfaceStats> {
         self.ifaces

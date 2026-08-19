@@ -367,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         let session_id = format!("{}-{}-{index}", iface.name, std::process::id());
                         let address = iface_manager.lock().await.spawn_named(
-                            &format!("{}-peer-{index}", iface.name),
+                            format!("{}-peer-{index}", iface.name),
                             reticulum::iface::i2p::I2pPeer::new_initiator(
                                 &sam_addr,
                                 &session_id,

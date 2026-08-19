@@ -2,7 +2,9 @@ use std::collections::HashMap;
 
 use crate::{
     hash::AddressHash,
-    packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType},
+    packet::{
+        DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType,
+    },
 };
 
 /// Path expiry time (Python `Transport.PATHFINDER_E` = 1 week).
@@ -95,6 +97,25 @@ impl PathTable {
             .filter(|entry| !entry.unresponsive)
     }
 
+    #[allow(dead_code)]
+    pub fn get_mut(&mut self, destination: &AddressHash) -> Option<&mut PathEntry> {
+        self.map
+            .get_mut(destination)
+            .filter(|entry| !entry.unresponsive)
+    }
+
+    /// Mark a path for immediate expiry (Python `Transport.expire_path`
+    /// zeroes `IDX_PT_TIMESTAMP`).
+    pub fn expire_path(&mut self, destination: &AddressHash) -> bool {
+        match self.map.get_mut(destination) {
+            Some(entry) => {
+                entry.timestamp = core::time::Duration::ZERO;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Whether an entry exists, including retained unresponsive entries used
     /// for diagnostics and equal-hop recovery.
     pub fn contains(&self, destination: &AddressHash) -> bool {
@@ -170,7 +191,7 @@ impl PathTable {
     }
 
     pub fn handle_inbound_packet(
-        &self,
+        &mut self,
         original_packet: &Packet,
         lookup: Option<AddressHash>,
     ) -> (Packet, Option<AddressHash>) {
@@ -182,11 +203,20 @@ impl PathTable {
         };
 
         // Python `Transport.inbound` path-forwarding: with more than one
-        // hop to go the packet stays addressed (HEADER_2) to the next
-        // transport node; when the destination itself is the next hop
-        // (single hop left) the transport headers are stripped so the
-        // endpoint receives a plain HEADER_1 packet.
+        // hop to go the packet stays addressed (HEADER_2 + TRANSPORT
+        // propagation) to the next transport node; when the destination
+        // itself is the next hop (single hop left) the transport headers
+        // are stripped (HEADER_1 + BROADCAST) so the endpoint receives a
+        // plain broadcast-form packet.
         let last_hop = entry.hops <= 1;
+        let iface = entry.iface;
+        let next_hop = entry.received_from;
+
+        // Routed traffic refreshes the path timestamp (Python updates
+        // `IDX_PT_TIMESTAMP` after forwarding).
+        if let Some(entry) = self.map.get_mut(&lookup) {
+            entry.timestamp = (self.now)();
+        }
 
         (
             Packet {
@@ -197,20 +227,21 @@ impl PathTable {
                     } else {
                         HeaderType::Type2
                     },
+                    propagation_type: if last_hop {
+                        PropagationType::Broadcast
+                    } else {
+                        PropagationType::Transport
+                    },
                     hops: original_packet.header.hops + 1,
                     ..original_packet.header
                 },
                 ifac: None,
                 destination: original_packet.destination,
-                transport: if last_hop {
-                    None
-                } else {
-                    Some(entry.received_from)
-                },
+                transport: if last_hop { None } else { Some(next_hop) },
                 context: original_packet.context,
                 data: original_packet.data,
             },
-            Some(entry.iface),
+            Some(iface),
         )
     }
 
@@ -222,21 +253,21 @@ impl PathTable {
     /// data packets carrying a transport id that is not its own, so
     /// wrapping single-hop packets would never be delivered.
     /// Update the hop count of a known path (link-request proof
-    /// rebalancing, Python `IDX_PT_HOPS` update).
+    /// rebalancing, Python writes `IDX_PT_HOPS` directly).
     pub fn rebalance_hops(&mut self, destination: &AddressHash, hops: u8) -> bool {
         match self.map.get_mut(destination) {
-            Some(entry) if hops < entry.hops => {
+            Some(entry) => {
                 entry.hops = hops;
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
     /// Route a locally-originated packet toward its destination.
     /// Python `Transport.outbound` writes the packet's own hop count
     /// (0 for freshly created packets); relays add hops on receive.
-    pub fn handle_local_packet(&self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
+    pub fn handle_local_packet(&mut self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
         let lookup = original_packet.destination;
 
         let entry = match self.map.get(&lookup).filter(|entry| !entry.unresponsive) {
@@ -244,21 +275,38 @@ impl PathTable {
             None => return (*original_packet, None),
         };
 
+        // Python `Transport.outbound`: packets for destinations more than
+        // one hop away are inserted into transport (HEADER_2 + TRANSPORT
+        // propagation, next-hop transport id, own hop count); paths with a
+        // single hop transmit the packet unchanged on the path interface.
+        let direct = entry.hops <= 1;
+        let iface = entry.iface;
+        let next_hop = entry.received_from;
+
+        if let Some(entry) = self.map.get_mut(&lookup) {
+            entry.timestamp = (self.now)();
+        }
+
+        if direct {
+            return (*original_packet, Some(iface));
+        }
+
         (
             Packet {
                 header: Header {
                     ifac_flag: IfacFlag::Open,
                     header_type: HeaderType::Type2,
+                    propagation_type: PropagationType::Transport,
                     hops: original_packet.header.hops,
                     ..original_packet.header
                 },
                 ifac: None,
                 destination: original_packet.destination,
-                transport: Some(entry.received_from),
+                transport: Some(next_hop),
                 context: original_packet.context,
                 data: original_packet.data,
             },
-            Some(entry.iface),
+            Some(iface),
         )
     }
 
