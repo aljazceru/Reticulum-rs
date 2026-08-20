@@ -98,7 +98,7 @@ pub struct PathRequests {
     controlled_destination: PlainInputDestination,
     /// Outstanding (discovery) path requests sent on behalf of an unknown
     /// destination (Python `Transport.discovery_path_requests`).
-    discovery: BTreeMap<AddressHash, Instant>,
+    discovery: BTreeMap<AddressHash, (Instant, Option<AddressHash>)>,
     /// Path requests issued locally, with the time they were last sent
     /// (Python `Transport.path_requests` accounting, used to exempt
     /// announces for requested destinations from ingress limiting).
@@ -202,22 +202,22 @@ impl PathRequests {
     /// waiting (Python `Transport.discovery_path_requests`).
     pub fn discovery_pending(&self, destination: &AddressHash) -> bool {
         match self.discovery.get(destination) {
-            Some(timeout) => Instant::now() < *timeout,
+            Some((timeout, _)) => Instant::now() < *timeout,
             None => false,
         }
     }
 
     /// Register a waiting discovery path request for `destination`
     /// (Python inserts `{"destination_hash", "timeout", "requesting_interface"}`).
-    pub fn register_discovery(&mut self, destination: &AddressHash) {
+    pub fn register_discovery(&mut self, destination: &AddressHash, requesting_iface: Option<AddressHash>) {
         self.discovery
-            .insert(*destination, Instant::now() + PATH_REQUEST_TIMEOUT);
+            .insert(*destination, (Instant::now() + PATH_REQUEST_TIMEOUT, requesting_iface));
     }
 
     /// A matching announce arrived for a waiting discovery request
     /// (Python removes the entry in `Transport.inbound`).
-    pub fn clear_discovery(&mut self, destination: &AddressHash) -> bool {
-        self.discovery.remove(destination).is_some()
+    pub fn clear_discovery(&mut self, destination: &AddressHash) -> Option<Option<AddressHash>> {
+        self.discovery.remove(destination).map(|(_, iface)| iface)
     }
 
     /// Whether an automated path request for `destination` may be sent now,
@@ -269,14 +269,14 @@ mod tests {
         let dest = AddressHash::new_from_rand(OsRng);
 
         assert!(!testee.discovery_pending(&dest));
-        testee.register_discovery(&dest);
+        testee.register_discovery(&dest, None);
         assert!(testee.discovery_pending(&dest));
-        assert!(testee.clear_discovery(&dest));
+        assert!(testee.clear_discovery(&dest).is_some());
         assert!(!testee.discovery_pending(&dest));
 
         // Requests are gated on waiting discovery entries in the transport
         // layer via `discovery_pending`.
-        testee.register_discovery(&dest);
+        testee.register_discovery(&dest, None);
         assert!(testee.discovery_pending(&dest));
     }
 }

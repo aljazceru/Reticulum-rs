@@ -1260,6 +1260,18 @@ buffer streams) are still open; see the phase descriptions above.
 | LXMF crate | ✅ byte-exact message format, stamps, peers, router + resource-backed delivery |
 | LXST crate | ✅ codecs, wire protocol, pipelines, calls |
 
+## Progress log — intermediary link routing & full E2E interop (latest)
+
+| Area | Status |
+| --- | --- |
+| Link-request proof authentication | ✅ `transport/link_table.rs`: intermediary link entries (`IDX_LT_*` parity), LRPROOF validation via recalled identity over `link_id‖pub‖sig_pub‖signalling`, hop/interface gating, validated relay toward the initiator, path rebalancing (sequential rebalance-then-relay like Python), 6s/hop proof timeout, 900s validated-link lifetime, 5s cull cadence, retried LRs refresh entries |
+| Bidirectional intermediary link routing | ✅ directional `outbound_iface_for` (same-interface links accept either hop count; differing interfaces forward on the opposite interface with exact hop match); link data, keepalives, message proofs, resource proofs and channel packets all relay; forwarding preserves the original header bytes and rewrites only the hop count (Python `new_raw = raw[0:1] + hops + raw[2:]`) |
+| Python-parity relay semantics | ✅ path-table relay re-addressing (multi-hop → HEADER_2/TRANSPORT via next hop; last hop → HEADER_1/BROADCAST stripped), LRs addressed via the known path, unaddressed remote-dest LRs/data no longer relayed on a path-table hit (Python `transport_id` gate), LR MTU signalling stripped onto non-MTU interfaces, packet-hash insertion deferred for link-table packets and LRPROOFs, blind re-broadcast of received packets removed (every relayed class handled explicitly) |
+| Path responses through Rust transports | ✅ grace-delayed responses are queued until actually retransmitted (a 1s tick inside the 400ms grace window used to silently drop them) — Python clients now learn paths through Rust middles |
+| Pending-link recovery | ✅ establishment timeout closes the link, expires the failed path on client instances and re-requests it (Python Link watchdog + `Transport.jobs`) |
+| E2E interop matrix | ✅ `tests/python_middle.rs` (4 tests): Rust↔Python-middle↔Rust announce/LR/proof/bidirectional data; Python endpoints ↔ Rust middle (announce, LR re-address, LRPROOF, ping/echo); 80KB resource + request/response through the Python middle; Python request client/server through the Rust middle. Live-program validation: rncp 300KB/500KB through a Python `rnsd` middle both directions, **Python rncp client↔server with the Rust `rs-rnsd` daemon as the only transport: 2MB @ ~79Mbps, sha256-verified** |
+| rnsh wire protocol | ✅ real Python rnsh protocol (msgpack messages `0xac00`–`0xac07`, StreamData 2-byte header, identify→VersionInfo→ExecuteCommand→streamed output→CommandExited); `rn sh -c "cmd"` → Rust client → Rust `rs-rnsd` middle → Python rnsh listener verified live (command execution + output streaming). Empty closed stdin advertises no pipe (Python's listener kills the child 50ms after stdin EOF, which loses fast-command output otherwise) |
+
 ## Remaining open (documented, lower priority)
 
 * WeaveInterface — requires WeaveMesh radio hardware; the WDCL device

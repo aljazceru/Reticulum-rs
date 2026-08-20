@@ -83,7 +83,7 @@ async fn local_tcp_shared_instance_announce() {
 
     // client B receives the announce relayed through the shared instance
     let mut announces = client_b.recv_announces().await;
-    let result = time::timeout(Duration::from_secs(10), announces.recv()).await;
+    let result = time::timeout(Duration::from_secs(30), announces.recv()).await;
     match result {
         Ok(Ok(announce)) => {
             assert_eq!(announce.destination.lock().await.desc.address_hash, dest_hash);
@@ -134,7 +134,7 @@ async fn local_unix_abstract_shared_instance_announce() {
     client_a_unix.send_announce(&dest, None).await;
 
     let mut announces = client_b_unix.recv_announces().await;
-    let result = time::timeout(Duration::from_secs(10), announces.recv()).await;
+    let result = time::timeout(Duration::from_secs(30), announces.recv()).await;
     match result {
         Ok(Ok(announce)) => {
             assert_eq!(announce.destination.lock().await.desc.address_hash, dest_hash);

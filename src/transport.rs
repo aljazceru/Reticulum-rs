@@ -3037,11 +3037,14 @@ async fn handle_announce<'a>(
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
         // requesting interface (Python `discovery_path_requests` handling).
-        if handler.path_requests.clear_discovery(&packet.destination) {
+        if let Some(requesting_iface) = handler.path_requests.clear_discovery(&packet.destination) {
             let hops = packet.header.hops + 1;
+            // Python retransmits to the interface the discovery request
+            // arrived on, not the announce ingress.
+            let to_iface = requesting_iface.unwrap_or(iface);
             handler
                 .announce_table
-                .add_response(packet.destination, iface, hops, Duration::ZERO);
+                .add_response(packet.destination, to_iface, hops, Duration::ZERO);
             log::trace!(
                 "tp({}): got matching announce, answering waiting discovery path request for {}",
                 handler.config.name,
@@ -3190,13 +3193,25 @@ async fn handle_path_request<'a>(
             }
 
             // Directly reachable peers answer first: wait the grace
-            // period, longer on roaming-mode interfaces.
-            let grace = PATH_REQUEST_GRACE
-                + if mode == InterfaceMode::Roaming {
-                    PATH_REQUEST_RG
-                } else {
-                    Duration::ZERO
-                };
+            // period, longer on roaming-mode interfaces. Requests from
+            // local clients (or whose next hop is a local client
+            // interface) are answered immediately (Python sets
+            // `retransmit_timeout = now` for those).
+            let from_local_client = {
+                let manager = handler.iface_manager.lock().await;
+                manager.is_local_client_iface(&iface)
+                    || manager.is_local_client_iface(&entry.iface)
+            };
+            let grace = if from_local_client {
+                Duration::ZERO
+            } else {
+                PATH_REQUEST_GRACE
+                    + if mode == InterfaceMode::Roaming {
+                        PATH_REQUEST_RG
+                    } else {
+                        Duration::ZERO
+                    }
+            };
 
             let hops = entry.hops;
 
@@ -3239,7 +3254,7 @@ async fn handle_path_request<'a>(
         );
         handler
             .path_requests
-            .register_discovery(&request.destination);
+            .register_discovery(&request.destination, Some(iface));
 
         let interfaces = handler.iface_manager.lock().await.live_iface_addresses();
         for (other, online) in interfaces {
@@ -3312,7 +3327,7 @@ async fn handle_path_request<'a>(
 
         handler
             .path_requests
-            .register_discovery(&request.destination);
+            .register_discovery(&request.destination, Some(iface));
 
         log::trace!(
             "tp({}): attempting to discover unknown path to {} on behalf of path request",

@@ -1449,6 +1449,7 @@ dependencies = [
 name = "reticulum-utils"
 version = "0.1.0"
 dependencies = [
+ "bzip2",
  "clap",
  "env_logger",
  "libc",

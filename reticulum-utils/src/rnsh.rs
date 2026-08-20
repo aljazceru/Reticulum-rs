@@ -275,10 +275,22 @@ impl Message for RnshMessage {
                     return Err(RnsError::ChannelMessageTooBig);
                 }
                 let header = u16::from_be_bytes([packed[0], packed[1]]);
+                let compressed = header & 0x4000 > 0;
+                let data = if compressed {
+                    // Python `RNS.Buffer.StreamDataMessage` opportunistically
+                    // bzip2-compresses repetitive stream chunks.
+                    let mut decoder = bzip2::read::BzDecoder::new(&packed[2..]);
+                    let mut data = Vec::new();
+                    std::io::Read::read_to_end(&mut decoder, &mut data)
+                        .map_err(|_| RnsError::ChannelMessageTooBig)?;
+                    data
+                } else {
+                    packed[2..].to_vec()
+                };
                 Ok(Self::StreamData {
                     stream_id: header & 0x3fff,
                     eof: header & 0x8000 > 0,
-                    data: packed[2..].to_vec(),
+                    data,
                 })
             }
             MSG_VERSION_INFO => {
@@ -452,6 +464,11 @@ async fn start_session(
     tokio::spawn(async move {
         let mut child: Option<tokio::process::Child> = None;
         let mut version_exchanged = false;
+        // Subscribe before consuming the execute command: stdin frames
+        // arriving right after it must not be missed by a subscription
+        // created only later (Python keeps one message handler across
+        // the whole session).
+        let stdin_receiver = channel.subscribe();
 
         while let Ok(message) = receiver.recv().await {
             match message {
@@ -551,18 +568,15 @@ async fn start_session(
         let channel_out = channel.clone();
         let stdout_task = tokio::spawn(async move {
             if let Some(mut stdout) = stdout {
-                let mut buffer = [0u8; 4096];
+                let mut buffer = vec![0u8; stream_chunk_size(&channel_out.link).await];
                 loop {
                     match stdout.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if !send_when_ready(
+                            if !send_stream_data(
                                 &channel_out,
-                                RnshMessage::StreamData {
-                                    stream_id: STREAM_ID_STDOUT,
-                                    eof: false,
-                                    data: buffer[..n].to_vec(),
-                                },
+                                STREAM_ID_STDOUT,
+                                buffer[..n].to_vec(),
                             )
                             .await
                             {
@@ -586,18 +600,15 @@ async fn start_session(
         let channel_err = channel.clone();
         let stderr_task = tokio::spawn(async move {
             if let Some(mut stderr) = stderr {
-                let mut buffer = [0u8; 4096];
+                let mut buffer = vec![0u8; stream_chunk_size(&channel_err.link).await];
                 loop {
                     match stderr.read(&mut buffer).await {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if !send_when_ready(
+                            if !send_stream_data(
                                 &channel_err,
-                                RnshMessage::StreamData {
-                                    stream_id: STREAM_ID_STDERR,
-                                    eof: false,
-                                    data: buffer[..n].to_vec(),
-                                },
+                                STREAM_ID_STDERR,
+                                buffer[..n].to_vec(),
                             )
                             .await
                             {
@@ -612,9 +623,8 @@ async fn start_session(
         // If the initiator wants to pipe stdin, forward stream data to
         // the child process.
         if let Some(mut stdin) = stdin {
-            let channel_stdin = channel.clone();
             tokio::spawn(async move {
-                let mut receiver = channel_stdin.subscribe();
+                let mut receiver = stdin_receiver;
                 while let Ok(message) = receiver.recv().await {
                     if let RnshMessage::StreamData { stream_id: STREAM_ID_STDIN, data, eof } =
                         message
@@ -642,6 +652,57 @@ async fn start_session(
         )
         .await;
     });
+}
+
+/// Maximum payload of one StreamDataMessage: the link MDU minus the
+/// channel envelope (6 bytes) and the stream header (2 bytes)
+/// (Python `StreamDataMessage.OVERHEAD`).
+async fn stream_chunk_size(
+    link: &Arc<tokio::sync::Mutex<reticulum::destination::link::Link>>,
+) -> usize {
+    link.lock().await.mdu().saturating_sub(8).max(32)
+}
+
+/// Stream arbitrary data as MDU-sized StreamDataMessages on one stream id.
+async fn send_stream_data(
+    channel: &reticulum::channel::Channel<RnshMessage>,
+    stream_id: u16,
+    data: Vec<u8>,
+) -> bool {
+    let chunk_size = stream_chunk_size(&channel.link).await;
+    let mut start = 0;
+    while start < data.len() {
+        let end = (start + chunk_size).min(data.len());
+        let last = end == data.len();
+        if !send_when_ready(
+            channel,
+            RnshMessage::StreamData {
+                stream_id,
+                eof: false,
+                data: data[start..end].to_vec(),
+            },
+        )
+        .await
+        {
+            return false;
+        }
+        start = end;
+        if !last {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    if data.is_empty() {
+        return send_when_ready(
+            channel,
+            RnshMessage::StreamData {
+                stream_id,
+                eof: false,
+                data: Vec::new(),
+            },
+        )
+        .await;
+    }
+    true
 }
 
 async fn send_when_ready(
@@ -785,16 +846,7 @@ pub async fn run_command(
     // command, which also gives the listener time to start pumping the
     // command output before any EOF arrives.
     if stdin_is_pipe {
-        if !stdin_data.is_empty()
-            && !send_when_ready(
-                &channel,
-                RnshMessage::StreamData {
-                    stream_id: STREAM_ID_STDIN,
-                    eof: false,
-                    data: stdin_data,
-                },
-            )
-            .await
+        if !stdin_data.is_empty() && !send_stream_data(&channel, STREAM_ID_STDIN, stdin_data).await
         {
             return Err("could not stream stdin".into());
         }
@@ -855,14 +907,21 @@ fn atty_or_true() -> bool {
 /// and the buffered data: a TTY or a non-empty read means the remote
 /// should pipe stdin, an immediately-empty closed stdin does not.
 fn read_initial_stdin() -> (bool, Vec<u8>) {
+    // Python's initiator sets `pipe_stdin = not os.isatty(0)` and sends
+    // a stdin EOF once its buffer drains. An immediately-closed, empty
+    // stdin (e.g. `rn sh -c ... < /dev/null`) here advertises no pipe
+    // instead: the Python listener closes the child's stdin on EOF and
+    // runs a "prompt shutdown" check 50 ms later that kills fast
+    // commands before their output has been streamed back, losing the
+    // response entirely. Real piped input keeps the pipe and a delayed
+    // EOF so EOF-dependent commands still terminate.
     if atty_or_true() {
-        return (true, Vec::new());
+        return (false, Vec::new());
     }
     use std::io::Read;
     let mut buffer = Vec::new();
     let _ = std::io::stdin().lock().read_to_end(&mut buffer);
     if buffer.is_empty() {
-        // An immediately-closed, empty stdin advertises no pipe at all.
         (false, buffer)
     } else {
         (true, buffer)

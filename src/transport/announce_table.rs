@@ -10,6 +10,13 @@ use crate::packet::{
     PropagationType,
 };
 
+/// Announce rebroadcast retries (Python `Transport.PATHFINDER_R`).
+const PATHFINDER_R: u8 = 1;
+/// Retry grace period (Python `Transport.PATHFINDER_G` = 5 s).
+const PATHFINDER_GRACE: Duration = Duration::from_secs(5);
+/// Random window for announce rebroadcast (Python `PATHFINDER_RW`).
+const PATHFINDER_RANDOM_WINDOW: Duration = Duration::from_millis(500);
+
 #[derive(Clone)]
 pub struct AnnounceEntry {
     pub packet: Packet,
@@ -22,25 +29,28 @@ pub struct AnnounceEntry {
 
 impl AnnounceEntry {
     pub fn retransmit(&mut self, transport_id: &AddressHash) -> Option<TxMessage> {
-        if self.retries == 0 {
-            return None;
-        }
-
-        let deadline_passed = Instant::now() >= self.timeout;
-
-        // Path responses wait out their grace period before they are sent
-        // (directly reachable peers answer first); regular announce
-        // rebroadcasts retransmit until their random window closes.
         if self.response_to_iface.is_some() {
-            if !deadline_passed {
+            // Path responses wait out their grace period before they are
+            // sent once (directly reachable peers answer first).
+            if self.retries == 0 || Instant::now() < self.timeout {
                 return None;
             }
-        } else if deadline_passed {
-            return None;
+            self.retries = 0;
+            return Some(self.always_retransmit(transport_id));
         }
 
-        self.retries = self.retries.saturating_sub(1);
-
+        // Ordinary announce rebroadcasts follow Python's announce table:
+        // the entry waits out a random window (`PATHFINDER_RW`), sends,
+        // then retries once more after `PATHFINDER_G + PATHFINDER_RW`,
+        // completing once retries exceed `PATHFINDER_R`.
+        if Instant::now() < self.timeout {
+            return None;
+        }
+        self.retries += 1;
+        if self.retries > PATHFINDER_R {
+            return None;
+        }
+        self.timeout = Instant::now() + PATHFINDER_GRACE + PATHFINDER_RANDOM_WINDOW;
         Some(self.always_retransmit(transport_id))
     }
 
@@ -148,7 +158,7 @@ impl AnnounceTable {
             packet: *announce,
             timeout: now + rand_window,
             received_from,
-            retries: 1, // Python `PATHFINDER_R`
+            retries: 0,
             hops,
             response_to_iface: None,
         };
@@ -200,10 +210,18 @@ impl AnnounceTable {
         dest_hash: &AddressHash,
         transport_id: &AddressHash,
     ) -> Option<TxMessage> {
-        // temporary hack
-        self.map
-            .get_mut(dest_hash)
-            .and_then(|e| e.retransmit(transport_id))
+        // Immediate first rebroadcast: the entry would otherwise wait out
+        // its random window plus one retransmit tick, which starves under
+        // heavy CPU load. Sending now consumes the first retry like
+        // Python's post-retransmit state (retries = 1, next try after
+        // PATHFINDER_G + PATHFINDER_RW).
+        let entry = self.map.get_mut(dest_hash)?;
+        if entry.response_to_iface.is_some() || entry.retries > 0 {
+            return None;
+        }
+        entry.retries = 1;
+        entry.timeout = Instant::now() + PATHFINDER_GRACE + PATHFINDER_RANDOM_WINDOW;
+        Some(entry.always_retransmit(transport_id))
     }
 
     pub fn tx_to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {

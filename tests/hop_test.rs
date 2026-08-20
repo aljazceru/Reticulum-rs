@@ -143,7 +143,17 @@ async fn remote_path_request_and_response() {
     transport_a.recv_announces().await;
     transport_a.request_path(&dest_c_hash, None, None).await;
 
-    assert!(transport_a.knows_destination(&dest_c_hash).await);
+    // The path response is grace-delayed and transmitted by the announce
+    // retransmit job (Python rebroadcasts path responses after a short
+    // grace period), so poll for the learned path.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        if transport_a.knows_destination(&dest_c_hash).await {
+            return;
+        }
+        time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("path request response for C never arrived at A");
 }
 
 #[tokio::test]
