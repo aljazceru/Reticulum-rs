@@ -754,6 +754,30 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
 // Transfer progress tracking (shared by send)
 // ---------------------------------------------------------------------------
 
+fn transfer_event_match(
+    event: &reticulum::resource::ResourceEvent,
+    expected: &AddressHash,
+) -> Option<bool> {
+    if let Some(advertisement) = event.advertisement.as_ref() {
+        let logical_match = AddressHash::new_from_hash(&advertisement.original_hash) == *expected;
+        if logical_match {
+            return Some(advertisement.segment_index == advertisement.total_segments);
+        }
+
+        // Preserve the unsplit/initial direct-hash form for older peers.
+        let direct_match = AddressHash::new_from_hash(&event.hash) == *expected;
+        if direct_match && advertisement.segment_index == 1 && advertisement.total_segments == 1 {
+            return Some(true);
+        }
+        return None;
+    }
+
+    // Initial unsplit events use the resource hash directly. Later split
+    // events have a different hash and must carry the original hash in their
+    // advertisement to be correlated.
+    (AddressHash::new_from_hash(&event.hash) == *expected).then_some(true)
+}
+
 /// Wait for a sent resource to conclude, printing progress while it runs.
 ///
 /// Progress lines are flushed so `\r` updates render live.
@@ -775,11 +799,22 @@ pub async fn wait_for_transfer(
             .await
             .map_err(|_| "The transfer timed out".to_string())?
             .map_err(|_| "resource events closed".to_string())?;
-        if &AddressHash::new_from_hash(&event.hash) != resource_hash {
+        let Some(is_final_segment) = transfer_event_match(&event, resource_hash) else {
             continue;
-        }
+        };
         match event.status {
             ResourceStatus::Complete => {
+                if !is_final_segment {
+                    if show_progress {
+                        let percent = (event.progress * 100.0 * 10.0).round() / 10.0;
+                        if percent > last_percent {
+                            last_percent = percent;
+                            print!("\rTransferring file {percent:.1}%");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                    }
+                    continue;
+                }
                 if show_progress {
                     print!("\rTransfer complete  100.0%\n");
                 }
@@ -825,6 +860,53 @@ pub async fn print_identity(config_dir: &Path, identity_path: Option<&Path>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transfer_event(
+        hash: u8,
+        original_hash: u8,
+        segment_index: usize,
+        total_segments: usize,
+        advertisement: bool,
+    ) -> reticulum::resource::ResourceEvent {
+        reticulum::resource::ResourceEvent {
+            link_id: reticulum::destination::link::LinkId::new_from_rand(OsRng),
+            hash: reticulum::hash::Hash::new([hash; 32]),
+            status: ResourceStatus::Complete,
+            progress: 0.5,
+            data: None,
+            metadata: None,
+            advertisement: advertisement.then(|| reticulum::resource::ResourceAdvertisement {
+                transfer_size: 1,
+                data_size: 1,
+                parts: 1,
+                hash: reticulum::hash::Hash::new([hash; 32]),
+                random_hash: [0; 4],
+                original_hash: reticulum::hash::Hash::new([original_hash; 32]),
+                segment_index,
+                total_segments,
+                request_id: None,
+                flags: 0,
+                hashmap: vec![],
+            }),
+        }
+    }
+
+    #[test]
+    fn transfer_events_follow_original_hash_and_final_segment() {
+        let expected = AddressHash::new([1; 16]);
+        assert_eq!(
+            transfer_event_match(&transfer_event(2, 1, 1, 2, true), &expected),
+            Some(false)
+        );
+        assert_eq!(
+            transfer_event_match(&transfer_event(3, 1, 2, 2, true), &expected),
+            Some(true)
+        );
+        assert_eq!(
+            transfer_event_match(&transfer_event(3, 3, 2, 2, false), &expected),
+            None
+        );
+    }
 
     #[test]
     fn metadata_roundtrip_matches_python_layout() {

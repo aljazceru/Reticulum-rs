@@ -43,6 +43,7 @@ pub struct OutgoingResource {
     pub total_segments: usize,
     pub request_id: Option<AddressHash>,
     pub is_response: bool,
+    pub auto_compress: bool,
     pub sdu: usize,
 
     /// Pre-built part packets with per-part map hashes.
@@ -106,18 +107,13 @@ impl OutgoingResource {
         stream.extend_from_slice(&data);
         let total_size = stream.len();
 
-        // Segmentation: segment k covers stream[(k-1)*MAX .. k*MAX] where the
-        // first segment additionally begins with the metadata blob
-        // (Python `Resource.__init__` seek arithmetic).
         let total_segments = if total_size <= MAX_EFFICIENT_SIZE {
             1
         } else {
             (total_size - 1) / MAX_EFFICIENT_SIZE + 1
         };
         let segment_index = 1;
-        let start = 0;
-        let end = core::cmp::min(MAX_EFFICIENT_SIZE, total_size);
-        let segment_range = start..end;
+        let segment_range = Self::segment_range(total_size, metadata_size, segment_index);
 
         Self::new_segment(
             stream,
@@ -280,6 +276,7 @@ impl OutgoingResource {
             total_segments,
             request_id: opts.request_id,
             is_response: opts.is_response,
+            auto_compress: opts.auto_compress,
             sdu,
             parts,
             part_hashes,
@@ -310,9 +307,6 @@ impl OutgoingResource {
         metadata_size: usize,
         segment_index: usize,
     ) -> core::ops::Range<usize> {
-        if total_size <= MAX_EFFICIENT_SIZE {
-            return 0..total_size;
-        }
         let _ = metadata_size;
         let start = (segment_index - 1) * MAX_EFFICIENT_SIZE;
         let end = core::cmp::min(segment_index * MAX_EFFICIENT_SIZE, total_size);
@@ -492,7 +486,6 @@ impl OutgoingResource {
     pub(super) fn prepare_next_segment(
         &self,
         link: &Link,
-        opts: ResourceOptions,
     ) -> Result<Option<Box<OutgoingResource>>, RnsError> {
         if !self.split || self.segment_index >= self.total_segments {
             return Ok(None);
@@ -502,35 +495,30 @@ impl OutgoingResource {
             return Ok(None);
         };
 
-        // Python arithmetic: seek_index = segment_index - 1; segment 1
-        // covers [0, first_read_size), segment N > 1 covers
-        // [first_read_size + (N-2)*MAX, ... + MAX). With
-        // `self.segment_index` = the completed segment, the NEXT segment's
-        // index is segment_index + 1.
         let next_segment = self.segment_index + 1;
-        let first_read_size = MAX_EFFICIENT_SIZE - self.metadata_size;
-        let (start, end) = if next_segment == 1 {
-            (0, core::cmp::min(first_read_size, stream.len()))
-        } else {
-            let seek_index = next_segment - 1;
-            let start = first_read_size + (seek_index - 1) * MAX_EFFICIENT_SIZE;
-            let end = core::cmp::min(start + MAX_EFFICIENT_SIZE, stream.len());
-            (start, end)
-        };
+        let range = Self::segment_range(stream.len(), self.metadata_size, next_segment);
 
-        if start >= stream.len() {
+        if range.start >= stream.len() {
             return Ok(None);
         }
 
+        let next_opts = ResourceOptions {
+            auto_compress: self.auto_compress,
+            timeout: Some(self.timeout),
+            request_id: self.request_id,
+            is_response: self.is_response,
+            metadata: None,
+        };
+
         Ok(Some(Box::new(Self::new_segment(
             stream.clone(),
-            start..end,
+            range,
             stream.len(),
             self.total_segments,
             next_segment,
             Some(self.original_hash),
             link,
-            opts,
+            next_opts,
             self.has_metadata,
             self.metadata_size,
         )?)))

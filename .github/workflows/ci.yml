@@ -65,7 +65,9 @@ jobs:
         run: python3 -c "import RNS; print(RNS.__file__)"
       - name: test
         run: |
-          cargo test --workspace --all-targets --features="python-tests" -- --no-capture
+          cargo test --workspace --lib --bins --tests --examples \
+            --features="python-tests" -- --no-capture
+          cargo bench --workspace --no-run
           cargo test -p reticulum-core --all-targets --no-default-features --features="embassy-time"
           # bzip2 compression matrix for resources
           cargo test -p reticulum --features bz2 --test resource_transfer

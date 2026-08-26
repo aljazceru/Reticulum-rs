@@ -763,6 +763,7 @@ impl BlackholeUpdater {
         &self,
         desc: reticulum::destination::DestinationDesc,
     ) -> Result<(), reticulum::error::RnsError> {
+        let publisher = desc.identity.address_hash;
         let link = self.transport.link(desc).await;
 
         // Wait for activation.
@@ -791,27 +792,9 @@ impl BlackholeUpdater {
             return Err(reticulum::error::RnsError::LinkNotReady);
         };
 
-        // Merge every reported identity into the blackhole table.
-        let mut cursor = std::io::Cursor::new(&response);
-        let Ok(rmpv::Value::Array(items)) = rmpv::decode::read_value(&mut cursor) else {
-            return Ok(());
-        };
-
         let own = self.transport.identity_hash().await;
         let blackholes = self.transport.blackholes();
-        let mut added = 0;
-        for item in items {
-            if let rmpv::Value::Binary(bytes) = item {
-                // Raw 16-byte identity hashes: copy, never re-hash.
-                if let Some(identity) = AddressHash::new_from_raw_slice(&bytes) {
-                    let mut blackholes = blackholes.write().await;
-                    if !blackholes.is_blackholed(&identity) {
-                        blackholes.blackhole(identity, own);
-                        added += 1;
-                    }
-                }
-            }
-        }
+        let added = blackholes.write().await.merge_list(&response, publisher, own);
 
         if added > 0 {
             log::debug!("blackhole updater: merged {added} blackholed identities");

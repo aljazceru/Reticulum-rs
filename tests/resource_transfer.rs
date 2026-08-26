@@ -16,6 +16,7 @@ use reticulum::resource::{
     self, advertisement::ResourceAdvertisement, pack_response, request_id, unpack_request,
     unpack_response, ResourceOptions, ResourceStatus, ResourceStrategy,
 };
+use reticulum::resource::manager::RequestEvent;
 use reticulum::transport::{Transport, TransportConfig};
 
 fn setup_logging() {
@@ -414,6 +415,47 @@ async fn request_response_large_resource_backed() {
 }
 
 #[tokio::test]
+async fn split_response_can_be_awaited_after_completion_event() {
+    let (server, client, link) = connected_pair(4353, 4354).await;
+
+    let destination = server
+        .get_in_destination(&link.lock().await.destination().address_hash)
+        .await
+        .expect("destination");
+    let dest_hash = destination.lock().await.desc.address_hash;
+    let payload: Vec<u8> = (0..(resource::MAX_EFFICIENT_SIZE + 4096) as u32)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let response_payload = payload.clone();
+    server
+        .register_request_handler(&dest_hash, "split-bulk", move |_ctx| {
+            Some(response_payload.clone())
+        })
+        .await;
+
+    let mut request_events = client.request_events().await;
+    let rid = client
+        .request(&link, "split-bulk", b"late-await")
+        .await
+        .expect("request");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let event = tokio::time::timeout_at(deadline, request_events.recv())
+            .await
+            .expect("response event timeout")
+            .expect("request event channel");
+        if matches!(event.event, RequestEvent::Response { request_id, .. } if request_id == rid) {
+            break;
+        }
+    }
+
+    let response = client
+        .await_request_response(rid, Duration::from_secs(10))
+        .await;
+    assert_eq!(response, Some(payload));
+}
+
+#[tokio::test]
 async fn resource_transfer_reject_oversized() {
     let (server, client, link) = connected_pair(4361, 4362).await;
     // Default strategy is None: advertisements are ignored
@@ -429,5 +471,3 @@ async fn resource_transfer_reject_oversized() {
         assert_ne!(event.status, ResourceStatus::Complete);
     }
 }
-
-

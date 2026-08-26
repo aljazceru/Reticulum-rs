@@ -97,12 +97,18 @@ impl Blackholes {
     }
 
     /// Unpack a blackhole list received in an announce app data and merge it.
-    pub fn merge_list(&mut self, packed: &[u8], source: AddressHash) -> usize {
+    pub fn merge_list(
+        &mut self,
+        packed: &[u8],
+        source: AddressHash,
+        local_identity: AddressHash,
+    ) -> usize {
         let mut cursor: &[u8] = packed;
         let Ok(count) = rmp::decode::read_array_len(&mut cursor) else {
             return 0;
         };
         let mut merged = 0;
+        let now = (self.now)();
         for _ in 0..count {
             let Ok(len) = rmp::decode::read_bin_len(&mut cursor) else { break };
             let len = len as usize;
@@ -111,10 +117,15 @@ impl Blackholes {
             }
             let hash = AddressHash::new(cursor[..len].try_into().unwrap());
             cursor = &cursor[len..];
-            if !self.entries.contains_key(&hash) {
+            if let Some((existing_source, since)) = self.entries.get_mut(&hash) {
+                if *existing_source != local_identity {
+                    *existing_source = source;
+                    *since = now;
+                }
+            } else {
+                self.entries.insert(hash, (source, now));
                 merged += 1;
             }
-            self.blackhole(hash, source);
         }
         merged
     }
@@ -150,12 +161,12 @@ mod tests {
         let packed = bh.pack_list();
 
         let mut other = Blackholes::new(false);
-        let merged = other.merge_list(&packed, hash(8));
+        let merged = other.merge_list(&packed, hash(8), hash(9));
         assert_eq!(merged, 2);
         assert!(other.is_blackholed(&hash(1)));
         assert!(other.is_blackholed(&hash(2)));
         // merging again adds nothing
-        assert_eq!(other.merge_list(&packed, hash(8)), 0);
+        assert_eq!(other.merge_list(&packed, hash(8), hash(9)), 0);
     }
 
     #[test]
@@ -184,7 +195,25 @@ mod tests {
     #[test]
     fn malformed_list_is_ignored() {
         let mut bh = Blackholes::new(false);
-        assert_eq!(bh.merge_list(&[0xff, 0xff], hash(9)), 0);
-        assert_eq!(bh.merge_list(&[], hash(9)), 0);
+        assert_eq!(bh.merge_list(&[0xff, 0xff], hash(9), hash(8)), 0);
+        assert_eq!(bh.merge_list(&[], hash(9), hash(8)), 0);
+    }
+
+    #[test]
+    fn merge_preserves_local_source_and_renews_remote_source() {
+        let local = hash(0xaa);
+        let publisher = hash(0xbb);
+        let remote = hash(0xcc);
+        let mut bh = Blackholes::new(false);
+        bh.blackhole(local, local);
+        bh.blackhole(remote, hash(0xdd));
+
+        let mut packed = Vec::new();
+        rmp::encode::write_array_len(&mut packed, 2).unwrap();
+        rmp::encode::write_bin(&mut packed, local.as_slice()).unwrap();
+        rmp::encode::write_bin(&mut packed, remote.as_slice()).unwrap();
+        assert_eq!(bh.merge_list(&packed, publisher, local), 0);
+        assert_eq!(bh.entries[&local].0, local);
+        assert_eq!(bh.entries[&remote].0, publisher);
     }
 }

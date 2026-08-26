@@ -1,3 +1,5 @@
+#![cfg(feature = "python-tests")]
+
 //! Full-stack interop with a PYTHON node in the middle routing between
 //! two Rust endpoints (the drop-in-replacement proof): Rust A <->
 //! Python transport <-> Rust C. Exercises announce propagation, path

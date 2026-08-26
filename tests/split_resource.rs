@@ -10,7 +10,7 @@ use rand_core::OsRng;
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
-use reticulum::resource::ResourceStatus;
+use reticulum::resource::{ResourceOptions, ResourceStatus, MAX_EFFICIENT_SIZE};
 use reticulum::transport::{Transport, TransportConfig};
 
 async fn udp_pair(name: &str, pa: u16, pb: u16) -> (Transport, Transport) {
@@ -75,11 +75,26 @@ async fn split_resource_transfers_all_segments() {
     b.set_resource_strategy(link_id, reticulum::resource::ResourceStrategy::All)
         .await;
 
-    // ~2.5 segments worth of data (MAX_EFFICIENT_SIZE = 1 MiB - 1).
-    let payload: Vec<u8> = (0..(1024 * 1024 + 256 * 1024)).map(|i| (i % 251) as u8).collect();
+    // A split transfer with metadata, deliberately disabling compression.
+    let payload: Vec<u8> = (0..(MAX_EFFICIENT_SIZE + 256 * 1024))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let metadata = vec![0x81, 0xa4, b'n', b'a', b'm', b'e', 0xc4, 0x0b,
+                        b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'.', b'b', b'i', b'n'];
 
     let mut events = a.resource_events().await;
-    a.send_resource(&link, payload.clone()).await.expect("send");
+    let mut receiver_events = b.resource_events().await;
+    a.send_resource_with_options(
+        &link,
+        payload.clone(),
+        ResourceOptions {
+            auto_compress: false,
+            metadata: Some(metadata.clone()),
+            ..ResourceOptions::default()
+        },
+    )
+    .await
+    .expect("send");
 
     let mut segments_completed = 0;
     let expected = 2;
@@ -97,4 +112,20 @@ async fn split_resource_transfers_all_segments() {
         segments_completed >= expected,
         "expected {expected} segment completions for a 1.25 MiB payload, got {segments_completed}"
     );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut final_data = None;
+    let mut final_metadata = None;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(event)) = tokio::time::timeout_at(deadline, receiver_events.recv()).await else {
+            break;
+        };
+        if event.status == ResourceStatus::Complete && event.data.is_some() {
+            final_data = event.data;
+            final_metadata = event.metadata;
+            break;
+        }
+    }
+    assert_eq!(final_data.as_deref(), Some(payload.as_slice()));
+    assert_eq!(final_metadata, Some(metadata));
 }

@@ -1,7 +1,7 @@
 //! Per-transport resource state: tracks outgoing/incoming resources per
 //! link, routes resource packets and runs watchdog checks.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -57,6 +57,12 @@ pub type AsyncRequestHandler = Arc<
         + Sync,
 >;
 
+#[derive(Debug)]
+pub(crate) struct SplitAssembly {
+    pub(crate) data: Vec<u8>,
+    pub(crate) metadata: Option<Vec<u8>>,
+}
+
 pub(crate) struct ResourceManager {
     pub out: HashMap<LinkId, Vec<OutgoingResource>>,
     pub incoming: HashMap<LinkId, Vec<IncomingResource>>,
@@ -74,7 +80,7 @@ pub(crate) struct ResourceManager {
     pub completed_responses: HashMap<AddressHash, Option<Vec<u8>>>,
     /// Accumulated bytes of split resources by original hash
     /// (Python appends per-segment assembled data to storage).
-    pub split_assembly: HashMap<crate::hash::Hash, Vec<u8>>,
+    pub split_assembly: HashMap<crate::hash::Hash, SplitAssembly>,
     pub events: broadcast::Sender<ResourceEvent>,
     pub request_events: broadcast::Sender<RequestEventData>,
     pub max_decompressed_size: usize,
@@ -449,83 +455,86 @@ impl ResourceManager {
         let resources = self.incoming.get_mut(link.id())?;
         for resource in resources.iter_mut() {
             if resource.assembled.is_some() || resource.status != ResourceStatus::Assembling {
-                    continue;
+                continue;
             }
             match resource.assemble(link, self.max_decompressed_size) {
                 Ok(data) => {
-                    let hash = resource.hash;
                     resource.status = ResourceStatus::Complete;
                     resource.prove(link, &resource.assembled.clone().unwrap(), tx);
                     resource.last_activity = super::unix_time();
 
                     let progress = resource.progress();
-                    let metadata = resource.metadata.clone();
                     let advertisement = resource.advertisement_of();
-
-                    let _is_request = resource.request_id.is_some() && !resource.is_response;
                     let is_response = resource.is_response;
                     let request_id = resource.request_id;
                     let is_final = resource.segment_index == resource.total_segments;
 
-                    // Split resources accumulate across segments (Python
-                    // appends each segment's assembled data to the storage
-                    // file keyed by original_hash): only the final event
-                    // carries the complete data.
-                    let (event_hash, event_data) = if resource.split {
-                        let buffer = self
+                    let (event_data, event_metadata, full_data) = if resource.split {
+                        let assembly = self
                             .split_assembly
                             .entry(resource.original_hash)
-                            .or_default();
-                        buffer.extend_from_slice(&data);
+                            .or_insert_with(|| SplitAssembly {
+                                data: Vec::new(),
+                                metadata: None,
+                            });
+                        if resource.segment_index == 1 && assembly.metadata.is_none() {
+                            assembly.metadata = resource.metadata.clone();
+                        }
+                        assembly.data.extend_from_slice(&data);
 
                         if is_final {
-                            let complete = self.split_assembly.remove(&resource.original_hash);
-                            (resource.original_hash, complete)
+                            let Some(complete) = self.split_assembly.remove(&resource.original_hash)
+                            else {
+                                resource.status = ResourceStatus::Corrupt;
+                                let _ = self.events.send(ResourceEvent {
+                                    link_id: *link.id(),
+                                    hash: resource.hash,
+                                    status: ResourceStatus::Corrupt,
+                                    progress: resource.progress(),
+                                    data: None,
+                                    metadata: None,
+                                    advertisement: Some(resource.advertisement_of()),
+                                });
+                                continue;
+                            };
+                            (
+                                Some(complete.data.clone()),
+                                complete.metadata.clone(),
+                                Some(complete.data),
+                            )
                         } else {
-                            (resource.original_hash, None)
+                            (None, None, None)
                         }
                     } else {
-                        (hash, Some(data.clone()))
+                        (Some(data.clone()), resource.metadata.clone(), Some(data.clone()))
                     };
 
                     let _ = self.events.send(ResourceEvent {
                         link_id: *link.id(),
-                        hash: event_hash,
+                        hash: resource.hash,
                         status: ResourceStatus::Complete,
                         progress,
                         data: event_data,
-                        metadata,
+                        metadata: event_metadata.clone(),
                         advertisement: Some(advertisement),
                     });
 
-                    // Request/response payloads span segments: the packed
-                    // request/response lives in the FIRST segment; the
-                    // complete data is what later segments append to.
-                    let full_data = if resource.split {
-                        self.split_assembly
-                            .get(&resource.original_hash)
-                            .cloned()
-                            .unwrap_or_default()
-                    } else {
-                        data.clone()
-                    };
-
                     let response_rid = if is_response && is_final { request_id } else { None };
-                    if let Some(request_id) = response_rid {
-                        let event = match unpack_response(&full_data) {
+                    if let (Some(request_id), Some(full_data)) = (response_rid, full_data.as_ref()) {
+                        let event = match unpack_response(full_data) {
                             Some((rid, response)) if rid == request_id => {
                                 // Retain for late awaiters before emitting.
                                 self.completed_responses.insert(rid, Some(response.clone()));
                                 RequestEvent::Response {
                                     request_id: rid,
                                     data: response,
-                                    metadata: None,
+                                    metadata: event_metadata.clone(),
                                 }
                             }
                             Some((rid, response)) => RequestEvent::Response {
                                 request_id: rid,
                                 data: response,
-                                metadata: None,
+                                metadata: event_metadata.clone(),
                             },
                             None => RequestEvent::Failed { request_id },
                         };
@@ -535,13 +544,16 @@ impl ResourceManager {
                         self.pending_requests.remove(&request_id);
                     }
 
-                    // Split requests deliver the accumulated payload once
-                    // the final segment lands.
-                    return Some((event_hash, full_data));
+                    if let Some(full_data) = full_data {
+                        return Some((resource.hash, full_data));
+                    }
                 }
                 Err(err) => {
                     log::debug!("resource: assembly failed: {err:?}");
                     resource.status = ResourceStatus::Corrupt;
+                    if resource.split {
+                        self.split_assembly.remove(&resource.original_hash);
+                    }
                     let hash = resource.hash;
                     let advertisement = resource.advertisement_of();
                     let _ = self.events.send(ResourceEvent {
@@ -588,7 +600,7 @@ impl ResourceManager {
         let resource_hash = crate::hash::Hash::new(hash_bytes);
 
         let mut next_to_advertise: Option<OutgoingResource> = None;
-        let mut completed_hashes: Vec<(crate::hash::Hash, ResourceAdvertisement)> = Vec::new();
+        let mut completed_hashes: Vec<(crate::hash::Hash, f64, ResourceAdvertisement)> = Vec::new();
 
         if let Some(resources) = self.out.get_mut(link.id()) {
             for resource in resources.iter_mut() {
@@ -598,25 +610,13 @@ impl ResourceManager {
                     continue;
                 }
                 if resource.validate_proof(proof_data) {
-                    completed_hashes.push((resource.hash, resource.advertisement()));
+                    completed_hashes.push((resource.hash, resource.progress(), resource.advertisement()));
 
                     // Advertise the next segment of a split resource.
                     if resource.split && resource.segment_index < resource.total_segments {
                         // Prepare lazily if not pre-built.
                         if resource.next_segment.is_none() {
-                            // Preserve request metadata across segments:
-                            // later response segments keep request_id and
-                            // is_response so the receiver routes them as
-                            // responses (dropping them, as
-                            // ResourceOptions::default() did, made later
-                            // segments look like ordinary resources that
-                            // get rejected under the default strategy).
-                            let opts = ResourceOptions {
-                                request_id: resource.request_id,
-                                is_response: resource.is_response,
-                                ..ResourceOptions::default()
-                            };
-                            match resource.prepare_next_segment(link, opts) {
+                            match resource.prepare_next_segment(link) {
                                 Ok(next) => resource.next_segment = next,
                                 Err(error) => {
                                     log::debug!("resource: next-segment prep failed: {error:?}")
@@ -632,12 +632,12 @@ impl ResourceManager {
             }
         }
 
-        for (hash, advertisement) in completed_hashes {
+        for (hash, progress, advertisement) in completed_hashes {
             let _ = self.events.send(ResourceEvent {
                 link_id: *link.id(),
                 hash,
                 status: ResourceStatus::Complete,
-                progress: 1.0,
+                progress,
                 data: None,
                 metadata: None,
                 advertisement: Some(advertisement),
@@ -712,7 +712,7 @@ impl ResourceManager {
     /// Watchdog pass over all resources. Returns packets to send.
     pub fn check(&mut self, links: &HashMap<LinkId, Arc<Mutex<Link>>>) -> ResourceTx {
         let mut tx = ResourceTx::default();
-        let mut failed_events = Vec::new();
+        let mut failed_events: Vec<(LinkId, crate::hash::Hash, ResourceStatus, f64, ResourceAdvertisement)> = Vec::new();
 
         let link_ids: Vec<LinkId> = self.out.keys().copied().collect();
         for link_id in link_ids {
@@ -728,7 +728,7 @@ impl ResourceManager {
                 let mut i = 0;
                 while i < resources.len() {
                     let tx_advertised_this_sweep = advertised_any;
-                    let (hash, failed) = {
+                    let (hash, failed, progress, advertisement) = {
                         let resource = &mut resources[i];
                         if resource.status.is_concluded() {
                             i += 1;
@@ -750,10 +750,10 @@ impl ResourceManager {
                             continue;
                         }
                         let failed = resource.check(&link, &mut tx);
-                        (resource.hash, failed)
+                        (resource.hash, failed, resource.progress(), resource.advertisement())
                     };
                     if failed {
-                        failed_events.push((link_id, hash, ResourceStatus::Failed));
+                        failed_events.push((link_id, hash, ResourceStatus::Failed, progress, advertisement));
                     }
                     advertised_any |= tx_advertised_this_sweep;
                     i += 1;
@@ -770,32 +770,32 @@ impl ResourceManager {
             if let Some(resources) = self.incoming.get_mut(&link_id) {
                 let mut i = 0;
                 while i < resources.len() {
-                    let (hash, failed) = {
+                    let (hash, failed, progress, advertisement) = {
                         let resource = &mut resources[i];
                         if resource.status.is_concluded() {
                             i += 1;
                             continue;
                         }
                         let failed = resource.check(&link, &mut tx);
-                        (resource.hash, failed)
+                        (resource.hash, failed, resource.progress(), resource.advertisement_of())
                     };
                     if failed {
-                        failed_events.push((link_id, hash, ResourceStatus::Failed));
+                        failed_events.push((link_id, hash, ResourceStatus::Failed, progress, advertisement));
                     }
                     i += 1;
                 }
             }
         }
 
-        for (link_id, hash, status) in failed_events {
+        for (link_id, hash, status, progress, advertisement) in failed_events {
             let _ = self.events.send(ResourceEvent {
                 link_id,
                 hash,
                 status,
-                progress: 0.0,
+                progress,
                 data: None,
                 metadata: None,
-                advertisement: None,
+                advertisement: Some(advertisement),
             });
         }
 
@@ -804,6 +804,21 @@ impl ResourceManager {
 
     /// Drop concluded resources to free memory.
     pub fn cleanup(&mut self) {
+        let abandoned: HashSet<crate::hash::Hash> = self
+            .incoming
+            .values()
+            .flat_map(|list| list.iter())
+            .filter(|resource| {
+                resource.split
+                    && matches!(
+                        resource.status,
+                        ResourceStatus::Failed
+                            | ResourceStatus::Corrupt
+                            | ResourceStatus::Rejected
+                    )
+            })
+            .map(|resource| resource.original_hash)
+            .collect();
         self.out.retain(|_, list| {
             list.retain(|r| !r.status.is_concluded());
             !list.is_empty()
@@ -812,6 +827,8 @@ impl ResourceManager {
             list.retain(|r| !r.status.is_concluded());
             !list.is_empty()
         });
+        self.split_assembly
+            .retain(|hash, _| !abandoned.contains(hash));
     }
 }
 

@@ -118,6 +118,55 @@ async fn send_file_over_udp_loopback() {
 }
 
 #[tokio::test]
+async fn send_split_file_over_udp_loopback() {
+    let server_config = temp_dir("split-server");
+    let client_config = temp_dir("split-client");
+    let save_dir = temp_dir("split-received");
+    write_udp_config(&server_config, 4681, 4682);
+    write_udp_config(&client_config, 4682, 4681);
+
+    let destination = rncp_destination_hash(&server_config);
+    let payload = test_file(
+        &client_config,
+        reticulum::resource::MAX_EFFICIENT_SIZE + 4096,
+    );
+    let shutdown = CancellationToken::new();
+    let serve_task = {
+        let options = ServeOptions {
+            config_dir: Some(server_config.clone()),
+            save_dir: save_dir.clone(),
+            no_auth: true,
+            ..Default::default()
+        };
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move { rncp::serve_with_shutdown(options, shutdown).await })
+    };
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    rncp::send(SendOptions {
+        config_dir: Some(client_config.clone()),
+        file: payload.clone(),
+        destination,
+        timeout: Duration::from_secs(120),
+        no_compress: true,
+        silent: true,
+        identity_path: None,
+        udp_loopback: None,
+    })
+    .await
+    .expect("split transfer");
+
+    let received = wait_for_file(&save_dir, "payload.bin", Duration::from_secs(20))
+        .await
+        .expect("received split file");
+    assert_eq!(std::fs::read(received).unwrap(), std::fs::read(payload).unwrap());
+    assert!(!save_dir.join("rncp.incoming").exists());
+
+    shutdown.cancel();
+    serve_task.await.expect("serve task").expect("serve ok");
+}
+
+#[tokio::test]
 async fn fetch_file_over_udp_loopback() {
     let server_config = temp_dir("fetch-server");
     let client_config = temp_dir("fetch-client");
