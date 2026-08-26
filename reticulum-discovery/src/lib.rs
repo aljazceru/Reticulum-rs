@@ -661,27 +661,34 @@ impl InterfaceDiscovery {
 /// the local blackhole table (Python `Discovery.BlackholeUpdater`).
 pub struct BlackholeUpdater {
     transport: Arc<Transport>,
-    sources: RwLock<Vec<Hash>>,
+    /// Configured source identities (Python `Reticulum.blackhole_sources`,
+    /// 16-byte truncated identity hashes).
+    sources: RwLock<Vec<reticulum::hash::AddressHash>>,
+    /// Update interval (Python `blackhole_update_interval`).
     interval: Duration,
-    /// Announced blackhole destinations by announcing network identity.
-    announced: RwLock<HashMap<Hash, reticulum::destination::DestinationDesc>>,
+}
+
+/// Python `Destination.hash_from_name_and_identity` for a source known
+/// only by its truncated identity hash.
+struct SourceIdentity(reticulum::hash::AddressHash);
+
+impl reticulum::identity::HashIdentity for SourceIdentity {
+    fn as_address_hash_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
 }
 
 impl BlackholeUpdater {
     pub async fn start(
         transport: &Arc<Transport>,
-        sources: Vec<Hash>,
+        sources: Vec<reticulum::hash::AddressHash>,
         interval: Duration,
     ) -> Arc<Self> {
         let updater = Arc::new(Self {
             transport: transport.clone(),
             sources: RwLock::new(sources),
             interval,
-            announced: RwLock::new(HashMap::new()),
         });
-
-        let tracker = updater.clone();
-        tokio::spawn(async move { tracker.track_announces().await });
 
         let runner = updater.clone();
         tokio::spawn(async move { runner.job().await });
@@ -696,66 +703,40 @@ impl BlackholeUpdater {
         loop {
             let sources = self.sources.read().await.clone();
             for source in sources {
-                let material = source.as_slice();
-                let _ = material;
+                let name = reticulum::destination::DestinationName::new(
+                    "rnstransport",
+                    "info.blackhole",
+                );
+                let destination_hash = name.address_hash_for(&SourceIdentity(source));
 
-                // Look up the announced blackhole destination of the
-                // source from the announce stream.
-                if let Some(desc) = self.blackhole_destination_of(&source).await {
-                    if let Err(error) = self.update_from(desc).await {
-                        log::debug!("blackhole updater: {error:?}");
-                    }
-                } else {
+                if !self
+                    .transport
+                    .await_path(&destination_hash, Some(Duration::from_secs(25)), None)
+                    .await
+                {
+                    log::debug!(
+                        "blackhole updater: no path available for source {source}, retrying later"
+                    );
+                    continue;
+                }
+
+                let Some(identity) = self.transport.recall(&destination_hash).await else {
                     log::debug!("blackhole updater: no known path for source {source}");
+                    continue;
+                };
+
+                let desc = reticulum::destination::DestinationDesc {
+                    identity,
+                    address_hash: destination_hash,
+                    name,
+                };
+
+                if let Err(error) = self.update_from(desc).await {
+                    log::debug!("blackhole updater: {error:?}");
                 }
             }
 
             tokio::time::sleep(self.interval).await;
-        }
-    }
-
-    /// Find the announced `rnstransport.info.blackhole` destination of a
-    /// source identity from the tracked announce stream.
-    async fn blackhole_destination_of(
-        &self,
-        source: &Hash,
-    ) -> Option<reticulum::destination::DestinationDesc> {
-        let destinations = self.announced.read().await;
-        destinations.get(source).cloned()
-    }
-
-    /// Track announces of `rnstransport.info.blackhole` destinations by
-    /// announcing identity.
-    async fn track_announces(self: Arc<Self>) {
-        let mut announces = self.transport.recv_announces().await;
-
-        loop {
-            let Ok(event) = announces.recv().await else { return };
-
-            let desc = {
-                let destination = event.destination.lock().await;
-                let name = destination.desc.name;
-                let identity = destination.desc.identity;
-                let address_hash = destination.desc.address_hash;
-
-                let wanted = reticulum::destination::DestinationName::new(
-                    "rnstransport",
-                    "info.blackhole",
-                );
-                if name.hash.as_slice() != wanted.hash.as_slice() {
-                    continue;
-                }
-
-                reticulum::destination::DestinationDesc {
-                    identity,
-                    address_hash,
-                    name,
-                }
-            };
-
-            let network_id = Hash::new_from_slice(desc.identity.to_bytes().as_slice());
-            self.announced.write().await.insert(network_id, desc);
-            log::debug!("blackhole updater: tracking published blackhole list {desc}");
         }
     }
 
@@ -764,10 +745,14 @@ impl BlackholeUpdater {
         desc: reticulum::destination::DestinationDesc,
     ) -> Result<(), reticulum::error::RnsError> {
         let publisher = desc.identity.address_hash;
+
+        // Subscribe BEFORE creating the link: the activation event can
+        // fire (and be dropped by the broadcast channel) before a
+        // subscription created afterwards exists.
+        let mut events = self.transport.out_link_events();
         let link = self.transport.link(desc).await;
 
         // Wait for activation.
-        let mut events = self.transport.out_link_events();
         let activated = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
         match activated {
             Ok(Ok(_)) => {}
@@ -777,10 +762,7 @@ impl BlackholeUpdater {
             }
         }
 
-        let rid = self
-            .transport
-            .request(&link, "/list", &[])
-            .await?;
+        let rid = self.transport.request(&link, "/list", &[]).await?;
         let response = self
             .transport
             .await_request_response(rid, Duration::from_secs(10))
@@ -794,10 +776,18 @@ impl BlackholeUpdater {
 
         let own = self.transport.identity_hash().await;
         let blackholes = self.transport.blackholes();
-        let added = blackholes.write().await.merge_list(&response, publisher, own);
+        let added = blackholes.write().await.merge_table(&response, publisher, own);
 
         if added > 0 {
             log::debug!("blackhole updater: merged {added} blackholed identities");
+
+            // Persist the fetched list under the publisher's identity so a
+            // restart restores it (Python `Discovery.BlackholeUpdater`
+            // writes `blackhole/<hex identity>` with the raw response,
+            // only when new entries were added).
+            self.transport
+                .persist_blackhole_source(&publisher, &response)
+                .await;
         }
 
         Ok(())

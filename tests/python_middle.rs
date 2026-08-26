@@ -332,7 +332,7 @@ async fn resource_and_request_through_python_middle() {
         .await;
     let dest_hash = destination.lock().await.desc.address_hash;
 
-    c.register_request_handler(&dest_hash, "echo", |ctx| Some(ctx.data.clone()))
+    c.register_request_handler(&dest_hash, "echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
         .await;
 
     // Accept resources on inbound links as they appear.

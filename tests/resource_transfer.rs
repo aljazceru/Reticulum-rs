@@ -13,8 +13,8 @@ use reticulum::hash::{AddressHash, Hash};
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::resource::{
-    self, advertisement::ResourceAdvertisement, pack_response, request_id, unpack_request,
-    unpack_response, ResourceOptions, ResourceStatus, ResourceStrategy,
+    self, advertisement::ResourceAdvertisement, msgpack_bin, pack_response, request_id,
+    unpack_request, unpack_response, ResourceOptions, ResourceStatus, ResourceStrategy,
 };
 use reticulum::resource::manager::RequestEvent;
 use reticulum::transport::{Transport, TransportConfig};
@@ -127,7 +127,9 @@ fn request_and_response_wire_formats_match_python() {
     assert_eq!(rid.as_slice(), &[0x22; 16]);
     assert_eq!(response, b"response-data");
 
-    let re_packed = pack_response(&rid, &response);
+    // `unpack_response` unwraps binary elements to their contents, so a
+    // byte-for-byte roundtrip re-wraps them as msgpack bins first.
+    let re_packed = pack_response(&rid, &msgpack_bin(&response));
     assert_eq!(hex(&re_packed), golden_resp);
 
     // Request id is the truncated hash of the packed request
@@ -372,7 +374,7 @@ async fn request_response_roundtrip() {
 
     let dest_hash = destination.lock().await.desc.address_hash;
     server
-        .register_request_handler(&dest_hash, "echo", |ctx| Some(ctx.data.clone()))
+        .register_request_handler(&dest_hash, "echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
         .await;
 
     // Send a request and await the response
@@ -402,7 +404,7 @@ async fn request_response_large_resource_backed() {
 
     server
         .register_request_handler(&dest_hash, "bulk", move |_ctx| {
-            Some(response_payload.clone())
+            Some(msgpack_bin(&response_payload))
         })
         .await;
 
@@ -429,7 +431,7 @@ async fn split_response_can_be_awaited_after_completion_event() {
     let response_payload = payload.clone();
     server
         .register_request_handler(&dest_hash, "split-bulk", move |_ctx| {
-            Some(response_payload.clone())
+            Some(msgpack_bin(&response_payload))
         })
         .await;
 

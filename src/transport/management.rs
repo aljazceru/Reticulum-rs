@@ -27,7 +27,9 @@ pub struct ManagementSnapshot {
     pub paths: Vec<crate::transport::PathTableSnapshotEntry>,
     /// (link_table, inbound, outbound) link counts
     pub link_counts: (usize, usize, usize),
-    pub blackholes: Vec<Vec<u8>>,
+    /// Packed blackhole table in the Python wire format
+    /// (msgpack dict `{hash: {source, until, reason}}`).
+    pub blackholes: Vec<u8>,
 }
 
 /// Whether a request from `remote_identity` is allowed
@@ -223,15 +225,10 @@ fn value_u64(value: &rmpv::Value) -> Option<u64> {
 }
 
 /// Encode a blackhole-list response
-/// (Python `blackhole_list_handler`: the list of blackholed identity
-/// hashes as msgpack byte arrays).
-pub fn encode_blackhole_list(identities: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    mp::write_array_len(&mut out, identities.len() as u32).ok();
-    for identity in identities {
-        mp::write_bin(&mut out, identity).ok();
-    }
-    out
+/// (Python `blackhole_list_handler`: the packed `blackholed_identities`
+/// dict, msgpack `{hash: {"source", "until", "reason"}}`).
+pub fn encode_blackhole_list(packed_table: &[u8]) -> Vec<u8> {
+    packed_table.to_vec()
 }
 
 /// Build the remote-management inbound destination
@@ -300,19 +297,43 @@ mod tests {
     }
 
     #[test]
-    fn blackhole_list_encoding_roundtrip() {
-        let encoded = encode_blackhole_list(&[vec![1, 2, 3], vec![4, 5, 6]]);
+    fn blackhole_list_encoding_passthrough() {
+        // The handler serves the packed Python-format table verbatim.
+        let mut table = Vec::new();
+        mp::write_map_len(&mut table, 1).ok();
+        mp::write_bin(&mut table, &[7u8; 16]).ok();
+        mp::write_map_len(&mut table, 3).ok();
+        mp::write_str(&mut table, "source").ok();
+        mp::write_bin(&mut table, &[1u8; 16]).ok();
+        mp::write_str(&mut table, "until").ok();
+        mp::write_nil(&mut table).ok();
+        mp::write_str(&mut table, "reason").ok();
+        mp::write_nil(&mut table).ok();
 
-        // Decode with rmpv for the roundtrip check.
+        let encoded = encode_blackhole_list(&table);
+        assert_eq!(encoded, table);
+
+        // Decode with rmpv: the wire shape is the Python dict.
         let mut cursor = std::io::Cursor::new(&encoded);
         let value = rmpv::decode::read_value(&mut cursor).ok().unwrap();
-        let rmpv::Value::Array(items) = value else {
-            panic!("expected msgpack array");
+        let rmpv::Value::Map(pairs) = value else {
+            panic!("expected msgpack map");
         };
-        assert_eq!(items.len(), 2);
+        assert_eq!(pairs.len(), 1);
+        let (key, entry) = &pairs[0];
         assert_eq!(
-            items[0],
-            rmpv::Value::Binary(vec![1, 2, 3].into_iter().collect())
+            key,
+            &rmpv::Value::Binary(vec![7u8; 16].into_iter().collect())
         );
+        let rmpv::Value::Map(entry_pairs) = entry else {
+            panic!("expected entry map");
+        };
+        let keys: Vec<_> = entry_pairs
+            .iter()
+            .map(|(k, _)| k.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(keys.contains(&"source".to_string()));
+        assert!(keys.contains(&"until".to_string()));
+        assert!(keys.contains(&"reason".to_string()));
     }
 }

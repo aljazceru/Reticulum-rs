@@ -48,7 +48,7 @@ mod path_requests;
 mod path_table;
 mod tunnels;
 
-pub use blackholes::{BLACKHOLE_TIMEOUT, Blackholes, SharedBlackholes};
+pub use blackholes::{BlackholeEntry, Blackholes, SharedBlackholes};
 
 use self::announce_limits::AnnounceLimits;
 use self::announce_table::AnnounceTable;
@@ -147,9 +147,12 @@ pub struct TransportConfig {
     /// the initial round of announces is over.
     announce_forever: bool,
 
-    /// Publish this node's blackhole list in announces
+    /// Publish this node's blackhole list
     /// (Python `publish_blackhole_enabled`).
     blackhole_publish: bool,
+    /// Remote identities whose persisted blackhole lists are trusted on
+    /// reload (Python `Reticulum.blackhole_sources`).
+    blackhole_sources: Vec<crate::hash::AddressHash>,
 
     /// Storage backend for identity & destination persistence. When unset,
     /// known destinations and ratchets are kept in memory only.
@@ -297,6 +300,10 @@ pub(crate) struct TransportHandler {
     /// (Python `Transport.remote_management_allowed`).
     remote_management_allowed: Arc<std::sync::RwLock<Vec<AddressHash>>>,
 
+    /// Trusted remote blackhole-list sources
+    /// (Python `Reticulum.blackhole_sources`).
+    blackhole_sources: Vec<AddressHash>,
+
     cancel: CancellationToken,
 }
 
@@ -325,6 +332,7 @@ impl TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             blackhole_publish: false,
+            blackhole_sources: Vec::new(),
             storage: None,
             use_implicit_proof: true,
             timer_config: TimerConfig::default(),
@@ -376,10 +384,20 @@ impl TransportConfig {
         self
     }
 
-    /// Publish the blackhole list in announces
+    /// Publish the blackhole list
     /// (Python `Reticulum.publish_blackhole_enabled`).
     pub fn set_blackhole_publish(mut self, publish: bool) -> Self {
         self.blackhole_publish = publish;
+        self
+    }
+
+    /// Trust persisted blackhole lists from these remote identities
+    /// (Python `Reticulum.blackhole_sources`).
+    pub fn set_blackhole_sources(
+        mut self,
+        sources: Vec<crate::hash::AddressHash>,
+    ) -> Self {
+        self.blackhole_sources = sources;
         self
     }
 
@@ -404,6 +422,7 @@ impl Default for TransportConfig {
             restart_outlinks: false,
             announce_forever: false,
             blackhole_publish: false,
+            blackhole_sources: Vec::new(),
             storage: None,
             use_implicit_proof: true,
             timer_config: Default::default(),
@@ -440,6 +459,7 @@ impl Transport {
         let name = config.name.clone();
         let reroute_eager = config.reroute_eager;
         let blackhole_publish = config.blackhole_publish;
+        let blackhole_sources = config.blackhole_sources.clone();
         let storage = config.storage.clone();
         let identity = config.identity.clone();
         let blackholes = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -465,6 +485,7 @@ impl Transport {
             path_requests,
             tunnels: Tunnels::new(),
             remote_management_allowed: Arc::new(std::sync::RwLock::new(Vec::new())),
+            blackhole_sources,
             fixed_dest_tunnel_synthesize: tunnels::create_tunnel_synthesize_destination()
                 .desc
                 .address_hash,
@@ -560,27 +581,118 @@ impl Transport {
     }
 
     /// Blackhole an identity: its announces and paths are dropped
-    /// (Python `Reticulum.blackhole_identity`).
-    pub async fn blackhole_identity(&self, identity: AddressHash) {
-        let own = *self.handler.lock().await.config.identity.address_hash();
-        self.handler
-            .lock()
-            .await
-            .blackholes
-            .write()
-            .await
-            .blackhole(identity, own);
+    /// (Python `Reticulum.blackhole_identity`). Locally sourced entries
+    /// are persisted to `<storage>/blackhole/local` when storage is set.
+    pub async fn blackhole_identity(
+        &self,
+        identity: AddressHash,
+        until: Option<f64>,
+        reason: Option<String>,
+    ) {
+        let handler = self.handler.lock().await;
+        let own = *handler.config.identity.address_hash();
+        let storage = handler.storage.clone();
+        let mut blackholes = handler.blackholes.write().await;
+        blackholes.blackhole(identity, own, until, reason);
+        if let Some(storage) = storage {
+            if let Err(error) = blackholes.persist_local(&*storage, &own) {
+                log::error!("tp({}): could not persist blackhole list: {error:?}", self.name);
+            }
+        }
+        drop(blackholes);
+        drop(handler);
+        self.remove_blackholed_paths().await;
     }
 
-    /// Remove an identity from the blackhole list.
+    /// Remove an identity from the blackhole list
+    /// (Python `Reticulum.unblackhole_identity`), persisting the local
+    /// list afterwards.
     pub async fn unblackhole_identity(&self, identity: &AddressHash) -> bool {
-        self.handler
-            .lock()
-            .await
+        let handler = self.handler.lock().await;
+        let own = *handler.config.identity.address_hash();
+        let storage = handler.storage.clone();
+        let mut blackholes = handler.blackholes.write().await;
+        let removed = blackholes.unblackhole(identity);
+        if removed {
+            if let Some(storage) = storage {
+                if let Err(error) = blackholes.persist_local(&*storage, &own) {
+                    log::error!("tp({}): could not persist blackhole list: {error:?}", self.name);
+                }
+            }
+        }
+        removed
+    }
+
+    /// Load persisted blackhole lists into the table and drop paths of
+    /// blackholed identities (Python `Transport.reload_blackhole`).
+    pub async fn reload_blackholes(&self) -> usize {
+        let handler = self.handler.lock().await;
+        let own = *handler.config.identity.address_hash();
+        let storage = handler.storage.clone();
+        let Some(storage) = storage else {
+            return 0;
+        };
+        let allowed = handler.blackhole_sources.clone();
+        let mut blackholes = handler.blackholes.write().await;
+        let loaded = blackholes.reload(&*storage, &own, &allowed);
+        drop(blackholes);
+        drop(handler);
+        if loaded > 0 {
+            log::info!("tp({}): loaded {loaded} blackholed identities", self.name);
+            self.remove_blackholed_paths().await;
+        }
+        loaded
+    }
+
+    /// Persist a blackhole list fetched from a remote publisher
+    /// (Python `Discovery.BlackholeUpdater` writes the response to
+    /// `blackhole/<hex source identity>`).
+    pub async fn persist_blackhole_source(&self, publisher: &AddressHash, packed: &[u8]) {
+        let handler = self.handler.lock().await;
+        let Some(storage) = handler.storage.clone() else {
+            return;
+        };
+        let path = format!(
+            "blackhole/{}",
+            publisher.to_hex_string()
+        );
+        if let Err(error) = storage.write(&path, packed) {
+            log::error!("tp({}): could not persist blackhole source list: {error:?}", self.name);
+        }
+    }
+
+    /// Drop every path-table entry whose destination belongs to a
+    /// blackholed identity (Python `Transport.remove_blackholed_paths`).
+    pub async fn remove_blackholed_paths(&self) -> usize {
+        let mut handler = self.handler.lock().await;
+        let blackholed: Vec<AddressHash> = handler
             .blackholes
-            .write()
+            .read()
             .await
-            .unblackhole(identity)
+            .blackholed_identities();
+        let mut dropped = 0;
+        let keys: Vec<AddressHash> =
+            handler.path_table.iter().map(|(hash, _)| *hash).collect();
+        for destination in keys {
+            let Some(identity) =
+                handler.known_destinations.recall_no_use(&destination)
+            else {
+                continue;
+            };
+            let identity_hash = identity.address_hash;
+            if blackholed.contains(&identity_hash)
+                && handler.path_table.drop_path(&destination)
+            {
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            log::info!(
+                "tp({}): removed {dropped} destinations associated with blackholed identities from path table",
+                self.name
+            );
+        }
+        dropped
     }
 
     /// Whether an identity is blackholed.
@@ -1212,12 +1324,19 @@ impl Transport {
         }
 
         let packed = pack_request(path, data);
-        let rid = make_request_id(&packed);
 
-        if packed.len() <= link_guard.mdu() {
+        let rid = if packed.len() <= link_guard.mdu() {
             let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
             handler.send_packet(packet).await;
+            // A packet-carried request is tracked by its packet hashable
+            // part (Python `PacketReceipt.truncated_hash`), which is the
+            // id a responder echoes back.
+            request_id_from_packet(&packet)
         } else {
+            // A resource-carried request keeps the packed-payload id
+            // (Python `Link.request` sets `request_id =
+            // truncated_hash(packed_request)`).
+            let rid = make_request_id(&packed);
             let opts = ResourceOptions {
                 request_id: Some(rid),
                 is_response: false,
@@ -1237,7 +1356,8 @@ impl Transport {
                 .entry(*link_guard.id())
                 .or_default()
                 .push(resource);
-        }
+            rid
+        };
 
         handler
             .resources
@@ -1623,13 +1743,24 @@ impl Transport {
     }
 
     /// Load the known-destinations store from storage
-    /// (Python `Identity.load_known_destinations`).
+    /// (Python `Identity.load_known_destinations`). Persisted blackhole
+    /// lists are reloaded afterwards, exactly like Python's
+    /// `Transport.start` ordering, so blackholed paths are dropped with
+    /// the recalled-identity table available.
     pub async fn load_known_destinations(&self) -> Result<(), RnsError> {
         let mut handler = self.handler.lock().await;
 
         let storage = handler.storage.clone().ok_or(RnsError::Storage)?;
 
-        handler.known_destinations.load(&*storage)
+        handler.known_destinations.load(&*storage)?;
+
+        // Python `Transport.start`: reload persisted blackhole lists once
+        // the recalled identities are available, then drop blackholed
+        // paths.
+        drop(handler);
+        self.reload_blackholes().await;
+
+        Ok(())
     }
 
     /// The current ratchet key of a destination
@@ -2503,13 +2634,32 @@ async fn handle_incoming_request<'a>(
     }
 }
 
+/// The request id of a packet-carried request
+/// (Python `PacketReceipt.truncated_hash` over `Packet.get_hashable_part`):
+/// truncated SHA-256 of `[flags & 0x0F] ++ destination ++ context ++ data`.
+fn request_id_from_packet(packet: &Packet) -> AddressHash {
+    let mut hashable = Vec::with_capacity(2 + 16 + 1 + packet.data.len());
+    // Python packs `(header_type << 6) | (context_flag << 5) |
+    // (transport_type << 4) | (destination_type << 2) | packet_type`
+    // and masks the byte with 0x0F, keeping destination type and
+    // packet type.
+    let flags = ((packet.header.header_type as u8) << 6)
+        | ((packet.header.context_flag as u8) << 5)
+        | ((packet.header.propagation_type as u8) << 4)
+        | ((packet.header.destination_type as u8) << 2)
+        | (packet.header.packet_type as u8);
+    hashable.push(flags & 0x0f);
+    hashable.extend_from_slice(packet.destination.as_slice());
+    hashable.push(packet.context as u8);
+    hashable.extend_from_slice(packet.data.as_slice());
+    make_request_id(&hashable)
+}
+
 async fn handle_request_or_response_packet<'a>(
     packet: &Packet,
     link: &Arc<Mutex<Link>>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
-    let rid_from_plaintext = |plaintext: &[u8]| make_request_id(plaintext);
-
     let link_guard = link.lock().await;
     let mut buffer = [0u8; PACKET_MDU];
     let Ok(plaintext) = link_guard.decrypt(packet.data.as_slice(), &mut buffer[..]) else {
@@ -2523,7 +2673,15 @@ async fn handle_request_or_response_packet<'a>(
                 log::debug!("tp: could not unpack request payload");
                 return false;
             };
-            let rid = rid_from_plaintext(plaintext);
+            // The request id a packet-carried request is known by is the
+            // truncated hash of the *packet's hashable part*
+            // (Python `Packet.get_hashable_part`:
+            // `[flags & 0x0F] ++ raw[2:]` = flags-nibble, destination,
+            // context, data), NOT a hash of the packed payload — that
+            // scheme is only used for resource-carried requests
+            // (`Link.request` sets `request_id =
+            // truncated_hash(packed_request)` there).
+            let rid = request_id_from_packet(packet);
             drop(link_guard);
             handle_incoming_request(link, rid, time, path_hash, data, handler).await;
             true
@@ -4157,9 +4315,9 @@ async fn manage_transport(
                             .await
                             .release(timer_config.keep_packet_cached);
 
-                        // Clean expired blackhole entries.
-                        let own = *handler.config.identity.address_hash();
-                        handler.blackholes.write().await.clean(&own);
+                        // Clean expired blackhole entries
+                        // (Python `blackhole_check_interval` job).
+                        handler.blackholes.write().await.clean();
                     },
                 }
             }
@@ -4830,14 +4988,7 @@ impl Transport {
                         announce_hash: entry.packet_hash,
                     })
                     .collect();
-                let blackholes = handler
-                    .blackholes
-                    .read()
-                    .await
-                    .blackholed_identities()
-                    .iter()
-                    .map(|hash| hash.as_slice().to_vec())
-                    .collect();
+                let blackholes = handler.blackholes.read().await.pack_table();
 
                 *snapshot.write().unwrap() = management::ManagementSnapshot {
                     stats,
@@ -4928,17 +5079,8 @@ impl Transport {
         let handler = self.handler.clone();
         tokio::spawn(async move {
             loop {
-                let handler = handler.lock().await;
-                let blackholes = handler
-                    .blackholes
-                    .read()
-                    .await
-                    .blackholed_identities()
-                    .iter()
-                    .map(|hash| hash.as_slice().to_vec())
-                    .collect();
+                let blackholes = handler.lock().await.blackholes.read().await.pack_table();
                 snapshot.write().unwrap().blackholes = blackholes;
-                drop(handler);
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });

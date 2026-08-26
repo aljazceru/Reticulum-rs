@@ -269,7 +269,7 @@ async fn python_request_to_rust() {
     let hash = destination.lock().await.desc.address_hash;
 
     transport
-        .register_request_handler(&hash, "echo", |ctx| Some(ctx.data.clone()))
+        .register_request_handler(&hash, "echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
         .await;
 
     let partner = spawn_partner("request-client", Some(&hash.to_hex_string()), 5000).await;

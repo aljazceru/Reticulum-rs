@@ -40,6 +40,21 @@ use reticulum_daemon::config::{Config, InterfaceConfig};
 /// it.
 const IDENTITY_FILE: &str = "identity";
 
+/// Parse `blackhole_sources` identity hashes (Python validates
+/// `len(hexhash) == 32` and raises otherwise).
+fn parse_blackhole_sources(values: &[String]) -> Result<Vec<AddressHash>, String> {
+    values
+        .iter()
+        .map(|value| {
+            if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(format!("invalid identity hash for blackhole source: {value}"));
+            }
+            AddressHash::new_from_hex_string(value)
+                .map_err(|_| format!("invalid identity hash for blackhole source: {value}"))
+        })
+        .collect()
+}
+
 fn parse_management_allowed(values: &[String]) -> Result<Vec<AddressHash>, String> {
     values
         .iter()
@@ -135,6 +150,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = std::sync::Arc::new(
         TransportConfig::new(&instance_name, &identity, config.reticulum.enable_transport)
             .set_retransmit(config.reticulum.enable_transport)
+            .set_blackhole_publish(config.reticulum.publish_blackhole)
+            .set_blackhole_sources(parse_blackhole_sources(
+                &config.reticulum.blackhole_sources,
+            )?)
             .set_storage(std::sync::Arc::new(FsStorage::new(
                 config_path.join("storage").to_string_lossy().into_owned(),
             )))
@@ -853,6 +872,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // management destinations when enabled in the configuration).
     if config.reticulum.probe_destination {
         transport.enable_probe_destination().await;
+    }
+
+    if config.reticulum.publish_blackhole {
+        transport.enable_blackhole_publishing().await;
+        log::info!(
+            "Enabled blackhole list publishing for transport identity {}",
+            transport.identity_hash().await.to_hex_string()
+        );
+    }
+
+    if !config.reticulum.blackhole_sources.is_empty() {
+        // Python `Reticulum.__blackhole_sources` enables the updater.
+        let sources = parse_blackhole_sources(&config.reticulum.blackhole_sources)?;
+        reticulum_discovery::BlackholeUpdater::start(
+            &transport,
+            sources,
+            std::time::Duration::from_secs(12 * 60 * 60),
+        );
+        log::info!(
+            "Enabled blackhole updater for {} source(s)",
+            config.reticulum.blackhole_sources.len()
+        );
     }
 
     if config.reticulum.remote_management {

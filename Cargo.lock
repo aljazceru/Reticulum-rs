@@ -1381,6 +1381,7 @@ dependencies = [
  "log",
  "rand_core",
  "reticulum-core",
+ "reticulum-discovery",
  "rmp",
  "rmpv",
  "serde",

@@ -162,7 +162,7 @@ async fn blackhole_blocks_announces() {
 
     // Blackhole the identity and announce again: must not be delivered
     let identity_hash = other_identity.address_hash();
-    client.blackhole_identity(*identity_hash).await;
+    client.blackhole_identity(*identity_hash, None, None).await;
     assert!(client.is_blackholed(identity_hash).await);
 
     other.0.send_announce(&other.1, None).await;

@@ -843,12 +843,28 @@ pub fn unpack_response(data: &[u8]) -> Option<(AddressHash, Vec<u8>)> {
         return None;
     }
     let request_id = AddressHash::new(cursor[..len].try_into().ok()?);
-    cursor = &cursor[len..];
-    let data = rmp::decode::read_bin_len(&mut cursor).ok()? as usize;
-    if cursor.len() < data {
-        return None;
+    let rest = &cursor[len..];
+    // The response value may be any msgpack element (Python packs the
+    // handler's return value directly). Binary values are unwrapped to
+    // their contents — the convention for opaque payload echoes — while
+    // every other element (dicts, ints, bools, ...) is returned as its
+    // raw encoding for the caller to interpret.
+    let mut value_cursor: &[u8] = rest;
+    let value = rmpv::decode::read_value(&mut value_cursor).ok()?;
+    let consumed = rest.len() - value_cursor.len();
+    match value {
+        rmpv::Value::Binary(bytes) => Some((request_id, bytes.to_vec())),
+        _ => Some((request_id, rest[..consumed].to_vec())),
     }
-    Some((request_id, cursor[..data].to_vec()))
+}
+
+/// Wrap opaque bytes as a msgpack bin value (Python request handlers
+/// receive `data` as bytes; responses must be valid msgpack elements,
+/// so binary responses are bin-wrapped like umsgpack would).
+pub fn msgpack_bin(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    rmp::encode::write_bin(&mut out, data).expect("write bin");
+    out
 }
 
 /// Pack a request payload `[time, path_hash, data]` like Python
@@ -870,22 +886,29 @@ pub fn request_id(packed_request: &[u8]) -> AddressHash {
 
 /// Unpack a packed request `[time, path_hash, data]`.
 pub fn unpack_request(data: &[u8]) -> Option<(f64, AddressHash, Vec<u8>)> {
+    // Python `Link.request`: `[time.time(), truncated_hash(path), data]`
+    // where `data` is `None` (msgpack `nil`) when the request carries no
+    // payload.
     let mut cursor: &[u8] = data;
     if rmp::decode::read_array_len(&mut cursor).ok()? != 3 {
         return None;
     }
-    let time = rmp::decode::read_f64(&mut cursor).ok()?;
-    let len = rmp::decode::read_bin_len(&mut cursor).ok()? as usize;
-    if cursor.len() < len || len != 16 {
+    let time = rmpv::decode::read_value(&mut cursor).ok()?.as_f64()?;
+    let path = rmpv::decode::read_value(&mut cursor).ok()?;
+    let path_bytes = match &path {
+        rmpv::Value::Binary(bytes) => bytes.as_slice(),
+        _ => return None,
+    };
+    if path_bytes.len() != 16 {
         return None;
     }
-    let path_hash = AddressHash::new(cursor[..len].try_into().ok()?);
-    cursor = &cursor[len..];
-    let dlen = rmp::decode::read_bin_len(&mut cursor).ok()? as usize;
-    if cursor.len() < dlen {
-        return None;
-    }
-    Some((time, path_hash, cursor[..dlen].to_vec()))
+    let path_hash = AddressHash::new(path_bytes.try_into().ok()?);
+    let payload = match rmpv::decode::read_value(&mut cursor).ok()? {
+        rmpv::Value::Nil => Vec::new(),
+        rmpv::Value::Binary(bytes) => bytes.to_vec(),
+        _ => return None,
+    };
+    Some((time, path_hash, payload))
 }
 
 /// Pack a response `[request_id, response]`.
@@ -893,7 +916,10 @@ pub fn pack_response(request_id: &AddressHash, response: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + response.len());
     rmp::encode::write_array_len(&mut out, 2).unwrap();
     rmp::encode::write_bin(&mut out, request_id.as_slice()).unwrap();
-    rmp::encode::write_bin(&mut out, response).unwrap();
+    // Python packs the handler's return value with umsgpack, so handler
+    // output is already a valid msgpack element and is spliced in
+    // verbatim (dicts become nested maps, opaque blobs stay bins).
+    out.extend_from_slice(response);
     out
 }
 

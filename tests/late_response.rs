@@ -41,7 +41,7 @@ async fn response_before_await_is_delivered() {
         )
         .await;
     let dest_hash = destination.lock().await.desc.address_hash;
-    b.register_request_handler(&dest_hash, "/echo", |ctx| Some(ctx.data.clone()))
+    b.register_request_handler(&dest_hash, "/echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
         .await;
     b.send_announce(&destination, None).await;
 

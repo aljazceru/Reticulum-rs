@@ -43,6 +43,16 @@ pub struct ReticulumConfig {
     /// (Python `enable_remote_management`).
     #[serde(default, alias = "enable_remote_management")]
     pub remote_management: bool,
+    /// Publish this node's blackhole list over the
+    /// `rnstransport.info.blackhole` destination
+    /// (Python `publish_blackhole`).
+    #[serde(default)]
+    pub publish_blackhole: bool,
+    /// Trusted remote blackhole-list publishers, as 32-character hex
+    /// identity hashes (Python `blackhole_sources`; non-empty enables
+    /// the blackhole updater).
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub blackhole_sources: Vec<String>,
     /// Enable the probe destination (Python `enable_remote_probe`).
     #[serde(default, alias = "respond_to_probes", alias = "enable_remote_probe")]
     pub probe_destination: bool,
@@ -580,6 +590,8 @@ impl Default for ReticulumConfig {
     fn default() -> Self {
         Self {
             remote_management: false,
+            publish_blackhole: false,
+            blackhole_sources: Vec::new(),
             probe_destination: false,
             remote_management_allowed: Vec::new(),
             enable_transport: false,
