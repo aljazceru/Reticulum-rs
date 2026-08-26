@@ -621,6 +621,10 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
     if !options.silent {
         println!("Advertising file resource");
     }
+    // Subscribe BEFORE starting the transfer: the broadcast channel has
+    // no replay, so a fast completion must not race the subscription in
+    // `wait_for_transfer`.
+    let mut events = transport.resource_events().await;
     let resource_hash = transport
         .send_resource_with_options(
             &link,
@@ -635,7 +639,7 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
         .map_err(|err| format!("Could not start transfer: {err:?}"))?;
 
     wait_for_transfer(
-        &transport,
+        &mut events,
         &resource_hash,
         options.timeout.max(Duration::from_secs(60)),
         !options.silent,
@@ -687,6 +691,10 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
     if !options.silent {
         println!("Requesting file from remote");
     }
+    // Subscribe BEFORE the request: the server starts the file resource
+    // concurrently with the permission response, so a fast-completing
+    // resource must not race past a later subscription.
+    let mut events = transport.resource_events().await;
     let request_id = transport
         .request(&link, "fetch_file", options.file.as_bytes())
         .await
@@ -718,9 +726,7 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
 
     // The response resource follows; wait for it to complete.
     let deadline = tokio::time::Instant::now() + options.timeout.max(Duration::from_secs(60));
-    let mut events = transport.resource_events().await;
     let saved = loop {
-        assert!(tokio::time::Instant::now() < deadline, "transfer timed out");
         let event = tokio::time::timeout_at(deadline, events.recv())
             .await
             .map_err(|_| "transfer timed out".to_string())?
@@ -782,12 +788,11 @@ fn transfer_event_match(
 ///
 /// Progress lines are flushed so `\r` updates render live.
 pub async fn wait_for_transfer(
-    transport: &Transport,
+    events: &mut tokio::sync::broadcast::Receiver<reticulum::resource::ResourceEvent>,
     resource_hash: &AddressHash,
     timeout: Duration,
     show_progress: bool,
 ) -> Result<(), String> {
-    let mut events = transport.resource_events().await;
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_percent = -1.0f64;
     loop {

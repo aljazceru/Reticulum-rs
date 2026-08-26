@@ -885,11 +885,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !config.reticulum.blackhole_sources.is_empty() {
         // Python `Reticulum.__blackhole_sources` enables the updater.
         let sources = parse_blackhole_sources(&config.reticulum.blackhole_sources)?;
-        reticulum_discovery::BlackholeUpdater::start(
+        let _updater = reticulum_discovery::BlackholeUpdater::start(
             &transport,
             sources,
             std::time::Duration::from_secs(12 * 60 * 60),
-        );
+        )
+        .await;
         log::info!(
             "Enabled blackhole updater for {} source(s)",
             config.reticulum.blackhole_sources.len()

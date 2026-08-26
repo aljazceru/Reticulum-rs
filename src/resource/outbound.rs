@@ -357,6 +357,18 @@ impl OutgoingResource {
         }
     }
 
+    /// Resend the current advertisement WITHOUT resetting the retry
+    /// counter (Python's watchdog re-sends `advertisement_packet` and
+    /// only decrements; `advertise()` itself never resets retries).
+    pub fn resend_advertisement(&mut self, link: &Link, tx: &mut ResourceTx) {
+        let packed = self.advertisement().pack();
+        if let Ok(packet) = link.context_packet(&packed, PacketContext::ResourceAdvertisement) {
+            self.adv_sent = Some(unix_time());
+            self.last_activity = self.adv_sent.unwrap_or_default();
+            tx.push(packet);
+        }
+    }
+
     /// Send (or queue) the advertisement packet. Mirrors Python `advertise`.
     pub fn advertise(&mut self, link: &Link, tx: &mut ResourceTx) -> Result<(), RnsError> {
         let packed = self.advertisement().pack();
@@ -565,7 +577,7 @@ impl OutgoingResource {
                         return true;
                     }
                     self.retries_left -= 1;
-                    let _ = self.advertise(link, tx);
+                    self.resend_advertisement(link, tx);
                 }
                 false
             }
@@ -595,7 +607,29 @@ impl OutgoingResource {
                         return true;
                     }
                     self.retries_left -= 1;
-                    // Python queries the network cache here; we simply retry
+                    // Python queries the network cache for the expected
+                    // proof packet here (`Resource.AWAITING_PROOF`): the
+                    // peer that already has the proof re-sends it from
+                    // its own packet cache.
+                    let mut expected_proof = Vec::with_capacity(64);
+                    expected_proof.extend_from_slice(self.hash.as_slice());
+                    expected_proof.extend_from_slice(self.expected_proof.as_slice());
+                    let expected_packet_hash = crate::hash::Hash::new_from_slice(
+                        &{
+                            let mut hasher = crate::hash::Hash::generator();
+                            hasher.update([0x0f]);
+                            hasher.update(link.id().as_slice());
+                            hasher.update([PacketContext::ResourceProof as u8]);
+                            hasher.update(&expected_proof);
+                            hasher.finalize()
+                        },
+                    );
+                    if let Ok(cache_request) = link.context_packet(
+                        expected_packet_hash.as_slice(),
+                        PacketContext::CacheRequest,
+                    ) {
+                        tx.push(cache_request);
+                    }
                     self.last_part_sent = now;
                 }
                 false

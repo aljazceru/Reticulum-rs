@@ -61,7 +61,25 @@ pub type AsyncRequestHandler = Arc<
 pub(crate) struct SplitAssembly {
     pub(crate) data: Vec<u8>,
     pub(crate) metadata: Option<Vec<u8>>,
+    /// Expected next segment index (segments must arrive contiguously:
+    /// Python's sender only advertises segment n+1 after segment n's
+    /// proof, so anything else is a hostile or broken peer).
+    pub(crate) next_index: usize,
+    /// Total segments and logical size fixed by segment one.
+    pub(crate) total_segments: usize,
+    pub(crate) data_size: usize,
+    /// Last accepted segment time (stale assemblies expire).
+    pub(crate) last_activity: f64,
 }
+
+/// Split assemblies whose sender disappears mid-transfer expire after
+/// this long without progress (Python re-requests would keep a live
+/// sender under the link RTT scale, not minutes).
+const SPLIT_ASSEMBLY_TIMEOUT: f64 = 300.0;
+
+/// Assemblies may only grow to their advertised logical size (plus a
+/// small tolerance), never multiples of it.
+const SPLIT_ASSEMBLY_GRACE_BYTES: f64 = 1024.0;
 
 pub(crate) struct ResourceManager {
     pub out: HashMap<LinkId, Vec<OutgoingResource>>,
@@ -476,11 +494,40 @@ impl ResourceManager {
                             .or_insert_with(|| SplitAssembly {
                                 data: Vec::new(),
                                 metadata: None,
+                                next_index: 1,
+                                total_segments: resource.total_segments,
+                                data_size: resource.advertisement_of().data_size,
+                                last_activity: super::unix_time(),
                             });
+
+                        // Segment invariants: contiguous, no duplicates,
+                        // and a consistent logical transfer (index, total
+                        // and size may not change mid-assembly).
+                        let advertisement = resource.advertisement_of();
+                        let inconsistent = resource.segment_index != assembly.next_index
+                            || resource.total_segments != assembly.total_segments
+                            || advertisement.data_size != assembly.data_size;
+                        if inconsistent {
+                            resource.status = ResourceStatus::Corrupt;
+                            self.split_assembly.remove(&resource.original_hash);
+                            let _ = self.events.send(ResourceEvent {
+                                link_id: *link.id(),
+                                hash: resource.hash,
+                                status: ResourceStatus::Corrupt,
+                                progress: 0.0,
+                                data: None,
+                                metadata: None,
+                                advertisement: Some(advertisement),
+                            });
+                            continue;
+                        }
+
                         if resource.segment_index == 1 && assembly.metadata.is_none() {
                             assembly.metadata = resource.metadata.clone();
                         }
                         assembly.data.extend_from_slice(&data);
+                        assembly.next_index += 1;
+                        assembly.last_activity = super::unix_time();
 
                         if is_final {
                             let Some(complete) = self.split_assembly.remove(&resource.original_hash)
@@ -536,6 +583,21 @@ impl ResourceManager {
                                 data: response,
                                 metadata: event_metadata.clone(),
                             },
+                            // A response resource with metadata is a FILE
+                            // response (Python `Link.resource_concluded`:
+                            // `if resource.has_metadata: handle_response(
+                            // ..., resource.data, ..., metadata=...)`):
+                            // the raw bytes are the response, no
+                            // `[rid, data]` envelope exists.
+                            None if event_metadata.is_some() => {
+                                self.completed_responses
+                                    .insert(request_id, Some(full_data.clone()));
+                                RequestEvent::Response {
+                                    request_id,
+                                    data: full_data.clone(),
+                                    metadata: event_metadata.clone(),
+                                }
+                            }
                             None => RequestEvent::Failed { request_id },
                         };
                         self.request_events
@@ -829,6 +891,19 @@ impl ResourceManager {
         });
         self.split_assembly
             .retain(|hash, _| !abandoned.contains(hash));
+
+        // A split assembly whose sender stopped after a SUCCESSFUL
+        // non-final segment has no live resource left to fail it: expire
+        // stale assemblies so an abandoned (or hostile) sender cannot pin
+        // unbounded memory (Python writes segments to disk instead and
+        // cleans its temporary files).
+        let now = super::unix_time();
+        self.split_assembly.retain(|_, assembly| {
+            // next_index == 1 means nothing was accepted yet.
+            assembly.next_index > 0
+                && (assembly.data.len() as f64) < (assembly.data_size as f64) * 2.0 + SPLIT_ASSEMBLY_GRACE_BYTES
+                && now < assembly.last_activity + SPLIT_ASSEMBLY_TIMEOUT
+        });
     }
 }
 
@@ -971,5 +1046,47 @@ mod tests {
             .handle_request_data(&link, &valid_exhausted)
             .packets
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod split_validation_tests {
+    use super::*;
+
+    #[test]
+    fn response_unpack_unwraps_bins_keeps_other_elements_raw() {
+        // A Python bytes response stays unwrapped contents.
+        let mut packed = Vec::new();
+        rmp::encode::write_array_len(&mut packed, 2).unwrap();
+        rmp::encode::write_bin(&mut packed, &[0x22u8; 16]).unwrap();
+        rmp::encode::write_bin(&mut packed, b"response-data").unwrap();
+        let (rid, response) = unpack_response(&packed).unwrap();
+        assert_eq!(rid.as_slice(), &[0x22u8; 16][..]);
+        assert_eq!(response, b"response-data");
+
+        // A dict response returns its raw encoding for callers to parse.
+        let mut packed = Vec::new();
+        rmp::encode::write_array_len(&mut packed, 2).unwrap();
+        rmp::encode::write_bin(&mut packed, &[0x22u8; 16]).unwrap();
+        rmp::encode::write_map_len(&mut packed, 1).unwrap();
+        rmp::encode::write_bin(&mut packed, &[1u8; 16]).unwrap();
+        rmp::encode::write_str(&mut packed, "x").unwrap();
+        let (rid, response) = unpack_response(&packed).unwrap();
+        assert_eq!(rid.as_slice(), &[0x22u8; 16][..]);
+        assert!(response.starts_with(&[0x81]));
+    }
+
+    #[test]
+    fn request_unpack_accepts_nil_data() {
+        // Python link.request(path) with no payload packs [time, hash, None].
+        let mut packed = Vec::new();
+        rmp::encode::write_array_len(&mut packed, 3).unwrap();
+        rmp::encode::write_f64(&mut packed, 12345.678).unwrap();
+        rmp::encode::write_bin(&mut packed, &[0x11u8; 16]).unwrap();
+        rmp::encode::write_nil(&mut packed).unwrap();
+        let (time, path, data) = unpack_request(&packed).expect("nil data request");
+        assert!((time - 12345.678).abs() < 0.001);
+        assert_eq!(path.as_slice(), &[0x11u8; 16][..]);
+        assert!(data.is_empty());
     }
 }

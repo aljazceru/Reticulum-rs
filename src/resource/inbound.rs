@@ -168,6 +168,13 @@ impl IncomingResource {
         self.status = ResourceStatus::Transferring;
         let seg_len = HASHMAP_MAX_LEN;
         let hashes = hashmap.len() / MAPHASH_LEN;
+        // The segment index is attacker-controlled: bound it before the
+        // multiply so a hostile HMU cannot overflow the index arithmetic.
+        let max_segment = self.hashmap.len() / seg_len + 1;
+        if segment > max_segment {
+            log::debug!("resource: hashmap update segment out of range");
+            return;
+        }
         for i in 0..hashes {
             let idx = i + segment * seg_len;
             if idx >= self.hashmap.len() {
@@ -220,7 +227,12 @@ impl IncomingResource {
                 return;
             }
         };
-        let segment = segment as usize;
+        // `u64::try_into` instead of `as`: a hostile 128-bit-ish encoded
+        // integer must fail loudly rather than wrap.
+        let Ok(segment) = usize::try_from(segment) else {
+            log::debug!("resource: hashmap update segment out of range");
+            return;
+        };
         let hashmap = match rmp::decode::read_bin_len(&mut cursor) {
             Ok(len) => {
                 let len = len as usize;
@@ -496,15 +508,28 @@ impl IncomingResource {
             return Err(crate::error::RnsError::ResourceMsg("resource hash mismatch"));
         }
 
-        // Strip metadata header if present
-        if self.has_metadata && self.segment_index == 1 && data.len() >= 3 {
+        // Strip the `[3-byte metadata length][metadata]` prefix when the
+        // advertisement promised metadata. A prefix that does not fit the
+        // segment is corrupt data, not a payload (Python would slice past
+        // the end of the buffer and error).
+        if self.has_metadata && self.segment_index == 1 {
+            if data.len() < 3 {
+                self.status = ResourceStatus::Corrupt;
+                return Err(crate::error::RnsError::ResourceMsg(
+                    "metadata resource shorter than its length prefix",
+                ));
+            }
             let metadata_size =
                 ((data[0] as usize) << 16) | ((data[1] as usize) << 8) | (data[2] as usize);
-            if 3 + metadata_size <= data.len() {
-                self.metadata = Some(data[3..3 + metadata_size].to_vec());
-                self.assembled = Some(data.clone());
-                return Ok(data[3 + metadata_size..].to_vec());
+            if 3 + metadata_size > data.len() {
+                self.status = ResourceStatus::Corrupt;
+                return Err(crate::error::RnsError::ResourceMsg(
+                    "metadata length exceeds segment",
+                ));
             }
+            self.metadata = Some(data[3..3 + metadata_size].to_vec());
+            self.assembled = Some(data.clone());
+            return Ok(data[3 + metadata_size..].to_vec());
         }
 
         self.assembled = Some(data.clone());
@@ -699,6 +724,9 @@ impl IncomingResource {
         let processed = processed_segments * max_parts_per_segment
             + self.received_count as f64 * factor;
         let total = self.total_segments as f64 * max_parts_per_segment;
-        (processed / total).min(1.0)
+        // 1.0 is reserved for the proven final segment: all parts of the
+        // last segment being present is not completion until the proof
+        // validates.
+        (processed / total).min(0.999)
     }
 }

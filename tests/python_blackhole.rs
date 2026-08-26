@@ -207,7 +207,6 @@ async fn rust_updater_persists_python_list() {
     );
 
     // A fresh transport with the same storage restores the list.
-    let identity = PrivateIdentity::new_from_name("blackhole-rust-2");
     let transport2 = rust_transport(
         "bh-rust-c",
         4295,
