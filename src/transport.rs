@@ -1952,6 +1952,17 @@ impl TransportHandler {
     }
 
     async fn send(&self, message: TxMessage) {
+        // Early rejection of excessive hop counts
+        // (Python `Transport._outbound`:
+        // `if packet.hops > Transport.PATHFINDER_M-1: return False`).
+        if message.packet.header.hops as usize > PATHFINDER_M - 1 {
+            log::debug!(
+                "tp({}): dropping outbound packet with excessive hop count {}",
+                self.config.name,
+                message.packet.header.hops
+            );
+            return;
+        }
         self.packet_cache.lock().await.update(&message.packet);
         self.iface_manager.lock().await.send(message).await;
     }
@@ -3067,7 +3078,7 @@ async fn handle_announce<'a>(
     // ingress limiting. Announces for destinations with waiting path
     // requests are never limited.
     {
-        handler.iface_manager.lock().await.received_announce(&iface);
+        handler.iface_manager.lock().await.received_announce(&iface, packet.data.as_slice().len() + 18);
 
         let known_path = handler.path_table.get(&packet.destination).is_some();
         let pending_request = handler.path_requests.has_pending(&packet.destination);
@@ -3189,14 +3200,20 @@ async fn handle_announce<'a>(
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
         // requesting interface (Python `discovery_path_requests` handling).
-        if let Some(requesting_iface) = handler.path_requests.clear_discovery(&packet.destination) {
+        if let Some(requesting_ifaces) = handler.path_requests.clear_discovery(&packet.destination) {
             let hops = packet.header.hops + 1;
-            // Python retransmits to the interface the discovery request
-            // arrived on, not the announce ingress.
-            let to_iface = requesting_iface.unwrap_or(iface);
-            handler
-                .announce_table
-                .add_response(packet.destination, to_iface, hops, Duration::ZERO);
+            // Python sends the path response to every interface that
+            // batched onto the in-flight discovery request (1.5.0
+            // batching), falling back to the announce ingress.
+            let mut targets = requesting_ifaces;
+            if targets.is_empty() {
+                targets.push(iface);
+            }
+            for to_iface in targets {
+                handler
+                    .announce_table
+                    .add_response(packet.destination, to_iface, hops, Duration::ZERO);
+            }
             log::trace!(
                 "tp({}): got matching announce, answering waiting discovery path request for {}",
                 handler.config.name,
@@ -3289,7 +3306,7 @@ async fn handle_path_request<'a>(
         .iface_manager
         .lock()
         .await
-        .received_path_request(&iface);
+        .received_path_request(&iface, packet.data.as_slice().len() + 18);
 
     // The destination is local to this system: announce it directly to the
     // requestor as a path response (Python `local_destination.announce(path_response=True)`).
@@ -3413,7 +3430,7 @@ async fn handle_path_request<'a>(
             if other == iface || !online {
                 continue;
             }
-            handler.iface_manager.lock().await.sent_path_request(&other);
+            handler.iface_manager.lock().await.sent_path_request(&other, 0);
             handler
                 .request_path(&request.destination, Some(other), None)
                 .await;
@@ -3522,7 +3539,7 @@ async fn handle_path_request<'a>(
                 continue;
             }
 
-            handler.iface_manager.lock().await.sent_path_request(&other);
+            handler.iface_manager.lock().await.sent_path_request(&other, 0);
             handler
                 .request_path(&request.destination, Some(other), Some(tag.clone()))
                 .await;
@@ -3549,7 +3566,7 @@ async fn handle_path_request<'a>(
                 .iface_manager
                 .lock()
                 .await
-                .sent_path_request(&client_iface);
+                .sent_path_request(&client_iface, 0);
             handler
                 .request_path(&request.destination, Some(client_iface), None)
                 .await;
@@ -3970,6 +3987,41 @@ async fn retransmit_announces<'a>(
     }
 }
 
+/// The early packet filter (Python `Transport.packet_filter`).
+/// Returns `false` when the packet must be dropped; violation-worthy
+/// conditions are accounted on the interface by the caller when this
+/// function reports them through the second return value.
+fn packet_filter_violation(packet: &Packet) -> Option<&'static str> {
+    use reticulum_core::packet::DestinationType;
+    match packet.header.destination_type {
+        DestinationType::Plain => {
+            if packet.header.packet_type != PacketType::Announce {
+                if packet.header.hops > 1 {
+                    return Some("Transported PLAIN packet with hops > 1");
+                }
+            } else {
+                return Some("Announce packet with PLAIN type");
+            }
+        }
+        DestinationType::Group => {
+            if packet.header.packet_type != PacketType::Announce {
+                if packet.header.hops > 1 {
+                    return Some("Transported GROUP packet with hops > 1");
+                }
+            } else {
+                return Some("Announce packet with GROUP type");
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Combined check: `true` when the packet passes the filter.
+fn packet_filter(packet: &Packet) -> bool {
+    packet_filter_violation(packet).is_none()
+}
+
 async fn manage_transport(
     handler: Arc<Mutex<TransportHandler>>,
     rx_receiver: Arc<Mutex<InterfaceRxReceiver>>,
@@ -4015,6 +4067,18 @@ async fn manage_transport(
 
                         if PACKET_TRACE {
                             log::debug!("tp: << rx({}) = {} {}", message.address, packet, packet.hash());
+                        }
+
+                        // Early packet filter with protocol-violation
+                        // accounting (Python 1.5.0 `Transport.packet_filter`
+                        // + `Interface.protocol_violation`).
+                        if !packet_filter(&packet) {
+                            handler
+                                .iface_manager
+                                .lock()
+                                .await
+                                .count_packet_filter_hit(&message.address);
+                            continue;
                         }
 
                         if handle_fixed_destinations(

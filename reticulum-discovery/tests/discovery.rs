@@ -99,7 +99,10 @@ async fn discovery_announce_validate_and_autoconnect() {
             latitude: None,
             longitude: None,
             height: None,
-            reachable_on: Some("127.0.0.1".to_string()),
+            // A hostname, not a loopback literal: Python 1.5.0 never
+            // auto-connects discovered interfaces on invalid IPs like
+            // 127.0.0.1.
+            reachable_on: Some("localhost".to_string()),
             port: Some(tcp_port),
             frequency: None,
             bandwidth: None,
@@ -109,6 +112,9 @@ async fn discovery_announce_validate_and_autoconnect() {
             modulation: None,
             ifac_netname: None,
             ifac_netkey: None,
+            transport_impl: None,
+            transport_vers: None,
+            operator_lxmf_address: None,
         })
         .await;
 

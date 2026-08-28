@@ -34,6 +34,12 @@ pub struct IfaceRow {
     pub bitrate: String,
     pub tx: String,
     pub rx: String,
+    /// Announces sent/received (Python 1.5.0 `rnstatus` traffic stats).
+    pub announces: String,
+    /// Path requests sent/received.
+    pub path_requests: String,
+    /// Protocol violations / IFAC violations / filter hits.
+    pub violations: String,
 }
 
 /// Snapshot of everything `rnstatus` displays.
@@ -78,21 +84,24 @@ impl StatusReport {
         // Interface table, mirroring the Python column set
         // (Name, Status, Mode, Bitrate, TX, RX, ...).
         out.push_str(&format!(
-            "{:<34} {:<12} {:<7} {:<8} {:<12} {:<10} {:<10}\n",
-            "Name", "Type", "Status", "Mode", "Bitrate", "TX", "RX"
+            "{:<34} {:<12} {:<7} {:<8} {:<12} {:<10} {:<10} {:<20} {:<8} {:<16}\n",
+            "Name", "Type", "Status", "Mode", "Bitrate", "TX", "RX", "Announces", "PRs", "Violations"
         ));
-        out.push_str(&"-".repeat(98));
+        out.push_str(&"-".repeat(150));
         out.push('\n');
         for iface in &self.interfaces {
             out.push_str(&format!(
-                "{:<34} {:<12} {:<7} {:<8} {:<12} {:<10} {:<10}\n",
+                "{:<34} {:<12} {:<7} {:<8} {:<12} {:<10} {:<10} {:<20} {:<8} {:<16}\n",
                 iface.name,
                 iface.kind,
                 iface.status,
                 iface.mode,
                 iface.bitrate,
                 iface.tx,
-                iface.rx
+                iface.rx,
+                iface.announces,
+                iface.path_requests,
+                iface.violations
             ));
         }
         if self.interfaces.is_empty() {
@@ -172,6 +181,21 @@ pub async fn collect(transport: &Transport, transport_enabled: bool) -> StatusRe
             bitrate: "Unknown".to_string(),
             tx: pretty_size(stats.tx_bytes),
             rx: pretty_size(stats.rx_bytes),
+            announces: format!(
+                "{}/{} ({}/{})",
+                stats.announces_sent,
+                stats.announces_received,
+                pretty_size(stats.announce_bytes_sent),
+                pretty_size(stats.announce_bytes_received),
+            ),
+            path_requests: format!(
+                "{}/{}",
+                stats.path_requests_sent, stats.path_requests_received
+            ),
+            violations: format!(
+                "{}/{} (filter {})",
+                stats.protocol_violations, stats.ifac_violations, stats.packet_filter_hits
+            ),
         })
         .collect();
 
@@ -210,6 +234,9 @@ mod tests {
                 bitrate: "Unknown".to_string(),
                 tx: "0 B".to_string(),
                 rx: "0 B".to_string(),
+                announces: "0/0 (0 B/0 B)".to_string(),
+                path_requests: "0/0".to_string(),
+                violations: "0/0 (filter 0)".to_string(),
             }],
             paths: vec![],
             link_counts: Default::default(),

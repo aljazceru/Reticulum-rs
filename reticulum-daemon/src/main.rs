@@ -1032,6 +1032,15 @@ fn discovery_info_for(
         modulation: None,
         ifac_netname: None,
         ifac_netkey: None,
+        // The 1.5.0 implementation identity is filled at pack time.
+        transport_impl: None,
+        transport_vers: None,
+        // Operator LXMF address published with the interface
+        // (Python `discovery_lxmf_address`).
+        operator_lxmf_address: iface
+            .discovery_lxmf_address
+            .as_deref()
+            .and_then(|hex| AddressHash::new_from_hex_string(hex).ok()),
     })
 }
 

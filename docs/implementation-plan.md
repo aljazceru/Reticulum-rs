@@ -1272,6 +1272,31 @@ buffer streams) are still open; see the phase descriptions above.
 | E2E interop matrix | ✅ `tests/python_middle.rs` (4 tests): Rust↔Python-middle↔Rust announce/LR/proof/bidirectional data; Python endpoints ↔ Rust middle (announce, LR re-address, LRPROOF, ping/echo); 80KB resource + request/response through the Python middle; Python request client/server through the Rust middle. Live-program validation: rncp 300KB/500KB through a Python `rnsd` middle both directions, **Python rncp client↔server with the Rust `rs-rnsd` daemon as the only transport: 2MB @ ~79Mbps, sha256-verified** |
 | rnsh wire protocol | ✅ real Python rnsh protocol (msgpack messages `0xac00`–`0xac07`, StreamData 2-byte header, identify→VersionInfo→ExecuteCommand→streamed output→CommandExited); `rn sh -c "cmd"` → Rust client → Rust `rs-rnsd` middle → Python rnsh listener verified live (command execution + output streaming). Empty closed stdin advertises no pipe (Python's listener kills the child 50ms after stdin EOF, which loses fast-command output otherwise) |
 
+## Progress log — Python 1.5.0 parity (latest)
+
+Reference pulled to 1.5.0+5 (b123a756, was 1.4.2/b48b96e6). Upstream Rust
+fork merged (LinkRequest forwarding-loop fixes, `TransportConfig` broadcast
+flag removal — routing capability is `retransmit` now).
+
+| Area | Status |
+| --- | --- |
+| Discovery wire format | ✅ **was wire-incompatible** (string keys vs Python's integer keys — Rust↔Python interface discovery never actually interopped); now the exact Python integer-key msgpack map (0x00 type … 0xFF name), verified bidirectionally against real Python 1.5.0 pack+validation |
+| Discovery implementation identity | ✅ `TRANSPORT_IMPL` (0xFD, "reticulum-rs") + `TRANSPORT_VERS` (0xFC, crate version) packed per the 1.5.0 requirement |
+| Operator LXMF address | ✅ `OP_ADDR` (0xF0) packed from `discovery_lxmf_address` interface config; validated on receive (nil or 16-byte bin) |
+| Discovery autoconnect hardening | ✅ `.onion` targets and invalid IPs (127.0.0.1, 0.0.0.0) never auto-connect |
+| Protocol violations | ✅ per-interface counters (`protocol_violations`, `ifac_violations`, `packet_filter_hits`) with Python's violation conditions: PLAIN/GROUP data with hops > 1, PLAIN/GROUP announces |
+| Early packet filter | ✅ Python `packet_filter` semantics hooked at ingress before processing |
+| Excessive hop rejection | ✅ outbound packets with hops > PATHFINDER_M-1 dropped (`Transport._outbound` parity) |
+| In-flight PR batching | ✅ discovery path requests batch requesting interfaces; the path response fans out to every batched requestor (Python 1.5.0 batching semantics) |
+| Interface traffic stats | ✅ announce/path-request counts + announce bytes on `InterfaceStats` (Python `arxb/atxb/arxc/atxc/prxc/ptxc`) |
+| rnstatus | ✅ Announces / PRs / Violations columns (per-interface traffic stats parity) |
+
+Not ported (documented gaps): link MTU discovery disable option
+(`link_mtu_discovery` config — Rust always signals MTU, Python default is
+enabled too), prioritized queue backend (Python-internal performance
+architecture; the tokio pipeline differs by design), adaptive
+medium-bitrate timeouts in utilities.
+
 ## Remaining open (documented, lower priority)
 
 * WeaveInterface — requires WeaveMesh radio hardware; the WDCL device

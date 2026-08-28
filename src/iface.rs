@@ -76,6 +76,20 @@ pub struct InterfaceCounters {
     tx_bytes: AtomicU64,
     rx_bytes: AtomicU64,
     online: AtomicBool,
+    /// Announce traffic (Python `arxb/atxb/arxc/atxc`).
+    announces_received: AtomicU64,
+    announces_sent: AtomicU64,
+    announce_bytes_received: AtomicU64,
+    announce_bytes_sent: AtomicU64,
+    /// Path request traffic (Python `prxb/ptxb/prxc/ptxc`).
+    path_requests_received: AtomicU64,
+    path_requests_sent: AtomicU64,
+    /// Protocol violations (Python `protocol_violations`).
+    protocol_violations: AtomicU64,
+    /// IFAC violations (Python `ifac_violations`).
+    ifac_violations: AtomicU64,
+    /// Early packet filter hits (Python `packet_filter_hits`).
+    packet_filter_hits: AtomicU64,
 }
 
 impl InterfaceCounters {
@@ -93,6 +107,92 @@ impl InterfaceCounters {
 
     pub fn set_online(&self, online: bool) {
         self.online.store(online, Ordering::Relaxed);
+    }
+
+    /// Account a received announce (Python `Interface.received_announce`).
+    pub fn count_announce_rx(&self, bytes: usize) {
+        self.announces_received.fetch_add(1, Ordering::Relaxed);
+        self.announce_bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Account a sent announce (Python `Interface.sent_announce`).
+    pub fn count_announce_tx(&self, bytes: usize) {
+        self.announces_sent.fetch_add(1, Ordering::Relaxed);
+        self.announce_bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Account a received path request
+    /// (Python `Interface.received_path_request`).
+    pub fn count_path_request_rx(&self, bytes: usize) {
+        self.path_requests_received.fetch_add(1, Ordering::Relaxed);
+        let _ = bytes;
+    }
+
+    /// Account a sent path request (Python `Interface.sent_path_request`).
+    pub fn count_path_request_tx(&self, bytes: usize) {
+        self.path_requests_sent.fetch_add(1, Ordering::Relaxed);
+        let _ = bytes;
+    }
+
+    /// Account a protocol violation (Python `Interface.protocol_violation`).
+    pub fn count_protocol_violation(&self) {
+        self.protocol_violations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Account an IFAC violation (Python `Interface.ifac_violation`).
+    pub fn count_ifac_violation(&self) {
+        self.ifac_violations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Account an early packet filter hit
+    /// (Python `Interface.packet_filter_hit`).
+    pub fn count_packet_filter_hit(&self) {
+        self.packet_filter_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Received announce count.
+    pub fn announces_received(&self) -> u64 {
+        self.announces_received.load(Ordering::Relaxed)
+    }
+
+    /// Sent announce count.
+    pub fn announces_sent(&self) -> u64 {
+        self.announces_sent.load(Ordering::Relaxed)
+    }
+
+    /// Received announce bytes.
+    pub fn announce_bytes_received(&self) -> u64 {
+        self.announce_bytes_received.load(Ordering::Relaxed)
+    }
+
+    /// Sent announce bytes.
+    pub fn announce_bytes_sent(&self) -> u64 {
+        self.announce_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Received path request count.
+    pub fn path_requests_received(&self) -> u64 {
+        self.path_requests_received.load(Ordering::Relaxed)
+    }
+
+    /// Sent path request count.
+    pub fn path_requests_sent(&self) -> u64 {
+        self.path_requests_sent.load(Ordering::Relaxed)
+    }
+
+    /// Protocol violation count.
+    pub fn protocol_violations(&self) -> u64 {
+        self.protocol_violations.load(Ordering::Relaxed)
+    }
+
+    /// IFAC violation count.
+    pub fn ifac_violations(&self) -> u64 {
+        self.ifac_violations.load(Ordering::Relaxed)
+    }
+
+    /// Packet filter hit count.
+    pub fn packet_filter_hits(&self) -> u64 {
+        self.packet_filter_hits.load(Ordering::Relaxed)
     }
 
     pub fn sent(&self) -> u64 {
@@ -136,6 +236,21 @@ pub struct InterfaceStats {
     pub rx_bytes: u64,
     /// Whether the interface considers itself online
     pub online: bool,
+    /// Announces received/sent (Python 1.5.0 traffic stats).
+    pub announces_received: u64,
+    pub announces_sent: u64,
+    /// Announce payload bytes received/sent.
+    pub announce_bytes_received: u64,
+    pub announce_bytes_sent: u64,
+    /// Path requests received/sent.
+    pub path_requests_received: u64,
+    pub path_requests_sent: u64,
+    /// Protocol violations detected on this interface.
+    pub protocol_violations: u64,
+    /// IFAC violations detected on this interface.
+    pub ifac_violations: u64,
+    /// Early packet filter hits.
+    pub packet_filter_hits: u64,
 }
 
 pub struct InterfaceChannel {
@@ -330,6 +445,12 @@ impl InterfaceManager {
         controls.get_mut(address).map(f)
     }
 
+    fn with_stats(&self, address: &AddressHash, f: impl FnOnce(&InterfaceCounters)) {
+        if let Some(iface) = self.ifaces.iter().find(|i| i.address == *address) {
+            f(&iface.stats);
+        }
+    }
+
     /// Configure the interface mode of an interface
     /// (Python interface `mode` configuration option).
     pub fn set_iface_mode(&self, address: &AddressHash, mode: InterfaceMode) -> bool {
@@ -479,30 +600,52 @@ impl InterfaceManager {
 
     /// Account a received announce on an interface
     /// (Python `Interface.received_announce`).
-    pub fn received_announce(&self, address: &AddressHash) {
+    pub fn received_announce(&self, address: &AddressHash, bytes: usize) {
         let now = tokio::time::Instant::now();
         self.with_control(address, |control| control.received_announce(now));
+        self.with_stats(address, |stats| stats.count_announce_rx(bytes));
     }
 
     /// Account a sent announce on an interface
     /// (Python `Interface.sent_announce`).
-    pub fn sent_announce(&self, address: &AddressHash) {
+    pub fn sent_announce(&self, address: &AddressHash, bytes: usize) {
         let now = tokio::time::Instant::now();
         self.with_control(address, |control| control.sent_announce(now));
+        self.with_stats(address, |stats| stats.count_announce_tx(bytes));
     }
 
     /// Account a received path request on an interface
     /// (Python `Interface.received_path_request`).
-    pub fn received_path_request(&self, address: &AddressHash) {
+    pub fn received_path_request(&self, address: &AddressHash, bytes: usize) {
         let now = tokio::time::Instant::now();
         self.with_control(address, |control| control.received_path_request(now));
+        self.with_stats(address, |stats| stats.count_path_request_rx(bytes));
     }
 
     /// Account a sent path request on an interface
     /// (Python `Interface.sent_path_request`).
-    pub fn sent_path_request(&self, address: &AddressHash) {
+    pub fn sent_path_request(&self, address: &AddressHash, bytes: usize) {
         let now = tokio::time::Instant::now();
         self.with_control(address, |control| control.sent_path_request(now));
+        self.with_stats(address, |stats| stats.count_path_request_tx(bytes));
+    }
+
+    /// Account an early packet filter hit on an interface
+    /// (Python `Interface.packet_filter_hit`).
+    pub fn count_packet_filter_hit(&self, address: &AddressHash) {
+        self.with_stats(address, |stats| stats.count_packet_filter_hit());
+    }
+
+    /// Account a protocol violation on an interface
+    /// (Python `Interface.protocol_violation`).
+    pub fn count_protocol_violation(&self, address: &AddressHash) {
+        self.with_stats(address, |stats| stats.count_protocol_violation());
+    }
+
+    /// Account an IFAC violation on an interface
+    /// (Python `Interface.ifac_violation`).
+    pub fn count_ifac_violation(&self, address: &AddressHash) {
+        self.with_stats(address, |stats| stats.count_ifac_violation());
     }
 
     /// Release held announces on all interfaces whose burst penalty has
@@ -573,6 +716,15 @@ impl InterfaceManager {
                 tx_bytes: iface.stats.tx_bytes(),
                 rx_bytes: iface.stats.rx_bytes(),
                 online: iface.stats.online(),
+                announces_received: iface.stats.announces_received(),
+                announces_sent: iface.stats.announces_sent(),
+                announce_bytes_received: iface.stats.announce_bytes_received(),
+                announce_bytes_sent: iface.stats.announce_bytes_sent(),
+                path_requests_received: iface.stats.path_requests_received(),
+                path_requests_sent: iface.stats.path_requests_sent(),
+                protocol_violations: iface.stats.protocol_violations(),
+                ifac_violations: iface.stats.ifac_violations(),
+                packet_filter_hits: iface.stats.packet_filter_hits(),
             })
             .collect()
     }
@@ -662,6 +814,10 @@ impl InterfaceManager {
                             false
                         }
                     });
+                    // Announce traffic stats (Python `Interface.sent_announce`).
+                    if allowed.unwrap_or(false) {
+                        iface.stats.count_announce_tx(size);
+                    }
 
                     if !allowed.unwrap_or(true) {
                         continue;

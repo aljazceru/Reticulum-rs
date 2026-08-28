@@ -291,7 +291,7 @@ async fn control_params_override_defaults() {
     for _ in 0..10 {
         let manager = a.iface_manager();
         let manager = manager.lock().await;
-        manager.received_announce(&a_iface);
+        manager.received_announce(&a_iface, 0);
         drop(manager);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

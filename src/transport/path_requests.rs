@@ -98,7 +98,7 @@ pub struct PathRequests {
     controlled_destination: PlainInputDestination,
     /// Outstanding (discovery) path requests sent on behalf of an unknown
     /// destination (Python `Transport.discovery_path_requests`).
-    discovery: BTreeMap<AddressHash, (Instant, Option<AddressHash>)>,
+    discovery: BTreeMap<AddressHash, (Instant, Vec<AddressHash>)>,
     /// Path requests issued locally, with the time they were last sent
     /// (Python `Transport.path_requests` accounting, used to exempt
     /// announces for requested destinations from ingress limiting).
@@ -207,17 +207,36 @@ impl PathRequests {
         }
     }
 
+
     /// Register a waiting discovery path request for `destination`
-    /// (Python inserts `{"destination_hash", "timeout", "requesting_interface"}`).
+    /// (Python inserts `{"destination_hash", "timeout",
+    /// "requesting_interfaces": [...]}`). A second request for the same
+    /// destination while one is in flight is BATCHED: its interface is
+    /// appended so the eventual path response reaches every requestor
+    /// (Python 1.5.0 in-flight path request batching).
     pub fn register_discovery(&mut self, destination: &AddressHash, requesting_iface: Option<AddressHash>) {
-        self.discovery
-            .insert(*destination, (Instant::now() + PATH_REQUEST_TIMEOUT, requesting_iface));
+        let Some(iface) = requesting_iface else {
+            return;
+        };
+        match self.discovery.get_mut(destination) {
+            Some((timeout, ifaces)) if Instant::now() < *timeout => {
+                if !ifaces.contains(&iface) {
+                    ifaces.push(iface);
+                }
+            }
+            _ => {
+                self.discovery.insert(
+                    *destination,
+                    (Instant::now() + PATH_REQUEST_TIMEOUT, vec![iface]),
+                );
+            }
+        }
     }
 
     /// A matching announce arrived for a waiting discovery request
     /// (Python removes the entry in `Transport.inbound`).
-    pub fn clear_discovery(&mut self, destination: &AddressHash) -> Option<Option<AddressHash>> {
-        self.discovery.remove(destination).map(|(_, iface)| iface)
+    pub fn clear_discovery(&mut self, destination: &AddressHash) -> Option<Vec<AddressHash>> {
+        self.discovery.remove(destination).map(|(_, ifaces)| ifaces)
     }
 
     /// Whether an automated path request for `destination` may be sent now,
@@ -264,19 +283,27 @@ mod tests {
     }
 
     #[test]
-    fn discovery_registration() {
+    fn discovery_registration_and_batching() {
         let mut testee = PathRequests::new("", None);
         let dest = AddressHash::new_from_rand(OsRng);
+        let iface_a = AddressHash::new_from_rand(OsRng);
+        let iface_b = AddressHash::new_from_rand(OsRng);
 
         assert!(!testee.discovery_pending(&dest));
+        // A request without a requesting interface registers nothing
+        // (Python entries always carry their requesting interface).
         testee.register_discovery(&dest, None);
-        assert!(testee.discovery_pending(&dest));
-        assert!(testee.clear_discovery(&dest).is_some());
         assert!(!testee.discovery_pending(&dest));
 
-        // Requests are gated on waiting discovery entries in the transport
-        // layer via `discovery_pending`.
-        testee.register_discovery(&dest, None);
+        testee.register_discovery(&dest, Some(iface_a));
         assert!(testee.discovery_pending(&dest));
+
+        // A second in-flight request batches onto the existing entry
+        // (Python 1.5.0 in-flight path request batching).
+        testee.register_discovery(&dest, Some(iface_b));
+        let batched = testee.clear_discovery(&dest).expect("batched entry");
+        assert!(batched.contains(&iface_a));
+        assert!(batched.contains(&iface_b));
+        assert!(!testee.discovery_pending(&dest));
     }
 }

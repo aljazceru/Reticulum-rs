@@ -63,6 +63,87 @@ pub fn discovery_destination_name() -> DestinationName {
     DestinationName::new("rnstransport", "discovery.interface")
 }
 
+/// Whether the string is a valid IPv4/IPv6 literal
+/// (Python `Discovery.is_ip_address`).
+fn is_ip_address(address: &str) -> bool {
+    use std::net::IpAddr;
+    address.parse::<IpAddr>().is_ok()
+}
+
+/// Whether the string is a valid (non-numeric-TLD) hostname
+/// (Python `Discovery.is_hostname`).
+fn is_hostname(hostname: &str) -> bool {
+    let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
+    if hostname.is_empty() || hostname.len() > 253 {
+        return false;
+    }
+    let components: Vec<&str> = hostname.split('.').collect();
+    // A trailing all-numeric label is not a hostname
+    // (Python `re.match(r"[0-9]+$", ...)`).
+    if components.last().map(|c| !c.is_empty() && c.chars().all(|b| b.is_ascii_digit())) == Some(true) {
+        return false;
+    }
+    let allowed = |label: &str| {
+        if label.is_empty() || label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    components.iter().all(|c| allowed(c))
+}
+
+/// Whether the string is a `.onion` address (Python 1.5.0
+/// `is_onion_address`).
+fn is_onion_address(address: &str) -> bool {
+    address.to_ascii_lowercase().ends_with(".onion")
+}
+
+/// IP addresses that must never be auto-connected
+/// (Python 1.5.0 `INVALID_IP_ADDRESSES`).
+const INVALID_IP_ADDRESSES: [&str; 2] = ["127.0.0.1", "0.0.0.0"];
+
+fn is_invalid_ip_address(address: &str) -> bool {
+    INVALID_IP_ADDRESSES.contains(&address)
+}
+
+// Discovery information wire keys (Python `RNS/Discovery.py`). The
+// announce payload is a msgpack map with these short INTEGER keys, not
+// string keys.
+pub const KEY_INTERFACE_TYPE: u64 = 0x00;
+pub const KEY_TRANSPORT: u64 = 0x01;
+pub const KEY_REACHABLE_ON: u64 = 0x02;
+pub const KEY_LATITUDE: u64 = 0x03;
+pub const KEY_LONGITUDE: u64 = 0x04;
+pub const KEY_HEIGHT: u64 = 0x05;
+pub const KEY_PORT: u64 = 0x06;
+pub const KEY_IFAC_NETNAME: u64 = 0x07;
+pub const KEY_IFAC_NETKEY: u64 = 0x08;
+pub const KEY_FREQUENCY: u64 = 0x09;
+pub const KEY_BANDWIDTH: u64 = 0x0A;
+pub const KEY_SPREADINGFACTOR: u64 = 0x0B;
+pub const KEY_CODINGRATE: u64 = 0x0C;
+pub const KEY_MODULATION: u64 = 0x0D;
+pub const KEY_CHANNEL: u64 = 0x0E;
+pub const KEY_OP_ADDR: u64 = 0xF0;
+pub const KEY_TRANSPORT_VERS: u64 = 0xFC;
+pub const KEY_TRANSPORT_IMPL: u64 = 0xFD;
+pub const KEY_TRANSPORT_ID: u64 = 0xFE;
+pub const KEY_NAME: u64 = 0xFF;
+
+/// Implementation identifier included in announced discovery
+/// information (Python `IMPLEMENTATION_NAME = "RNS"`; RNS 1.5.0 made
+/// this field a requirement).
+pub const IMPLEMENTATION_NAME: &str = "reticulum-rs";
+
+/// Implementation version included in announced discovery information
+/// (Python ships `RNS.__version__`).
+pub const IMPLEMENTATION_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// One announced, discoverable interface (Python discovery `info` map).
 #[derive(Debug, Clone)]
 pub struct InterfaceInfo {
@@ -91,15 +172,23 @@ pub struct InterfaceInfo {
     /// IFAC credentials published alongside the interface.
     pub ifac_netname: Option<String>,
     pub ifac_netkey: Option<String>,
+    /// Implementation identifier (Python `TRANSPORT_IMPL`, required
+    /// since RNS 1.5.0).
+    pub transport_impl: Option<String>,
+    /// Implementation version (Python `TRANSPORT_VERS`).
+    pub transport_vers: Option<String>,
+    /// Operator LXMF address (Python `OP_ADDR`, 16-byte truncated hash).
+    pub operator_lxmf_address: Option<AddressHash>,
 }
 
 impl InterfaceInfo {
-    /// Pack the description as msgpack
-    /// (Python `info` dict with short string keys).
+    /// Pack the description as msgpack with Python's short integer
+    /// keys (`RNS/Discovery.py` `InterfaceAnnouncer.__init__` info map).
     pub fn pack(&self) -> Vec<u8> {
         use rmp::encode as mp;
 
-        let mut field_count = 7;
+        // type, transport, transport_id, impl, vers, name + 3 geo fields
+        let mut field_count = 9;
         if self.reachable_on.is_some() { field_count += 1; }
         if self.port.is_some() { field_count += 1; }
         if self.frequency.is_some() { field_count += 1; }
@@ -110,31 +199,38 @@ impl InterfaceInfo {
         if self.modulation.is_some() { field_count += 1; }
         if self.ifac_netname.is_some() { field_count += 1; }
         if self.ifac_netkey.is_some() { field_count += 1; }
+        if self.operator_lxmf_address.is_some() { field_count += 1; }
 
         let mut out = Vec::new();
         mp::write_map_len(&mut out, field_count as u32).ok();
 
-        mp::write_str(&mut out, "type").ok();
+        mp::write_uint(&mut out, KEY_INTERFACE_TYPE).ok();
         mp::write_str(&mut out, &self.interface_type).ok();
 
-        mp::write_str(&mut out, "transport").ok();
+        mp::write_uint(&mut out, KEY_TRANSPORT).ok();
         mp::write_bool(&mut out, self.transport).ok();
 
-        mp::write_str(&mut out, "transport_id").ok();
+        mp::write_uint(&mut out, KEY_TRANSPORT_ID).ok();
         mp::write_bin(&mut out, self.transport_id.as_slice()).ok();
 
-        mp::write_str(&mut out, "name").ok();
+        mp::write_uint(&mut out, KEY_TRANSPORT_IMPL).ok();
+        mp::write_str(&mut out, self.transport_impl.as_deref().unwrap_or(IMPLEMENTATION_NAME)).ok();
+
+        mp::write_uint(&mut out, KEY_TRANSPORT_VERS).ok();
+        mp::write_str(&mut out, self.transport_vers.as_deref().unwrap_or(IMPLEMENTATION_VERSION)).ok();
+
+        mp::write_uint(&mut out, KEY_NAME).ok();
         match &self.name {
             Some(name) => mp::write_str(&mut out, name).ok(),
             None => mp::write_nil(&mut out).ok(),
         };
 
         for (key, value) in [
-            ("latitude", self.latitude),
-            ("longitude", self.longitude),
-            ("height", self.height),
+            (KEY_LATITUDE, self.latitude),
+            (KEY_LONGITUDE, self.longitude),
+            (KEY_HEIGHT, self.height),
         ] {
-            mp::write_str(&mut out, key).ok();
+            mp::write_uint(&mut out, key).ok();
             match value {
                 Some(value) => {
                     mp::write_f64(&mut out, value).ok();
@@ -146,51 +242,57 @@ impl InterfaceInfo {
         }
 
         if let Some(host) = &self.reachable_on {
-            mp::write_str(&mut out, "reachable_on").ok();
+            mp::write_uint(&mut out, KEY_REACHABLE_ON).ok();
             mp::write_str(&mut out, host).ok();
         }
         if let Some(port) = self.port {
-            mp::write_str(&mut out, "port").ok();
+            mp::write_uint(&mut out, KEY_PORT).ok();
             mp::write_u64(&mut out, port as u64).ok();
         }
         if let Some(frequency) = self.frequency {
-            mp::write_str(&mut out, "frequency").ok();
+            mp::write_uint(&mut out, KEY_FREQUENCY).ok();
             mp::write_u64(&mut out, frequency).ok();
         }
         if let Some(bandwidth) = self.bandwidth {
-            mp::write_str(&mut out, "bandwidth").ok();
+            mp::write_uint(&mut out, KEY_BANDWIDTH).ok();
             mp::write_u64(&mut out, bandwidth).ok();
         }
-        if let Some(sf) = self.spreadingfactor {
-            mp::write_str(&mut out, "spreadingfactor").ok();
-            mp::write_u8(&mut out, sf).ok();
+        if let Some(spreadingfactor) = self.spreadingfactor {
+            mp::write_uint(&mut out, KEY_SPREADINGFACTOR).ok();
+            mp::write_u64(&mut out, spreadingfactor as u64).ok();
         }
-        if let Some(cr) = &self.codingrate {
-            mp::write_str(&mut out, "codingrate").ok();
-            mp::write_str(&mut out, cr).ok();
+        if let Some(codingrate) = &self.codingrate {
+            mp::write_uint(&mut out, KEY_CODINGRATE).ok();
+            mp::write_str(&mut out, codingrate).ok();
         }
         if let Some(channel) = self.channel {
-            mp::write_str(&mut out, "channel").ok();
+            mp::write_uint(&mut out, KEY_CHANNEL).ok();
             mp::write_u64(&mut out, channel).ok();
         }
         if let Some(modulation) = &self.modulation {
-            mp::write_str(&mut out, "modulation").ok();
+            mp::write_uint(&mut out, KEY_MODULATION).ok();
             mp::write_str(&mut out, modulation).ok();
         }
         if let Some(netname) = &self.ifac_netname {
-            mp::write_str(&mut out, "ifac_netname").ok();
+            mp::write_uint(&mut out, KEY_IFAC_NETNAME).ok();
             mp::write_str(&mut out, netname).ok();
         }
         if let Some(netkey) = &self.ifac_netkey {
-            mp::write_str(&mut out, "ifac_netkey").ok();
+            mp::write_uint(&mut out, KEY_IFAC_NETKEY).ok();
             mp::write_str(&mut out, netkey).ok();
+        }
+        if let Some(address) = self.operator_lxmf_address {
+            mp::write_uint(&mut out, KEY_OP_ADDR).ok();
+            mp::write_bin(&mut out, address.as_slice()).ok();
         }
 
         out
     }
 
     /// Unpack a description (Python `InterfaceAnnounceHandler` field
-    /// validation).
+    /// validation). The wire format is a msgpack map with short
+    /// integer keys; malformed entries are rejected like Python's
+    /// `ValueError` handling.
     pub fn unpack(packed: &[u8]) -> Option<Self> {
         let mut cursor = std::io::Cursor::new(packed);
         let value = rmpv::decode::read_value(&mut cursor).ok()?;
@@ -198,23 +300,22 @@ impl InterfaceInfo {
             return None;
         };
 
-        let mut fields: HashMap<String, rmpv::Value> = HashMap::new();
+        let mut fields: HashMap<u64, rmpv::Value> = HashMap::new();
         for (key, value) in entries {
-            let key = key.as_str()?.to_string();
-            fields.insert(key, value);
+            fields.insert(key.as_u64()?, value);
         }
 
-        let interface_type = fields.get("type")?.as_str()?.to_string();
+        let interface_type = fields.get(&KEY_INTERFACE_TYPE)?.as_str()?.to_string();
         if !DISCOVERABLE_TYPES.contains(&interface_type.as_str()) {
             return None;
         }
 
-        let transport = match fields.get("transport")? {
+        let transport = match fields.get(&KEY_TRANSPORT)? {
             rmpv::Value::Boolean(value) => *value,
             _ => return None,
         };
 
-        let transport_id_bytes = match fields.get("transport_id")? {
+        let transport_id_bytes = match fields.get(&KEY_TRANSPORT_ID)? {
             rmpv::Value::Binary(bytes) => bytes,
             _ => return None,
         };
@@ -222,37 +323,74 @@ impl InterfaceInfo {
         // (re-hashing produces an unrelated address).
         let transport_id = AddressHash::new_from_raw_slice(transport_id_bytes)?;
 
-        let str_field = |key: &str| -> Option<String> {
-            fields.get(key).and_then(|v| v.as_str()).map(str::to_string)
-        };
-        let float_field = |key: &str| -> Option<f64> {
+        // Latitude/longitude/height must be float or nil
+        // (Python `type(...) not in [type(None), float]` rejects).
+        // These helpers return `None` only for INVALID values; an absent
+        // key is a valid `None` field.
+        let float_field = |key: &u64| -> Option<Option<f64>> {
             match fields.get(key) {
-                Some(rmpv::Value::F64(value)) => Some(*value),
+                None => Some(None),
+                Some(rmpv::Value::Nil) => Some(None),
+                Some(rmpv::Value::F64(value)) => Some(Some(*value)),
+                // Integers coerce like Python's numeric tolerance for
+                // geo fields; anything else is invalid.
+                Some(value) => value.as_f64().map(Some),
+            }
+        };
+        let latitude = float_field(&KEY_LATITUDE)?;
+        let longitude = float_field(&KEY_LONGITUDE)?;
+        let height = float_field(&KEY_HEIGHT)?;
+
+        let str_field = |key: &u64| -> Option<Option<String>> {
+            match fields.get(key) {
+                None => Some(None),
+                Some(rmpv::Value::Nil) => Some(None),
+                Some(rmpv::Value::String(value)) => Some(Some(value.as_str()?.to_string())),
                 _ => None,
             }
         };
-        let u64_field = |key: &str| -> Option<u64> {
-            fields.get(key).and_then(|v| v.as_u64())
+        let name = str_field(&KEY_NAME)?;
+        let reachable_on = str_field(&KEY_REACHABLE_ON)?;
+        if let Some(host) = &reachable_on {
+            if !(is_ip_address(host) || is_hostname(host)) {
+            return None;
+            }
+        }
+
+        let u64_field = |key: &u64| fields.get(key).and_then(|v| v.as_u64());
+
+        // Operator LXMF address: nil or a 16-byte binary
+        // (Python rejects other shapes entirely).
+        let operator_lxmf_address = match fields.get(&KEY_OP_ADDR) {
+            None => None,
+            Some(rmpv::Value::Nil) => None,
+            Some(rmpv::Value::Binary(bytes)) if bytes.len() == 16 => {
+                Some(AddressHash::new_from_raw_slice(bytes)?)
+            }
+            _ => return None,
         };
 
         Some(Self {
             interface_type,
             transport,
             transport_id,
-            name: str_field("name"),
-            latitude: float_field("latitude"),
-            longitude: float_field("longitude"),
-            height: float_field("height"),
-            reachable_on: str_field("reachable_on"),
-            port: u64_field("port").map(|p| p as u16),
-            frequency: u64_field("frequency"),
-            bandwidth: u64_field("bandwidth"),
-            spreadingfactor: u64_field("spreadingfactor").map(|v| v as u8),
-            codingrate: str_field("codingrate"),
-            channel: u64_field("channel"),
-            modulation: str_field("modulation"),
-            ifac_netname: str_field("ifac_netname"),
-            ifac_netkey: str_field("ifac_netkey"),
+            transport_impl: str_field(&KEY_TRANSPORT_IMPL)?.filter(|s| !s.is_empty()),
+            transport_vers: str_field(&KEY_TRANSPORT_VERS)?.filter(|s| !s.is_empty()),
+            name,
+            latitude,
+            longitude,
+            height,
+            reachable_on,
+            port: u64_field(&KEY_PORT).map(|p| p as u16),
+            frequency: u64_field(&KEY_FREQUENCY),
+            bandwidth: u64_field(&KEY_BANDWIDTH),
+            spreadingfactor: u64_field(&KEY_SPREADINGFACTOR).map(|v| v as u8),
+            codingrate: str_field(&KEY_CODINGRATE)?,
+            channel: u64_field(&KEY_CHANNEL),
+            modulation: str_field(&KEY_MODULATION)?,
+            ifac_netname: str_field(&KEY_IFAC_NETNAME)?,
+            ifac_netkey: str_field(&KEY_IFAC_NETKEY)?,
+            operator_lxmf_address,
         })
     }
 
@@ -609,6 +747,14 @@ impl InterfaceDiscovery {
                 continue;
             };
 
+            // Never auto-connect to loopback/any addresses or onion
+            // services (Python 1.5.0 `is_invalid_ip_address` /
+            // `is_onion_address` guards).
+            if is_invalid_ip_address(&host) || is_onion_address(&host) {
+                log::debug!("discovery: not auto-connecting to {host}");
+                continue;
+            }
+
             // Skip interfaces we are already connected to.
             let _endpoint = entry.endpoint_hash();
             let exists = {
@@ -795,6 +941,22 @@ impl BlackholeUpdater {
 }
 
 #[cfg(test)]
+mod addr_tests {
+    #[test]
+    fn ip_and_hostname_checks() {
+        assert!(super::is_ip_address("127.0.0.1"));
+        assert!(super::is_ip_address("::1"));
+        assert!(!super::is_ip_address("node.example"));
+        assert!(super::is_hostname("node.example"));
+        assert!(!super::is_hostname("127.0.0.1"));
+        assert!(!super::is_hostname("bad_host")); // underscore invalid
+        assert!(super::is_onion_address("abc123.onion"));
+        assert!(super::is_invalid_ip_address("127.0.0.1"));
+        assert!(!super::is_invalid_ip_address("10.0.0.1"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -818,6 +980,9 @@ mod tests {
             modulation: Some("lora".to_string()),
             ifac_netname: None,
             ifac_netkey: None,
+            transport_impl: None,
+            transport_vers: None,
+            operator_lxmf_address: None,
         };
 
         let packed = info.pack();
@@ -826,6 +991,12 @@ mod tests {
         assert_eq!(unpacked.port, Some(4434));
         assert_eq!(unpacked.reachable_on.as_deref(), Some("127.0.0.1"));
         assert_eq!(unpacked.name.as_deref(), Some("node"));
+        // The 1.5.0 implementation identity is always packed
+        assert_eq!(
+            unpacked.transport_impl.as_deref(),
+            Some(IMPLEMENTATION_NAME)
+        );
+        assert!(unpacked.transport_vers.is_some());
         assert_eq!(unpacked.frequency, Some(868_000_000));
     }
 }

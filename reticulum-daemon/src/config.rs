@@ -132,6 +132,11 @@ pub struct NamedInterface {
     /// Discovery announce stamp cost (Python `discovery_stamp_value`).
     #[serde(default)]
     pub discovery_stamp_value: Option<u32>,
+    /// Discovery LXMF address of the operator, published in interface
+    /// discovery information (Python `discovery_lxmf_address`, 32 hex
+    /// characters).
+    #[serde(default)]
+    pub discovery_lxmf_address: Option<String>,
     /// Discovery name of the interface (Python `discovery_name`).
     #[serde(default)]
     pub discovery_name: Option<String>,
@@ -772,6 +777,7 @@ impl Config {
                 discoverable: false,
                 discovery_announce_interval_minutes: None,
                 discovery_stamp_value: None,
+                discovery_lxmf_address: None,
                 discovery_name: None,
                 reachable_on: None,
                 config: InterfaceConfig::TCPServerInterface {
@@ -859,6 +865,7 @@ pub const KNOWN_INTERFACE_KEYS: &[&str] = &[
     "announce_interval",
     "discovery_stamp_value",
     "discovery_name",
+    "discovery_lxmf_address",
     "reachable_on",
 ];
 
