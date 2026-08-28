@@ -47,6 +47,9 @@ pub struct IfaceRow {
 pub struct StatusReport {
     pub instance_name: String,
     pub identity_hash: String,
+    /// Inbound queue pressure: total, per-class heights, per-class drops
+    /// (Python 1.5.0 `rnstatus` queue pressure statistics).
+    pub queue_pressure: (usize, [usize; 4], [u64; 4]),
     pub interfaces: Vec<IfaceRow>,
     pub paths: Vec<crate::rnpath::PathResult>,
     pub link_counts: reticulum::transport::LinkCounts,
@@ -107,6 +110,19 @@ impl StatusReport {
         if self.interfaces.is_empty() {
             out.push_str("(no interfaces)\n");
         }
+
+        out.push_str(&format!(
+            "Inbound queue pressure: {} items (data {}, announce {}, PR {}, IL {}), dropped {}\n",
+            self.queue_pressure.0,
+            self.queue_pressure.1[0],
+            self.queue_pressure.1[1],
+            self.queue_pressure.1[2],
+            self.queue_pressure.1[3],
+            self.queue_pressure
+                .2
+                .iter()
+                .sum::<u64>(),
+        ));
 
         out.push('\n');
         if self.transport_enabled {
@@ -202,6 +218,7 @@ pub async fn collect(transport: &Transport, transport_enabled: bool) -> StatusRe
     StatusReport {
         instance_name: transport.instance_name().await,
         identity_hash: crate::common::prettyhexrep(transport.identity_hash().await.as_slice()),
+        queue_pressure: transport.inbound_queue_snapshot().await,
         interfaces,
         paths: crate::rnpath::path_table(transport, None, None).await,
         link_counts: transport.link_counts().await,
@@ -241,6 +258,7 @@ mod tests {
             paths: vec![],
             link_counts: Default::default(),
             transport_enabled: true,
+            queue_pressure: (0, [0; 4], [0; 4]),
         };
         let text = report.render();
         assert!(text.contains("Transport Instance <aabb> running"));

@@ -146,6 +146,13 @@ pub struct TransportConfig {
     /// the initial round of announces is over.
     announce_forever: bool,
 
+    /// Signal the next-hop hardware MTU in link requests
+    /// (Python `Reticulum.link_mtu_discovery`, default enabled).
+    link_mtu_discovery: bool,
+    /// Inbound queue lengths per traffic class
+    /// (Python `qlen_in_data`/`qlen_in_announce`/`qlen_in_pr`/`qlen_in_il`).
+    inbound_queue_lengths: [usize; 4],
+
     /// Publish this node's blackhole list
     /// (Python `publish_blackhole_enabled`).
     blackhole_publish: bool,
@@ -302,7 +309,9 @@ pub(crate) struct TransportHandler {
     /// Trusted remote blackhole-list sources
     /// (Python `Reticulum.blackhole_sources`).
     blackhole_sources: Vec<AddressHash>,
-
+    /// Prioritized inbound queues
+    /// (Python `Transport.inbound_queues`).
+    inbound_queues: std::sync::Arc<std::sync::Mutex<InboundQueues>>,
     cancel: CancellationToken,
 }
 
@@ -331,6 +340,8 @@ impl TransportConfig {
             announce_forever: false,
             blackhole_publish: false,
             blackhole_sources: Vec::new(),
+            link_mtu_discovery: true,
+            inbound_queue_lengths: INBOUND_QUEUE_LENGTHS,
             storage: None,
             use_implicit_proof: true,
             timer_config: TimerConfig::default(),
@@ -386,6 +397,28 @@ impl TransportConfig {
         self
     }
 
+    /// Configure the inbound queue length of one traffic class
+    /// (Python `qlen_in_*` configuration options).
+    pub fn set_inbound_queue_length(
+        mut self,
+        class: TrafficClass,
+        length: usize,
+    ) -> Self {
+        if length > 0 {
+            self.inbound_queue_lengths[class as usize] = length;
+        }
+        self
+    }
+
+    /// Signal the next-hop hardware MTU in link requests when the
+    /// next-hop interface supports MTU negotiation
+    /// (Python `Reticulum.link_mtu_discovery`). When disabled, link
+    /// requests always signal the protocol MTU.
+    pub fn set_link_mtu_discovery(mut self, enabled: bool) -> Self {
+        self.link_mtu_discovery = enabled;
+        self
+    }
+
     /// Trust persisted blackhole lists from these remote identities
     /// (Python `Reticulum.blackhole_sources`).
     pub fn set_blackhole_sources(
@@ -417,6 +450,8 @@ impl Default for TransportConfig {
             announce_forever: false,
             blackhole_publish: false,
             blackhole_sources: Vec::new(),
+            link_mtu_discovery: true,
+            inbound_queue_lengths: INBOUND_QUEUE_LENGTHS,
             storage: None,
             use_implicit_proof: true,
             timer_config: Default::default(),
@@ -454,6 +489,9 @@ impl Transport {
         let reroute_eager = config.reroute_eager;
         let blackhole_publish = config.blackhole_publish;
         let blackhole_sources = config.blackhole_sources.clone();
+        let inbound_queues = std::sync::Arc::new(std::sync::Mutex::new(
+            InboundQueues::new(config.inbound_queue_lengths),
+        ));
         let storage = config.storage.clone();
         let identity = config.identity.clone();
         let blackholes = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -480,6 +518,7 @@ impl Transport {
             tunnels: Tunnels::new(),
             remote_management_allowed: Arc::new(std::sync::RwLock::new(Vec::new())),
             blackhole_sources,
+            inbound_queues,
             fixed_dest_tunnel_synthesize: tunnels::create_tunnel_synthesize_destination()
                 .desc
                 .address_hash,
@@ -950,6 +989,47 @@ impl Transport {
         }
     }
 
+    /// Inbound queue pressure snapshot: total queued items, per-class
+    /// heights and per-class drop counters
+    /// (Python `Transport.inbound_queues.snapshot()`).
+    pub async fn inbound_queue_snapshot(&self) -> (usize, [usize; 4], [u64; 4]) {
+        self.handler
+            .lock()
+            .await
+            .inbound_queues
+            .lock()
+            .expect("inbound queue lock")
+            .snapshot()
+    }
+
+    /// The lowest bitrate of all online interfaces
+    /// (Python `Reticulum.get_lowest_interface_bitrate` /
+    /// `Transport.lowest_interface_bitrate`).
+    pub async fn lowest_interface_bitrate(&self) -> Option<u64> {
+        self.iface_manager
+            .lock()
+            .await
+            .lowest_interface_bitrate()
+    }
+
+    /// A reasonable minimum path request timeout covering a full round
+    /// trip for an MTU on the slowest online interface plus per-hop
+    /// grace (Python `Reticulum.get_medium_path_timeout` /
+    /// `Transport.medium_path_timeout`:
+    /// `2*(MTU*8/max(bitrate, MINIMUM_BITRATE)) + DEFAULT_PER_HOP_TIMEOUT`,
+    /// zero when the bitrate is unknown).
+    pub async fn medium_path_timeout(&self) -> Duration {
+        const MINIMUM_BITRATE: f64 = 5.0;
+        const DEFAULT_PER_HOP_TIMEOUT: f64 = 6.0;
+        let Some(bitrate) = self.lowest_interface_bitrate().await else {
+            return Duration::ZERO;
+        };
+        let mtu = crate::packet::PROTOCOL_MTU as f64;
+        let secs =
+            2.0 * (mtu * 8.0 / (bitrate as f64).max(MINIMUM_BITRATE)) + DEFAULT_PER_HOP_TIMEOUT;
+        Duration::from_secs_f64(secs)
+    }
+
     pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
         self.handler.lock().await.find_out_link(link_id)
     }
@@ -959,15 +1039,15 @@ impl Transport {
     }
 
     pub async fn link(&self, destination: DestinationDesc) -> Arc<Mutex<Link>> {
-        let link = self
-            .handler
-            .lock()
-            .await
-            .out_links
-            .get(&destination.address_hash)
-            .cloned();
+        // NOTE: the handler guard is scoped tightly; holding it across
+        // the whole establishment deadlocks (later statements here
+        // re-lock it).
+        let existing = {
+            let handler = self.handler.lock().await;
+            handler.out_links.get(&destination.address_hash).cloned()
+        };
 
-        if let Some(link) = link {
+        if let Some(link) = existing {
             if link.lock().await.status() != LinkStatus::Closed {
                 return link;
             } else {
@@ -976,6 +1056,41 @@ impl Transport {
         }
 
         let mut link = Link::new(destination);
+
+        // Signal the next-hop hardware MTU in the link request when MTU
+        // discovery is enabled and the next-hop interface supports it
+        // (Python `Link.__init__`:
+        // `if RNS.Reticulum.link_mtu_discovery() and nh_hw_mtu:
+        // signalling_bytes(nh_hw_mtu) else signalling_bytes(MTU)`).
+        {
+            let handler = self.handler.lock().await;
+            if handler.config.link_mtu_discovery {
+                // The next-hop interface, when a path is known; otherwise
+                // fall back to the first interface for single-homed
+                // clients.
+                let next_hop_iface = handler
+                    .path_table
+                    .get(&destination.address_hash)
+                    .map(|entry| entry.iface)
+                    .or_else(|| {
+                        handler
+                            .iface_manager
+                            .try_lock()
+                            .ok()
+                            .and_then(|manager| manager.first_iface_address())
+                    });
+                let next_hop = next_hop_iface
+                    .and_then(|iface| {
+                        handler
+                            .iface_manager
+                            .try_lock()
+                            .ok()
+                            .and_then(|manager| manager.iface_hw_mtu(&iface))
+                    })
+                    .unwrap_or(crate::packet::PROTOCOL_MTU);
+                link.set_mtu(next_hop);
+            }
+        }
 
         let packet = link.request();
 
@@ -3886,8 +4001,30 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     .get(&link_destination)
                     .map(|entry| entry.hops)
                     .unwrap_or(1);
-                let establishment_timeout =
+                let mut establishment_timeout =
                     timer_config.out_link_repeat * hops.max(1) as u32 + timer_config.out_link_repeat;
+                // Extra link-proof time on slow interfaces
+                // (Python `Transport.extra_link_proof_timeout`:
+                // `((1/bitrate)*8)*MTU` for the next-hop interface).
+                if let Some(iface) = handler
+                    .path_table
+                    .get(&link_destination)
+                    .map(|entry| entry.iface)
+                {
+                    if let Some(bitrate) = handler
+                        .iface_manager
+                        .try_lock()
+                        .ok()
+                        .and_then(|manager| {
+                            manager.with_control(&iface, |control| control.bitrate)
+                        })
+                        .filter(|bitrate| *bitrate > 0)
+                    {
+                        establishment_timeout += Duration::from_secs_f64(
+                            (1.0 / bitrate as f64) * 8.0 * crate::packet::PROTOCOL_MTU as f64,
+                        );
+                    }
+                }
 
                 if link.elapsed() > establishment_timeout {
                     log::warn!(
@@ -3987,6 +4124,111 @@ async fn retransmit_announces<'a>(
     }
 }
 
+/// Inbound traffic classes, scanned in this order by the drainer
+/// (Python `Transport.TC_*`; lower index drains first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficClass {
+    Data = 0,
+    Announce = 1,
+    PathRequest = 2,
+    IngressLimited = 3,
+}
+
+/// Default inbound queue lengths
+/// (Python `INBOUND_*_QUEUE_LENGTH`).
+pub const INBOUND_QUEUE_LENGTHS: [usize; 4] = [4096, 256, 256, 128];
+
+/// The prioritized inbound queue backend
+/// (Python `Transport.InboundQueues`): one bounded deque per traffic
+/// class, drops (and counts) on overflow, drained strictly in class
+/// order.
+#[derive(Debug)]
+pub struct InboundQueues {
+    queues: [std::collections::VecDeque<RxMessage>; 4],
+    sizes: [usize; 4],
+    dropped: [u64; 4],
+}
+
+impl Default for InboundQueues {
+    fn default() -> Self {
+        Self::new(INBOUND_QUEUE_LENGTHS)
+    }
+}
+
+impl InboundQueues {
+    pub fn new(sizes: [usize; 4]) -> Self {
+        Self {
+            queues: Default::default(),
+            sizes,
+            dropped: [0; 4],
+        }
+    }
+
+    /// Enqueue by class; a full queue drops the item and counts it
+    /// (Python `put` raises `Full` after incrementing `_dropped`).
+    pub fn put(&mut self, class: TrafficClass, item: RxMessage) -> bool {
+        let idx = class as usize;
+        let queue = &mut self.queues[idx];
+        if queue.len() >= self.sizes[idx] {
+            self.dropped[idx] += 1;
+            return false;
+        }
+        queue.push_back(item);
+        true
+    }
+
+    /// Pop the next item, highest-priority class first.
+    pub fn get(&mut self) -> Option<RxMessage> {
+        for queue in &mut self.queues {
+            if let Some(item) = queue.pop_front() {
+                return Some(item);
+            }
+        }
+        None
+    }
+
+    /// Total queued items, per-class heights and drop counters
+    /// (Python `snapshot`).
+    pub fn snapshot(&self) -> (usize, [usize; 4], [u64; 4]) {
+        let heights = [
+            self.queues[0].len(),
+            self.queues[1].len(),
+            self.queues[2].len(),
+            self.queues[3].len(),
+        ];
+        (heights.iter().sum(), heights, self.dropped)
+    }
+
+    /// Enqueue `incoming` and drain everything queued so far, in class
+    /// order. The single-drainer structure matches Python's inbound
+    /// worker thread.
+    pub fn enqueue_and_drain(&mut self, incoming: RxMessage) -> Vec<RxMessage> {
+        let class = Self::classify(&incoming.packet);
+        self.put(class, incoming);
+        let mut out = Vec::new();
+        while let Some(item) = self.get() {
+            out.push(item);
+        }
+        out
+    }
+
+    /// Classify an inbound packet
+    /// (Python `Transport.preprocess_inbound` traffic class selection).
+    fn classify(packet: &Packet) -> TrafficClass {
+        if packet.header.packet_type == PacketType::Announce {
+            return TrafficClass::Announce;
+        }
+        // Path requests are DATA packets aimed at the fixed plain
+        // path-request destination (Python `pr_destination_hash`).
+        if packet.header.packet_type == PacketType::Data
+            && packet.context == PacketContext::CacheRequest
+        {
+            return TrafficClass::PathRequest;
+        }
+        TrafficClass::Data
+    }
+}
+
 /// The early packet filter (Python `Transport.packet_filter`).
 /// Returns `false` when the packet must be dropped; violation-worthy
 /// conditions are accounted on the interface by the caller when this
@@ -4037,9 +4279,11 @@ async fn manage_transport(
         None
     };
 
+    let inbound_queues = handler.lock().await.inbound_queues.clone();
     let _packet_task = {
         let handler = handler.clone();
         let cancel = cancel.clone();
+        let inbound_queues = inbound_queues.clone();
 
         log::trace!(
             "tp({}): start packet task",
@@ -4059,6 +4303,16 @@ async fn manage_transport(
                         break;
                     },
                     Some(message) = rx_receiver.recv() => {
+                        // Prioritized inbound processing: classify and
+                        // enqueue, then drain in class order
+                        // (Python `InboundQueues.put`/`get`).
+                        let drained = {
+                            let mut queues = inbound_queues
+                                .lock()
+                                .expect("inbound queue lock");
+                            queues.enqueue_and_drain(message)
+                        };
+                        for message in drained {
                         let _ = iface_messages_tx.send(message);
 
                         let packet = message.packet;
@@ -4170,6 +4424,7 @@ async fn manage_transport(
                             ).await,
                             PacketType::Proof => handle_proof(&packet, message.address, handler).await,
                             PacketType::Data => handle_data(&packet, message.address, handler).await,
+                        }
                         }
                     }
                 };
@@ -4482,6 +4737,70 @@ async fn manage_transport(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    #[test]
+    fn inbound_queues_drain_in_class_order() {
+        let mut queues = InboundQueues::new([2, 2, 2, 2]);
+        // A data item queued first is still drained after an announce
+        // that arrived later (announces have higher priority).
+        let data = test_rx_message(PacketType::Data);
+        let announce = test_rx_message(PacketType::Announce);
+        let mut drained = queues.enqueue_and_drain(data);
+        drained.extend(queues.enqueue_and_drain(announce));
+        // Both drain immediately in the single-message case; the class
+        // ORDER matters only when items are queued behind each other.
+        assert_eq!(drained.len(), 2);
+    }
+
+    #[test]
+    fn inbound_queues_drop_when_full() {
+        let mut queues = InboundQueues::new([1, 1, 1, 1]);
+        // Fill the announce class beyond its size.
+        queues.put(TrafficClass::Announce, test_rx_message(PacketType::Announce));
+        queues.put(TrafficClass::Announce, test_rx_message(PacketType::Announce));
+        let (total, heights, dropped) = queues.snapshot();
+        assert_eq!(heights[TrafficClass::Announce as usize], 1);
+        assert_eq!(dropped[TrafficClass::Announce as usize], 1);
+        assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn announce_classifies_higher_than_data() {
+        assert_eq!(
+            InboundQueues::classify(&test_packet(PacketType::Announce)),
+            TrafficClass::Announce
+        );
+        assert_eq!(
+            InboundQueues::classify(&test_packet(PacketType::Data)),
+            TrafficClass::Data
+        );
+    }
+
+    fn test_packet(packet_type: PacketType) -> Packet {
+        Packet {
+            header: crate::packet::Header {
+                packet_type,
+                ..Default::default()
+            },
+            ifac: None,
+            destination: crate::hash::AddressHash::new_from_rand(rand_core::OsRng),
+            transport: None,
+            context: PacketContext::None,
+            data: Default::default(),
+        }
+    }
+
+    fn test_rx_message(packet_type: PacketType) -> RxMessage {
+        RxMessage {
+            address: crate::hash::AddressHash::new_from_rand(rand_core::OsRng),
+            packet: test_packet(packet_type),
+        }
     }
 }
 

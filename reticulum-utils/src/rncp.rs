@@ -548,6 +548,10 @@ async fn connect(
     timeout: Duration,
     silent: bool,
 ) -> Result<Arc<Mutex<Link>>, String> {
+    // Slow links need longer for path establishment: never wait less
+    // than the medium path timeout (Python `rncp`:
+    // `estab_timeout = max(timeout, reticulum.get_medium_path_timeout())`).
+    let timeout = timeout.max(transport.medium_path_timeout().await);
     if !transport.has_path(destination).await {
         println!("Path to {} requested", prettyhexrep(destination.as_slice()));
     }

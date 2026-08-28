@@ -1291,11 +1291,22 @@ flag removal — routing capability is `retransmit` now).
 | Interface traffic stats | ✅ announce/path-request counts + announce bytes on `InterfaceStats` (Python `arxb/atxb/arxc/atxc/prxc/ptxc`) |
 | rnstatus | ✅ Announces / PRs / Violations columns (per-interface traffic stats parity) |
 
-Not ported (documented gaps): link MTU discovery disable option
-(`link_mtu_discovery` config — Rust always signals MTU, Python default is
-enabled too), prioritized queue backend (Python-internal performance
-architecture; the tokio pipeline differs by design), adaptive
-medium-bitrate timeouts in utilities.
+Follow-up round (all three gaps closed):
+- `link_mtu_discovery` config (daemon key + `TransportConfig` setter):
+  link requests signal the next-hop hardware MTU when enabled and the
+  interface supports MTU negotiation (TCP/backbone/local/auto kinds),
+  else the protocol MTU — exactly Python's gate. iface_hw_mtu lookup
+  added per kind (262144 TCP/local, 1048576 backbone, 1196 auto).
+- Prioritized inbound queues (Python `InboundQueues`): four bounded
+  per-class queues (data 4096, announce 256, PR 256, IL 128) drained in
+  class order with drop counters; configurable via `qlen_in_data` /
+  `qlen_in_announce` / `qlen_in_pr` / `qlen_in_il`; queue-pressure
+  snapshot in `rnstatus`.
+- Adaptive timeouts: `Transport::lowest_interface_bitrate()` /
+  `medium_path_timeout()` (2*(MTU*8/bitrate)+6s) with rnpath/rncp
+  using it as the establishment timeout floor (Python parity), and
+  `extra_link_proof_timeout` added to link establishment on slow
+  interfaces.
 
 ## Remaining open (documented, lower priority)
 

@@ -150,6 +150,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = std::sync::Arc::new(
         TransportConfig::new(&instance_name, &identity)
             .set_retransmit(config.reticulum.enable_transport)
+            .set_link_mtu_discovery(config.reticulum.link_mtu_discovery.unwrap_or(true))
+            .set_inbound_queue_length(
+                reticulum::transport::TrafficClass::Data,
+                config.reticulum.qlen_in_data.unwrap_or(0),
+            )
+            .set_inbound_queue_length(
+                reticulum::transport::TrafficClass::Announce,
+                config.reticulum.qlen_in_announce.unwrap_or(0),
+            )
+            .set_inbound_queue_length(
+                reticulum::transport::TrafficClass::PathRequest,
+                config.reticulum.qlen_in_pr.unwrap_or(0),
+            )
+            .set_inbound_queue_length(
+                reticulum::transport::TrafficClass::IngressLimited,
+                config.reticulum.qlen_in_il.unwrap_or(0),
+            )
             .set_blackhole_publish(config.reticulum.publish_blackhole)
             .set_blackhole_sources(parse_blackhole_sources(
                 &config.reticulum.blackhole_sources,

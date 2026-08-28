@@ -702,6 +702,51 @@ impl InterfaceManager {
             .map(|iface| iface.kind.clone())
     }
 
+    /// The hardware MTU of an interface (Python
+    /// `Transport.next_hop_interface_hw_mtu`): `None` for interface
+    /// types that cannot negotiate a path MTU, otherwise the type's
+    /// fixed/auto-configured MTU.
+    /// The lowest bitrate of all online interfaces with a configured
+    /// bitrate (Python `Transport.lowest_interface_bitrate`, recomputed
+    /// on the jobs loop there; `None` when no online interface has one).
+    pub fn lowest_interface_bitrate(&self) -> Option<u64> {
+        self.ifaces
+            .iter()
+            .filter(|iface| !iface.stop.is_cancelled() && iface.stats.online())
+            .filter_map(|iface| self.with_control(&iface.address, |c| c.bitrate))
+            .min()
+    }
+
+    /// The hardware MTU of the first live interface (single-interface
+    /// instances have an unambiguous next hop).
+    /// Address of the first live interface.
+    pub fn first_iface_address(&self) -> Option<AddressHash> {
+        self.ifaces
+            .first()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .map(|iface| iface.address)
+    }
+
+    pub fn first_iface_hw_mtu(&self) -> Option<usize> {
+        self.ifaces
+            .first()
+            .filter(|iface| !iface.stop.is_cancelled())
+            .and_then(|iface| self.iface_hw_mtu(&iface.address))
+    }
+
+    pub fn iface_hw_mtu(&self, address: &AddressHash) -> Option<usize> {
+        let kind = self.iface_kind(address)?;
+        match kind.as_str() {
+            // Python `AUTOCONFIGURE_MTU`/`FIXED_MTU` interfaces
+            // (LocalInterface 262144, TCP 262144, Backbone 1048576,
+            // AutoInterface 1196).
+            "LocalServer" | "LocalClient" | "TcpClient" | "TcpServer" => Some(262_144),
+            "BackboneClient" | "BackboneServer" => Some(1_048_576),
+            "AutoInterface" => Some(1_196),
+            _ => None,
+        }
+    }
+
     /// Snapshot of the statistics of all live interfaces.
     pub fn stats(&self) -> Vec<InterfaceStats> {
         self.ifaces

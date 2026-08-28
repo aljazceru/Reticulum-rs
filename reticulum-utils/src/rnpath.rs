@@ -59,6 +59,11 @@ pub async fn wait_for_path(
 
     transport.request_path(destination, None, None).await;
 
+    // Slow links need longer than the default timeout for a full round
+    // trip: never wait less than the medium path timeout
+    // (Python `rnpath`: `timeout = max(timeout,
+    // reticulum.get_medium_path_timeout())`).
+    let timeout = timeout.max(transport.medium_path_timeout().await);
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if transport.has_path(destination).await {

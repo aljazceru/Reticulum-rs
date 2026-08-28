@@ -43,6 +43,22 @@ pub struct ReticulumConfig {
     /// (Python `enable_remote_management`).
     #[serde(default, alias = "enable_remote_management")]
     pub remote_management: bool,
+    /// Inbound data queue length (Python `qlen_in_data`).
+    #[serde(default)]
+    pub qlen_in_data: Option<usize>,
+    /// Inbound announce queue length (Python `qlen_in_announce`).
+    #[serde(default)]
+    pub qlen_in_announce: Option<usize>,
+    /// Inbound path request queue length (Python `qlen_in_pr`).
+    #[serde(default)]
+    pub qlen_in_pr: Option<usize>,
+    /// Inbound ingress-limited queue length (Python `qlen_in_il`).
+    #[serde(default)]
+    pub qlen_in_il: Option<usize>,
+    /// Signal the next-hop hardware MTU in link requests
+    /// (Python `link_mtu_discovery`, default enabled).
+    #[serde(default)]
+    pub link_mtu_discovery: Option<bool>,
     /// Publish this node's blackhole list over the
     /// `rnstransport.info.blackhole` destination
     /// (Python `publish_blackhole`).
@@ -595,6 +611,11 @@ impl Default for ReticulumConfig {
     fn default() -> Self {
         Self {
             remote_management: false,
+            qlen_in_data: None,
+            qlen_in_announce: None,
+            qlen_in_pr: None,
+            qlen_in_il: None,
+            link_mtu_discovery: None,
             publish_blackhole: false,
             blackhole_sources: Vec::new(),
             probe_destination: false,
