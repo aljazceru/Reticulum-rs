@@ -190,9 +190,9 @@ async fn rnode_detect_validate_and_exchange() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
-    let a = Arc::new(TransportConfig::new("rnode-a", &identity_a, false).build());
+    let a = Arc::new(TransportConfig::new("rnode-a", &identity_a).build());
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
-    let b = Arc::new(TransportConfig::new("rnode-b", &identity_b, false).build());
+    let b = Arc::new(TransportConfig::new("rnode-b", &identity_b).build());
 
     let iface_a = {
         let manager = a.iface_manager();

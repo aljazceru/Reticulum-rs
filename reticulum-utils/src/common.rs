@@ -301,7 +301,7 @@ fn read_config_file(config_dir: &Path) -> Option<String> {
 /// `config_dir` (if any) or the explicit `udp_loopback` fallback.
 pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transport {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let transport = TransportConfig::new(options.instance_name, &identity, options.enable_transport)
+    let transport = TransportConfig::new(options.instance_name, &identity)
         .set_retransmit(options.enable_transport)
         .build();
 

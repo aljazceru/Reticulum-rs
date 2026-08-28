@@ -57,11 +57,11 @@ async fn discovery_announce_validate_and_autoconnect() {
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
 
     let a = Arc::new(
-        TransportConfig::new("disc-a", &identity_a, false)
+        TransportConfig::new("disc-a", &identity_a)
             .build(),
     );
     let b = Arc::new(
-        TransportConfig::new("disc-b", &identity_b, false)
+        TransportConfig::new("disc-b", &identity_b)
             .build(),
     );
 

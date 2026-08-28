@@ -37,7 +37,7 @@ fn free_tcp_port() -> u16 {
 
 /// Shared instance transport with a local server on `address`.
 async fn build_shared_instance(name: &str, address: SharedInstanceAddress) -> Transport {
-    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true)
+    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng))
         .set_retransmit(true)
         .build();
 
@@ -51,7 +51,7 @@ async fn build_shared_instance(name: &str, address: SharedInstanceAddress) -> Tr
 
 /// Client transport attached to a shared instance.
 async fn build_local_client(name: &str, address: SharedInstanceAddress) -> Transport {
-    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true).build();
+    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
 
     transport.iface_manager().lock().await.spawn(
         LocalClient::new(name.to_string(), address),

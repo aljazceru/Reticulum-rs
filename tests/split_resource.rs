@@ -16,8 +16,8 @@ use reticulum::transport::{Transport, TransportConfig};
 async fn udp_pair(name: &str, pa: u16, pb: u16) -> (Transport, Transport) {
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
-    let a = TransportConfig::new(format!("{name}-a"), &identity_a, true).build();
-    let b = TransportConfig::new(format!("{name}-b"), &identity_b, true).build();
+    let a = TransportConfig::new(format!("{name}-a"), &identity_a).build();
+    let b = TransportConfig::new(format!("{name}-b"), &identity_b).build();
 
     {
         let manager = a.iface_manager();

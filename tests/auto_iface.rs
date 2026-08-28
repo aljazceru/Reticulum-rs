@@ -55,7 +55,7 @@ fn auto_config(group: &str, adopt: &str, discovery_port: u16) -> AutoInterfaceCo
 }
 
 async fn auto_transport(name: &str, config: AutoInterfaceConfig) -> Transport {
-    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true).build();
+    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
 
     transport.iface_manager().lock().await.spawn(
         AutoInterface::new(config, transport.iface_manager()),

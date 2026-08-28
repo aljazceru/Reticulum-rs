@@ -83,7 +83,7 @@ async fn hw_detect_firmware_and_identity() {
     let _guard = HW_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let transport = Arc::new(TransportConfig::new("hw-rnode", &identity, false).build());
+    let transport = Arc::new(TransportConfig::new("hw-rnode", &identity).build());
     let iface = spawn_rnode(&transport).await;
 
     // The interface must pass detection + firmware validation and come
@@ -171,7 +171,7 @@ async fn hw_packet_transmit() {
     let _guard = HW_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let transport = Arc::new(TransportConfig::new("hw-tx", &identity, false).build());
+    let transport = Arc::new(TransportConfig::new("hw-tx", &identity).build());
     let iface = spawn_rnode(&transport).await;
 
     let online = async {

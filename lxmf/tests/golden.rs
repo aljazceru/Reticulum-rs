@@ -733,7 +733,6 @@ async fn router_ingests_python_style_propagation_transfer() {
     let transport = Transport::new(TransportConfig::new(
         "test-pn-ingest",
         &destination_identity,
-        false,
     ));
     let router = LxmRouter::new(
         transport,

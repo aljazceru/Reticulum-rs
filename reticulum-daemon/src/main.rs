@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Instance name: {instance_name}");
 
     let transport = std::sync::Arc::new(
-        TransportConfig::new(&instance_name, &identity, config.reticulum.enable_transport)
+        TransportConfig::new(&instance_name, &identity)
             .set_retransmit(config.reticulum.enable_transport)
             .set_blackhole_publish(config.reticulum.publish_blackhole)
             .set_blackhole_sources(parse_blackhole_sources(

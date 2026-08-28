@@ -131,7 +131,6 @@ impl Default for TimerConfig {
 pub struct TransportConfig {
     name: String,
     identity: PrivateIdentity,
-    broadcast: bool,
     retransmit: bool,
 
     /// If `false`, `Transport` will replace known routes to distant destinations
@@ -322,11 +321,10 @@ pub struct Transport {
 }
 
 impl TransportConfig {
-    pub fn new<T: Into<String>>(name: T, identity: &PrivateIdentity, broadcast: bool) -> Self {
+    pub fn new<T: Into<String>>(name: T, identity: &PrivateIdentity) -> Self {
         Self {
             name: name.into(),
             identity: identity.clone(),
-            broadcast,
             retransmit: false,
             reroute_eager: false,
             restart_outlinks: false,
@@ -358,15 +356,12 @@ impl TransportConfig {
         self
     }
 
-    /// Whether this instance routes traffic for other peers
-    /// (Python `Reticulum.transport_enabled`).
-    pub fn transport_enabled(&self) -> bool {
-        self.broadcast
-    }
-
-    pub fn set_broadcast(mut self, broadcast: bool) -> Self {
-        self.broadcast = broadcast;
-        self
+    /// Whether this instance relays announces and routes traffic for
+    /// other peers (Python `Reticulum.transport_enabled`). The separate
+    /// `broadcast` flag was removed; announce retransmission expresses
+    /// routing capability.
+    pub fn is_transport_enabled(&self) -> bool {
+        self.retransmit
     }
 
     pub fn set_reroute_eager(mut self, reroute_eager: bool) -> Self {
@@ -416,7 +411,6 @@ impl Default for TransportConfig {
         Self {
             name: "tp".into(),
             identity: PrivateIdentity::new_from_rand(OsRng),
-            broadcast: false,
             retransmit: false,
             reroute_eager: false,
             restart_outlinks: false,
@@ -3884,7 +3878,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         handler.config.name,
                         link.id()
                     );
-                    let rediscover = !handler.config.transport_enabled();
+                    let rediscover = !handler.config.retransmit;
                     if let Some(packet) = link.teardown(&handler.link_out_event_tx).ok().flatten() {
                         handler.send_packet(packet).await;
                     }
@@ -4069,6 +4063,35 @@ async fn manage_transport(
                         // accounting (announces via the announce table,
                         // link requests/proofs/link data via the link
                         // table, addressed data via the path table).
+                        //
+                        // Only the designated next hop processes in-transit packets:
+                        // nodes that merely overhear them on shared-medium (radio)
+                        // interfaces must ignore them, otherwise forwarded packets
+                        // circulate (e.g. LinkRequest ping-pong between originator and
+                        // relay).
+                        //
+                        // A node accepts an in-transit packet when the transport field
+                        // designates it as the next hop. For relay next hops this is the
+                        // node's own identity hash; for the final hop to a non-relay
+                        // destination host (whose announce carried no transport id) the
+                        // path table records the destination address itself, so we also
+                        // accept when it matches a locally hosted destination.
+                        if let Some(transport) = packet.transport {
+                            if packet.header.destination_type != DestinationType::Link
+                                && packet.header.packet_type != PacketType::Announce
+                                && packet.header.packet_type != PacketType::Proof
+                                && transport != *handler.config.identity.address_hash()
+                                && !handler.has_destination(&transport)
+                            {
+                                log::trace!(
+                                    "tp({}): ignoring in-transit packet not addressed to this node: dst={}, type={:?}",
+                                    handler.config.name,
+                                    packet.destination,
+                                    packet.header.packet_type
+                                );
+                                continue;
+                            }
+                        }
 
                         match packet.header.packet_type {
                             PacketType::Announce => handle_announce(
@@ -4409,7 +4432,7 @@ mod tests {
     #[tokio::test]
     async fn synchronous_accessors_are_safe_inside_a_runtime() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let transport = TransportConfig::new("accessors", &identity, false).build();
+        let transport = TransportConfig::new("accessors", &identity).build();
 
         assert_eq!(
             transport.identity_private().to_hex_string(),

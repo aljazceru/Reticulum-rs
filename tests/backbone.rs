@@ -17,10 +17,10 @@ use reticulum::transport::TransportConfig;
 #[tokio::test]
 async fn backbone_end_to_end_and_tunnel_request() {
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
-    let a = Arc::new(TransportConfig::new("bb-a", &identity_a, false).build());
+    let a = Arc::new(TransportConfig::new("bb-a", &identity_a).build());
 
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
-    let b = Arc::new(TransportConfig::new("bb-b", &identity_b, false).build());
+    let b = Arc::new(TransportConfig::new("bb-b", &identity_b).build());
 
     // Server on A.
     let server_addr = {

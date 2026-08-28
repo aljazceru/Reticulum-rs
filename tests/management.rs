@@ -18,8 +18,8 @@ async fn udp_pair(
     identity_a: &PrivateIdentity,
     identity_b: &PrivateIdentity,
 ) -> (Transport, Transport) {
-    let a = TransportConfig::new(format!("mgmt-{name}-a"), identity_a, false).build();
-    let b = TransportConfig::new(format!("mgmt-{name}-b"), identity_b, false).build();
+    let a = TransportConfig::new(format!("mgmt-{name}-a"), identity_a).build();
+    let b = TransportConfig::new(format!("mgmt-{name}-b"), identity_b).build();
 
     {
         let manager = a.iface_manager();

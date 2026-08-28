@@ -47,7 +47,7 @@ async fn udp_pair(a: &Arc<Transport>, b: &Arc<Transport>, port_a: u16, port_b: u
 fn transport(name: &str) -> (PrivateIdentity, Arc<Transport>) {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let t = Arc::new(Transport::new(
-        reticulum::transport::TransportConfig::new(name, &identity, true),
+        reticulum::transport::TransportConfig::new(name, &identity),
     ));
     (identity, t)
 }
@@ -58,7 +58,7 @@ async fn call_end_to_end_over_udp() {
     let callee_identity = PrivateIdentity::new_from_rand(OsRng);
     // register the call destination before wrapping the transport in an Arc
     let callee_transport = Transport::new(
-        reticulum::transport::TransportConfig::new("callee", &callee_identity, true),
+        reticulum::transport::TransportConfig::new("callee", &callee_identity),
     );
     let destination = callee_transport
         .add_destination(callee_identity.clone(), call_endpoint_name())
@@ -199,7 +199,7 @@ async fn packetizer_to_link_source_loop() {
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = Transport::new(
-        reticulum::transport::TransportConfig::new("loop", &identity, true),
+        reticulum::transport::TransportConfig::new("loop", &identity),
     );
     let _dest = transport
         .add_destination(identity.clone(), call_endpoint_name())

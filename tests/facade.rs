@@ -10,7 +10,7 @@ use reticulum::transport::TransportConfig;
 #[tokio::test]
 async fn facade_lifecycle() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let reticulum = Reticulum::new(TransportConfig::new("facade", &identity, false));
+    let reticulum = Reticulum::new(TransportConfig::new("facade", &identity));
 
     assert!(!reticulum.is_transport_enabled().await);
     assert_eq!(reticulum.identity_hash().await, *identity.address_hash());

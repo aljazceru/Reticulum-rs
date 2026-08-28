@@ -20,7 +20,7 @@ struct Pair {
 }
 
 async fn pair(base_port: u16) -> Pair {
-    let server = TransportConfig::new("server", &PrivateIdentity::new_from_rand(OsRng), false)
+    let server = TransportConfig::new("server", &PrivateIdentity::new_from_rand(OsRng))
         .set_storage(Arc::new(MemoryStorage::new()))
         .build();
     server.iface_manager().lock().await.spawn(
@@ -32,7 +32,7 @@ async fn pair(base_port: u16) -> Pair {
         UdpInterface::spawn,
     );
 
-    let client = TransportConfig::new("client", &PrivateIdentity::new_from_rand(OsRng), false)
+    let client = TransportConfig::new("client", &PrivateIdentity::new_from_rand(OsRng))
         .set_storage(Arc::new(MemoryStorage::new()))
         .build();
     client.iface_manager().lock().await.spawn(
@@ -277,7 +277,7 @@ async fn known_destinations_persist_across_restart() {
 
     // Build the pair manually so the client shares the storage that the
     // restarted transport reloads from.
-    let server = TransportConfig::new("server", &PrivateIdentity::new_from_rand(OsRng), false)
+    let server = TransportConfig::new("server", &PrivateIdentity::new_from_rand(OsRng))
         .set_storage(Arc::new(MemoryStorage::new()))
         .build();
     server.iface_manager().lock().await.spawn(
@@ -285,7 +285,7 @@ async fn known_destinations_persist_across_restart() {
         UdpInterface::spawn,
     );
 
-    let client = TransportConfig::new("client", &PrivateIdentity::new_from_rand(OsRng), false)
+    let client = TransportConfig::new("client", &PrivateIdentity::new_from_rand(OsRng))
         .set_storage(storage.clone())
         .build();
     client.iface_manager().lock().await.spawn(
@@ -318,7 +318,7 @@ async fn known_destinations_persist_across_restart() {
     client.save_known_destinations().await.expect("save");
 
     // A fresh transport with the same storage recalls the destination.
-    let restarted = TransportConfig::new("restarted", &PrivateIdentity::new_from_rand(OsRng), false)
+    let restarted = TransportConfig::new("restarted", &PrivateIdentity::new_from_rand(OsRng))
         .set_storage(storage)
         .build();
 
@@ -348,7 +348,7 @@ async fn destination_ratchets_are_signed_by_the_destination_and_reload() {
     let name = DestinationName::new("test", "destination.ratchet-signature");
     let path = "local-destination.ratchets";
 
-    let transport = TransportConfig::new("ratchet-writer", &transport_identity, false)
+    let transport = TransportConfig::new("ratchet-writer", &transport_identity)
         .set_storage(storage.clone())
         .build();
     let destination = transport
@@ -384,7 +384,7 @@ async fn destination_ratchets_are_signed_by_the_destination_and_reload() {
     .expect("rotated ratchets verify");
     assert_eq!(persisted.len(), 1);
 
-    let restarted = TransportConfig::new("ratchet-reader", &transport_identity, false)
+    let restarted = TransportConfig::new("ratchet-reader", &transport_identity)
         .set_storage(storage)
         .build();
     let reloaded = restarted

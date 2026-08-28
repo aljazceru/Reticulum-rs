@@ -66,7 +66,7 @@ async fn spawn_middle(listen_a: u16, forward_a: u16, listen_c: u16, forward_c: u
 /// A Rust endpoint facing the Python middle on one UDP interface.
 async fn rust_endpoint(name: &str, listen: u16, forward: u16) -> Transport {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let transport = TransportConfig::new(name, &identity, false).build();
+    let transport = TransportConfig::new(name, &identity).build();
 
     {
         let manager = transport.iface_manager();
@@ -176,7 +176,7 @@ async fn python_endpoint_through_rust_middle() {
     // The Python endpoints are driven by partner.py in "announce"/"link"
     // modes.
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let middle = TransportConfig::new("rust-middle", &identity, true)
+    let middle = TransportConfig::new("rust-middle", &identity)
         .set_retransmit(true)
         .build();
 
@@ -434,7 +434,7 @@ async fn python_request_through_rust_middle() {
         .try_init();
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let middle = TransportConfig::new("rust-middle", &identity, true)
+    let middle = TransportConfig::new("rust-middle", &identity)
         .set_retransmit(true)
         .build();
 

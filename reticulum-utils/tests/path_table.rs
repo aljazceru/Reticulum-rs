@@ -10,8 +10,8 @@ use reticulum::transport::{Transport, TransportConfig};
 use reticulum_utils::rnpath;
 
 async fn udp_pair(server_port: u16, client_port: u16) -> (Transport, Transport) {
-    let server = TransportConfig::new("srv", &PrivateIdentity::new_from_rand(OsRng), false).build();
-    let client = TransportConfig::new("cli", &PrivateIdentity::new_from_rand(OsRng), false).build();
+    let server = TransportConfig::new("srv", &PrivateIdentity::new_from_rand(OsRng)).build();
+    let client = TransportConfig::new("cli", &PrivateIdentity::new_from_rand(OsRng)).build();
     server
         .iface_manager()
         .lock()

@@ -79,8 +79,8 @@ fn group_destination_key_lifecycle() {
 async fn group_transport_roundtrip_encrypted() {
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
-    let a = TransportConfig::new("grp-a", &identity_a, false).build();
-    let mut b = TransportConfig::new("grp-b", &identity_b, false).build();
+    let a = TransportConfig::new("grp-a", &identity_a).build();
+    let mut b = TransportConfig::new("grp-b", &identity_b).build();
 
     {
         let manager = a.iface_manager();

@@ -241,7 +241,7 @@ async fn i2p_end_to_end_over_mock_sam() {
 
     // Node A: connectable I2P server.
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
-    let a = Arc::new(TransportConfig::new("i2p-a", &identity_a, false).build());
+    let a = Arc::new(TransportConfig::new("i2p-a", &identity_a).build());
 
     let server_address = {
         let manager = a.iface_manager();
@@ -270,7 +270,7 @@ async fn i2p_end_to_end_over_mock_sam() {
 
     // Node B: initiator peer targeting A's destination.
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
-    let b = Arc::new(TransportConfig::new("i2p-b", &identity_b, false).build());
+    let b = Arc::new(TransportConfig::new("i2p-b", &identity_b).build());
 
     let peer_address = {
         let manager = b.iface_manager();

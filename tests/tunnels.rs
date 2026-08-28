@@ -15,7 +15,6 @@ async fn udp_pair(name: &str, port_a: u16, port_b: u16) -> (Transport, Transport
     let a = TransportConfig::new(
         format!("tunnel-{name}-a"),
         &PrivateIdentity::new_from_rand(OsRng),
-        true,
     )
     .set_retransmit(true)
     .build();
@@ -23,7 +22,6 @@ async fn udp_pair(name: &str, port_a: u16, port_b: u16) -> (Transport, Transport
     let b = TransportConfig::new(
         format!("tunnel-{name}-b"),
         &PrivateIdentity::new_from_rand(OsRng),
-        true,
     )
     .set_retransmit(true)
     .build();

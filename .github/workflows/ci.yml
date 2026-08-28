@@ -35,7 +35,7 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets
           cargo clippy -p reticulum --all-targets --all-features
-          cargo clippy -p reticulum-core --no-default-features --features="embassy-time"
+          cargo clippy -p reticulum-core --no-default-features --features="no_std"
       - name: no_std bare-metal check
         run: |
           rustup target add thumbv7em-none-eabihf
@@ -68,7 +68,7 @@ jobs:
           cargo test --workspace --lib --bins --tests --examples \
             --features="python-tests" -- --no-capture
           cargo bench --workspace --no-run
-          cargo test -p reticulum-core --all-targets --no-default-features --features="embassy-time"
+          cargo test -p reticulum-core --all-targets --no-default-features --features="no_std"
           # bzip2 compression matrix for resources
           cargo test -p reticulum --features bz2 --test resource_transfer
 

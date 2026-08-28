@@ -36,7 +36,7 @@ fn setup() {
 }
 
 async fn kiss_transport(name: &str, mode: KissMode, stream: tokio_serial::SerialStream) -> Transport {
-    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true).build();
+    let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
 
     transport.iface_manager().lock().await.spawn(
         KissInterface::from_stream(mode, CsmaParams::default(), false, stream),
@@ -135,7 +135,7 @@ async fn serial_hdlc_announce_over_pty_pair() {
 
     async fn build(name: &str, stream: tokio_serial::SerialStream) -> Transport {
         let transport =
-            TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng), true).build();
+            TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
 
         transport
             .iface_manager()

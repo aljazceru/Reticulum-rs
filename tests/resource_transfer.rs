@@ -180,11 +180,10 @@ fn compression_roundtrip() {
 async fn connected_pair(server_port: u16, client_port: u16) -> (Transport, Transport, Arc<Mutex<Link>>) {
     let server_identity = PrivateIdentity::new_from_rand(OsRng);
     let server =
-        TransportConfig::new("srv", &server_identity, false).build();
+        TransportConfig::new("srv", &server_identity).build();
     let client = TransportConfig::new(
         "cli",
         &PrivateIdentity::new_from_rand(OsRng),
-        false,
     )
     .build();
 

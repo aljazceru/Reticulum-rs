@@ -34,7 +34,6 @@ async fn pair(name: &str, port_a: u16, port_b: u16) -> Pair {
     let a = TransportConfig::new(
         format!("rust-{name}-a"),
         &PrivateIdentity::new_from_rand(OsRng),
-        true,
     )
     .set_retransmit(true)
     .build();
@@ -42,7 +41,6 @@ async fn pair(name: &str, port_a: u16, port_b: u16) -> Pair {
     let b = TransportConfig::new(
         format!("rust-{name}-b"),
         &PrivateIdentity::new_from_rand(OsRng),
-        true,
     )
     .set_retransmit(true)
     .build();

@@ -36,7 +36,7 @@ async fn pipe_echo_with_cat() {
     setup();
 
     let transport =
-        TransportConfig::new("pipe", &PrivateIdentity::new_from_rand(OsRng), false).build();
+        TransportConfig::new("pipe", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     transport.iface_manager().lock().await.spawn(
         PipeInterface::new("/bin/cat"),
@@ -92,7 +92,6 @@ async fn pipe_respawns_after_exit() {
     let transport = TransportConfig::new(
         "pipe-respawn",
         &PrivateIdentity::new_from_rand(OsRng),
-        false,
     )
     .build();
 

@@ -21,7 +21,7 @@ const BOB_KEY: &str = "d85d036245436a3c33d3228affae06721f8203bc364ee0ee7556368ac
 
 async fn build_transport(name: &str, bind: &str, forward: &str) -> Transport {
     let id = PrivateIdentity::new_from_rand(OsRng);
-    let transport = Transport::new(TransportConfig::new(name, &id, true));
+    let transport = Transport::new(TransportConfig::new(name, &id));
     transport.iface_manager().lock().await.spawn(
         UdpInterface::new(bind, Some(forward), false),
         UdpInterface::spawn,
@@ -328,7 +328,7 @@ async fn paper_uri_ingest() {
     let alice_delivery = delivery_destination_hash(alice_identity.as_identity());
     let bob_delivery = delivery_destination_hash(bob_identity.as_identity());
 
-    let transport = Transport::new(TransportConfig::new("paper", &bob_identity, false));
+    let transport = Transport::new(TransportConfig::new("paper", &bob_identity));
     let router = LxmRouter::new(
         transport,
         bob_identity.clone(),
@@ -459,7 +459,7 @@ async fn propagation_node_announce_peering() {
 async fn delivery_destination_registration() {
     let identity = fixed_identity(ALICE_KEY);
 
-    let transport = Transport::new(TransportConfig::new("dests", &identity, false));
+    let transport = Transport::new(TransportConfig::new("dests", &identity));
     let router = LxmRouter::new(
         transport,
         identity.clone(),

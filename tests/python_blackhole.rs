@@ -79,7 +79,7 @@ async fn rust_transport(
     sources: Vec<AddressHash>,
 ) -> Transport {
     let identity = PrivateIdentity::new_from_name(name);
-    let mut config = TransportConfig::new(name, &identity, true)
+    let mut config = TransportConfig::new(name, &identity)
         .set_retransmit(true)
         .set_blackhole_publish(true)
         .set_blackhole_sources(sources);

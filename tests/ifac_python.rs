@@ -101,7 +101,7 @@ async fn ifac_protected_tcp_exchange_with_python() {
 
     // Rust TCP client with the same access code.
     let transport =
-        TransportConfig::new("ifac-client", &PrivateIdentity::new_from_rand(OsRng), false).build();
+        TransportConfig::new("ifac-client", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     let iface = {
         let manager = transport.iface_manager();
@@ -166,10 +166,10 @@ async fn ifac_rejects_packets_without_the_passphrase() {
     // A UDP pair where the receiver expects an access code but the sender
     // does not apply one: the packets must be dropped.
     let receiver =
-        TransportConfig::new("ifac-recv", &PrivateIdentity::new_from_rand(OsRng), false).build();
+        TransportConfig::new("ifac-recv", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     let sender =
-        TransportConfig::new("ifac-send", &PrivateIdentity::new_from_rand(OsRng), false).build();
+        TransportConfig::new("ifac-send", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     let recv_iface = {
         let manager = receiver.iface_manager();

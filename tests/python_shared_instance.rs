@@ -149,7 +149,6 @@ async fn rust_local_client() -> Transport {
     let transport = TransportConfig::new(
         "rust-local-client",
         &PrivateIdentity::new_from_rand(OsRng),
-        true,
     )
     .build();
 
@@ -169,7 +168,6 @@ async fn rust_shared_instance() -> Transport {
     let transport = TransportConfig::new(
         "rust-shared-instance",
         &PrivateIdentity::new_from_rand(OsRng),
-        true,
     )
     .set_retransmit(true)
     .build();

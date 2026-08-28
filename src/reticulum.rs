@@ -14,7 +14,7 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let reticulum = Reticulum::new(
-//!         TransportConfig::new("my-app", &PrivateIdentity::new_from_rand(OsRng), false)
+//!         TransportConfig::new("my-app", &PrivateIdentity::new_from_rand(OsRng))
 //!     );
 //!     assert!(!reticulum.is_transport_enabled().await);
 //! }
@@ -45,7 +45,7 @@ impl Reticulum {
     /// Create a Reticulum instance from a transport configuration
     /// (Python `RNS.Reticulum(configdir=...)`).
     pub fn new(config: TransportConfig) -> Self {
-        let transport_enabled = config.transport_enabled();
+        let transport_enabled = config.is_transport_enabled();
         Self {
             transport: Arc::new(config.build()),
             transport_enabled,

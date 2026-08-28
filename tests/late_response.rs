@@ -13,8 +13,8 @@ use reticulum::transport::TransportConfig;
 async fn response_before_await_is_delivered() {
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
-    let a = TransportConfig::new("late-a", &identity_a, true).build();
-    let b = TransportConfig::new("late-b", &identity_b, true).build();
+    let a = TransportConfig::new("late-a", &identity_a).build();
+    let b = TransportConfig::new("late-b", &identity_b).build();
 
     {
         let manager = a.iface_manager();

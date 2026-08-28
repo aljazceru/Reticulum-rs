@@ -23,7 +23,7 @@ async fn main() {
     let reason = std::env::args().nth(5);
 
     let identity = PrivateIdentity::new_from_rand(rand_core::OsRng);
-    let transport = TransportConfig::new("publisher", &identity, true)
+    let transport = TransportConfig::new("publisher", &identity)
         .set_retransmit(true)
         .set_blackhole_publish(true)
         .build();

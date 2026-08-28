@@ -389,7 +389,7 @@ impl ActiveCallHandle {
 /// Utility for constructing a transport bound to a call identity (Python
 /// builds `RNS.Transport` in the application).
 pub fn call_transport(identity: &PrivateIdentity, name: &str) -> Arc<Transport> {
-    Arc::new(Transport::new(TransportConfig::new(name, identity, true)))
+    Arc::new(Transport::new(TransportConfig::new(name, identity)))
 }
 
 //***************************************************************************//
