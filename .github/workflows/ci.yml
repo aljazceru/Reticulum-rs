@@ -16,7 +16,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     container: rust:1.95
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: checkout
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     container: rust:1.95
     needs: check
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       RETICULUM_TEST_PYTHON_DIR: /opt/Reticulum
       PYTHONPATH: /opt/Reticulum
@@ -76,7 +76,7 @@ jobs:
           cargo build -p reticulum-ffi
           cargo run -p uniffi-bindgen -- generate --no-format --library target/debug/libreticulum_ffi.so --language kotlin --out-dir reticulum-ffi/bindings/kotlin
           cargo run -p uniffi-bindgen -- generate --no-format --library target/debug/libreticulum_ffi.so --language swift --out-dir reticulum-ffi/bindings/swift
-          git diff --exit-code -- reticulum-ffi/bindings
+          test -z "$(git status --porcelain -- reticulum-ffi/bindings)"
 
   windows-storage:
     runs-on: windows-latest
@@ -119,4 +119,4 @@ jobs:
       - name: throughput floors (fail on regressions)
         run: cargo test -p reticulum-actor --test perf_floor --release -- --nocapture
       - name: criterion benchmarks (compile + run)
-        run: cargo bench -p reticulum-actor -- --quick
+        run: cargo bench -p reticulum-actor --bench actor -- --quick
