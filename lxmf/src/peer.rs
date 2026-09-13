@@ -17,6 +17,10 @@ use crate::fields::FieldValue;
 pub const OFFER_REQUEST_PATH: &str = "/offer";
 /// Link request path for client message fetches.
 pub const MESSAGE_GET_PATH: &str = "/get";
+/// Authenticated control path that schedules a peer sync.
+pub const SYNC_REQUEST_PATH: &str = "/pn/peer/sync";
+/// Authenticated control path that removes a peer.
+pub const UNPEER_REQUEST_PATH: &str = "/pn/peer/unpeer";
 
 /// Peer state: idle.
 pub const IDLE: u8 = 0x00;
@@ -177,7 +181,8 @@ impl PeerData {
     /// Serialise the peer to msgpack bytes, with the exact key order of the
     /// Python `LXMPeer.to_bytes`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256 + 64 * (self.handled_ids.len() + self.unhandled_ids.len()));
+        let mut out =
+            Vec::with_capacity(256 + 64 * (self.handled_ids.len() + self.unhandled_ids.len()));
 
         let entry = |out: &mut Vec<u8>, key: &str, value: &FieldValue| {
             rmp::encode::write_str(out, key).ok();
@@ -186,7 +191,11 @@ impl PeerData {
 
         rmp::encode::write_map_len(&mut out, 22).ok();
 
-        entry(&mut out, "peering_timebase", &FieldValue::Int(self.peering_timebase));
+        entry(
+            &mut out,
+            "peering_timebase",
+            &FieldValue::Int(self.peering_timebase),
+        );
         entry(&mut out, "alive", &FieldValue::Bool(self.alive));
         entry(
             &mut out,
@@ -400,8 +409,7 @@ impl PeerData {
         }
 
         // Python raises on missing required keys
-        peer.destination_hash =
-            destination_hash.ok_or(LxmfError::InvalidFormat)?;
+        peer.destination_hash = destination_hash.ok_or(LxmfError::InvalidFormat)?;
         peer.peering_timebase = peering_timebase.ok_or(LxmfError::InvalidFormat)?;
         peer.alive = alive.ok_or(LxmfError::InvalidFormat)?;
         peer.last_heard = last_heard.ok_or(LxmfError::InvalidFormat)?;

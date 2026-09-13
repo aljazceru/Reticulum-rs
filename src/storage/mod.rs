@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use reticulum_core::destination::RATCHET_COUNT;
+use reticulum_core::error::RnsError;
 use reticulum_core::hash::{AddressHash, HASH_SIZE};
 use reticulum_core::identity::{
     pack_destination_ratchets, pack_known_destinations, pack_ratchet, pack_ratchet_list,
@@ -28,7 +29,6 @@ use reticulum_core::identity::{
     DestinationUses, Identity, KnownDestinationData, PrivateIdentity, RatchetFileData,
     RATCHET_EXPIRY_SECS, RATCHET_KEY_LENGTH,
 };
-use reticulum_core::error::RnsError;
 
 /// File name of the known-destinations store inside the storage path
 /// (Python `RNS.Reticulum.storagepath + "/known_destinations"`).
@@ -214,7 +214,6 @@ impl Storage for MemoryStorage {
 //***************************************************************************/
 // Identity files (Python `Identity.to_file` / `from_file` / `pub_to_file`)
 //***************************************************************************/
-
 /// Identity file persistence, mirroring Python `Identity` file methods on
 /// top of the [`Storage`] trait.
 pub trait IdentityFiles {
@@ -273,7 +272,6 @@ impl IdentityFiles for Identity {
 //***************************************************************************/
 // Known destinations (Python `Identity.known_destinations`)
 //***************************************************************************/
-
 /// In-memory mirror of Python `Identity.known_destinations`, persisted as
 /// msgpack into [`KNOWN_DESTINATIONS_FILE`].
 ///
@@ -315,8 +313,7 @@ impl KnownDestinations {
                 entry.app_data = app_data;
             }
             None => {
-                self.index
-                    .insert(destination_hash, self.entries.len());
+                self.index.insert(destination_hash, self.entries.len());
                 self.entries.push((
                     destination_hash,
                     KnownDestinationData {
@@ -534,7 +531,6 @@ impl KnownDestinations {
 //***************************************************************************/
 // Known ratchets (Python `Identity.known_ratchets`)
 //***************************************************************************/
-
 /// Remembered *public* ratchet keys of remote destinations, persisted as
 /// `ratchets/<destination hash hex>` files.
 #[derive(Default)]
@@ -561,14 +557,25 @@ impl KnownRatchets {
         ratchet: [u8; RATCHET_KEY_LENGTH],
         now: f64,
     ) -> Result<(), RnsError> {
-        if self.ratchets.get(&destination_hash).map(|(known, _)| *known) == Some(ratchet) {
+        if self
+            .ratchets
+            .get(&destination_hash)
+            .map(|(known, _)| *known)
+            == Some(ratchet)
+        {
             return Ok(());
         }
 
         self.ratchets.insert(destination_hash, (ratchet, now));
 
-        let data = RatchetFileData { ratchet, received: now };
-        storage.write(&Self::ratchet_path(&destination_hash), &pack_ratchet(&data)?)
+        let data = RatchetFileData {
+            ratchet,
+            received: now,
+        };
+        storage.write(
+            &Self::ratchet_path(&destination_hash),
+            &pack_ratchet(&data)?,
+        )
     }
 
     /// Recall the current ratchet of a destination
@@ -635,7 +642,10 @@ impl KnownRatchets {
                 }
             };
 
-            let remove = match storage.read(&path).and_then(|bytes| unpack_ratchet(&bytes).ok()) {
+            let remove = match storage
+                .read(&path)
+                .and_then(|bytes| unpack_ratchet(&bytes).ok())
+            {
                 Some(data) => now >= data.received + RATCHET_EXPIRY_SECS as f64,
                 None => true,
             };
@@ -654,7 +664,6 @@ impl KnownRatchets {
 //***************************************************************************/
 // Destination ratchet files (Python `Destination._persist_ratchets`)
 //***************************************************************************/
-
 /// Load the private ratchet keys of an announcing destination
 /// (Python `Destination._reload_ratchets`). Returns an empty list when the
 /// file does not exist yet, exactly like a fresh destination in Python.

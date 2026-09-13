@@ -10,9 +10,7 @@ use std::path::Path;
 use rand_core::OsRng;
 use reticulum::identity::PrivateIdentity;
 
-use crate::common::{
-    identity_from_raw_keys, load_private_identity, save_private_identity,
-};
+use crate::common::{identity_from_raw_keys, load_private_identity, save_private_identity};
 
 /// Exit code for an invalid identity (Python `rnid.py` `R_INVALID_IDENTITY`).
 pub const R_INVALID_IDENTITY: i32 = 8;
@@ -84,8 +82,9 @@ pub fn run(options: IdOptions) -> Result<i32, String> {
         let info = info_for_private(&identity, &options);
         let mut info = info;
         if !options.no_save {
-            save_private_identity(&path, &identity)
-                .map_err(|err| format!("An error occurred while saving the generated identity: {err}"))?;
+            save_private_identity(&path, &identity).map_err(|err| {
+                format!("An error occurred while saving the generated identity: {err}")
+            })?;
             info.saved_to = Some(path.display().to_string());
         }
         print!("{}", info.render());
@@ -174,7 +173,13 @@ mod tests {
     #[test]
     fn private_key_hidden_in_public_mode() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let info = info_for_private(&identity, &IdOptions { public: true, ..Default::default() });
+        let info = info_for_private(
+            &identity,
+            &IdOptions {
+                public: true,
+                ..Default::default()
+            },
+        );
         assert!(info.private_key.is_none());
         let full = info_for_private(&identity, &IdOptions::default());
         assert!(full.private_key.is_some());

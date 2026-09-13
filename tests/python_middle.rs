@@ -10,8 +10,8 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use rand_core::OsRng;
-use reticulum::destination::DestinationName;
 use reticulum::destination::link::LinkEvent;
+use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport, TransportConfig};
@@ -332,8 +332,10 @@ async fn resource_and_request_through_python_middle() {
         .await;
     let dest_hash = destination.lock().await.desc.address_hash;
 
-    c.register_request_handler(&dest_hash, "echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
-        .await;
+    c.register_request_handler(&dest_hash, "echo", |ctx| {
+        Some(reticulum::resource::msgpack_bin(&ctx.data))
+    })
+    .await;
 
     // Accept resources on inbound links as they appear.
     tokio::spawn({
@@ -384,7 +386,10 @@ async fn resource_and_request_through_python_middle() {
     let expected_sha = {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(&resource_payload);
-        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
 
     a.send_resource_with_options(
@@ -417,7 +422,10 @@ async fn resource_and_request_through_python_middle() {
     let received_sha = {
         use sha2::Digest;
         let digest = sha2::Sha256::digest(&received);
-        digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
     };
     assert_eq!(received_sha, expected_sha);
 
@@ -492,7 +500,7 @@ async fn python_request_through_rust_middle() {
         .expect("python request server announced");
     let hex: String = dest_line
         .split_whitespace()
- .rev()
+        .rev()
         .find(|w| w.len() == 32 && w.chars().all(|c| c.is_ascii_hexdigit()))
         .expect("destination hash")
         .to_string();
@@ -530,7 +538,11 @@ async fn python_request_through_rust_middle() {
     let requesting = wait_for(&mut a_rx, "requesting sha ", Duration::from_secs(30))
         .await
         .expect("python client requested through the rust middle");
-    let expected: String = requesting.split_whitespace().last().expect("sha").to_string();
+    let expected: String = requesting
+        .split_whitespace()
+        .last()
+        .expect("sha")
+        .to_string();
 
     let response = wait_for(&mut a_rx, "response sha ", Duration::from_secs(30))
         .await

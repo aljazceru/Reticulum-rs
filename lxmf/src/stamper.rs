@@ -116,7 +116,12 @@ pub fn stamp_valid(stamp: &[u8], target_cost: u32, workblock: &[u8]) -> bool {
 /// This is a single-process, single-core generator (the equivalent of the
 /// Python `job_simple` fallback path).
 pub fn generate_stamp(material: &[u8], stamp_cost: u32) -> (Option<[u8; STAMP_SIZE]>, u64) {
-    generate_stamp_with_rounds(material, stamp_cost, WORKBLOCK_EXPAND_ROUNDS, &mut rand_core::OsRng)
+    generate_stamp_with_rounds(
+        material,
+        stamp_cost,
+        WORKBLOCK_EXPAND_ROUNDS,
+        &mut rand_core::OsRng,
+    )
 }
 
 /// Find a stamp for `material` at `stamp_cost` with a custom work block
@@ -144,20 +149,14 @@ pub fn generate_stamp_against_workblock<R: CryptoRngCore>(
         rounds += 1;
         if stamp_valid(&stamp, stamp_cost, workblock) {
             let value = stamp_value(workblock, &stamp);
-            log::debug!(
-                "Stamp with value {value} generated in {rounds} rounds"
-            );
+            log::debug!("Stamp with value {value} generated in {rounds} rounds");
             return (Some(stamp), value);
         }
     }
 }
 
 /// Validate a peering key (`LXStamper.validate_peering_key`).
-pub fn validate_peering_key(
-    peering_id: &[u8],
-    peering_key: &[u8],
-    target_cost: u32,
-) -> bool {
+pub fn validate_peering_key(peering_id: &[u8], peering_key: &[u8], target_cost: u32) -> bool {
     let workblock = stamp_workblock_with_rounds(peering_id, WORKBLOCK_EXPAND_ROUNDS_PEERING);
     stamp_valid(peering_key, target_cost, &workblock)
 }
@@ -208,10 +207,7 @@ pub fn validate_pn_stamp(transient_data: &[u8], target_cost: u32) -> Option<Vali
 }
 
 /// Validate a batch of propagated message entries (`LXStamper.validate_pn_stamps`).
-pub fn validate_pn_stamps(
-    transient_list: &[Vec<u8>],
-    target_cost: u32,
-) -> Vec<ValidatedPnStamp> {
+pub fn validate_pn_stamps(transient_list: &[Vec<u8>], target_cost: u32) -> Vec<ValidatedPnStamp> {
     transient_list
         .iter()
         .filter_map(|transient_data| validate_pn_stamp(transient_data, target_cost))

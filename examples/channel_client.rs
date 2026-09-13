@@ -6,12 +6,9 @@ use reticulum::transport::{Transport, TransportConfig};
 mod utils;
 use utils::channel::ExampleMessage;
 
-
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("trace")
-    ).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
     let transport = Transport::new(TransportConfig::default());
 
@@ -42,12 +39,9 @@ async fn main() {
             match channel.send(&message).await {
                 Ok(hash) => {
                     watch_delivery = channel.watch_message_delivery(hash).await;
-                    log::info!(
-                        "message {} successfully sent over channel", 
-                        hash
-                    );
+                    log::info!("message {} successfully sent over channel", hash);
                     packet_hash = hash;
-                },
+                }
                 Err(e) => {
                     log::info!("error sending message: {:?}", e);
                     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -68,4 +62,3 @@ async fn main() {
 
     let _ = tokio::signal::ctrl_c().await;
 }
-

@@ -29,13 +29,15 @@ impl Drop for Partner {
     }
 }
 
-async fn spawn_buffer(
-    mode: &str,
-    destination: Option<&str>,
-    size: usize,
-    timeout: f64,
-) -> Partner {
-    spawn_buffer_on("tests/rns-py-configs/udp-buffer", mode, destination, size, timeout).await
+async fn spawn_buffer(mode: &str, destination: Option<&str>, size: usize, timeout: f64) -> Partner {
+    spawn_buffer_on(
+        "tests/rns-py-configs/udp-buffer",
+        mode,
+        destination,
+        size,
+        timeout,
+    )
+    .await
 }
 
 async fn spawn_buffer_on(
@@ -79,7 +81,11 @@ async fn spawn_buffer_on(
     Partner { child, lines: rx }
 }
 
-async fn wait_line(rx: &mut broadcast::Receiver<String>, needle: &str, secs: u64) -> Option<String> {
+async fn wait_line(
+    rx: &mut broadcast::Receiver<String>,
+    needle: &str,
+    secs: u64,
+) -> Option<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -96,7 +102,10 @@ async fn wait_line(rx: &mut broadcast::Receiver<String>, needle: &str, secs: u64
 
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::Digest;
-    sha2::Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    sha2::Sha256::digest(data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 async fn rust_transport(bind: u16, forward: u16) -> Transport {
@@ -121,7 +130,10 @@ async fn python_writer_rust_reader() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = rust_transport(4252, 4253).await;
     let destination = transport
-        .add_destination(identity, DestinationName::new("example_utilities", "buffer.stream"))
+        .add_destination(
+            identity,
+            DestinationName::new("example_utilities", "buffer.stream"),
+        )
         .await;
     let hash = destination.lock().await.desc.address_hash;
     transport.send_announce(&destination, None).await;
@@ -133,7 +145,10 @@ async fn python_writer_rust_reader() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
     let (mut reader, _channel) = loop {
-        assert!(tokio::time::Instant::now() < deadline, "no inbound link from python");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no inbound link from python"
+        );
         let event = tokio::time::timeout_at(deadline, in_link_events.recv())
             .await
             .expect("timeout")
@@ -155,7 +170,10 @@ async fn python_writer_rust_reader() {
     let mut received = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "stream did not finish");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stream did not finish"
+        );
         let mut tmp = [0u8; 4096];
         let n = tokio::time::timeout(Duration::from_secs(2), reader.read(&mut tmp))
             .await
@@ -171,7 +189,9 @@ async fn python_writer_rust_reader() {
     }
 
     // Python prints "<n> bytes sha <hex>" after writing
-    let sha_line = wait_line(&mut lines, "wrote", 20).await.expect("python wrote log");
+    let sha_line = wait_line(&mut lines, "wrote", 20)
+        .await
+        .expect("python wrote log");
     let parts: Vec<&str> = sha_line.split_whitespace().collect();
     // "[PYI] wrote <len> bytes sha <hex>"
     let expected_len: usize = parts[2].parse().expect("len");
@@ -186,10 +206,13 @@ async fn rust_writer_python_reader() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
 
-    let partner = spawn_buffer_on("tests/rns-py-configs/udp-buffer2", "reader", None, 0, 40.0).await;
+    let partner =
+        spawn_buffer_on("tests/rns-py-configs/udp-buffer2", "reader", None, 0, 40.0).await;
     let mut lines = partner.lines.resubscribe();
 
-    let dest_line = wait_line(&mut lines, "[PYI] destination", 20).await.expect("destination");
+    let dest_line = wait_line(&mut lines, "[PYI] destination", 20)
+        .await
+        .expect("destination");
     let hex = dest_line
         .split_whitespace()
         .nth(2)
@@ -228,7 +251,9 @@ async fn rust_writer_python_reader() {
     }
 
     // wait for python's "link established"
-    wait_line(&mut lines, "link established", 15).await.expect("py link");
+    wait_line(&mut lines, "link established", 15)
+        .await
+        .expect("py link");
 
     let (channel, _rx) = transport
         .mk_channel::<StreamDataMessage>(link.clone())
@@ -241,7 +266,9 @@ async fn rust_writer_python_reader() {
     writer.write_all(&payload).await.expect("write");
     writer.shutdown().await.expect("eof");
 
-    let sha_line = wait_line(&mut lines, "read", 40).await.expect("python read log");
+    let sha_line = wait_line(&mut lines, "read", 40)
+        .await
+        .expect("python read log");
     let expected_sha: String = sha_line.split_whitespace().last().expect("sha").to_string();
     assert_eq!(sha256_hex(&payload), expected_sha);
 }

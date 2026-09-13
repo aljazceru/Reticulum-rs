@@ -29,22 +29,23 @@ pub const AES128_BLOCKSIZE: usize = 16;
 /// Maximum payload of an unencrypted packet (`RNS.Packet.MDU`).
 pub const PACKET_PROTOCOL_MDU: usize = PROTOCOL_MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE;
 /// Maximum plaintext payload of a link-encrypted packet (`RNS.Link.MDU`).
-pub const LINK_MDU: usize =
-    (PROTOCOL_MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD) / AES128_BLOCKSIZE
-        * AES128_BLOCKSIZE
-        - 1;
+pub const LINK_MDU: usize = (PROTOCOL_MTU - IFAC_MIN_SIZE - HEADER_MINSIZE - TOKEN_OVERHEAD)
+    / AES128_BLOCKSIZE
+    * AES128_BLOCKSIZE
+    - 1;
 /// Minimum nonzero negotiated link MTU that still leaves one full encrypted
 /// block after header, IFAC and token overhead.
-pub const LINK_MTU_MIN: usize =
-    IFAC_MIN_SIZE + HEADER_MINSIZE + TOKEN_OVERHEAD + AES128_BLOCKSIZE;
+pub const LINK_MTU_MIN: usize = IFAC_MIN_SIZE + HEADER_MINSIZE + TOKEN_OVERHEAD + AES128_BLOCKSIZE;
 /// Maximum plaintext accepted for a SINGLE-destination packet. Besides normal
 /// packet overhead, SINGLE encryption adds an ephemeral public key.
-pub const SINGLE_PLAINTEXT_MDU: usize =
-    (PROTOCOL_MTU - HEADER_MAXSIZE - IFAC_MIN_SIZE - crate::identity::RATCHET_KEY_LENGTH
-        - TOKEN_OVERHEAD)
-        / AES128_BLOCKSIZE
-        * AES128_BLOCKSIZE
-        - 1;
+pub const SINGLE_PLAINTEXT_MDU: usize = (PROTOCOL_MTU
+    - HEADER_MAXSIZE
+    - IFAC_MIN_SIZE
+    - crate::identity::RATCHET_KEY_LENGTH
+    - TOKEN_OVERHEAD)
+    / AES128_BLOCKSIZE
+    * AES128_BLOCKSIZE
+    - 1;
 
 /// Number of bytes in a truncated hash (an address or link id).
 pub const TRUNCATED_HASHLENGTH_BYTES: usize = 16;
@@ -147,7 +148,7 @@ impl From<u8> for PacketType {
 pub enum PacketContext {
     None = 0x00,                    // Generic data packet
     Resource = 0x01,                // Packet is part of a resource
-    ResourceAdvertisement = 0x02,    // Packet is a resource advertisement
+    ResourceAdvertisement = 0x02,   // Packet is a resource advertisement
     ResourceRequest = 0x03,         // Packet is a resource part request
     ResourceHashUpdate = 0x04,      // Packet is a resource hashmap update
     ResourceProof = 0x05,           // Packet is a resource proof

@@ -22,13 +22,12 @@ pub use outbound::OutgoingResource;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-
 use sha2::Digest;
 
 use crate::destination::link::LinkId;
-use crate::packet::Packet;
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
+use crate::packet::Packet;
 
 use crate::time::now;
 

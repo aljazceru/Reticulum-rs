@@ -83,6 +83,6 @@ mod no_std_only {
 pub use std_only::*;
 
 #[cfg(not(feature = "std"))]
-pub (crate) use no_std_only::*;
-#[cfg(not(feature = "std"))]
 pub use no_std_only::init;
+#[cfg(not(feature = "std"))]
+pub(crate) use no_std_only::*;

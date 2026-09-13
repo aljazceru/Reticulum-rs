@@ -7,8 +7,8 @@ use std::time::Duration;
 use rand_core::OsRng;
 use tokio::sync::Mutex;
 
-use reticulum::destination::DestinationDesc;
 use reticulum::destination::link::{Link, LinkStatus};
+use reticulum::destination::DestinationDesc;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::Transport;
@@ -20,35 +20,29 @@ use lxst::network::{LinkSourceEvent, Signal};
 
 /// Spawn a UDP interface pair connecting two transports (loopback).
 async fn udp_pair(a: &Arc<Transport>, b: &Arc<Transport>, port_a: u16, port_b: u16) {
-    a.iface_manager()
-        .lock()
-        .await
-        .spawn(
-            UdpInterface::new(
-                format!("127.0.0.1:{port_a}"),
-                Some(format!("127.0.0.1:{port_b}")),
-                false,
-            ),
-            UdpInterface::spawn,
-        );
-    b.iface_manager()
-        .lock()
-        .await
-        .spawn(
-            UdpInterface::new(
-                format!("127.0.0.1:{port_b}"),
-                Some(format!("127.0.0.1:{port_a}")),
-                false,
-            ),
-            UdpInterface::spawn,
-        );
+    a.iface_manager().lock().await.spawn(
+        UdpInterface::new(
+            format!("127.0.0.1:{port_a}"),
+            Some(format!("127.0.0.1:{port_b}")),
+            false,
+        ),
+        UdpInterface::spawn,
+    );
+    b.iface_manager().lock().await.spawn(
+        UdpInterface::new(
+            format!("127.0.0.1:{port_b}"),
+            Some(format!("127.0.0.1:{port_a}")),
+            false,
+        ),
+        UdpInterface::spawn,
+    );
 }
 
 fn transport(name: &str) -> (PrivateIdentity, Arc<Transport>) {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let t = Arc::new(Transport::new(
-        reticulum::transport::TransportConfig::new(name, &identity),
-    ));
+    let t = Arc::new(Transport::new(reticulum::transport::TransportConfig::new(
+        name, &identity,
+    )));
     (identity, t)
 }
 
@@ -57,16 +51,20 @@ async fn call_end_to_end_over_udp() {
     // --- callee ------------------------------------------------------------
     let callee_identity = PrivateIdentity::new_from_rand(OsRng);
     // register the call destination before wrapping the transport in an Arc
-    let callee_transport = Transport::new(
-        reticulum::transport::TransportConfig::new("callee", &callee_identity),
-    );
+    let callee_transport = Transport::new(reticulum::transport::TransportConfig::new(
+        "callee",
+        &callee_identity,
+    ));
     let destination = callee_transport
         .add_destination(callee_identity.clone(), call_endpoint_name())
         .await;
     let callee_transport = Arc::new(callee_transport);
 
-    let (mut callee, mut callee_events) =
-        CallEndpoint::with_destination(callee_transport.clone(), destination, callee_identity.clone());
+    let (mut callee, mut callee_events) = CallEndpoint::with_destination(
+        callee_transport.clone(),
+        destination,
+        callee_identity.clone(),
+    );
 
     // --- caller ------------------------------------------------------------
     let (_caller_identity, caller_transport) = transport("caller");
@@ -83,7 +81,9 @@ async fn call_end_to_end_over_udp() {
         if let Ok(announce) = announces.try_recv() {
             let d = announce.destination.lock().await.desc;
             if d.address_hash
-                == RemoteCallDestination::for_identity(&callee_identity).desc.address_hash
+                == RemoteCallDestination::for_identity(&callee_identity)
+                    .desc
+                    .address_hash
             {
                 remote_desc = Some(d);
                 break;
@@ -166,7 +166,10 @@ async fn call_end_to_end_over_udp() {
     assert_eq!(received.samples, vec![0.5, -0.5, 0.25]);
 
     // --- signalling ----------------------------------------------------------
-    packetizer.send_signal(Signal::StatusEstablished.code()).await.unwrap();
+    packetizer
+        .send_signal(Signal::StatusEstablished.code())
+        .await
+        .unwrap();
     let mut saw_signal = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
@@ -198,9 +201,9 @@ async fn packetizer_to_link_source_loop() {
     use lxst::network::{LinkSource, Packetizer};
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let transport = Transport::new(
-        reticulum::transport::TransportConfig::new("loop", &identity),
-    );
+    let transport = Transport::new(reticulum::transport::TransportConfig::new(
+        "loop", &identity,
+    ));
     let _dest = transport
         .add_destination(identity.clone(), call_endpoint_name())
         .await;
@@ -223,7 +226,10 @@ async fn packetizer_to_link_source_loop() {
     // source directly (no interface needed).
     let mut codec = Raw::new(Some(2), 32);
     let frame = codec
-        .encode(&AudioFrame::from_interleaved(vec![0.5, -0.5, 0.25, 0.125], 2))
+        .encode(&AudioFrame::from_interleaved(
+            vec![0.5, -0.5, 0.25, 0.125],
+            2,
+        ))
         .unwrap();
     let payload = packetizer.frame_payload(&frame).unwrap();
     source.handle_packet(&payload).await;

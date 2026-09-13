@@ -14,12 +14,9 @@
 //!   dedup by message hash / transient id
 //! * delivery receipts and send failures via a tokio broadcast channel
 //!
-//! Not yet implemented (explicit integration points, see the TODOs):
-//! resource-backed delivery of messages larger than `LINK_PACKET_MAX_CONTENT`,
-//! the propagation node peering and sync protocol (peering keys, offer and
-//! message-get requests over link resources), ratchets, backchannel
-//! identification, and opportunistic packet delivery receipts (RNS packet
-//! proofs are not surfaced by the transport yet).
+//! Resource-backed delivery and the propagation `/get` and `/offer` request
+//! paths are implemented. Ratchets, backchannel identification, and
+//! opportunistic packet delivery receipts remain separate integration points.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -40,15 +37,19 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::time::{timeout, Duration};
 
 use crate::error::LxmfError;
-use crate::fields::{FieldValue, Fields, SF_COMPRESSION, FIELD_TICKET};
+use crate::fields::{FieldValue, Fields, FIELD_TICKET, SF_COMPRESSION};
 use crate::message::{
     decrypt_for_identity, encrypt_for_identity, full_hash, LXMessage, DELIVERED, DIRECT, FAILED,
     LXMF_OVERHEAD, OPPORTUNISTIC, OUTBOUND, PROPAGATED, RESOURCE, SENDING, SENT, TICKET_EXPIRY,
     TICKET_INTERVAL, TICKET_LENGTH, TICKET_RENEW,
 };
-use crate::APP_NAME;
-use crate::peer::PeerData;
+use crate::peer::{
+    PeerData, ERROR_INVALID_DATA, ERROR_INVALID_KEY, ERROR_NOT_FOUND, ERROR_NO_ACCESS,
+    ERROR_NO_IDENTITY, MESSAGE_GET_PATH, OFFER_REQUEST_PATH, SYNC_REQUEST_PATH,
+    UNPEER_REQUEST_PATH,
+};
 use crate::stamper;
+use crate::APP_NAME;
 use crate::{
     compression_support_from_app_data, delivery_destination_hash, delivery_name,
     display_name_from_app_data, pack_announce_app_data, pack_propagation_node_app_data,
@@ -170,6 +171,35 @@ pub enum LxmEvent {
         /// Work value of the propagation stamp.
         stamp_value: u64,
     },
+    /// Progress or completion of a client download from a propagation node.
+    PropagationTransfer(PropagationTransferState),
+}
+
+/// Observable state of a client propagation-node download.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropagationTransferState {
+    /// Protocol state (`PR_*`).
+    pub state: u8,
+    /// Transfer progress between zero and one.
+    pub progress: f64,
+    /// Bytes received in the last response.
+    pub size: usize,
+    /// Number of newly ingested messages, when complete.
+    pub last_result: Option<usize>,
+    /// Number of duplicates in the last download.
+    pub last_duplicates: usize,
+}
+
+impl Default for PropagationTransferState {
+    fn default() -> Self {
+        Self {
+            state: PR_IDLE,
+            progress: 0.0,
+            size: 0,
+            last_result: None,
+            last_duplicates: 0,
+        }
+    }
 }
 
 /// Reasons an outbound message failed.
@@ -261,6 +291,14 @@ pub struct RouterConfig {
     pub max_peering_cost: i64,
     /// Maximum number of propagation peers.
     pub max_peers: usize,
+    /// Keep already-present message ids on the remote node during downloads.
+    pub retain_synced_on_node: bool,
+    /// Maximum messages accepted in one client download response.
+    pub delivery_per_transfer_limit: i64,
+    /// Maximum simultaneous accepted inbound peer sync resources.
+    pub propagation_max_inbound_syncs: usize,
+    /// Identities allowed to use propagation control request paths.
+    pub control_allowed: Vec<AddressHash>,
     /// How long to wait for a delivery receipt before declaring failure.
     pub delivery_timeout: Duration,
     /// How long to wait for link activation.
@@ -287,6 +325,10 @@ impl Default for RouterConfig {
             peering_cost: PEERING_COST,
             max_peering_cost: MAX_PEERING_COST,
             max_peers: MAX_PEERS,
+            retain_synced_on_node: false,
+            delivery_per_transfer_limit: DELIVERY_LIMIT,
+            propagation_max_inbound_syncs: 10,
+            control_allowed: Vec::new(),
             delivery_timeout: Duration::from_secs(LINK_MAX_INACTIVITY),
             link_timeout: Duration::from_secs(30),
         }
@@ -375,6 +417,9 @@ pub struct LxmRouter {
     config: RouterConfig,
     state: Arc<Mutex<RouterState>>,
     events: broadcast::Sender<LxmEvent>,
+    propagation_transfer: Arc<Mutex<PropagationTransferState>>,
+    propagation_download: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    accepted_offer_links: Mutex<HashSet<LinkId>>,
 }
 
 impl LxmRouter {
@@ -430,9 +475,7 @@ impl LxmRouter {
             });
 
         let delivery_destination = if let Some(delivery_config) = delivery {
-            let delivery_identity = delivery_config
-                .identity
-                .unwrap_or_else(|| identity.clone());
+            let delivery_identity = delivery_config.identity.unwrap_or_else(|| identity.clone());
             let destination = transport
                 .add_destination(delivery_identity.clone(), delivery_name())
                 .await;
@@ -470,7 +513,12 @@ impl LxmRouter {
             config,
             state: Arc::new(Mutex::new(state)),
             events,
+            propagation_transfer: Arc::new(Mutex::new(PropagationTransferState::default())),
+            propagation_download: Mutex::new(None),
+            accepted_offer_links: Mutex::new(HashSet::new()),
         });
+
+        router.register_propagation_handlers().await;
 
         router.spawn_watchers();
 
@@ -497,6 +545,227 @@ impl LxmRouter {
         tokio::spawn(async move {
             router.resource_event_watcher().await;
         });
+    }
+
+    async fn register_propagation_handlers(self: &Arc<Self>) {
+        let router = Arc::clone(self);
+        self.transport
+            .register_async_request_handler(
+                &self.propagation_destination_hash,
+                MESSAGE_GET_PATH,
+                move |ctx| {
+                    let router = Arc::clone(&router);
+                    async move { Some(router.handle_message_get(ctx).await) }
+                },
+            )
+            .await;
+
+        let router = Arc::clone(self);
+        self.transport
+            .register_async_request_handler(
+                &self.propagation_destination_hash,
+                OFFER_REQUEST_PATH,
+                move |ctx| {
+                    let router = Arc::clone(&router);
+                    async move { Some(router.handle_offer(ctx).await) }
+                },
+            )
+            .await;
+
+        let router = Arc::clone(self);
+        self.transport
+            .register_async_request_handler(
+                &self.propagation_destination_hash,
+                SYNC_REQUEST_PATH,
+                move |ctx| {
+                    let router = Arc::clone(&router);
+                    async move { Some(router.handle_control(ctx, true).await) }
+                },
+            )
+            .await;
+
+        let router = Arc::clone(self);
+        self.transport
+            .register_async_request_handler(
+                &self.propagation_destination_hash,
+                UNPEER_REQUEST_PATH,
+                move |ctx| {
+                    let router = Arc::clone(&router);
+                    async move { Some(router.handle_control(ctx, false).await) }
+                },
+            )
+            .await;
+    }
+
+    async fn handle_offer(&self, ctx: reticulum::resource::RequestContext) -> Vec<u8> {
+        let Some(remote) = ctx.remote_identity else {
+            return pack_field(&FieldValue::Int(ERROR_NO_IDENTITY as i64));
+        };
+        if !self.config.propagation_node
+            || self.accepted_offer_links.lock().await.len()
+                >= self.config.propagation_max_inbound_syncs
+        {
+            return pack_field(&FieldValue::Int(ERROR_NO_ACCESS as i64));
+        }
+        let mut rd = ctx.data.as_slice();
+        let Ok(FieldValue::Array(parts)) = FieldValue::unpack(&mut rd) else {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        };
+        if parts.len() != 2 {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        }
+        let FieldValue::Bin(key) = &parts[0] else {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        };
+        let Ok(offered) = field_hashes(parts.get(1)) else {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        };
+        let mut peering_id = Vec::with_capacity(HASH_SIZE);
+        peering_id.extend_from_slice(self.identity.address_hash().as_slice());
+        peering_id.extend_from_slice(remote.address_hash.as_slice());
+        if !stamper::validate_peering_key(&peering_id, key, self.config.peering_cost.max(0) as u32)
+        {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_KEY as i64));
+        }
+        let entries = self.state.lock().await.propagation_entries.clone();
+        let wanted: Vec<Hash> = offered
+            .into_iter()
+            .filter(|id| !entries.contains_key(id))
+            .collect();
+        if wanted.is_empty() {
+            return pack_field(&FieldValue::Bool(false));
+        }
+        self.accepted_offer_links.lock().await.insert(ctx.link_id);
+        pack_field(&hashes_field(&wanted))
+    }
+
+    async fn handle_control(
+        &self,
+        ctx: reticulum::resource::RequestContext,
+        sync: bool,
+    ) -> Vec<u8> {
+        let Some(remote) = ctx.remote_identity else {
+            return pack_field(&FieldValue::Int(ERROR_NO_IDENTITY as i64));
+        };
+        if !self.config.control_allowed.contains(&remote.address_hash) {
+            return pack_field(&FieldValue::Int(ERROR_NO_ACCESS as i64));
+        }
+        let mut rd = ctx.data.as_slice();
+        let Ok(FieldValue::Bin(raw_destination)) = FieldValue::unpack(&mut rd) else {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        };
+        if raw_destination.len() != HASH_SIZE / 2 {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        }
+        let mut bytes = [0u8; HASH_SIZE / 2];
+        bytes.copy_from_slice(&raw_destination);
+        let destination = AddressHash::new(bytes);
+        if !self.state.lock().await.peers.contains_key(&destination) {
+            return pack_field(&FieldValue::Int(ERROR_NOT_FOUND as i64));
+        }
+        if sync {
+            if let Some(peer) = self.state.lock().await.peers.get_mut(&destination) {
+                peer.last_sync_attempt = 0.0;
+            }
+        } else {
+            self.unpeer(&destination, None).await;
+        }
+        pack_field(&FieldValue::Bool(true))
+    }
+
+    async fn handle_message_get(&self, ctx: reticulum::resource::RequestContext) -> Vec<u8> {
+        let Some(remote_identity) = ctx.remote_identity else {
+            return pack_field(&FieldValue::Int(ERROR_NO_IDENTITY as i64));
+        };
+        let mut rd = ctx.data.as_slice();
+        let Ok(FieldValue::Array(parts)) = FieldValue::unpack(&mut rd) else {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        };
+        if !(2..=3).contains(&parts.len()) {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        }
+        let destination_hash = delivery_name().address_hash_for(&remote_identity);
+        let wants = field_hashes(parts.first());
+        let haves = field_hashes(parts.get(1));
+        if wants.is_err() || haves.is_err() {
+            return pack_field(&FieldValue::Int(ERROR_INVALID_DATA as i64));
+        }
+        let wants = wants.unwrap();
+        let haves = haves.unwrap();
+
+        if parts[0] == FieldValue::Nil && parts[1] == FieldValue::Nil {
+            let mut entries: Vec<(Hash, usize)> = self
+                .state
+                .lock()
+                .await
+                .propagation_entries
+                .iter()
+                .filter(|(_, entry)| entry.destination_hash == destination_hash)
+                .map(|(id, entry)| (*id, entry.size))
+                .collect();
+            entries.sort_by_key(|(_, size)| *size);
+            return pack_field(&hashes_field(
+                &entries.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            ));
+        }
+
+        if !haves.is_empty() {
+            let paths = {
+                let mut state = self.state.lock().await;
+                let ids: Vec<Hash> = haves
+                    .iter()
+                    .copied()
+                    .filter(|id| {
+                        state
+                            .propagation_entries
+                            .get(id)
+                            .is_some_and(|e| e.destination_hash == destination_hash)
+                    })
+                    .collect();
+                ids.into_iter()
+                    .filter_map(|id| state.propagation_entries.remove(&id).map(|e| e.file_path))
+                    .collect::<Vec<_>>()
+            };
+            for path in paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        if wants.is_empty() {
+            return pack_field(&FieldValue::Bool(true));
+        }
+
+        let client_limit = parts
+            .get(2)
+            .and_then(FieldValue::as_int)
+            .unwrap_or(self.config.delivery_per_transfer_limit)
+            .max(0) as usize
+            * 1000;
+        let server_limit = self.config.propagation_transfer_limit.max(0) as usize * 1000;
+        let limit = client_limit.min(server_limit);
+        let entries = self.state.lock().await.propagation_entries.clone();
+        let mut total = 24usize;
+        let mut messages = Vec::new();
+        for id in wants {
+            let Some(entry) = entries
+                .get(&id)
+                .filter(|e| e.destination_hash == destination_hash)
+            else {
+                continue;
+            };
+            let Ok(mut data) = std::fs::read(&entry.file_path) else {
+                continue;
+            };
+            if data.len() >= stamper::STAMP_SIZE {
+                data.truncate(data.len() - stamper::STAMP_SIZE);
+            }
+            let packed_size = data.len() + 16;
+            if packed_size > server_limit || total + packed_size > limit {
+                continue;
+            }
+            total += packed_size;
+            messages.push(FieldValue::Bin(data));
+        }
+        pack_field(&FieldValue::Array(messages))
     }
 
     /// Access the underlying transport (for interface setup, path requests
@@ -541,7 +810,11 @@ impl LxmRouter {
 
     /// The configured inbound stamp cost of the delivery destination.
     pub async fn inbound_stamp_cost(&self) -> Option<u8> {
-        self.delivery.lock().await.as_ref().and_then(|d| d.stamp_cost)
+        self.delivery
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|d| d.stamp_cost)
     }
 
     /// Set the inbound stamp cost of the delivery destination
@@ -618,9 +891,10 @@ impl LxmRouter {
         if let Some(stamp_cost) = stamp_cost {
             log::debug!("Updating outbound stamp cost for {destination_hash} to {stamp_cost}");
             let mut state = self.state.lock().await;
-            state
-                .outbound_stamp_costs
-                .insert(*destination_hash, (crate::message::now_as_f64(), stamp_cost));
+            state.outbound_stamp_costs.insert(
+                *destination_hash,
+                (crate::message::now_as_f64(), stamp_cost),
+            );
             save_stamp_costs(&self.storage_path, &state.outbound_stamp_costs);
         }
     }
@@ -645,6 +919,272 @@ impl LxmRouter {
     /// Get the configured outbound propagation node.
     pub async fn get_outbound_propagation_node(&self) -> Option<AddressHash> {
         self.state.lock().await.outbound_propagation_node
+    }
+
+    /// Current client propagation download state.
+    pub async fn propagation_transfer_state(&self) -> PropagationTransferState {
+        self.propagation_transfer.lock().await.clone()
+    }
+
+    /// Request available messages from the configured outbound propagation node.
+    /// The operation runs in the background and reports progress through
+    /// [`LxmEvent::PropagationTransfer`].
+    pub async fn request_messages_from_propagation_node(
+        self: &Arc<Self>,
+        max_messages: Option<u32>,
+    ) {
+        self.cancel_propagation_node_requests().await;
+        let router = Arc::clone(self);
+        let handle = tokio::spawn(async move {
+            router.run_propagation_download(max_messages).await;
+        });
+        *self.propagation_download.lock().await = Some(handle);
+    }
+
+    /// Cancel an active propagation-node download and reset it to idle.
+    pub async fn cancel_propagation_node_requests(&self) {
+        if let Some(handle) = self.propagation_download.lock().await.take() {
+            handle.abort();
+        }
+        self.set_propagation_transfer(PropagationTransferState::default())
+            .await;
+    }
+
+    async fn set_propagation_transfer(&self, value: PropagationTransferState) {
+        *self.propagation_transfer.lock().await = value.clone();
+        self.emit(LxmEvent::PropagationTransfer(value));
+    }
+
+    async fn run_propagation_download(self: Arc<Self>, max_messages: Option<u32>) {
+        let Some(node) = self.get_outbound_propagation_node().await else {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_FAILED,
+                ..Default::default()
+            })
+            .await;
+            return;
+        };
+        if !self.transport.has_path(&node).await {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_PATH_REQUESTED,
+                ..Default::default()
+            })
+            .await;
+            self.transport.request_path(&node, None, None).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(PR_PATH_TIMEOUT);
+            while !self.transport.has_path(&node).await && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if !self.transport.has_path(&node).await {
+                self.set_propagation_transfer(PropagationTransferState {
+                    state: PR_NO_PATH,
+                    ..Default::default()
+                })
+                .await;
+                return;
+            }
+        }
+        let Some(identity) = self.transport.recall(&node).await else {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_NO_IDENTITY_RCVD,
+                ..Default::default()
+            })
+            .await;
+            return;
+        };
+        self.set_propagation_transfer(PropagationTransferState {
+            state: PR_LINK_ESTABLISHING,
+            ..Default::default()
+        })
+        .await;
+        let link = self
+            .transport
+            .link(DestinationDesc {
+                identity,
+                address_hash: node,
+                name: propagation_name(),
+            })
+            .await;
+        let link_id = *link.lock().await.id();
+        let mut link_events = self.transport.out_link_events();
+        let active = if link.lock().await.status() == LinkStatus::Active {
+            true
+        } else {
+            timeout(self.config.link_timeout, async {
+                loop {
+                    match link_events.recv().await {
+                        Ok(event) if event.id == link_id => match event.event {
+                            LinkEvent::Activated => return true,
+                            LinkEvent::Closed => return false,
+                            _ => continue,
+                        },
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false)
+        };
+        if !active {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_LINK_FAILED,
+                ..Default::default()
+            })
+            .await;
+            return;
+        }
+        if let Ok(packet) = link.lock().await.identify(&self.identity) {
+            self.transport.send_packet(packet).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        self.set_propagation_transfer(PropagationTransferState {
+            state: PR_LINK_ESTABLISHED,
+            ..Default::default()
+        })
+        .await;
+
+        let list_request = pack_field(&FieldValue::Array(vec![FieldValue::Nil, FieldValue::Nil]));
+        let Ok(rid) = self
+            .transport
+            .request(&link, MESSAGE_GET_PATH, &list_request)
+            .await
+        else {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_TRANSFER_FAILED,
+                ..Default::default()
+            })
+            .await;
+            return;
+        };
+        self.set_propagation_transfer(PropagationTransferState {
+            state: PR_REQUEST_SENT,
+            ..Default::default()
+        })
+        .await;
+        let Some(response) = self
+            .transport
+            .await_request_response(rid, self.config.delivery_timeout)
+            .await
+        else {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_TRANSFER_FAILED,
+                ..Default::default()
+            })
+            .await;
+            return;
+        };
+        let Ok(available) = unpack_hash_list(&response) else {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_FAILED,
+                ..Default::default()
+            })
+            .await;
+            return;
+        };
+        let mut wants = Vec::new();
+        let mut haves = Vec::new();
+        for id in available {
+            if self.has_message(&id).await {
+                haves.push(id);
+            } else {
+                wants.push(id);
+            }
+        }
+        if let Some(max) = max_messages {
+            wants.truncate(max as usize);
+        }
+        if self.config.retain_synced_on_node {
+            haves.clear();
+        }
+        if wants.is_empty() {
+            if !haves.is_empty() {
+                let _ = self.send_get_ack(&link, &haves).await;
+            }
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_COMPLETE,
+                progress: 1.0,
+                last_result: Some(0),
+                ..Default::default()
+            })
+            .await;
+            return;
+        }
+        let fetch = FieldValue::Array(vec![
+            hashes_field(&wants),
+            hashes_field(&haves),
+            FieldValue::Int(self.config.delivery_per_transfer_limit),
+        ]);
+        let Ok(rid) = self
+            .transport
+            .request(&link, MESSAGE_GET_PATH, &pack_field(&fetch))
+            .await
+        else {
+            return;
+        };
+        self.set_propagation_transfer(PropagationTransferState {
+            state: PR_RECEIVING,
+            ..Default::default()
+        })
+        .await;
+        let Some(response) = self
+            .transport
+            .await_request_response(rid, self.config.delivery_timeout)
+            .await
+        else {
+            self.set_propagation_transfer(PropagationTransferState {
+                state: PR_TRANSFER_FAILED,
+                ..Default::default()
+            })
+            .await;
+            return;
+        };
+        let size = response.len();
+        let Ok(messages) = unpack_bin_list(&response) else {
+            return;
+        };
+        let mut accepted = 0;
+        let mut duplicates = 0;
+        let mut received_ids = Vec::new();
+        for message in messages {
+            let id = full_hash(&message);
+            if self.has_message(&id).await {
+                duplicates += 1;
+            } else if self
+                .lxmf_propagation(&message, true, false, None, None, None)
+                .await
+                .unwrap_or(false)
+            {
+                accepted += 1;
+            }
+            received_ids.push(id);
+        }
+        received_ids.extend(haves);
+        let _ = self.send_get_ack(&link, &received_ids).await;
+        self.set_propagation_transfer(PropagationTransferState {
+            state: PR_COMPLETE,
+            progress: 1.0,
+            size,
+            last_result: Some(accepted),
+            last_duplicates: duplicates,
+        })
+        .await;
+    }
+
+    async fn send_get_ack(
+        &self,
+        link: &Arc<Mutex<reticulum::destination::link::Link>>,
+        haves: &[Hash],
+    ) -> Result<(), ()> {
+        let data = pack_field(&FieldValue::Array(vec![
+            FieldValue::Nil,
+            hashes_field(haves),
+        ]));
+        self.transport
+            .request(link, MESSAGE_GET_PATH, &data)
+            .await
+            .map(|_| ())
+            .map_err(|_| ())
     }
 
     /// Whether we already have a given message (by message hash).
@@ -1054,7 +1594,10 @@ impl LxmRouter {
         // Messages larger than a single link packet are delivered as a
         // resource transfer over the link (Python `LXMessage.__as_resource`).
         if representation == RESOURCE && method == DIRECT {
-            if let Err(err) = self.deliver_as_resource(&destination_hash, &message, &source).await {
+            if let Err(err) = self
+                .deliver_as_resource(&destination_hash, &message, &source)
+                .await
+            {
                 log::debug!("resource delivery failed: {err:?}");
                 self.fail(&message, SendFailure::ResourceUnsupported).await;
             }
@@ -1122,7 +1665,8 @@ impl LxmRouter {
                     match encrypt_for_identity(OsRng, &identity, &packed[DESTINATION_LENGTH..]) {
                         Ok(token) => token,
                         Err(e) => {
-                            self.fail(&message, SendFailure::Invalid(e.to_string())).await;
+                            self.fail(&message, SendFailure::Invalid(e.to_string()))
+                                .await;
                             return;
                         }
                     };
@@ -1405,9 +1949,7 @@ impl LxmRouter {
                     if let (Some(expires), Some(FieldValue::Bin(ticket))) =
                         (items[0].as_f64(), items.get(1))
                     {
-                        if crate::message::now_as_f64() < expires
-                            && ticket.len() == TICKET_LENGTH
-                        {
+                        if crate::message::now_as_f64() < expires && ticket.len() == TICKET_LENGTH {
                             let mut entry = [0u8; TICKET_LENGTH];
                             entry.copy_from_slice(ticket);
                             self.remember_ticket(&message.source_hash, expires, entry)
@@ -1474,10 +2016,12 @@ impl LxmRouter {
             );
 
             // Remove from pending outbound bookkeeping if present
-            state.pending_outbound.retain(|entry| match entry.message.try_lock() {
-                Ok(message) => message.hash != Some(message_hash),
-                Err(_) => true,
-            });
+            state
+                .pending_outbound
+                .retain(|entry| match entry.message.try_lock() {
+                    Ok(message) => message.hash != Some(message_hash),
+                    Err(_) => true,
+                });
         }
 
         self.emit(LxmEvent::Received(message));
@@ -1539,8 +2083,7 @@ impl LxmRouter {
             // Locally destined message: decrypt and deliver
             let encrypted = &lxmf_data[DESTINATION_LENGTH..];
             if let Ok(decrypted) = decrypt_for_identity(&delivery_identity, encrypted) {
-                let mut delivery_data =
-                    Vec::with_capacity(DESTINATION_LENGTH + decrypted.len());
+                let mut delivery_data = Vec::with_capacity(DESTINATION_LENGTH + decrypted.len());
                 delivery_data.extend_from_slice(&lxmf_data[..DESTINATION_LENGTH]);
                 delivery_data.extend_from_slice(&decrypted);
 
@@ -1622,9 +2165,13 @@ impl LxmRouter {
                 stamp_value: stamp_value.unwrap_or(0),
             },
         );
-
-        // TODO(protocol): enqueue the message for distribution to peers
-        // (peer sync offers) once the peering/sync protocol is implemented.
+        for peer in state.peers.values_mut() {
+            if !peer.handled_ids.contains(&transient_id)
+                && !peer.unhandled_ids.contains(&transient_id)
+            {
+                peer.unhandled_ids.push(transient_id);
+            }
+        }
 
         self.emit(LxmEvent::PropagationStored {
             transient_id,
@@ -1693,8 +2240,7 @@ impl LxmRouter {
             let FieldValue::Bin(transient_data) = message else {
                 continue;
             };
-            if let Some(validated) = stamper::validate_pn_stamp(transient_data, min_accepted_cost)
-            {
+            if let Some(validated) = stamper::validate_pn_stamp(transient_data, min_accepted_cost) {
                 self.lxmf_propagation(
                     &validated.lxm_data,
                     false,
@@ -1761,6 +2307,8 @@ impl LxmRouter {
             peer.propagation_transfer_limit = Some(propagation_transfer_limit as f64);
             peer.propagation_sync_limit =
                 propagation_sync_limit.or(Some(propagation_transfer_limit));
+            peer.unhandled_ids
+                .extend(state.propagation_entries.keys().copied());
             state.peers.insert(destination_hash, peer);
             log::debug!("Peered with {destination_hash}");
         } else {
@@ -1788,6 +2336,33 @@ impl LxmRouter {
     /// Snapshot of the propagation message store index.
     pub async fn propagation_entries(&self) -> HashMap<Hash, PropagationEntry> {
         self.state.lock().await.propagation_entries.clone()
+    }
+
+    /// Remove expired propagation messages and their peer queue references.
+    pub async fn clean_message_store(&self) -> usize {
+        let cutoff = crate::message::now_as_f64() - MESSAGE_EXPIRY;
+        let (removed, paths) = {
+            let mut state = self.state.lock().await;
+            let ids: Vec<Hash> = state
+                .propagation_entries
+                .iter()
+                .filter(|(_, entry)| entry.received < cutoff)
+                .map(|(id, _)| *id)
+                .collect();
+            let paths = ids
+                .iter()
+                .filter_map(|id| state.propagation_entries.remove(id).map(|e| e.file_path))
+                .collect::<Vec<_>>();
+            for peer in state.peers.values_mut() {
+                peer.handled_ids.retain(|id| !ids.contains(id));
+                peer.unhandled_ids.retain(|id| !ids.contains(id));
+            }
+            (ids.len(), paths)
+        };
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+        removed
     }
 
     ////////////////////////////////////////////////////////////
@@ -1895,7 +2470,12 @@ impl LxmRouter {
         let mut received = self.transport.received_data_events();
 
         loop {
-            let Ok(ReceivedData { destination, data, decrypted }) = received.recv().await else {
+            let Ok(ReceivedData {
+                destination,
+                data,
+                decrypted,
+            }) = received.recv().await
+            else {
                 return;
             };
 
@@ -1940,7 +2520,6 @@ impl LxmRouter {
         }
     }
 
-
     /// links and ingest them as LXMF messages.
     async fn resource_event_watcher(self: Arc<Self>) {
         let mut events = self.transport.resource_events().await;
@@ -1951,6 +2530,18 @@ impl LxmRouter {
             };
 
             if event.status != ResourceStatus::Complete {
+                continue;
+            }
+
+            if self
+                .accepted_offer_links
+                .lock()
+                .await
+                .remove(&event.link_id)
+            {
+                if let Some(data) = event.data {
+                    let _ = self.handle_propagation_transfer(&data).await;
+                }
                 continue;
             }
 
@@ -2027,6 +2618,58 @@ impl LxmRouter {
     }
 }
 
+fn pack_field(value: &FieldValue) -> Vec<u8> {
+    let mut out = Vec::new();
+    value.pack(&mut out);
+    out
+}
+
+fn hashes_field(ids: &[Hash]) -> FieldValue {
+    FieldValue::Array(
+        ids.iter()
+            .map(|id| FieldValue::Bin(id.as_slice().to_vec()))
+            .collect(),
+    )
+}
+
+fn field_hashes(value: Option<&FieldValue>) -> Result<Vec<Hash>, ()> {
+    match value {
+        Some(FieldValue::Nil) => Ok(Vec::new()),
+        Some(FieldValue::Array(values)) => values
+            .iter()
+            .map(|value| match value {
+                FieldValue::Bin(bytes) if bytes.len() == HASH_SIZE => {
+                    let mut hash = [0u8; HASH_SIZE];
+                    hash.copy_from_slice(bytes);
+                    Ok(Hash::new(hash))
+                }
+                _ => Err(()),
+            })
+            .collect(),
+        _ => Err(()),
+    }
+}
+
+fn unpack_hash_list(data: &[u8]) -> Result<Vec<Hash>, ()> {
+    let mut rd = data;
+    let value = FieldValue::unpack(&mut rd).map_err(|_| ())?;
+    field_hashes(Some(&value))
+}
+
+fn unpack_bin_list(data: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    let mut rd = data;
+    match FieldValue::unpack(&mut rd).map_err(|_| ())? {
+        FieldValue::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                FieldValue::Bin(bytes) => Ok(bytes),
+                _ => Err(()),
+            })
+            .collect(),
+        _ => Err(()),
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////
 // Persistence helpers                                                    //
 ////////////////////////////////////////////////////////////////////////////
@@ -2082,10 +2725,7 @@ fn save_stamp_costs(path: &Path, costs: &HashMap<AddressHash, (f64, u8)>) {
         .map(|(hash, (time, cost))| {
             (
                 FieldValue::Bin(hash.as_slice().to_vec()),
-                FieldValue::Array(vec![
-                    FieldValue::F64(*time),
-                    FieldValue::Int(*cost as i64),
-                ]),
+                FieldValue::Array(vec![FieldValue::F64(*time), FieldValue::Int(*cost as i64)]),
             )
         })
         .collect();
@@ -2155,10 +2795,7 @@ fn save_tickets(path: &Path, tickets: &Tickets) {
     let container = FieldValue::Map(vec![
         (FieldValue::Str("outbound".into()), outbound),
         (FieldValue::Str("inbound".into()), inbound),
-        (
-            FieldValue::Str("last_deliveries".into()),
-            last_deliveries,
-        ),
+        (FieldValue::Str("last_deliveries".into()), last_deliveries),
     ]);
 
     let mut out = Vec::new();

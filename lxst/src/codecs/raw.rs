@@ -244,7 +244,9 @@ impl Codec for Raw {
         let channels = self.channels.unwrap();
         let adapted = frame.adapt_channels(channels);
 
-        let mut out = Vec::with_capacity(1 + adapted.samples.len() * SAMPLE_WIDTH[self.header_bitdepth as usize]);
+        let mut out = Vec::with_capacity(
+            1 + adapted.samples.len() * SAMPLE_WIDTH[self.header_bitdepth as usize],
+        );
         out.push(self.frame_header());
         for &s in &adapted.samples {
             self.write_sample(s, &mut out);
@@ -321,7 +323,9 @@ mod tests {
         assert_eq!(Raw::new(Some(99), 32).channels, Some(32));
         // encoding with 0 channels errors, like the Python OverflowError
         let mut c = Raw::new(Some(0), 32);
-        assert!(c.encode(&AudioFrame::from_interleaved(vec![0.5], 1)).is_err());
+        assert!(c
+            .encode(&AudioFrame::from_interleaved(vec![0.5], 1))
+            .is_err());
     }
 
     #[test]
@@ -353,10 +357,7 @@ mod tests {
                     _ => 1e-7,  // exact for 32/64/128 (values came from f32)
                 };
                 for (a, b) in out.samples.iter().zip(input.samples.iter()) {
-                    assert!(
-                        (a - b).abs() <= tolerance,
-                        "bd={bd} ch={ch}: {a} vs {b}"
-                    );
+                    assert!((a - b).abs() <= tolerance, "bd={bd} ch={ch}: {a} vs {b}");
                 }
             }
         }
@@ -367,19 +368,25 @@ mod tests {
         // More channels than configured -> truncate
         let mut c = Raw::new(Some(2), 32);
         let data = c.encode(&frame(&[0.5, -0.5, 0.25], 3)).unwrap();
-        assert_eq!(&data[1..], &[
-            0x00, 0x00, 0x00, 0x3f, //  0.5
-            0x00, 0x00, 0x00, 0xbf, // -0.5
-        ]);
+        assert_eq!(
+            &data[1..],
+            &[
+                0x00, 0x00, 0x00, 0x3f, //  0.5
+                0x00, 0x00, 0x00, 0xbf, // -0.5
+            ]
+        );
 
         // Fewer channels than configured -> pad with last original channel
         let mut c = Raw::new(Some(3), 32);
         let data = c.encode(&frame(&[0.5], 1)).unwrap();
-        assert_eq!(&data[1..], &[
-            0x00, 0x00, 0x00, 0x3f, //
-            0x00, 0x00, 0x00, 0x3f, //
-            0x00, 0x00, 0x00, 0x3f, //
-        ]);
+        assert_eq!(
+            &data[1..],
+            &[
+                0x00, 0x00, 0x00, 0x3f, //
+                0x00, 0x00, 0x00, 0x3f, //
+                0x00, 0x00, 0x00, 0x3f, //
+            ]
+        );
     }
 
     #[test]

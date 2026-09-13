@@ -62,8 +62,8 @@ pub mod sources;
 /// (Python `LXST.APP_NAME`).
 pub const APP_NAME: &str = "lxst";
 
-pub use common::{AudioFrame, SourceId};
 pub use codecs::{Codec, CodecError, CodecType, EncodedFrame};
+pub use common::{AudioFrame, SourceId};
 
 /// Error type shared by the pipeline, network and call layers.
 #[derive(Debug)]

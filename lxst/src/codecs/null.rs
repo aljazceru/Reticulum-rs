@@ -40,7 +40,10 @@ impl Codec for Null {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        Ok(AudioFrame { samples, channels: 1 })
+        Ok(AudioFrame {
+            samples,
+            channels: 1,
+        })
     }
 
     fn channels(&self) -> Option<usize> {

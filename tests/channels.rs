@@ -1,45 +1,45 @@
-use std::sync::Once;
 use rand_core::OsRng;
 use reticulum::{
     channel,
-    destination::DestinationName,
     destination::link::LinkEvent,
+    destination::DestinationName,
     error::RnsError,
     identity::PrivateIdentity,
     iface::udp::UdpInterface,
     transport::{Transport, TransportConfig},
 };
+use std::sync::Once;
 
 static INIT: Once = Once::new();
 
 #[derive(Clone)]
-pub struct ChannelMessage(pub Vec <u8>);
+pub struct ChannelMessage(pub Vec<u8>);
 
 impl channel::Message for ChannelMessage {
-  fn unpack(packed: &[u8], _message_type: u16) -> Result<Self, RnsError> {
-    Ok(ChannelMessage(packed.to_vec()))
-  }
+    fn unpack(packed: &[u8], _message_type: u16) -> Result<Self, RnsError> {
+        Ok(ChannelMessage(packed.to_vec()))
+    }
 
-  fn pack(&self) -> Vec<u8> {
-    self.0.clone()
-  }
+    fn pack(&self) -> Vec<u8> {
+        self.0.clone()
+    }
 
-  fn message_type(&self) -> u16 {
-    0x00
-  }
+    fn message_type(&self) -> u16 {
+        0x00
+    }
 }
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("trace")
-        ).init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init()
     });
 }
 
-async fn build_transport(name: &str, bind_addr: &str, forward_addr: &str)
-    -> (Transport, PrivateIdentity)
-{
+async fn build_transport(
+    name: &str,
+    bind_addr: &str,
+    forward_addr: &str,
+) -> (Transport, PrivateIdentity) {
     let id = PrivateIdentity::new_from_rand(OsRng);
     let transport = Transport::new(TransportConfig::new(name, &id));
 
@@ -63,28 +63,47 @@ async fn channel_send() {
     let mut in_link_events = transport_a.in_link_events();
     let mut out_link_events = transport_b.out_link_events();
     let mut recv_announces = transport_b.recv_announces().await;
-    let dest = transport_a.add_destination(
-        id_a.clone(),
-        DestinationName::new("test", "channels.send_multiple")).await;
+    let dest = transport_a
+        .add_destination(
+            id_a.clone(),
+            DestinationName::new("test", "channels.send_multiple"),
+        )
+        .await;
     transport_a.send_announce(&dest, None).await;
     let announce = recv_announces.recv().await.unwrap();
     // initiate the link from transport B and upgrade to channel
-    let link = transport_b.link(announce.destination.lock().await.desc).await;
-    let (_channel_endpoint_b, _receiver_b) = transport_b.mk_channel::<ChannelMessage>(link).await
+    let link = transport_b
+        .link(announce.destination.lock().await.desc)
+        .await;
+    let (_channel_endpoint_b, _receiver_b) = transport_b
+        .mk_channel::<ChannelMessage>(link)
+        .await
         .unwrap();
     // wait for link activated event on transport A and upgrade to channel
     let event = in_link_events.recv().await.unwrap();
     let (channel_endpoint_a, _receiver_a) = match event.event {
         LinkEvent::Activated => {
             let link = transport_a.find_in_link(&event.id).await.unwrap();
-            transport_a.mk_channel::<ChannelMessage>(link).await.unwrap()
+            transport_a
+                .mk_channel::<ChannelMessage>(link)
+                .await
+                .unwrap()
         }
-        _ => unreachable!()
+        _ => unreachable!(),
     };
     //let sub_a = channel_endpoint_a.subscribe();
-    assert!(matches!(out_link_events.recv().await.unwrap().event, LinkEvent::Activated));
+    assert!(matches!(
+        out_link_events.recv().await.unwrap().event,
+        LinkEvent::Activated
+    ));
     // send message A -> B and watch message delivery
     let message = ChannelMessage(b"test1".to_vec());
     let hash = channel_endpoint_a.send(&message).await.unwrap();
-    assert!(channel_endpoint_a.watch_message_delivery(hash).await.unwrap().recv().await.unwrap());
+    assert!(channel_endpoint_a
+        .watch_message_delivery(hash)
+        .await
+        .unwrap()
+        .recv()
+        .await
+        .unwrap());
 }

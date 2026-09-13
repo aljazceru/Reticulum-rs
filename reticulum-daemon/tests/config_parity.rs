@@ -46,7 +46,10 @@ configured_bitrate = 12000
 
     let config = Config::from_file(&dir).expect("config must parse despite unknown keys");
     assert!(!config.reticulum.enable_transport);
-    assert_eq!(config.reticulum.instance_name.as_deref(), Some("test-instance"));
+    assert_eq!(
+        config.reticulum.instance_name.as_deref(),
+        Some("test-instance")
+    );
     assert_eq!(config.interfaces.len(), 1);
 }
 
@@ -100,7 +103,10 @@ type = "SomeNewInterfaceType"
             _ => "other",
         })
         .collect();
-    assert_eq!(kinds, vec!["serial", "kiss", "pipe", "local", "unsupported"]);
+    assert_eq!(
+        kinds,
+        vec!["serial", "kiss", "pipe", "local", "unsupported"]
+    );
 
     match &config.interfaces[0].config {
         InterfaceConfig::SerialInterface { port, speed, .. } => {
@@ -110,14 +116,22 @@ type = "SomeNewInterfaceType"
         other => panic!("expected serial interface, got {other:?}"),
     }
     match &config.interfaces[2].config {
-        InterfaceConfig::PipeInterface { command, respawn_delay, .. } => {
+        InterfaceConfig::PipeInterface {
+            command,
+            respawn_delay,
+            ..
+        } => {
             assert!(command.starts_with("socat"));
             assert_eq!(*respawn_delay, 5.5);
         }
         other => panic!("expected pipe interface, got {other:?}"),
     }
     match &config.interfaces[3].config {
-        InterfaceConfig::LocalInterface { listen_ip, listen_port, .. } => {
+        InterfaceConfig::LocalInterface {
+            listen_ip,
+            listen_port,
+            ..
+        } => {
             assert_eq!(listen_ip, "127.0.0.1");
             assert_eq!(*listen_port, 37428);
         }

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 
-
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
@@ -23,7 +22,11 @@ async fn udp_pair(name: &str, pa: u16, pb: u16) -> (Transport, Transport) {
         let manager = a.iface_manager();
         let mut manager = manager.lock().await;
         manager.spawn(
-            UdpInterface::new(format!("127.0.0.1:{pa}"), Some(format!("127.0.0.1:{pb}")), true),
+            UdpInterface::new(
+                format!("127.0.0.1:{pa}"),
+                Some(format!("127.0.0.1:{pb}")),
+                true,
+            ),
             UdpInterface::spawn,
         );
     }
@@ -31,7 +34,11 @@ async fn udp_pair(name: &str, pa: u16, pb: u16) -> (Transport, Transport) {
         let manager = b.iface_manager();
         let mut manager = manager.lock().await;
         manager.spawn(
-            UdpInterface::new(format!("127.0.0.1:{pb}"), Some(format!("127.0.0.1:{pa}")), true),
+            UdpInterface::new(
+                format!("127.0.0.1:{pb}"),
+                Some(format!("127.0.0.1:{pa}")),
+                true,
+            ),
             UdpInterface::spawn,
         );
     }
@@ -41,10 +48,8 @@ async fn udp_pair(name: &str, pa: u16, pb: u16) -> (Transport, Transport) {
 
 #[tokio::test]
 async fn split_resource_transfers_all_segments() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
     let (a, b) = udp_pair("split", 4522, 4523).await;
 
     let destination = b
@@ -79,8 +84,10 @@ async fn split_resource_transfers_all_segments() {
     let payload: Vec<u8> = (0..(MAX_EFFICIENT_SIZE + 256 * 1024))
         .map(|i| (i % 251) as u8)
         .collect();
-    let metadata = vec![0x81, 0xa4, b'n', b'a', b'm', b'e', 0xc4, 0x0b,
-                        b'p', b'a', b'y', b'l', b'o', b'a', b'd', b'.', b'b', b'i', b'n'];
+    let metadata = vec![
+        0x81, 0xa4, b'n', b'a', b'm', b'e', 0xc4, 0x0b, b'p', b'a', b'y', b'l', b'o', b'a', b'd',
+        b'.', b'b', b'i', b'n',
+    ];
 
     let mut events = a.resource_events().await;
     let mut receiver_events = b.resource_events().await;

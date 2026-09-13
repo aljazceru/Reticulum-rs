@@ -4,8 +4,8 @@
 use lxst::codecs::{codec_header_byte, Codec, CodecType, Raw};
 use lxst::common::AudioFrame;
 use lxst::network::{
-    pack_frame, pack_signalling, unpack_message, LinkSource, LinkSourceEvent, Signal,
-    SignalCode, FIELD_FRAMES, FIELD_SIGNALLING,
+    pack_frame, pack_signalling, unpack_message, LinkSource, LinkSourceEvent, Signal, SignalCode,
+    FIELD_FRAMES, FIELD_SIGNALLING,
 };
 
 fn raw_frame(values: &[f32], channels: usize, bitdepth: u32) -> Vec<u8> {
@@ -162,7 +162,10 @@ async fn link_source_survives_malformed_packets() {
     let (mut source, mut events) = LinkSource::with_codec(CodecType::Null);
 
     // truncated msgpack
-    assert_eq!(source.handle_packet(&[0x81, 0x01, 0xc4, 0xff, 0x01]).await, 0);
+    assert_eq!(
+        source.handle_packet(&[0x81, 0x01, 0xc4, 0xff, 0x01]).await,
+        0
+    );
     // empty frame
     let packet = pack_frame(&[]).unwrap();
     assert_eq!(source.handle_packet(&packet).await, 0);
@@ -271,7 +274,8 @@ async fn remote_sink_forwards_to_channel() {
 
     let source_id = lxst::common::new_source_id();
     assert!(sink.can_receive(source_id).await);
-    sink.handle_frame(SinkFrame::Encoded(vec![1, 2, 3]), source_id).await;
+    sink.handle_frame(SinkFrame::Encoded(vec![1, 2, 3]), source_id)
+        .await;
     assert_eq!(sink.frames_sent(), 1);
 
     // decoded frames are rejected (the packetizer expects encoded bytes)

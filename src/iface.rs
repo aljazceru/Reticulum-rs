@@ -24,11 +24,13 @@ pub mod rnode;
 pub mod serial;
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use rand_core::RngCore;
 use tokio::sync::mpsc;
@@ -69,7 +71,7 @@ pub struct RxMessage {
 ///
 /// Mirrors the `sent/received/txb/rxb/online` bookkeeping of
 /// `RNS.Interfaces.Interface` used by `rnstatus`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InterfaceCounters {
     sent: AtomicU64,
     received: AtomicU64,
@@ -90,6 +92,13 @@ pub struct InterfaceCounters {
     ifac_violations: AtomicU64,
     /// Early packet filter hits (Python `packet_filter_hits`).
     packet_filter_hits: AtomicU64,
+    /// Last reported radio RSSI in dBm (`i32::MIN` = not reported).
+    rssi: AtomicI32,
+    /// Last reported radio SNR as f32 bits (`u32::MAX` = not reported).
+    snr_bits: AtomicU32,
+    /// Last reported derived link-quality percentage as f32 bits
+    /// (`u32::MAX` = not reported; Python `r_stat_q`).
+    quality_bits: AtomicU32,
 }
 
 impl InterfaceCounters {
@@ -112,13 +121,15 @@ impl InterfaceCounters {
     /// Account a received announce (Python `Interface.received_announce`).
     pub fn count_announce_rx(&self, bytes: usize) {
         self.announces_received.fetch_add(1, Ordering::Relaxed);
-        self.announce_bytes_received.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.announce_bytes_received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Account a sent announce (Python `Interface.sent_announce`).
     pub fn count_announce_tx(&self, bytes: usize) {
         self.announces_sent.fetch_add(1, Ordering::Relaxed);
-        self.announce_bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.announce_bytes_sent
+            .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     /// Account a received path request
@@ -214,11 +225,73 @@ impl InterfaceCounters {
     pub fn online(&self) -> bool {
         self.online.load(Ordering::Relaxed)
     }
+
+    /// Publish the latest radio link-quality telemetry for this interface
+    /// (Python `r_stat_rssi`/`r_stat_snr`/`r_stat_q`). `None` values keep
+    /// the previous reading; quality is usually derived from SNR by the
+    /// reporting interface.
+    pub fn set_radio_quality(&self, rssi: Option<i16>, snr: Option<f32>, quality: Option<f32>) {
+        if let Some(rssi) = rssi {
+            self.rssi.store(rssi as i32, Ordering::Relaxed);
+        }
+        if let Some(snr) = snr {
+            self.snr_bits.store(snr.to_bits(), Ordering::Relaxed);
+        }
+        if let Some(quality) = quality {
+            self.quality_bits
+                .store(quality.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Last reported RSSI in dBm, when this interface reports one.
+    pub fn rssi(&self) -> Option<i16> {
+        let value = self.rssi.load(Ordering::Relaxed);
+        (value != i32::MIN).then_some(value as i16)
+    }
+
+    /// Last reported SNR in dB, when this interface reports one.
+    pub fn snr(&self) -> Option<f32> {
+        let bits = self.snr_bits.load(Ordering::Relaxed);
+        (bits != u32::MAX).then(|| f32::from_bits(bits))
+    }
+
+    /// Last reported derived link-quality percentage (Python `r_stat_q`).
+    pub fn quality(&self) -> Option<f32> {
+        let bits = self.quality_bits.load(Ordering::Relaxed);
+        (bits != u32::MAX).then(|| f32::from_bits(bits))
+    }
+}
+
+/// Sentinel initializers for the radio-telemetry atomics in
+/// [`InterfaceCounters`] (`AtomicI32`/`AtomicU64` default to 0, which is a
+/// valid reading, so "unreported" is encoded explicitly).
+impl Default for InterfaceCounters {
+    fn default() -> Self {
+        Self {
+            sent: AtomicU64::new(0),
+            received: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            online: AtomicBool::new(false),
+            announces_received: AtomicU64::new(0),
+            announces_sent: AtomicU64::new(0),
+            announce_bytes_received: AtomicU64::new(0),
+            announce_bytes_sent: AtomicU64::new(0),
+            path_requests_received: AtomicU64::new(0),
+            path_requests_sent: AtomicU64::new(0),
+            protocol_violations: AtomicU64::new(0),
+            ifac_violations: AtomicU64::new(0),
+            packet_filter_hits: AtomicU64::new(0),
+            rssi: AtomicI32::new(i32::MIN),
+            snr_bits: AtomicU32::new(u32::MAX),
+            quality_bits: AtomicU32::new(u32::MAX),
+        }
+    }
 }
 
 /// Snapshot of the statistics of one interface
 /// (compare `rnstatus` output of the Python reference implementation).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct InterfaceStats {
     /// Interface address used for routing
     pub address: AddressHash,
@@ -251,6 +324,14 @@ pub struct InterfaceStats {
     pub ifac_violations: u64,
     /// Early packet filter hits.
     pub packet_filter_hits: u64,
+    /// Last reported radio RSSI in dBm (Python `r_stat_rssi`), when the
+    /// interface reports radio telemetry (RNode and friends).
+    pub rssi: Option<i16>,
+    /// Last reported radio SNR in dB (Python `r_stat_snr`).
+    pub snr: Option<f32>,
+    /// Last reported derived link-quality percentage 0–100
+    /// (Python `r_stat_q`).
+    pub quality: Option<f32>,
 }
 
 pub struct InterfaceChannel {
@@ -770,6 +851,9 @@ impl InterfaceManager {
                 protocol_violations: iface.stats.protocol_violations(),
                 ifac_violations: iface.stats.ifac_violations(),
                 packet_filter_hits: iface.stats.packet_filter_hits(),
+                rssi: iface.stats.rssi(),
+                snr: iface.stats.snr(),
+                quality: iface.stats.quality(),
             })
             .collect()
     }
@@ -1010,5 +1094,60 @@ mod tests {
         manager.stop_iface(&address);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(manager.stats().is_empty());
+    }
+
+    #[test]
+    fn radio_quality_counters_default_to_unreported() {
+        let counters = InterfaceCounters::default();
+        assert_eq!(counters.rssi(), None);
+        assert_eq!(counters.snr(), None);
+        assert_eq!(counters.quality(), None);
+
+        let stats = InterfaceStats {
+            address: AddressHash::new_empty(),
+            name: "rnode".into(),
+            kind: "RnodeInterface".into(),
+            sent: 0,
+            received: 0,
+            tx_bytes: 0,
+            rx_bytes: 0,
+            online: true,
+            announces_received: 0,
+            announces_sent: 0,
+            announce_bytes_received: 0,
+            announce_bytes_sent: 0,
+            path_requests_received: 0,
+            path_requests_sent: 0,
+            protocol_violations: 0,
+            ifac_violations: 0,
+            packet_filter_hits: 0,
+            rssi: None,
+            snr: None,
+            quality: None,
+        };
+        assert_eq!(stats.rssi, None);
+    }
+
+    #[test]
+    fn radio_quality_publish_keeps_previous_readings() {
+        let counters = InterfaceCounters::default();
+        // RNode-style telemetry: RSSI -87 dBm, SNR 9.25 dB, quality 75%.
+        counters.set_radio_quality(Some(-87), Some(9.25), Some(75.0));
+        assert_eq!(counters.rssi(), Some(-87));
+        assert_eq!(counters.snr(), Some(9.25));
+        assert_eq!(counters.quality(), Some(75.0));
+
+        // A partial update (RSSI only) keeps the other readings.
+        counters.set_radio_quality(Some(-90), None, None);
+        assert_eq!(counters.rssi(), Some(-90));
+        assert_eq!(counters.snr(), Some(9.25));
+        assert_eq!(counters.quality(), Some(75.0));
+
+        // Values round-trip through the snapshot.
+        let counters = InterfaceCounters::default();
+        counters.set_radio_quality(Some(-100), Some(-7.5), Some(0.0));
+        assert_eq!(counters.rssi(), Some(-100));
+        assert_eq!(counters.snr(), Some(-7.5));
+        assert_eq!(counters.quality(), Some(0.0));
     }
 }

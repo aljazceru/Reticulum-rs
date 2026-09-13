@@ -42,10 +42,7 @@ const SHARED_INSTANCE_PORT: u16 = 42840;
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init()
     });
 }
 
@@ -76,7 +73,9 @@ async fn spawn_rnsd() -> Child {
             return child;
         }
 
-        if let Some(status) = child.try_wait().expect("rnsd status") { panic!("python rnsd exited early: {status}") }
+        if let Some(status) = child.try_wait().expect("rnsd status") {
+            panic!("python rnsd exited early: {status}")
+        }
 
         time::sleep(Duration::from_millis(250)).await;
     }
@@ -146,11 +145,8 @@ impl std::ops::DerefMut for ChildGuard {
 
 /// Rust transport with a local client attached to the shared instance.
 async fn rust_local_client() -> Transport {
-    let transport = TransportConfig::new(
-        "rust-local-client",
-        &PrivateIdentity::new_from_rand(OsRng),
-    )
-    .build();
+    let transport =
+        TransportConfig::new("rust-local-client", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     transport.iface_manager().lock().await.spawn(
         LocalClient::new(
@@ -264,8 +260,7 @@ async fn python_shared_instance_relay() {
     let mut transport = rust_local_client().await;
 
     await_python_announce(&transport, Duration::from_secs(20)).await;
-    announce_and_confirm_partner(&mut transport, &mut partner_lines, Duration::from_secs(25))
-        .await;
+    announce_and_confirm_partner(&mut transport, &mut partner_lines, Duration::from_secs(25)).await;
 
     let stats = transport.interface_stats().await;
     assert!(stats
@@ -293,8 +288,7 @@ async fn rust_shared_instance_with_python_client() {
     let mut partner = ChildGuard(partner);
 
     await_python_announce(&transport, Duration::from_secs(20)).await;
-    announce_and_confirm_partner(&mut transport, &mut partner_lines, Duration::from_secs(25))
-        .await;
+    announce_and_confirm_partner(&mut transport, &mut partner_lines, Duration::from_secs(25)).await;
 
     let stats = transport.interface_stats().await;
     assert!(stats

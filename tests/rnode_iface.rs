@@ -198,7 +198,8 @@ async fn rnode_detect_validate_and_exchange() {
         let manager = a.iface_manager();
         let mut manager = manager.lock().await;
         manager.spawn(
-            RnodeInterface::tcp(format!("127.0.0.1:{PORT}"), CONFIG).with_manager(a.iface_manager()),
+            RnodeInterface::tcp(format!("127.0.0.1:{PORT}"), CONFIG)
+                .with_manager(a.iface_manager()),
             RnodeInterface::spawn,
         )
     };
@@ -207,7 +208,8 @@ async fn rnode_detect_validate_and_exchange() {
         let manager = b.iface_manager();
         let mut manager = manager.lock().await;
         manager.spawn(
-            RnodeInterface::tcp(format!("127.0.0.1:{PORT}"), CONFIG).with_manager(b.iface_manager()),
+            RnodeInterface::tcp(format!("127.0.0.1:{PORT}"), CONFIG)
+                .with_manager(b.iface_manager()),
             RnodeInterface::spawn,
         )
     };
@@ -227,7 +229,10 @@ async fn rnode_detect_validate_and_exchange() {
         false
     }
     .await;
-    assert!(online, "both rnode interfaces must validate and come online");
+    assert!(
+        online,
+        "both rnode interfaces must validate and come online"
+    );
 
     // B announces: A must learn the path through the bridged mock radio.
     let destination = SingleInputDestination::new(
@@ -276,7 +281,10 @@ async fn rnode_parser_and_framing() {
     let parsed = parse_frames(&frames.concat());
     assert_eq!(parsed[0], (CMD_FREQUENCY, vec![0x11, 0x22, 0x33, 0x44]));
     assert_eq!(parsed[5], (CMD_ST_ALOCK, vec![0x07, 0x3A])); // 18.5% * 100 = 1850
-    assert_eq!(parsed.last().unwrap(), &(CMD_RADIO_STATE, vec![RADIO_STATE_ON]));
+    assert_eq!(
+        parsed.last().unwrap(),
+        &(CMD_RADIO_STATE, vec![RADIO_STATE_ON])
+    );
 
     // Escaping round trips.
     let payload = vec![FEND, FESC, 0x00, 0xFF, TFEND, TFESC];
@@ -297,7 +305,10 @@ async fn rnode_parser_and_framing() {
     assert!(matches!(events[0], RnodeEvent::Detect));
     assert!(matches!(
         events[1],
-        RnodeEvent::FirmwareVersion { major: 1, minor: 61 }
+        RnodeEvent::FirmwareVersion {
+            major: 1,
+            minor: 61
+        }
     ));
     match &events[2] {
         RnodeEvent::Status(status) => assert_eq!(status.rssi, Some(100 - RSSI_OFFSET)),

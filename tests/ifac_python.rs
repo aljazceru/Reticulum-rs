@@ -168,8 +168,7 @@ async fn ifac_rejects_packets_without_the_passphrase() {
     let receiver =
         TransportConfig::new("ifac-recv", &PrivateIdentity::new_from_rand(OsRng)).build();
 
-    let sender =
-        TransportConfig::new("ifac-send", &PrivateIdentity::new_from_rand(OsRng)).build();
+    let sender = TransportConfig::new("ifac-send", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     let recv_iface = {
         let manager = receiver.iface_manager();

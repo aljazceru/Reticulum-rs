@@ -4,7 +4,7 @@ use std::time::Duration;
 use alloc::sync::Arc;
 use rand_core::OsRng;
 use reticulum_core::identity::Signer;
-use tokio::sync::{Mutex, MutexGuard, broadcast};
+use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
@@ -26,15 +26,16 @@ use crate::iface::{
     InterfaceManager, InterfaceMode, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType,
 };
 use crate::packet::{
-    DestinationType, Header, HeaderType, PACKET_MDU, Packet, PacketContext, PacketDataBuffer,
-    PacketType,
+    DestinationType, Header, HeaderType, Packet, PacketContext, PacketDataBuffer, PacketType,
+    PACKET_MDU,
 };
 use crate::resource::{
-    self, ResourceEvent, ResourceOptions, ResourceTx,
+    self,
     manager::{
-        RequestContext as RequestCtx, RequestEvent, RequestEventData, ResourceManager,
-        ResourceStrategy, pack_request, pack_response, request_id as make_request_id,
+        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
+        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
     },
+    ResourceEvent, ResourceOptions, ResourceTx,
 };
 use crate::storage::{KnownDestinations, KnownRatchets, Storage};
 
@@ -54,12 +55,12 @@ use self::announce_limits::AnnounceLimits;
 use self::announce_table::AnnounceTable;
 use self::link_table::LinkTable;
 use self::packet_cache::PacketCache;
-use self::path_requests::{PathRequests, TagBytes, create_path_request_destination};
+use self::path_requests::{create_path_request_destination, PathRequests, TagBytes};
 use self::path_table::PathTable;
 use self::tunnels::{TunnelPath, Tunnels};
 
 pub use self::tunnels::{
-    TUNNEL_SYNTHESIZE_LENGTH, TUNNEL_TIMEOUT, decode_tunnel_synthesize as decode_tunnel_synthesis,
+    decode_tunnel_synthesize as decode_tunnel_synthesis, TUNNEL_SYNTHESIZE_LENGTH, TUNNEL_TIMEOUT,
 };
 
 // TODO: Configure via features
@@ -266,6 +267,9 @@ pub(crate) struct TransportHandler {
 
     out_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
+    /// Receiving interface of each established inbound link
+    /// (endpoint view; the link table only covers intermediary relays).
+    in_link_ifaces: HashMap<LinkId, AddressHash>,
 
     packet_cache: Mutex<PacketCache>,
 
@@ -315,6 +319,7 @@ pub(crate) struct TransportHandler {
     cancel: CancellationToken,
 }
 
+#[derive(Clone)]
 pub struct Transport {
     name: String,
     identity: PrivateIdentity,
@@ -399,11 +404,7 @@ impl TransportConfig {
 
     /// Configure the inbound queue length of one traffic class
     /// (Python `qlen_in_*` configuration options).
-    pub fn set_inbound_queue_length(
-        mut self,
-        class: TrafficClass,
-        length: usize,
-    ) -> Self {
+    pub fn set_inbound_queue_length(mut self, class: TrafficClass, length: usize) -> Self {
         if length > 0 {
             self.inbound_queue_lengths[class as usize] = length;
         }
@@ -421,10 +422,7 @@ impl TransportConfig {
 
     /// Trust persisted blackhole lists from these remote identities
     /// (Python `Reticulum.blackhole_sources`).
-    pub fn set_blackhole_sources(
-        mut self,
-        sources: Vec<crate::hash::AddressHash>,
-    ) -> Self {
+    pub fn set_blackhole_sources(mut self, sources: Vec<crate::hash::AddressHash>) -> Self {
         self.blackhole_sources = sources;
         self
     }
@@ -489,9 +487,9 @@ impl Transport {
         let reroute_eager = config.reroute_eager;
         let blackhole_publish = config.blackhole_publish;
         let blackhole_sources = config.blackhole_sources.clone();
-        let inbound_queues = std::sync::Arc::new(std::sync::Mutex::new(
-            InboundQueues::new(config.inbound_queue_lengths),
-        ));
+        let inbound_queues = std::sync::Arc::new(std::sync::Mutex::new(InboundQueues::new(
+            config.inbound_queue_lengths,
+        )));
         let storage = config.storage.clone();
         let identity = config.identity.clone();
         let blackholes = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -511,6 +509,7 @@ impl Transport {
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
+            in_link_ifaces: HashMap::new(),
             packet_cache: Mutex::new(PacketCache::new()),
             resources: ResourceManager::new(),
             blackholes: blackholes.clone(),
@@ -629,7 +628,10 @@ impl Transport {
         blackholes.blackhole(identity, own, until, reason);
         if let Some(storage) = storage {
             if let Err(error) = blackholes.persist_local(&*storage, &own) {
-                log::error!("tp({}): could not persist blackhole list: {error:?}", self.name);
+                log::error!(
+                    "tp({}): could not persist blackhole list: {error:?}",
+                    self.name
+                );
             }
         }
         drop(blackholes);
@@ -649,7 +651,10 @@ impl Transport {
         if removed {
             if let Some(storage) = storage {
                 if let Err(error) = blackholes.persist_local(&*storage, &own) {
-                    log::error!("tp({}): could not persist blackhole list: {error:?}", self.name);
+                    log::error!(
+                        "tp({}): could not persist blackhole list: {error:?}",
+                        self.name
+                    );
                 }
             }
         }
@@ -685,12 +690,12 @@ impl Transport {
         let Some(storage) = handler.storage.clone() else {
             return;
         };
-        let path = format!(
-            "blackhole/{}",
-            publisher.to_hex_string()
-        );
+        let path = format!("blackhole/{}", publisher.to_hex_string());
         if let Err(error) = storage.write(&path, packed) {
-            log::error!("tp({}): could not persist blackhole source list: {error:?}", self.name);
+            log::error!(
+                "tp({}): could not persist blackhole source list: {error:?}",
+                self.name
+            );
         }
     }
 
@@ -698,24 +703,15 @@ impl Transport {
     /// blackholed identity (Python `Transport.remove_blackholed_paths`).
     pub async fn remove_blackholed_paths(&self) -> usize {
         let mut handler = self.handler.lock().await;
-        let blackholed: Vec<AddressHash> = handler
-            .blackholes
-            .read()
-            .await
-            .blackholed_identities();
+        let blackholed: Vec<AddressHash> = handler.blackholes.read().await.blackholed_identities();
         let mut dropped = 0;
-        let keys: Vec<AddressHash> =
-            handler.path_table.iter().map(|(hash, _)| *hash).collect();
+        let keys: Vec<AddressHash> = handler.path_table.iter().map(|(hash, _)| *hash).collect();
         for destination in keys {
-            let Some(identity) =
-                handler.known_destinations.recall_no_use(&destination)
-            else {
+            let Some(identity) = handler.known_destinations.recall_no_use(&destination) else {
                 continue;
             };
             let identity_hash = identity.address_hash;
-            if blackholed.contains(&identity_hash)
-                && handler.path_table.drop_path(&destination)
-            {
+            if blackholed.contains(&identity_hash) && handler.path_table.drop_path(&destination) {
                 dropped += 1;
             }
         }
@@ -1006,10 +1002,7 @@ impl Transport {
     /// (Python `Reticulum.get_lowest_interface_bitrate` /
     /// `Transport.lowest_interface_bitrate`).
     pub async fn lowest_interface_bitrate(&self) -> Option<u64> {
-        self.iface_manager
-            .lock()
-            .await
-            .lowest_interface_bitrate()
+        self.iface_manager.lock().await.lowest_interface_bitrate()
     }
 
     /// A reasonable minimum path request timeout covering a full round
@@ -1150,7 +1143,7 @@ impl Transport {
     }
 
     #[allow(unused)] // mocked out in the test build, so the linter
-    // would complain about dead code
+                     // would complain about dead code
     pub(crate) async fn bind_link_to_channel(
         &self,
         id: LinkId,
@@ -1296,6 +1289,17 @@ impl Transport {
             .set_resource_strategy(link_id, strategy);
     }
 
+    /// Set the resource strategy for links without an explicit entry
+    /// (Python `Link.ACCEPT_ALL`-style defaults; applies to inbound links
+    /// the application never opened itself).
+    pub async fn set_default_resource_strategy(&self, strategy: ResourceStrategy) {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .set_default_resource_strategy(strategy);
+    }
+
     /// Register an application callback deciding whether an advertised
     /// resource should be accepted (Python `Link.set_resource_callback`).
     pub async fn set_resource_accept_callback(
@@ -1360,12 +1364,15 @@ impl Transport {
             );
     }
 
-    /// Send an arbitrary-size payload as a resource over an established link.
+    /// Send an arbitrary-size payload as a resource over an established
+    /// link. Returns the full 32-byte resource hash — the same hash that
+    /// identifies the resource in [`Transport::resource_events`] and is
+    /// accepted by [`Transport::cancel_resource`].
     pub async fn send_resource(
         &self,
         link: &Arc<Mutex<Link>>,
         data: Vec<u8>,
-    ) -> Result<AddressHash, RnsError> {
+    ) -> Result<crate::hash::Hash, RnsError> {
         self.send_resource_with_options(link, data, ResourceOptions::default())
             .await
     }
@@ -1377,7 +1384,7 @@ impl Transport {
         link: &Arc<Mutex<Link>>,
         data: Vec<u8>,
         options: ResourceOptions,
-    ) -> Result<AddressHash, RnsError> {
+    ) -> Result<crate::hash::Hash, RnsError> {
         let mut handler = self.handler.lock().await;
         let link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
@@ -1396,7 +1403,7 @@ impl Transport {
             .map(|list| list.iter().any(|r| !r.status.is_concluded()))
             .unwrap_or(false);
 
-        let hash = resource.truncated_hash;
+        let hash = resource.hash;
         if active {
             resource.status = crate::resource::ResourceStatus::Queued;
         } else {
@@ -1415,6 +1422,42 @@ impl Transport {
             .push(resource);
 
         Ok(hash)
+    }
+
+    /// Cancel an outbound resource transfer on a link (Python
+    /// `Resource.cancel` from the initiator): sends the RESOURCE_ICL
+    /// packet and marks the transfer failed. Also cancels queued split
+    /// segments of the same logical resource.
+    pub async fn cancel_resource(
+        &self,
+        link_id: &LinkId,
+        hash: &crate::hash::Hash,
+    ) -> Result<(), RnsError> {
+        let mut handler = self.handler.lock().await;
+        let mut link = None;
+        for candidate in handler.out_links.values().chain(handler.in_links.values()) {
+            if candidate.lock().await.id() == link_id {
+                link = Some(candidate.clone());
+                break;
+            }
+        }
+        let link = link.ok_or(RnsError::InvalidArgument)?;
+        let link_guard = link.lock().await;
+        // Cancel an outgoing transfer first; if none matches, fall back to
+        // a receiver-side cancel of an incoming transfer.
+        let outbound = handler.resources.cancel_outbound(&link_guard, hash);
+        let tx = match outbound {
+            Some(tx) => tx,
+            None => handler
+                .resources
+                .cancel_inbound(&link_guard, hash)
+                .ok_or(RnsError::ResourceMsg("no such resource on link"))?,
+        };
+        drop(link_guard);
+        for packet in tx.packets {
+            handler.send_packet(packet).await;
+        }
+        Ok(())
     }
 
     /// Send a request to the remote end of a link and await nothing (events
@@ -2048,6 +2091,40 @@ impl Transport {
     pub async fn interface_stats(&self) -> Vec<crate::iface::InterfaceStats> {
         self.iface_manager.lock().await.stats()
     }
+
+    /// Snapshot the statistics of the interface a link is established over.
+    ///
+    /// Inbound (and relayed) links report the interface their link request
+    /// arrived on; outbound links report the next-hop interface of the
+    /// path toward their destination. Returns `None` for unknown links or
+    /// when no interface can be determined (e.g. an unserved path).
+    pub async fn interface_stats_for_link(
+        &self,
+        id: LinkId,
+    ) -> Option<crate::iface::InterfaceStats> {
+        let handler = self.handler.lock().await;
+        let iface = handler
+            .in_link_ifaces
+            .get(&id)
+            .copied()
+            .or_else(|| handler.link_table.iface_of(&id))
+            .or_else(|| {
+                handler
+                    .out_links
+                    .iter()
+                    .find(|(_, link)| link.try_lock().is_ok_and(|link| link.id() == &id))
+                    .and_then(|(destination, _)| {
+                        handler.path_table.get(destination).map(|entry| entry.iface)
+                    })
+            })?;
+        drop(handler);
+        self.iface_manager
+            .lock()
+            .await
+            .stats()
+            .into_iter()
+            .find(|stats| stats.address == iface)
+    }
 }
 
 impl Drop for Transport {
@@ -2486,7 +2563,13 @@ async fn send_to_next_hop<'a>(
                     // RNode, I2P, AX.25, pipes) disables the upgrade.
                     matches!(
                         kind.as_str(),
-                        "TcpClient" | "TcpServer" | "BackboneClient" | "BackboneServer" | "AutoInterface" | "LocalServer" | "LocalClient"
+                        "TcpClient"
+                            | "TcpServer"
+                            | "BackboneClient"
+                            | "BackboneServer"
+                            | "AutoInterface"
+                            | "LocalServer"
+                            | "LocalClient"
                     )
                 })
                 .unwrap_or(false);
@@ -2541,6 +2624,7 @@ async fn handle_keepalive_response<'a>(
 async fn handle_resource_packet<'a>(
     packet: &Packet,
     link_arc: &Arc<Mutex<Link>>,
+    transport_handler: &Arc<Mutex<TransportHandler>>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     use crate::packet::PacketContext as Ctx;
@@ -2614,6 +2698,7 @@ async fn handle_resource_packet<'a>(
                             _time,
                             path_hash,
                             req_payload,
+                            transport_handler,
                             handler,
                         )
                         .await;
@@ -2692,6 +2777,7 @@ async fn handle_incoming_request<'a>(
     requested_at: f64,
     path_hash: AddressHash,
     request_data: Vec<u8>,
+    transport_handler: &Arc<Mutex<TransportHandler>>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
     let link = link_arc.lock().await;
@@ -2712,20 +2798,30 @@ async fn handle_incoming_request<'a>(
         let _mdu = link.mdu();
         drop(link);
 
-        let response = async_fn(RequestCtx {
-            path_hash,
-            data: request_data,
-            request_id: rid,
-            link_id,
-            remote_identity,
-            requested_at,
-        })
-        .await;
+        // Async handlers run on the runtime WITHOUT the transport lock:
+        // awaiting user code while holding the handler guard stalls all
+        // packet processing and deadlocks handlers that re-enter
+        // transport APIs. The response is sent once the future resolves
+        // and the lock is re-acquired.
+        let link_arc = link_arc.clone();
+        let transport_handler = transport_handler.clone();
+        tokio::spawn(async move {
+            let response = async_fn(RequestCtx {
+                path_hash,
+                data: request_data,
+                request_id: rid,
+                link_id,
+                remote_identity,
+                requested_at,
+            })
+            .await;
 
-        if let Some(response) = response {
-            let link = link_arc.lock().await;
-            send_response(&link, &rid, &response, handler).await;
-        }
+            if let Some(response) = response {
+                let mut handler = transport_handler.lock().await;
+                let link = link_arc.lock().await;
+                send_response(&link, &rid, &response, &mut handler).await;
+            }
+        });
         return;
     }
 
@@ -2778,6 +2874,7 @@ fn request_id_from_packet(packet: &Packet) -> AddressHash {
 async fn handle_request_or_response_packet<'a>(
     packet: &Packet,
     link: &Arc<Mutex<Link>>,
+    transport_handler: &Arc<Mutex<TransportHandler>>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     let link_guard = link.lock().await;
@@ -2803,7 +2900,8 @@ async fn handle_request_or_response_packet<'a>(
             // truncated_hash(packed_request)` there).
             let rid = request_id_from_packet(packet);
             drop(link_guard);
-            handle_incoming_request(link, rid, time, path_hash, data, handler).await;
+            handle_incoming_request(link, rid, time, path_hash, data, transport_handler, handler)
+                .await;
             true
         }
         PacketContext::Response => {
@@ -2878,8 +2976,10 @@ async fn handle_cache_request<'a>(
 async fn handle_data<'a>(
     packet: &Packet,
     ingress_iface: AddressHash,
+    transport_handler: Arc<Mutex<TransportHandler>>,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
+    let transport_handler = &transport_handler;
     let mut data_handled = false;
 
     // Cache requests: if this instance can fulfill the request from its
@@ -2900,10 +3000,12 @@ async fn handle_data<'a>(
             // link-table routing must not also try to forward it
             // (Python delivers endpoint link data to the local link).
             local_out_link_handled = true;
-            if handle_resource_packet(packet, &link, &mut handler).await {
+            if handle_resource_packet(packet, &link, transport_handler, &mut handler).await {
                 return;
             }
-            if handle_request_or_response_packet(packet, &link, &mut handler).await {
+            if handle_request_or_response_packet(packet, &link, transport_handler, &mut handler)
+                .await
+            {
                 return;
             }
 
@@ -2983,12 +3085,14 @@ async fn handle_data<'a>(
             let link_id = *link.lock().await.id();
 
             if link_id == packet.destination {
-                if handle_resource_packet(packet, &link, &mut handler).await {
+                if handle_resource_packet(packet, &link, transport_handler, &mut handler).await {
                     local_out_link_handled = true;
                     data_handled = true;
                     continue;
                 }
-                if handle_request_or_response_packet(packet, &link, &mut handler).await {
+                if handle_request_or_response_packet(packet, &link, transport_handler, &mut handler)
+                    .await
+                {
                     local_out_link_handled = true;
                     data_handled = true;
                     continue;
@@ -3193,7 +3297,11 @@ async fn handle_announce<'a>(
     // ingress limiting. Announces for destinations with waiting path
     // requests are never limited.
     {
-        handler.iface_manager.lock().await.received_announce(&iface, packet.data.as_slice().len() + 18);
+        handler
+            .iface_manager
+            .lock()
+            .await
+            .received_announce(&iface, packet.data.as_slice().len() + 18);
 
         let known_path = handler.path_table.get(&packet.destination).is_some();
         let pending_request = handler.path_requests.has_pending(&packet.destination);
@@ -3315,7 +3423,8 @@ async fn handle_announce<'a>(
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
         // requesting interface (Python `discovery_path_requests` handling).
-        if let Some(requesting_ifaces) = handler.path_requests.clear_discovery(&packet.destination) {
+        if let Some(requesting_ifaces) = handler.path_requests.clear_discovery(&packet.destination)
+        {
             let hops = packet.header.hops + 1;
             // Python sends the path response to every interface that
             // batched onto the in-flight discovery request (1.5.0
@@ -3325,9 +3434,12 @@ async fn handle_announce<'a>(
                 targets.push(iface);
             }
             for to_iface in targets {
-                handler
-                    .announce_table
-                    .add_response(packet.destination, to_iface, hops, Duration::ZERO);
+                handler.announce_table.add_response(
+                    packet.destination,
+                    to_iface,
+                    hops,
+                    Duration::ZERO,
+                );
             }
             log::trace!(
                 "tp({}): got matching announce, answering waiting discovery path request for {}",
@@ -3483,8 +3595,7 @@ async fn handle_path_request<'a>(
             // `retransmit_timeout = now` for those).
             let from_local_client = {
                 let manager = handler.iface_manager.lock().await;
-                manager.is_local_client_iface(&iface)
-                    || manager.is_local_client_iface(&entry.iface)
+                manager.is_local_client_iface(&iface) || manager.is_local_client_iface(&entry.iface)
             };
             let grace = if from_local_client {
                 Duration::ZERO
@@ -3545,7 +3656,11 @@ async fn handle_path_request<'a>(
             if other == iface || !online {
                 continue;
             }
-            handler.iface_manager.lock().await.sent_path_request(&other, 0);
+            handler
+                .iface_manager
+                .lock()
+                .await
+                .sent_path_request(&other, 0);
             handler
                 .request_path(&request.destination, Some(other), None)
                 .await;
@@ -3654,7 +3769,11 @@ async fn handle_path_request<'a>(
                 continue;
             }
 
-            handler.iface_manager.lock().await.sent_path_request(&other, 0);
+            handler
+                .iface_manager
+                .lock()
+                .await
+                .sent_path_request(&other, 0);
             handler
                 .request_path(&request.destination, Some(other), Some(tag.clone()))
                 .await;
@@ -3784,6 +3903,7 @@ async fn handle_tunnel_synthesize<'a>(
 async fn handle_link_request_as_destination<'a>(
     destination: Arc<Mutex<SingleInputDestination>>,
     packet: &Packet,
+    iface: AddressHash,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
     let mut destination = destination.lock().await;
@@ -3829,6 +3949,7 @@ async fn handle_link_request_as_destination<'a>(
                         link.destination().address_hash
                     );
 
+                    handler.in_link_ifaces.insert(*link.id(), iface);
                     handler
                         .in_links
                         .insert(*link.id(), Arc::new(Mutex::new(link)));
@@ -3875,7 +3996,7 @@ async fn handle_link_request<'a>(
             packet.destination
         );
 
-        handle_link_request_as_destination(destination, packet, handler).await;
+        handle_link_request_as_destination(destination, packet, iface, handler).await;
     } else if let Some(entry) = handler.path_table.next_hop_full(&packet.destination) {
         // Python relays link requests only when the packet is addressed
         // to this instance (the `transport_id == Transport.identity.hash`
@@ -3955,6 +4076,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     for addr in &links_to_remove {
         handler.in_links.remove(addr);
+        handler.in_link_ifaces.remove(addr);
     }
 
     links_to_remove.clear();
@@ -4001,8 +4123,8 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     .get(&link_destination)
                     .map(|entry| entry.hops)
                     .unwrap_or(1);
-                let mut establishment_timeout =
-                    timer_config.out_link_repeat * hops.max(1) as u32 + timer_config.out_link_repeat;
+                let mut establishment_timeout = timer_config.out_link_repeat * hops.max(1) as u32
+                    + timer_config.out_link_repeat;
                 // Extra link-proof time on slow interfaces
                 // (Python `Transport.extra_link_proof_timeout`:
                 // `((1/bitrate)*8)*MTU` for the next-hop interface).
@@ -4015,9 +4137,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         .iface_manager
                         .try_lock()
                         .ok()
-                        .and_then(|manager| {
-                            manager.with_control(&iface, |control| control.bitrate)
-                        })
+                        .and_then(|manager| manager.with_control(&iface, |control| control.bitrate))
                         .filter(|bitrate| *bitrate > 0)
                     {
                         establishment_timeout += Duration::from_secs_f64(
@@ -4291,6 +4411,7 @@ async fn manage_transport(
         );
 
         tokio::spawn(async move {
+            let handler_arc = handler.clone();
             loop {
                 let mut rx_receiver = rx_receiver.lock().await;
 
@@ -4423,7 +4544,13 @@ async fn manage_transport(
                                 handler
                             ).await,
                             PacketType::Proof => handle_proof(&packet, message.address, handler).await,
-                            PacketType::Data => handle_data(&packet, message.address, handler).await,
+                            PacketType::Data => handle_data(
+                                &packet,
+                                message.address,
+                                handler_arc.clone(),
+                                handler,
+                            )
+                            .await,
                         }
                         }
                     }
@@ -4762,8 +4889,14 @@ mod queue_tests {
     fn inbound_queues_drop_when_full() {
         let mut queues = InboundQueues::new([1, 1, 1, 1]);
         // Fill the announce class beyond its size.
-        queues.put(TrafficClass::Announce, test_rx_message(PacketType::Announce));
-        queues.put(TrafficClass::Announce, test_rx_message(PacketType::Announce));
+        queues.put(
+            TrafficClass::Announce,
+            test_rx_message(PacketType::Announce),
+        );
+        queues.put(
+            TrafficClass::Announce,
+            test_rx_message(PacketType::Announce),
+        );
         let (total, heights, dropped) = queues.snapshot();
         assert_eq!(heights[TrafficClass::Announce as usize], 1);
         assert_eq!(dropped[TrafficClass::Announce as usize], 1);
@@ -4862,15 +4995,13 @@ mod tests {
 
         let sender = transport.handler.lock().await.announce_tx.clone();
         for destination in [unrelated, first_match, second_match] {
-            assert!(
-                sender
-                    .send(AnnounceEvent {
-                        destination: Arc::new(Mutex::new(destination)),
-                        app_data: PacketDataBuffer::new(),
-                        ratchet: None,
-                    })
-                    .is_ok()
-            );
+            assert!(sender
+                .send(AnnounceEvent {
+                    destination: Arc::new(Mutex::new(destination)),
+                    app_data: PacketDataBuffer::new(),
+                    ratchet: None,
+                })
+                .is_ok());
         }
 
         let first = time::timeout(Duration::from_secs(1), filtered.recv())
@@ -4885,23 +5016,17 @@ mod tests {
             first.destination.lock().await.desc.address_hash,
             second.destination.lock().await.desc.address_hash,
         ];
-        assert!(
-            addresses.contains(
-                &DestinationName::new("example", "wanted.aspect")
-                    .address_hash_for(first_identity.as_identity())
-            )
-        );
-        assert!(
-            addresses.contains(
-                &DestinationName::new("example", "wanted.aspect")
-                    .address_hash_for(second_identity.as_identity())
-            )
-        );
-        assert!(
-            time::timeout(Duration::from_millis(50), filtered.recv())
-                .await
-                .is_err()
-        );
+        assert!(addresses.contains(
+            &DestinationName::new("example", "wanted.aspect")
+                .address_hash_for(first_identity.as_identity())
+        ));
+        assert!(addresses.contains(
+            &DestinationName::new("example", "wanted.aspect")
+                .address_hash_for(second_identity.as_identity())
+        ));
+        assert!(time::timeout(Duration::from_millis(50), filtered.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -4969,12 +5094,10 @@ mod tests {
             .single_out_destinations
             .insert(address, Arc::new(Mutex::new(output)));
 
-        assert!(
-            transport
-                .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU])
-                .await
-                .is_ok()
-        );
+        assert!(transport
+            .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU])
+            .await
+            .is_ok());
         assert!(matches!(
             transport
                 .send_to_destination(&address, &vec![0; crate::packet::SINGLE_PLAINTEXT_MDU + 1])
@@ -4989,12 +5112,10 @@ mod tests {
         ));
 
         let plain_name = DestinationName::new("test", "plain.payload-bound");
-        assert!(
-            transport
-                .send_to_plain_destination(plain_name, &vec![0; crate::packet::PACKET_PROTOCOL_MDU])
-                .await
-                .is_ok()
-        );
+        assert!(transport
+            .send_to_plain_destination(plain_name, &vec![0; crate::packet::PACKET_PROTOCOL_MDU])
+            .await
+            .is_ok());
         assert!(matches!(
             transport
                 .send_to_plain_destination(
@@ -5031,11 +5152,9 @@ mod tests {
             .unwrap();
         assert_eq!(event.id, wanted);
         assert!(matches!(event.event, LinkEvent::Activated));
-        assert!(
-            time::timeout(Duration::from_millis(50), events.recv())
-                .await
-                .is_err()
-        );
+        assert!(time::timeout(Duration::from_millis(50), events.recv())
+            .await
+            .is_err());
     }
 
     #[tokio::test]

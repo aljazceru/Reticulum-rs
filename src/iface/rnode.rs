@@ -286,11 +286,17 @@ impl RnodeStatus {
 #[derive(Debug, Clone)]
 pub enum RnodeEvent {
     /// Payload data (CMD_DATA or a per-vport data command).
-    Data { vport: Option<u8>, data: Vec<u8> },
+    Data {
+        vport: Option<u8>,
+        data: Vec<u8>,
+    },
     /// A virtual port was selected (RNodeMulti).
     SelectedVport(u8),
     Detect,
-    FirmwareVersion { major: u8, minor: u8 },
+    FirmwareVersion {
+        major: u8,
+        minor: u8,
+    },
     Platform(u8),
     Mcu(u8),
     Ready(bool),
@@ -342,7 +348,10 @@ impl RnodeParser {
 
     fn vport_of(&self, command: u8) -> Option<u8> {
         if self.multi {
-            CMD_INT_DATA.iter().position(|&cmd| cmd == command).map(|v| v as u8)
+            CMD_INT_DATA
+                .iter()
+                .position(|&cmd| cmd == command)
+                .map(|v| v as u8)
         } else if command == CMD_DATA {
             Some(0)
         } else {
@@ -375,7 +384,9 @@ impl RnodeParser {
                 continue;
             }
 
-            let Some(byte) = self.unescape(byte) else { continue };
+            let Some(byte) = self.unescape(byte) else {
+                continue;
+            };
 
             // Bound the accumulating frame: a malicious TCP endpoint can
             // stream unterminated bytes indefinitely (Python caps
@@ -409,9 +420,7 @@ impl RnodeParser {
         }
 
         match command {
-            CMD_DETECT if data.first() == Some(&DETECT_RESP) => {
-                on_event(RnodeEvent::Detect)
-            }
+            CMD_DETECT if data.first() == Some(&DETECT_RESP) => on_event(RnodeEvent::Detect),
             CMD_FW_VERSION if data.len() >= 2 => on_event(RnodeEvent::FirmwareVersion {
                 major: data[0],
                 minor: data[1],
@@ -515,7 +524,10 @@ async fn wait_for_interface_ready(
 }
 
 fn vport_transmit_frames(index: u8, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    (kiss_frame(CMD_SEL_INT, &[index]), kiss_frame(CMD_DATA, data))
+    (
+        kiss_frame(CMD_SEL_INT, &[index]),
+        kiss_frame(CMD_DATA, data),
+    )
 }
 
 /// One open link to an RNode device: serial or TCP
@@ -579,11 +591,17 @@ impl RnodeLink {
             .write_all(data)
             .await
             .map_err(|_| RnsError::ConnectionError)?;
-        self.writer.flush().await.map_err(|_| RnsError::ConnectionError)
+        self.writer
+            .flush()
+            .await
+            .map_err(|_| RnsError::ConnectionError)
     }
 
     pub async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, RnsError> {
-        self.reader.read(buffer).await.map_err(|_| RnsError::ConnectionError)
+        self.reader
+            .read(buffer)
+            .await
+            .map_err(|_| RnsError::ConnectionError)
     }
 }
 
@@ -668,8 +686,8 @@ pub async fn detect_and_validate(
             break;
         }
 
-        let read = tokio::time::timeout(std::time::Duration::from_secs(1), link.read(&mut buffer))
-            .await;
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(1), link.read(&mut buffer)).await;
 
         let Ok(Ok(read)) = read else { break };
         if read == 0 {
@@ -700,7 +718,6 @@ pub async fn detect_and_validate(
 
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // RNodeInterface: one radio per interface.
@@ -777,7 +794,11 @@ impl RnodeInterface {
             let link = {
                 let (tcp_addr, serial_port, baudrate) = {
                     let inner = inner.lock().unwrap();
-                    (inner.tcp_addr.clone(), inner.serial_port.clone(), inner.baudrate)
+                    (
+                        inner.tcp_addr.clone(),
+                        inner.serial_port.clone(),
+                        inner.baudrate,
+                    )
                 };
 
                 let result = if let Some(addr) = tcp_addr {
@@ -862,6 +883,8 @@ impl RnodeInterface {
                                                 state.write().unwrap_or_else(|e| e.into_inner()).interface_ready = ready;
                                             }
                                             RnodeEvent::Status(status) => {
+                                                let quality = status.snr.and_then(|snr| RnodeStatus::quality_for(snr, None));
+                                                stats.set_radio_quality(status.rssi, status.snr, quality);
                                                 let mut shared = state.write().unwrap_or_else(|e| e.into_inner());
                                                 if let Some(rssi) = status.rssi { shared.status.rssi = Some(rssi); }
                                                 if let Some(snr) = status.snr {
@@ -1036,7 +1059,11 @@ pub struct RnodeMultiInterface {
 }
 
 impl RnodeMultiInterface {
-    pub fn tcp(addr: impl Into<String>, vports: Vec<RnodeVport>, iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>) -> Self {
+    pub fn tcp(
+        addr: impl Into<String>,
+        vports: Vec<RnodeVport>,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+    ) -> Self {
         Self {
             tcp_addr: Some(addr.into()),
             serial_port: None,
@@ -1048,7 +1075,12 @@ impl RnodeMultiInterface {
     }
 
     #[cfg(feature = "iface-serial")]
-    pub fn serial(port: impl Into<String>, baudrate: u32, vports: Vec<RnodeVport>, iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>) -> Self {
+    pub fn serial(
+        port: impl Into<String>,
+        baudrate: u32,
+        vports: Vec<RnodeVport>,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+    ) -> Self {
         Self {
             tcp_addr: None,
             serial_port: Some(port.into()),
@@ -1075,7 +1107,11 @@ impl RnodeMultiInterface {
             let mut link = {
                 let (tcp_addr, serial_port, baudrate) = {
                     let inner = inner.lock().unwrap();
-                    (inner.tcp_addr.clone(), inner.serial_port.clone(), inner.baudrate)
+                    (
+                        inner.tcp_addr.clone(),
+                        inner.serial_port.clone(),
+                        inner.baudrate,
+                    )
                 };
 
                 let result = if let Some(addr) = tcp_addr {
@@ -1223,6 +1259,7 @@ impl RnodeMultiInterface {
                 let mut reader = link.reader;
                 let state = state.clone();
                 let inbound = inbound.clone();
+                let rx_stats = stats.clone();
 
                 tokio::spawn(async move {
                     let mut parser = RnodeParser::new(true);
@@ -1241,6 +1278,8 @@ impl RnodeMultiInterface {
                                             RnodeEvent::Data { vport, data } => routed.push((vport, data)),
                                             RnodeEvent::SelectedVport(_) => {}
                                             RnodeEvent::Status(status) => {
+                                                let quality = status.snr.and_then(|snr| RnodeStatus::quality_for(snr, None));
+                                                rx_stats.set_radio_quality(status.rssi, status.snr, quality);
                                                 let mut shared = state.write().unwrap_or_else(|e| e.into_inner());
                                                 if let Some(rssi) = status.rssi { shared.status.rssi = Some(rssi); }
                                                 if let Some(snr) = status.snr { shared.status.snr = Some(snr); }

@@ -28,14 +28,15 @@ static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init()
     });
 }
 
-async fn kiss_transport(name: &str, mode: KissMode, stream: tokio_serial::SerialStream) -> Transport {
+async fn kiss_transport(
+    name: &str,
+    mode: KissMode,
+    stream: tokio_serial::SerialStream,
+) -> Transport {
     let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
 
     transport.iface_manager().lock().await.spawn(
@@ -69,16 +70,23 @@ async fn kiss_announce_over_pty_pair() {
     let result = time::timeout(Duration::from_secs(10), announces.recv()).await;
     match result {
         Ok(Ok(announce)) => {
-            assert_eq!(announce.destination.lock().await.desc.address_hash, dest_hash);
+            assert_eq!(
+                announce.destination.lock().await.desc.address_hash,
+                dest_hash
+            );
         }
         Ok(Err(err)) => panic!("error waiting for announce: {err}"),
         Err(_) => panic!("timeout waiting for announce over KISS pty pair"),
     }
 
     let stats = node_a.interface_stats().await;
-    assert!(stats.iter().any(|stat| stat.kind == "KissInterface" && stat.sent >= 1));
+    assert!(stats
+        .iter()
+        .any(|stat| stat.kind == "KissInterface" && stat.sent >= 1));
     let stats = node_b.interface_stats().await;
-    assert!(stats.iter().any(|stat| stat.kind == "KissInterface" && stat.received >= 1));
+    assert!(stats
+        .iter()
+        .any(|stat| stat.kind == "KissInterface" && stat.received >= 1));
 }
 
 #[tokio::test]
@@ -120,7 +128,10 @@ async fn ax25_kiss_announce_over_pty_pair() {
     let result = time::timeout(Duration::from_secs(10), announces.recv()).await;
     match result {
         Ok(Ok(announce)) => {
-            assert_eq!(announce.destination.lock().await.desc.address_hash, dest_hash);
+            assert_eq!(
+                announce.destination.lock().await.desc.address_hash,
+                dest_hash
+            );
         }
         Ok(Err(err)) => panic!("error waiting for announce: {err}"),
         Err(_) => panic!("timeout waiting for announce over AX.25 KISS pty pair"),
@@ -134,8 +145,7 @@ async fn serial_hdlc_announce_over_pty_pair() {
     let (master, slave) = tokio_serial::SerialStream::pair().expect("pty pair");
 
     async fn build(name: &str, stream: tokio_serial::SerialStream) -> Transport {
-        let transport =
-            TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
+        let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng)).build();
 
         transport
             .iface_manager()
@@ -163,7 +173,10 @@ async fn serial_hdlc_announce_over_pty_pair() {
     let result = time::timeout(Duration::from_secs(10), announces.recv()).await;
     match result {
         Ok(Ok(announce)) => {
-            assert_eq!(announce.destination.lock().await.desc.address_hash, dest_hash);
+            assert_eq!(
+                announce.destination.lock().await.desc.address_hash,
+                dest_hash
+            );
         }
         Ok(Err(err)) => panic!("error waiting for announce: {err}"),
         Err(_) => panic!("timeout waiting for announce over serial pty pair"),

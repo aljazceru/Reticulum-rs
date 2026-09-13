@@ -41,7 +41,8 @@ pub fn parse_hash(input: &str) -> Result<AddressHash, String> {
             cleaned.len()
         ));
     }
-    AddressHash::new_from_hex_string(&cleaned).map_err(|_| "Invalid hash entered. Check your input.".to_string())
+    AddressHash::new_from_hex_string(&cleaned)
+        .map_err(|_| "Invalid hash entered. Check your input.".to_string())
 }
 
 /// Resolve the configuration directory: explicit argument, else
@@ -157,7 +158,9 @@ pub fn identity_from_raw_keys(bytes: &[u8]) -> Option<PrivateIdentity> {
 
 /// Load the identity at `path`, creating (and persisting) a new one when the
 /// file does not exist yet. Returns the identity and whether it was created.
-pub fn load_or_create_private_identity(path: &Path) -> Result<(PrivateIdentity, bool), IdentityLoadError> {
+pub fn load_or_create_private_identity(
+    path: &Path,
+) -> Result<(PrivateIdentity, bool), IdentityLoadError> {
     if path.exists() {
         return load_private_identity(path).map(|identity| (identity, false));
     }
@@ -194,9 +197,20 @@ pub struct ConfiguredInterface {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InterfaceKind {
-    TcpServer { bind_host: String, bind_port: u16 },
-    TcpClient { target_host: String, target_port: u16 },
-    Udp { listen_ip: String, listen_port: u16, forward_ip: String, forward_port: u16 },
+    TcpServer {
+        bind_host: String,
+        bind_port: u16,
+    },
+    TcpClient {
+        target_host: String,
+        target_port: u16,
+    },
+    Udp {
+        listen_ip: String,
+        listen_port: u16,
+        forward_ip: String,
+        forward_port: u16,
+    },
     Unsupported(String),
 }
 
@@ -236,16 +250,34 @@ pub fn read_configured_interfaces(config_dir: &Path) -> Vec<ConfiguredInterface>
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         let kind_str = table.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let get = |key: &str| table.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let get_u16 = |key: &str| table.get(key).and_then(|v| v.as_integer()).and_then(|v| u16::try_from(v).ok());
+        let get = |key: &str| {
+            table
+                .get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let get_u16 = |key: &str| {
+            table
+                .get(key)
+                .and_then(|v| v.as_integer())
+                .and_then(|v| u16::try_from(v).ok())
+        };
 
         let listen_host = {
             let host = get("listen_ip");
-            if host.is_empty() { get("bind_host") } else { host }
+            if host.is_empty() {
+                get("bind_host")
+            } else {
+                host
+            }
         };
         let kind = match kind_str {
             "TCPServerInterface" => match get_u16("listen_port").or_else(|| get_u16("bind_port")) {
-                Some(port) => InterfaceKind::TcpServer { bind_host: listen_host, bind_port: port },
+                Some(port) => InterfaceKind::TcpServer {
+                    bind_host: listen_host,
+                    bind_port: port,
+                },
                 None => InterfaceKind::Unsupported(kind_str.to_string()),
             },
             "TCPClientInterface" => match get_u16("target_port") {
@@ -266,7 +298,11 @@ pub fn read_configured_interfaces(config_dir: &Path) -> Vec<ConfiguredInterface>
             },
             other => InterfaceKind::Unsupported(other.to_string()),
         };
-        out.push(ConfiguredInterface { name, kind, enabled });
+        out.push(ConfiguredInterface {
+            name,
+            kind,
+            enabled,
+        });
     }
     out
 }
@@ -315,19 +351,32 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transpor
         // Interfaces are spawned below without holding the manager lock
         // across awaits of the loop body.
         match &iface.kind {
-            InterfaceKind::TcpServer { bind_host, bind_port } => {
+            InterfaceKind::TcpServer {
+                bind_host,
+                bind_port,
+            } => {
                 let addr = format!("{}:{}", bind_host.trim_end_matches(':'), bind_port);
-                log::info!("Enabling interface '{}': TCP Server on {}", iface.name, addr);
-                transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .spawn(TcpServer::new(addr, transport.iface_manager()), TcpServer::spawn);
+                log::info!(
+                    "Enabling interface '{}': TCP Server on {}",
+                    iface.name,
+                    addr
+                );
+                transport.iface_manager().lock().await.spawn(
+                    TcpServer::new(addr, transport.iface_manager()),
+                    TcpServer::spawn,
+                );
                 spawned += 1;
             }
-            InterfaceKind::TcpClient { target_host, target_port } => {
+            InterfaceKind::TcpClient {
+                target_host,
+                target_port,
+            } => {
                 let addr = format!("{}:{}", target_host.trim_end_matches(':'), target_port);
-                log::info!("Enabling interface '{}': TCP Client to {}", iface.name, addr);
+                log::info!(
+                    "Enabling interface '{}': TCP Client to {}",
+                    iface.name,
+                    addr
+                );
                 transport
                     .iface_manager()
                     .lock()
@@ -335,18 +384,24 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transpor
                     .spawn(TcpClient::new(addr), TcpClient::spawn);
                 spawned += 1;
             }
-            InterfaceKind::Udp { listen_ip, listen_port, forward_ip, forward_port } => {
+            InterfaceKind::Udp {
+                listen_ip,
+                listen_port,
+                forward_ip,
+                forward_port,
+            } => {
                 let bind_addr = format!("{}:{}", listen_ip, listen_port);
                 let forward_addr = format!("{}:{}", forward_ip, forward_port);
-                log::info!("Enabling interface '{}': UDP {}→{}", iface.name, bind_addr, forward_addr);
-                transport
-                    .iface_manager()
-                    .lock()
-                    .await
-                    .spawn(
-                        UdpInterface::new(bind_addr, Some(forward_addr), false),
-                        UdpInterface::spawn,
-                    );
+                log::info!(
+                    "Enabling interface '{}': UDP {}→{}",
+                    iface.name,
+                    bind_addr,
+                    forward_addr
+                );
+                transport.iface_manager().lock().await.spawn(
+                    UdpInterface::new(bind_addr, Some(forward_addr), false),
+                    UdpInterface::spawn,
+                );
                 spawned += 1;
             }
             InterfaceKind::Unsupported(kind) => {
@@ -364,18 +419,14 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transpor
             log::info!(
                 "No configured interfaces, using UDP loopback 127.0.0.1:{bind_port}→127.0.0.1:{forward_port}"
             );
-            transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(
-                    UdpInterface::new(
-                        format!("127.0.0.1:{bind_port}"),
-                        Some(format!("127.0.0.1:{forward_port}")),
-                        false,
-                    ),
-                    UdpInterface::spawn,
-                );
+            transport.iface_manager().lock().await.spawn(
+                UdpInterface::new(
+                    format!("127.0.0.1:{bind_port}"),
+                    Some(format!("127.0.0.1:{forward_port}")),
+                    false,
+                ),
+                UdpInterface::spawn,
+            );
         }
     }
 

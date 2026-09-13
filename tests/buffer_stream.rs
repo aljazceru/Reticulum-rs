@@ -6,9 +6,7 @@ use std::time::Duration;
 use rand_core::OsRng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use reticulum::buffer_stream::{
-    create_bidirectional_buffer, StreamDataMessage, MAX_DATA_LEN,
-};
+use reticulum::buffer_stream::{create_bidirectional_buffer, StreamDataMessage, MAX_DATA_LEN};
 use reticulum::destination::link::LinkEvent;
 use reticulum::destination::DestinationName;
 use reticulum::identity::PrivateIdentity;
@@ -19,8 +17,7 @@ static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace"))
-            .init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init()
     });
 }
 
@@ -54,15 +51,22 @@ async fn buffer_round_trip() {
     transport_a.send_announce(&dest, None).await;
     let announce = recv_announces.recv().await.unwrap();
 
-    let link = transport_b.link(announce.destination.lock().await.desc).await;
-    let (channel_b, receiver_b) =
-        transport_b.mk_channel::<StreamDataMessage>(link).await.unwrap();
+    let link = transport_b
+        .link(announce.destination.lock().await.desc)
+        .await;
+    let (channel_b, receiver_b) = transport_b
+        .mk_channel::<StreamDataMessage>(link)
+        .await
+        .unwrap();
 
     let event = in_link_events.recv().await.unwrap();
     let (channel_a, receiver_a) = match event.event {
         LinkEvent::Activated => {
             let link = transport_a.find_in_link(&event.id).await.unwrap();
-            transport_a.mk_channel::<StreamDataMessage>(link).await.unwrap()
+            transport_a
+                .mk_channel::<StreamDataMessage>(link)
+                .await
+                .unwrap()
         }
         _ => unreachable!(),
     };
@@ -97,7 +101,10 @@ async fn buffer_round_trip() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut done = false;
     while !done {
-        assert!(tokio::time::Instant::now() < deadline, "stream did not complete");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stream did not complete"
+        );
         let mut tmp = [0u8; 4096];
         let n = tokio::time::timeout(Duration::from_secs(5), reader_a.read(&mut tmp))
             .await

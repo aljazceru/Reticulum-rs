@@ -134,7 +134,10 @@ async fn python_fetches_rust_blackhole_list() {
 
     let ok = wait_for(&mut lines, "FETCH-OK", 60).await;
     let _ = child.kill().await;
-    assert!(ok.is_some(), "python client did not confirm the fetched list");
+    assert!(
+        ok.is_some(),
+        "python client did not confirm the fetched list"
+    );
 
     drop(transport);
 }
@@ -171,12 +174,21 @@ async fn rust_updater_persists_python_list() {
     let publisher = AddressHash::new_from_hex_string(&publisher_hex).expect("publisher hash");
 
     // Rust transport with file storage; the updater runs every 2 s.
-    let storage = Arc::new(FsStorage::new(std::env::temp_dir().join(format!(
-        "rnsh-test-{}",
-        std::process::id()
-    )).to_string_lossy().into_owned()));
+    let storage = Arc::new(FsStorage::new(
+        std::env::temp_dir()
+            .join(format!("rnsh-test-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned(),
+    ));
     let transport = Arc::new(
-        rust_transport("bh-rust-b", 4293, 4294, Some(storage.clone()), vec![publisher]).await,
+        rust_transport(
+            "bh-rust-b",
+            4293,
+            4294,
+            Some(storage.clone()),
+            vec![publisher],
+        )
+        .await,
     );
 
     reticulum_discovery::BlackholeUpdater::start(
@@ -207,14 +219,7 @@ async fn rust_updater_persists_python_list() {
     );
 
     // A fresh transport with the same storage restores the list.
-    let transport2 = rust_transport(
-        "bh-rust-c",
-        4295,
-        4296,
-        Some(storage),
-        vec![publisher],
-    )
-    .await;
+    let transport2 = rust_transport("bh-rust-c", 4295, 4296, Some(storage), vec![publisher]).await;
     transport2.load_known_destinations().await.ok();
     let loaded = transport2.reload_blackholes().await;
     assert!(loaded >= 1, "fresh transport restored no blackholes");

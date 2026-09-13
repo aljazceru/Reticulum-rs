@@ -11,9 +11,9 @@ use super::advertisement::{ResourceAdvertisement, HASHMAP_MAX_LEN};
 use super::{
     map_hash, unix_time, ResourceStatus, ResourceTx, FAST_RATE_THRESHOLD, HASHMAP_IS_EXHAUSTED,
     HASHMAP_IS_NOT_EXHAUSTED, MAPHASH_LEN, MAX_EFFICIENT_SIZE, MAX_RETRIES, PART_TIMEOUT_FACTOR,
-    PART_TIMEOUT_FACTOR_AFTER_RTT, RATE_FAST, RATE_VERY_SLOW, RETRY_GRACE_TIME,
-    VERY_SLOW_RATE_THRESHOLD, WINDOW, WINDOW_FLEXIBILITY, WINDOW_MAX_SLOW, WINDOW_MAX_VERY_SLOW,
-    WINDOW_MAX_FAST, WINDOW_MIN, RANDOM_HASH_SIZE,
+    PART_TIMEOUT_FACTOR_AFTER_RTT, RANDOM_HASH_SIZE, RATE_FAST, RATE_VERY_SLOW, RETRY_GRACE_TIME,
+    VERY_SLOW_RATE_THRESHOLD, WINDOW, WINDOW_FLEXIBILITY, WINDOW_MAX_FAST, WINDOW_MAX_SLOW,
+    WINDOW_MAX_VERY_SLOW, WINDOW_MIN,
 };
 
 /// An accepted resource advertisement, transfer in progress.
@@ -183,8 +183,9 @@ impl IncomingResource {
             if self.hashmap[idx].is_none() {
                 self.hashmap_height += 1;
             }
-            let bytes: [u8; MAPHASH_LEN] =
-                hashmap[i * MAPHASH_LEN..(i + 1) * MAPHASH_LEN].try_into().unwrap();
+            let bytes: [u8; MAPHASH_LEN] = hashmap[i * MAPHASH_LEN..(i + 1) * MAPHASH_LEN]
+                .try_into()
+                .unwrap();
             self.hashmap[idx] = Some(bytes);
         }
 
@@ -251,7 +252,10 @@ impl IncomingResource {
     }
 
     fn update_eifr(&mut self, link: &Link) {
-        let rtt = self.rtt.unwrap_or_else(|| link.rtt().as_secs_f64()).max(0.0001);
+        let rtt = self
+            .rtt
+            .unwrap_or_else(|| link.rtt().as_secs_f64())
+            .max(0.0001);
         let expected_inflight_rate = if self.req_data_rtt_rate != 0.0 {
             self.req_data_rtt_rate * 8.0
         } else if let Some(prev) = self.previous_eifr {
@@ -293,8 +297,7 @@ impl IncomingResource {
                 let req_resp_cost = packet.data.len() + self.req_sent_bytes;
                 self.req_resp_rtt_rate = req_resp_cost as f64 / rtt;
 
-                if self.req_resp_rtt_rate > RATE_FAST
-                    && self.fast_rate_rounds < FAST_RATE_THRESHOLD
+                if self.req_resp_rtt_rate > RATE_FAST && self.fast_rate_rounds < FAST_RATE_THRESHOLD
                 {
                     self.fast_rate_rounds += 1;
                     if self.fast_rate_rounds == FAST_RATE_THRESHOLD {
@@ -323,8 +326,7 @@ impl IncomingResource {
                         self.parts[i] = Some(part_data.to_vec());
                         self.rtt_rxd_bytes += part_data.len();
                         self.received_count += 1;
-                        self.outstanding_parts =
-                            self.outstanding_parts.saturating_sub(1);
+                        self.outstanding_parts = self.outstanding_parts.saturating_sub(1);
 
                         if i as isize == self.consecutive_completed_height + 1 {
                             self.consecutive_completed_height = i as isize;
@@ -346,7 +348,7 @@ impl IncomingResource {
             && self.status != ResourceStatus::Assembling
             && self.assembled.is_none()
         {
-                self.status = ResourceStatus::Assembling;
+            self.status = ResourceStatus::Assembling;
             return true;
         } else if self.outstanding_parts == 0 {
             if self.window < self.window_max {
@@ -505,7 +507,9 @@ impl IncomingResource {
         let calculated = Hash::new(digest.into());
         if calculated != self.hash {
             self.status = ResourceStatus::Corrupt;
-            return Err(crate::error::RnsError::ResourceMsg("resource hash mismatch"));
+            return Err(crate::error::RnsError::ResourceMsg(
+                "resource hash mismatch",
+            ));
         }
 
         // Strip the `[3-byte metadata length][metadata]` prefix when the
@@ -560,22 +564,24 @@ impl IncomingResource {
     }
 
     /// Build a reject packet for this advertisement.
+    ///
+    /// RESOURCE_RCL is link-encrypted like any other link data packet
+    /// (Python `Packet.pack` only leaves RESOURCE parts and proofs
+    /// unencrypted).
     pub fn reject_packet(&self, link: &Link, tx: &mut ResourceTx) {
-        if let Ok(packet) = link.raw_packet(
-            self.hash.as_slice(),
-            PacketType::Data,
-            PacketContext::ResourceReceiverCancel,
-        ) {
+        if let Ok(packet) =
+            link.context_packet(self.hash.as_slice(), PacketContext::ResourceReceiverCancel)
+        {
             tx.push(packet);
         }
     }
 
+    /// Build a cancel packet for a receiver-initiated cancel
+    /// (Python `Resource.cancel` sends RESOURCE_RCL from the receiver).
     pub fn cancel_packet(&self, link: &Link, tx: &mut ResourceTx) {
-        if let Ok(packet) = link.raw_packet(
-            self.hash.as_slice(),
-            PacketType::Data,
-            PacketContext::ResourceInitiatorCancel,
-        ) {
+        if let Ok(packet) =
+            link.context_packet(self.hash.as_slice(), PacketContext::ResourceReceiverCancel)
+        {
             tx.push(packet);
         }
     }
@@ -628,11 +634,9 @@ impl IncomingResource {
     /// an `IncomingResource` exists.
     pub fn reject_packet_for(adv: &ResourceAdvertisement, link: &Link) -> Vec<Packet> {
         let mut tx = ResourceTx::default();
-        if let Ok(packet) = link.raw_packet(
-            adv.hash.as_slice(),
-            PacketType::Data,
-            PacketContext::ResourceReceiverCancel,
-        ) {
+        if let Ok(packet) =
+            link.context_packet(adv.hash.as_slice(), PacketContext::ResourceReceiverCancel)
+        {
             tx.push(packet);
         }
         tx.packets
@@ -655,14 +659,12 @@ impl IncomingResource {
         let retries_used = self.max_retries - self.retries_left;
         let extra_wait = retries_used as f64 * super::PER_RETRY_DELAY;
 
-        let expected_hmu_wait_remaining = if self.waiting_for_hmu || self.outstanding_parts == 0
-        {
+        let expected_hmu_wait_remaining = if self.waiting_for_hmu || self.outstanding_parts == 0 {
             (self.sdu as f64 * 8.0 * super::HMU_WAIT_FACTOR) / eifr
         } else {
             0.0
         };
-        let expected_tof_remaining =
-            (self.outstanding_parts as f64 * self.sdu as f64 * 8.0) / eifr;
+        let expected_tof_remaining = (self.outstanding_parts as f64 * self.sdu as f64 * 8.0) / eifr;
 
         let sleep_time = if self.req_resp_rtt_rate != 0.0 {
             self.last_activity
@@ -721,8 +723,8 @@ impl IncomingResource {
         } else {
             1.0
         };
-        let processed = processed_segments * max_parts_per_segment
-            + self.received_count as f64 * factor;
+        let processed =
+            processed_segments * max_parts_per_segment + self.received_count as f64 * factor;
         let total = self.total_segments as f64 * max_parts_per_segment;
         // 1.0 is reserved for the proven final segment: all parts of the
         // last segment being present is not completion until the proof

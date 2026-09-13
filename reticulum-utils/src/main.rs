@@ -280,10 +280,7 @@ fn init_logging(verbosity: u8) {
         2 => "debug",
         _ => "trace",
     };
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(level),
-    )
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 }
 
 fn duration_arg(seconds: Option<f64>, default: Duration) -> Duration {
@@ -369,7 +366,10 @@ fn exit_code(result: Result<(), String>) -> ExitCode {
 async fn run_path(args: PathArgs) -> Result<(), String> {
     init_logging(args.verbose);
     if !args.table && args.destination.is_none() {
-        return Err("No destination specified. Use -t/--table to list paths or pass a destination hash.".to_string());
+        return Err(
+            "No destination specified. Use -t/--table to list paths or pass a destination hash."
+                .to_string(),
+        );
     }
     let config_dir = reticulum_utils::common::resolve_config_dir(args.config.as_deref());
     let timeout = duration_arg(args.timeout, reticulum_utils::rnpath::DEFAULT_TIMEOUT);
@@ -389,7 +389,8 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
             Some(destination) => Some(parse_hash(destination)?),
             None => None,
         };
-        let entries = reticulum_utils::rnpath::path_table(&transport, filter.as_ref(), args.max).await;
+        let entries =
+            reticulum_utils::rnpath::path_table(&transport, filter.as_ref(), args.max).await;
         if args.json {
             #[derive(serde::Serialize)]
             struct Entry {
@@ -488,16 +489,15 @@ async fn run_cp(args: CpArgs) -> Result<(), String> {
         return reticulum_utils::rncp::serve(options).await;
     }
 
-    let (file, destination) = match (&args.file, &args.destination) {
-        (Some(file), Some(destination)) => (file.clone(), parse_hash(destination)?),
-        _ => {
-            return Err(
+    let (file, destination) =
+        match (&args.file, &args.destination) {
+            (Some(file), Some(destination)) => (file.clone(), parse_hash(destination)?),
+            _ => return Err(
                 "Nothing to do: pass <file> <destination> to send, --fetch <file> <destination> \
                  to fetch, or --serve <dir> to listen."
                     .to_string(),
-            )
-        }
-    };
+            ),
+        };
 
     if args.fetch {
         let options = FetchOptions {
@@ -560,7 +560,9 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
 
     let options = reticulum_utils::rnprobe::ProbeOptions {
         config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
-        size: args.size.unwrap_or(reticulum_utils::rnprobe::DEFAULT_PROBE_SIZE),
+        size: args
+            .size
+            .unwrap_or(reticulum_utils::rnprobe::DEFAULT_PROBE_SIZE),
         timeout: duration_arg(args.timeout, reticulum_utils::rnprobe::DEFAULT_TIMEOUT),
         probes: args.probes,
         udp_loopback,
@@ -570,10 +572,12 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
         .await
         .map_err(|err| format!("probe failed: {err:?}"))?;
 
-    print!("{}", reticulum_utils::rnprobe::render_results(&destination, &results));
+    print!(
+        "{}",
+        reticulum_utils::rnprobe::render_results(&destination, &results)
+    );
     Ok(())
 }
-
 
 fn parse_udp_pair(spec: Option<&str>) -> Option<(u16, u16)> {
     let spec = spec?;
@@ -711,12 +715,16 @@ async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
     };
 
     if args.validate {
-        let frequency = args.frequency.ok_or("--frequency is required for validation")?;
+        let frequency = args
+            .frequency
+            .ok_or("--frequency is required for validation")?;
         let config = reticulum::iface::rnode::RnodeRadioConfig {
             frequency,
             bandwidth: args.bandwidth.ok_or("--bandwidth is required")?,
             txpower: args.txpower.ok_or("--txpower is required")?,
-            spreadingfactor: args.spreadingfactor.ok_or("--spreadingfactor is required")?,
+            spreadingfactor: args
+                .spreadingfactor
+                .ok_or("--spreadingfactor is required")?,
             codingrate: args.codingrate.ok_or("--codingrate is required")?,
             st_alock: None,
             lt_alock: None,

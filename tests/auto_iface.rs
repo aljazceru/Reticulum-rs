@@ -36,10 +36,7 @@ static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init()
     });
 }
 
@@ -88,23 +85,17 @@ async fn auto_interface_peers_and_exchanges_announce() {
 
     // distinct ports from the defaults so a real reticulum on the host
     // isn't disturbed
-    let node_a = auto_transport(
-        "auto-a",
-        auto_config("rs-test-auto", "fe80::1", 39716),
-    )
-    .await;
-    let node_b = auto_transport(
-        "auto-b",
-        auto_config("rs-test-auto", "fe80::2", 39716),
-    )
-    .await;
+    let node_a = auto_transport("auto-a", auto_config("rs-test-auto", "fe80::1", 39716)).await;
+    let node_b = auto_transport("auto-b", auto_config("rs-test-auto", "fe80::2", 39716)).await;
 
     // wait for the peering (beacon every 1.6s, peering wait 1.2x announce)
     time::sleep(Duration::from_secs(6)).await;
 
     let stats = node_a.interface_stats().await;
     assert!(
-        stats.iter().any(|stat| stat.kind == "AutoPeer" && stat.online),
+        stats
+            .iter()
+            .any(|stat| stat.kind == "AutoPeer" && stat.online),
         "node a should have peered with node b: {stats:#?}"
     );
 
@@ -120,7 +111,10 @@ async fn auto_interface_peers_and_exchanges_announce() {
     let result = time::timeout(Duration::from_secs(15), announces.recv()).await;
     match result {
         Ok(Ok(announce)) => {
-            assert_eq!(announce.destination.lock().await.desc.address_hash, dest_hash);
+            assert_eq!(
+                announce.destination.lock().await.desc.address_hash,
+                dest_hash
+            );
         }
         Ok(Err(err)) => panic!("error waiting for announce: {err}"),
         Err(_) => panic!("timeout waiting for announce over auto-peered link"),

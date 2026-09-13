@@ -23,8 +23,7 @@ use reticulum::transport::{ReceivedData, Transport, TransportConfig};
 #[allow(dead_code)]
 static RETICULUM_PYTHON_DIR: LazyLock<String> =
     LazyLock::new(|| std::env::var("RETICULUM_TEST_PYTHON_DIR").unwrap());
-static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 static INIT: std::sync::Once = std::sync::Once::new();
 
 fn setup() {
@@ -54,14 +53,8 @@ impl Drop for PyPartner {
 /// its storage (identities, ratchets) and concurrent suites never share
 /// state (same isolation as the rncp python tests).
 fn isolated_config(name: &str) -> String {
-    let fixture = format!(
-        "{}/tests/rns-py-configs/udp",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let dir = std::env::temp_dir().join(format!(
-        "rn-pyid-{name}-{}",
-        std::process::id()
-    ));
+    let fixture = format!("{}/tests/rns-py-configs/udp", env!("CARGO_MANIFEST_DIR"));
+    let dir = std::env::temp_dir().join(format!("rn-pyid-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(format!("{fixture}/config"), dir.join("config")).unwrap();
@@ -78,10 +71,18 @@ async fn spawn_partner(mode: &str, destination: Option<&str>, size: usize) -> Py
         .arg(mode)
         .arg("--size")
         .arg(size.to_string())
-        .args(destination.map(|d| vec!["--destination".to_string(), d.to_string()]).unwrap_or_default())
+        .args(
+            destination
+                .map(|d| vec!["--destination".to_string(), d.to_string()])
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(if std::env::var("PYI_STDERR").is_ok() { Stdio::piped() } else { Stdio::null() })
+        .stderr(if std::env::var("PYI_STDERR").is_ok() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .expect("spawn python partner");
 
@@ -149,7 +150,10 @@ async fn wait_announce(
 ) -> Option<Option<[u8; 32]>> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "no announce from python");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no announce from python"
+        );
         let event = tokio::time::timeout_at(deadline, announces.recv())
             .await
             .expect("timeout")
@@ -200,7 +204,10 @@ async fn python_sends_encrypted_packet_to_rust() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = rust_transport(4242, 4243).await;
     let destination = transport
-        .add_destination(identity, DestinationName::new("example_utilities", "identity.echo"))
+        .add_destination(
+            identity,
+            DestinationName::new("example_utilities", "identity.echo"),
+        )
         .await;
     // Python default is PROVE_NONE (Destination.__init__); a destination
     // that wants delivery receipts opts in explicitly, like the reference
@@ -235,7 +242,11 @@ async fn python_sends_encrypted_packet_to_rust() {
     let sending_line =
         next_line_containing(&mut lines, "sending sha", Duration::from_secs(30)).await;
     let sending_line = sending_line.expect("python did not send");
-    let expected_sha: String = sending_line.split_whitespace().last().expect("sha").to_string();
+    let expected_sha: String = sending_line
+        .split_whitespace()
+        .last()
+        .expect("sha")
+        .to_string();
 
     let data = next_received(&mut received, &hash, Duration::from_secs(30))
         .await
@@ -246,7 +257,11 @@ async fn python_sends_encrypted_packet_to_rust() {
     let delivered_line =
         next_line_containing(&mut lines, "delivered sha", Duration::from_secs(30)).await;
     let delivered_line = delivered_line.expect("python did not get a delivery proof");
-    let delivered_sha: String = delivered_line.split_whitespace().last().expect("sha").to_string();
+    let delivered_sha: String = delivered_line
+        .split_whitespace()
+        .last()
+        .expect("sha")
+        .to_string();
     assert_eq!(delivered_sha, expected_sha);
 
     drop(partner);
@@ -290,7 +305,11 @@ async fn rust_sends_encrypted_packet_to_python() {
     let received_line =
         next_line_containing(&mut lines, "received sha", Duration::from_secs(30)).await;
     let received_line = received_line.expect("python did not receive the packet");
-    let received_sha: String = received_line.split_whitespace().last().expect("sha").to_string();
+    let received_sha: String = received_line
+        .split_whitespace()
+        .last()
+        .expect("sha")
+        .to_string();
     assert_eq!(received_sha, payload_sha);
 
     // Python proves the packet (PROVE_ALL) and the Rust receipt concludes.
@@ -405,7 +424,10 @@ async fn announce_ratchet_round_trip() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = rust_transport(4242, 4243).await;
     let destination = transport
-        .add_destination(identity, DestinationName::new("example_utilities", "identity.echo"))
+        .add_destination(
+            identity,
+            DestinationName::new("example_utilities", "identity.echo"),
+        )
         .await;
     let hash = destination.lock().await.desc.address_hash;
 
@@ -429,7 +451,11 @@ async fn announce_ratchet_round_trip() {
         .last()
         .expect("ratchet id")
         .to_string();
-    assert_eq!(reported_id.len(), 20, "ratchet id is 10 bytes hex: {ratchet_line}");
+    assert_eq!(
+        reported_id.len(),
+        20,
+        "ratchet id is 10 bytes hex: {ratchet_line}"
+    );
 
     // The id Python reports must be the id of the ratchet our destination
     // currently announces.

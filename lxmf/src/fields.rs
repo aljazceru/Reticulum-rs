@@ -280,8 +280,7 @@ impl FieldValue {
         // typed rmp reader which validates the marker itself.
         let marker = {
             let mut peek: &[u8] = rd;
-            rmp::decode::read_marker(&mut peek)
-                .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?
+            rmp::decode::read_marker(&mut peek).map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?
         };
 
         match marker {
@@ -300,17 +299,25 @@ impl FieldValue {
                 Ok(FieldValue::Bool(false))
             }
             Marker::F64 => {
-                let value = rmp::decode::read_f64(rd)
-                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?;
+                let value =
+                    rmp::decode::read_f64(rd).map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?;
                 Ok(FieldValue::F64(value))
             }
             Marker::F32 => {
-                let value = rmp::decode::read_f32(rd)
-                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?;
+                let value =
+                    rmp::decode::read_f32(rd).map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?;
                 Ok(FieldValue::F64(value as f64))
             }
-            Marker::FixPos(_) | Marker::U8 | Marker::U16 | Marker::U32 | Marker::U64
-            | Marker::FixNeg(_) | Marker::I8 | Marker::I16 | Marker::I32 | Marker::I64 => {
+            Marker::FixPos(_)
+            | Marker::U8
+            | Marker::U16
+            | Marker::U32
+            | Marker::U64
+            | Marker::FixNeg(_)
+            | Marker::I8
+            | Marker::I16
+            | Marker::I32
+            | Marker::I64 => {
                 // read_int accepts any integer marker, mirroring umsgpack
                 let value = rmp::decode::read_int::<i64, _>(rd)
                     .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?;
@@ -318,18 +325,20 @@ impl FieldValue {
             }
             Marker::FixStr(_) | Marker::Str8 | Marker::Str16 | Marker::Str32 => {
                 let len = rmp::decode::read_str_len(rd)
-                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))? as usize;
+                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?
+                    as usize;
                 if rd.len() < len {
                     return Err(LxmfError::InvalidFormat);
                 }
-                let s = String::from_utf8(rd[..len].to_vec())
-                    .map_err(|_| LxmfError::InvalidFormat)?;
+                let s =
+                    String::from_utf8(rd[..len].to_vec()).map_err(|_| LxmfError::InvalidFormat)?;
                 *rd = &rd[len..];
                 Ok(FieldValue::Str(s))
             }
             Marker::Bin8 | Marker::Bin16 | Marker::Bin32 => {
                 let len = rmp::decode::read_bin_len(rd)
-                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))? as usize;
+                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?
+                    as usize;
                 if rd.len() < len {
                     return Err(LxmfError::InvalidFormat);
                 }
@@ -339,7 +348,8 @@ impl FieldValue {
             }
             Marker::FixArray(_) | Marker::Array16 | Marker::Array32 => {
                 let len = rmp::decode::read_array_len(rd)
-                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))? as usize;
+                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?
+                    as usize;
                 let mut items = Vec::with_capacity(len);
                 for _ in 0..len {
                     items.push(FieldValue::unpack(rd)?);
@@ -348,7 +358,8 @@ impl FieldValue {
             }
             Marker::FixMap(_) | Marker::Map16 | Marker::Map32 => {
                 let len = rmp::decode::read_map_len(rd)
-                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))? as usize;
+                    .map_err(|e| LxmfError::Msgpack(format!("{e:?}")))?
+                    as usize;
                 // Same bound as arrays: each entry needs at least two
                 // input bytes (key + value markers).
                 if len.saturating_mul(2) > rd.len() {
@@ -413,7 +424,9 @@ pub struct Fields {
 impl Fields {
     /// Create an empty fields map.
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Insert a field. As with the Python dict, re-inserting an
@@ -520,10 +533,7 @@ mod tests {
                 "pn announce",
                 "97c2ce67748580c3cd0100cd0400931003128101c40954657374204e6f6465",
             ),
-            (
-                "delivery announce",
-                "93c40c446973706c6179204e616d650c9100",
-            ),
+            ("delivery announce", "93c40c446973706c6179204e616d650c9100"),
         ];
 
         for (name, hex) in cases {
@@ -535,13 +545,14 @@ mod tests {
         }
 
         // Full helper round-trip on the propagation node fixture
-        let pn = crate::from_hex(
-            "97c2ce67748580c3cd0100cd0400931003128101c40954657374204e6f6465",
-        )
-        .unwrap();
+        let pn = crate::from_hex("97c2ce67748580c3cd0100cd0400931003128101c40954657374204e6f6465")
+            .unwrap();
         let info = crate::pn_announce_data_from_app_data(Some(&pn))
             .expect("pn announce data must be valid");
         assert_eq!(info.timebase, 1735689600);
-        assert_eq!(crate::pn_name_from_app_data(Some(&pn)).as_deref(), Some("Test Node"));
-     }
+        assert_eq!(
+            crate::pn_name_from_app_data(Some(&pn)).as_deref(),
+            Some("Test Node")
+        );
+    }
 }

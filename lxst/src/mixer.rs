@@ -53,7 +53,8 @@ impl Mixer {
     pub fn with_samplerate(target_frame_ms: f64, samplerate: u32) -> Self {
         let mut m = Self::new(target_frame_ms);
         m.samplerate = Some(samplerate);
-        m.samples_per_frame = Some(((target_frame_ms / 1000.0) * samplerate as f64).ceil() as usize);
+        m.samples_per_frame =
+            Some(((target_frame_ms / 1000.0) * samplerate as f64).ceil() as usize);
         m
     }
 
@@ -99,7 +100,10 @@ impl Mixer {
 
     /// Frames buffered for a source.
     pub fn frames_waiting(&self, source: SourceId) -> usize {
-        self.incoming_frames.get(&source).map(|q| q.len()).unwrap_or(0)
+        self.incoming_frames
+            .get(&source)
+            .map(|q| q.len())
+            .unwrap_or(0)
     }
 
     /// Number of sources currently registered.
@@ -212,7 +216,10 @@ impl Mixer {
 
     /// Mix and encode the next frame with `codec` (Python encodes when a
     /// codec is configured on the mixer).
-    pub fn mix_next_encoded(&mut self, codec: &mut dyn Codec) -> Result<Option<Vec<u8>>, crate::LxstError> {
+    pub fn mix_next_encoded(
+        &mut self,
+        codec: &mut dyn Codec,
+    ) -> Result<Option<Vec<u8>>, crate::LxstError> {
         match self.mix_next_frame() {
             Some(frame) => Ok(Some(codec.encode(&frame)?)),
             None => Ok(None),
@@ -324,7 +331,13 @@ mod tests {
             .unwrap();
 
         mixer
-            .handle_frame(SinkFrame::Encoded(encoded), a, Some(48_000), Some(1), &mut raw)
+            .handle_frame(
+                SinkFrame::Encoded(encoded),
+                a,
+                Some(48_000),
+                Some(1),
+                &mut raw,
+            )
             .unwrap();
         let mixed = mixer.mix_next_frame().unwrap();
         assert_eq!(mixed.samples, vec![0.5, -0.5]);

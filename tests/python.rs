@@ -9,10 +9,7 @@ use tokio::process::Command;
 /// concurrent suites never share Python-side storage (identities,
 /// ratchets) or corrupt each other.
 fn isolated_config(name: &str) -> String {
-    let fixture = format!(
-        "{}/tests/rns-py-configs/udp",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let fixture = format!("{}/tests/rns-py-configs/udp", env!("CARGO_MANIFEST_DIR"));
     let dir = std::env::temp_dir().join(format!("rn-pyex-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();

@@ -12,18 +12,16 @@ use reticulum::destination::DestinationName;
 use reticulum::hash::{AddressHash, Hash};
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
+use reticulum::resource::manager::RequestEvent;
 use reticulum::resource::{
     self, advertisement::ResourceAdvertisement, msgpack_bin, pack_response, request_id,
     unpack_request, unpack_response, ResourceOptions, ResourceStatus, ResourceStrategy,
 };
-use reticulum::resource::manager::RequestEvent;
 use reticulum::transport::{Transport, TransportConfig};
 
 fn setup_logging() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
 }
 
 fn hex(data: &[u8]) -> String {
@@ -93,10 +91,7 @@ fn advertisement_pack_with_flags_matches_python() {
     assert!(unpacked.is_request());
     assert!(unpacked.is_response());
     assert!(unpacked.has_metadata());
-    assert_eq!(
-        unpacked.request_id,
-        Some(AddressHash::new([0x0f; 16]))
-    );
+    assert_eq!(unpacked.request_id, Some(AddressHash::new([0x0f; 16])));
 }
 
 fn load_vectors() -> std::collections::HashMap<String, String> {
@@ -177,15 +172,13 @@ fn compression_roundtrip() {
 }
 
 /// Two transports connected over loopback UDP with an active link.
-async fn connected_pair(server_port: u16, client_port: u16) -> (Transport, Transport, Arc<Mutex<Link>>) {
+async fn connected_pair(
+    server_port: u16,
+    client_port: u16,
+) -> (Transport, Transport, Arc<Mutex<Link>>) {
     let server_identity = PrivateIdentity::new_from_rand(OsRng);
-    let server =
-        TransportConfig::new("srv", &server_identity).build();
-    let client = TransportConfig::new(
-        "cli",
-        &PrivateIdentity::new_from_rand(OsRng),
-    )
-    .build();
+    let server = TransportConfig::new("srv", &server_identity).build();
+    let client = TransportConfig::new("cli", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     server.iface_manager().lock().await.spawn(
         UdpInterface::new(
@@ -208,24 +201,29 @@ async fn connected_pair(server_port: u16, client_port: u16) -> (Transport, Trans
         .add_destination(server_identity, DestinationName::new("test", "resources"))
         .await;
     let hash = destination.lock().await.desc.address_hash;
-    server.send_announce(&destination, None).await;
 
+    // Subscribe before announcing so the event cannot slip past the
+    // receiver; a slow retry covers interface-worker startup races under
+    // parallel test load.
     let mut announces = client.recv_announces().await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    server.send_announce(&destination, None).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let desc = loop {
         assert!(tokio::time::Instant::now() < deadline, "no announce");
-        let event = tokio::time::timeout_at(deadline, announces.recv())
-            .await
-            .expect("timeout")
-            .expect("channel");
-        if event.destination.lock().await.desc.address_hash == hash {
-            break event.destination.lock().await.desc;
+        match tokio::time::timeout(Duration::from_secs(3), announces.recv()).await {
+            Ok(Ok(event)) => {
+                if event.destination.lock().await.desc.address_hash == hash {
+                    break event.destination.lock().await.desc;
+                }
+            }
+            Ok(Err(err)) => panic!("error waiting for announce: {err}"),
+            Err(_) => server.send_announce(&destination, None).await,
         }
     };
 
     let mut client_events = client.out_link_events();
     let link = client.link(desc).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
         assert!(tokio::time::Instant::now() < deadline, "link inactive");
         let event = tokio::time::timeout_at(deadline, client_events.recv())
@@ -241,7 +239,10 @@ async fn connected_pair(server_port: u16, client_port: u16) -> (Transport, Trans
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let link_id = *link.lock().await.id();
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "server link missing");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "server link missing"
+        );
         if server.find_in_link(&link_id).await.is_some() {
             break;
         }
@@ -258,12 +259,17 @@ async fn resource_transfer_roundtrip() {
 
     // Accept all resources on the server side of the link
     let link_id = *link.lock().await.id();
-    server.set_resource_strategy(link_id, ResourceStrategy::All).await;
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
 
     let mut resource_events = server.resource_events().await;
 
     let payload: Vec<u8> = (0..150_000u32).map(|i| (i % 251) as u8).collect();
-    client.send_resource(&link, payload.clone()).await.expect("send resource");
+    client
+        .send_resource(&link, payload.clone())
+        .await
+        .expect("send resource");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut received = None;
@@ -286,7 +292,10 @@ async fn resource_transfer_roundtrip() {
     let mut client_events = client.resource_events().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "sender completion missing");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sender completion missing"
+        );
         let event = tokio::time::timeout_at(deadline, client_events.recv())
             .await
             .expect("timeout")
@@ -301,11 +310,16 @@ async fn resource_transfer_roundtrip() {
 async fn resource_transfer_tiny() {
     let (server, client, link) = connected_pair(4321, 4322).await;
     let link_id = *link.lock().await.id();
-    server.set_resource_strategy(link_id, ResourceStrategy::All).await;
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
 
     let mut resource_events = server.resource_events().await;
     let payload = b"tiny resource payload".to_vec();
-    client.send_resource(&link, payload.clone()).await.expect("send");
+    client
+        .send_resource(&link, payload.clone())
+        .await
+        .expect("send");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut received = None;
@@ -328,7 +342,9 @@ async fn resource_transfer_tiny() {
 async fn resource_transfer_with_metadata() {
     let (server, client, link) = connected_pair(4331, 4332).await;
     let link_id = *link.lock().await.id();
-    server.set_resource_strategy(link_id, ResourceStrategy::All).await;
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
 
     let mut resource_events = server.resource_events().await;
     let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 249) as u8).collect();
@@ -373,7 +389,9 @@ async fn request_response_roundtrip() {
 
     let dest_hash = destination.lock().await.desc.address_hash;
     server
-        .register_request_handler(&dest_hash, "echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
+        .register_request_handler(&dest_hash, "echo", |ctx| {
+            Some(reticulum::resource::msgpack_bin(&ctx.data))
+        })
         .await;
 
     // Send a request and await the response
@@ -407,7 +425,10 @@ async fn request_response_large_resource_backed() {
         })
         .await;
 
-    let rid = client.request(&link, "bulk", b"send-me-data").await.expect("request");
+    let rid = client
+        .request(&link, "bulk", b"send-me-data")
+        .await
+        .expect("request");
 
     let response = client
         .await_request_response(rid, Duration::from_secs(60))
@@ -465,10 +486,218 @@ async fn resource_transfer_reject_oversized() {
     client.send_resource(&link, payload).await.expect("send");
 
     // no acceptance event should arrive
-    let result =
-        tokio::time::timeout(Duration::from_secs(2), resource_events.recv()).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), resource_events.recv()).await;
     if let Ok(Ok(event)) = result {
         // any event other than a completion is fine
         assert_ne!(event.status, ResourceStatus::Complete);
     }
+}
+
+/// Cancelling two multi-megabyte loopback transfers concurrently floods
+/// the UDP socket buffers and starves other tests' control packets, so the
+/// cancel tests share a lock.
+static CANCEL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn incompressible(size: usize, seed: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(size);
+    let mut state = seed;
+    while payload.len() < size {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        payload.extend_from_slice(&state.to_le_bytes());
+    }
+    payload
+}
+
+#[tokio::test]
+async fn sender_cancel_fails_both_ends_of_a_transfer() {
+    setup_logging();
+    let _guard = CANCEL_TEST_LOCK.lock().await;
+    let (server, client, link) = connected_pair(4591, 4592).await;
+
+    let link_id = *link.lock().await.id();
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
+
+    let mut server_events = server.resource_events().await;
+    let mut client_events = client.resource_events().await;
+
+    // A megabyte of incompressible data keeps the transfer in flight
+    // while the sender cancels it.
+    let payload = incompressible(1024 * 1024, 0x1234_5678);
+    let hash = client
+        .send_resource(&link, payload)
+        .await
+        .expect("send resource");
+
+    // Give the receiver a moment to accept and start requesting parts,
+    // then cancel as the initiator (Python `Resource.cancel` sends
+    // RESOURCE_ICL).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut transferring = false;
+    while tokio::time::Instant::now() < deadline && !transferring {
+        let event = tokio::time::timeout(Duration::from_millis(500), server_events.recv())
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .expect("channel");
+        if event.hash == hash
+            && matches!(
+                event.status,
+                ResourceStatus::Transferring | ResourceStatus::Advertised
+            )
+        {
+            transferring = true;
+        }
+    }
+    assert!(transferring, "transfer never started");
+
+    client
+        .cancel_resource(&link_id, &hash)
+        .await
+        .expect("cancel resource");
+
+    // The sender observes the local cancellation.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sender never saw the cancellation"
+        );
+        let event = tokio::time::timeout_at(deadline, client_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.hash == hash && event.status == ResourceStatus::Failed {
+            break;
+        }
+    }
+
+    // The receiver learns about the cancellation over RESOURCE_ICL.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "receiver never saw the cancellation"
+        );
+        let event = tokio::time::timeout_at(deadline, server_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.hash == hash && event.status == ResourceStatus::Failed {
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn receiver_cancel_fails_sender_transfer() {
+    setup_logging();
+    let _guard = CANCEL_TEST_LOCK.lock().await;
+    let (server, client, link) = connected_pair(4593, 4594).await;
+
+    let link_id = *link.lock().await.id();
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
+
+    let mut server_events = server.resource_events().await;
+    let mut client_events = client.resource_events().await;
+
+    let payload = incompressible(1024 * 1024, 0x8765_4321);
+    let hash = client
+        .send_resource(&link, payload)
+        .await
+        .expect("send resource");
+
+    // Wait for the incoming transfer to be underway, then cancel as the
+    // receiver (Python `Resource.cancel` sends RESOURCE_RCL from the
+    // receiver).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut transferring = false;
+    while tokio::time::Instant::now() < deadline && !transferring {
+        let event = tokio::time::timeout(Duration::from_millis(500), server_events.recv())
+            .await
+            .ok()
+            .and_then(|result| result.ok())
+            .expect("channel");
+        if event.hash == hash
+            && matches!(
+                event.status,
+                ResourceStatus::Transferring | ResourceStatus::Advertised
+            )
+        {
+            transferring = true;
+        }
+    }
+    assert!(transferring, "transfer never started");
+
+    server
+        .cancel_resource(&link_id, &hash)
+        .await
+        .expect("cancel resource");
+
+    // The receiver marked its own side failed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "receiver never saw its own cancellation"
+        );
+        let event = tokio::time::timeout_at(deadline, server_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.hash == hash && event.status == ResourceStatus::Failed {
+            break;
+        }
+    }
+
+    // The sender receives RESOURCE_RCL and stops advertising/transferring.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sender never saw the receiver cancellation"
+        );
+        let event = tokio::time::timeout_at(deadline, client_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.hash == hash && event.status == ResourceStatus::Rejected {
+            break;
+        }
+    }
+
+    // Cancelling an unknown resource is an error, not a panic.
+    let unknown = Hash::new([0xAB; 32]);
+    assert!(client.cancel_resource(&link_id, &unknown).await.is_err());
+}
+
+#[tokio::test]
+async fn interface_stats_for_link_resolves_the_links_interface() {
+    setup_logging();
+    let (server, client, link) = connected_pair(4595, 4596).await;
+    let link_id = *link.lock().await.id();
+
+    // The outbound side resolves the next-hop interface of the path.
+    let stats = client
+        .interface_stats_for_link(link_id)
+        .await
+        .expect("link interface stats");
+    assert_eq!(stats.kind, "UdpInterface");
+    assert!(stats.online);
+
+    // The inbound side resolves the receiving interface.
+    let stats = server
+        .interface_stats_for_link(link_id)
+        .await
+        .expect("link interface stats");
+    assert_eq!(stats.kind, "UdpInterface");
+
+    // Unknown links report nothing instead of guessing.
+    assert!(client
+        .interface_stats_for_link(AddressHash::new([0x0e; 16]))
+        .await
+        .is_none());
 }

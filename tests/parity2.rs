@@ -137,7 +137,9 @@ async fn blackhole_blocks_announces() {
             UdpInterface::new("127.0.0.1:4633", Some("127.0.0.1:4632"), false),
             UdpInterface::spawn,
         );
-        let d = t.add_destination(id.clone(), DestinationName::new("test", "blocked")).await;
+        let d = t
+            .add_destination(id.clone(), DestinationName::new("test", "blocked"))
+            .await;
         (id, (t, d))
     };
 
@@ -180,7 +182,10 @@ async fn blackhole_blocks_announces() {
             _ => break,
         }
     }
-    assert!(!got_blocked, "announce from blackholed identity must be dropped");
+    assert!(
+        !got_blocked,
+        "announce from blackholed identity must be dropped"
+    );
 
     // And unblackhole works
     assert!(client.unblackhole_identity(identity_hash).await);

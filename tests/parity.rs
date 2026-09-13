@@ -113,8 +113,7 @@ fn identity_sign_validate() {
 /// Python `test_00_valid_announce`.
 #[test]
 fn valid_announce() {
-    let identity =
-        PrivateIdentity::new_from_hex_string(FIXED_KEYS[3].0).expect("valid key");
+    let identity = PrivateIdentity::new_from_hex_string(FIXED_KEYS[3].0).expect("valid key");
     let mut destination =
         SingleInputDestination::new(identity, DestinationName::new("test", "announce"));
 
@@ -130,8 +129,7 @@ fn valid_announce() {
 /// invalidates the announce.
 #[test]
 fn invalid_announce() {
-    let identity =
-        PrivateIdentity::new_from_hex_string(FIXED_KEYS[4].0).expect("valid key");
+    let identity = PrivateIdentity::new_from_hex_string(FIXED_KEYS[4].0).expect("valid key");
     let mut destination =
         SingleInputDestination::new(identity, DestinationName::new("test", "announce"));
 
@@ -157,10 +155,7 @@ fn invalid_announce() {
 #[test]
 fn fixed_destination_hash() {
     let identity = PrivateIdentity::new_from_hex_string(FIXED_KEYS[0].0).unwrap();
-    assert_eq!(
-        hex(identity.address_hash().as_slice()),
-        FIXED_KEYS[0].1
-    );
+    assert_eq!(hex(identity.address_hash().as_slice()), FIXED_KEYS[0].1);
 
     let destination = reticulum::destination::SingleOutputDestination::new(
         *identity.as_identity(),

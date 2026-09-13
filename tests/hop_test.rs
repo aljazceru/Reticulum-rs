@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum::{
-    destination::DestinationName,
     destination::link::LinkEvent,
+    destination::DestinationName,
     identity::PrivateIdentity,
     iface::{tcp_client::TcpClient, tcp_server::TcpServer},
     transport::{Transport, TransportConfig},
@@ -15,9 +15,7 @@ static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("trace")
-        ).init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init()
     });
 }
 
@@ -25,7 +23,7 @@ async fn build_transport_full(
     name: &str,
     server_addr: &str,
     client_addr: &[&str],
-    retransmit: bool
+    retransmit: bool,
 ) -> Transport {
     let transport = TransportConfig::new(name, &PrivateIdentity::new_from_rand(OsRng))
         .set_retransmit(retransmit)
@@ -107,12 +105,7 @@ async fn remote_path_request_and_response() {
     setup();
 
     let transport_a = build_transport("a", "127.0.0.1:8281", &[]).await;
-    let transport_b = build_transport_full(
-        "b",
-        "127.0.0.1:8282",
-        &["127.0.0.1:8281"],
-        true
-    ).await;
+    let transport_b = build_transport_full("b", "127.0.0.1:8282", &["127.0.0.1:8281"], true).await;
     let transport_c = build_transport("c", "127.0.0.1:8283", &["127.0.0.1:8282"]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
@@ -139,7 +132,7 @@ async fn remote_path_request_and_response() {
     time::pause();
     time::advance(time::Duration::from_secs(3600)).await;
 
-    transport_b.send_announce(&dest_b, None).await; 
+    transport_b.send_announce(&dest_b, None).await;
     transport_a.recv_announces().await;
     transport_a.request_path(&dest_c_hash, None, None).await;
 
@@ -161,12 +154,8 @@ async fn message_proof_over_remote_link() {
     setup();
 
     let transport_a = build_transport("a", "127.0.0.1:8381", &[]).await;
-    let _transport_b =
-        build_transport_full("b", "127.0.0.1:8382", &["127.0.0.1:8381"], true)
-        .await;
-    let transport_c =
-        build_transport("c", "127.0.0.1:8383", &["127.0.0.1:8382"])
-        .await;
+    let _transport_b = build_transport_full("b", "127.0.0.1:8382", &["127.0.0.1:8381"], true).await;
+    let transport_c = build_transport("c", "127.0.0.1:8383", &["127.0.0.1:8382"]).await;
 
     let id_c = PrivateIdentity::new_from_name("c");
     let dest_c = transport_c
@@ -194,7 +183,9 @@ async fn message_proof_over_remote_link() {
 
     let message = "foo";
 
-    let sent = transport_a.send_to_out_links(&dest_c_hash, message.as_bytes()).await;
+    let sent = transport_a
+        .send_to_out_links(&dest_c_hash, message.as_bytes())
+        .await;
     let expected_hash = sent[0];
 
     tokio::select! {

@@ -85,7 +85,10 @@ members = [
   "reticulum-discovery",
   "lxmf",
   "lxst",
-  "reticulum-utils"
+  "reticulum-utils",
+  "reticulum-actor",
+  "reticulum-ffi",
+  "uniffi-bindgen"
 ]
 
 [[bench]]
@@ -111,6 +114,11 @@ path = "examples/link_client.rs"
 [[example]]
 name = "testnet_client"
 path = "examples/testnet_client.rs"
+
+[[example]]
+name = "rnode_listen"
+path = "examples/rnode_listen.rs"
+required-features = ["iface-rnode", "iface-serial"]
 
 [[example]]
 name = "multihop"

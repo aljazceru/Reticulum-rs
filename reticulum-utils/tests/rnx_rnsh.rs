@@ -4,14 +4,11 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn rnx_remote_execution_roundtrip() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 
     // Listener on its own transport + config dir.
-    let server_dir =
-        std::env::temp_dir().join(format!("rn-rnx-server-{}", std::process::id()));
+    let server_dir = std::env::temp_dir().join(format!("rn-rnx-server-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&server_dir);
     std::fs::create_dir_all(&server_dir).unwrap();
 
@@ -40,8 +37,7 @@ async fn rnx_remote_execution_roundtrip() {
     // The destination hash derives from the app name + identity; use the
     // client-side announce discovery over the same UDP pair instead:
     // the listener announces, the client subscribes.
-    let client_dir =
-        std::env::temp_dir().join(format!("rn-rnx-client-{}", std::process::id()));
+    let client_dir = std::env::temp_dir().join(format!("rn-rnx-client-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&client_dir);
     std::fs::create_dir_all(&client_dir).unwrap();
 
@@ -56,20 +52,15 @@ async fn rnx_remote_execution_roundtrip() {
     };
 
     // Derive the destination hash from the identity file.
-    let identity =
-        reticulum::identity::PrivateIdentity::new_from_hex_string(identity_hex.trim())
-            .expect("listener identity");
-    let destination =
-        reticulum::destination::DestinationName::new("rnx", "execute")
-            .address_hash_for(identity.as_identity());
+    let identity = reticulum::identity::PrivateIdentity::new_from_hex_string(identity_hex.trim())
+        .expect("listener identity");
+    let destination = reticulum::destination::DestinationName::new("rnx", "execute")
+        .address_hash_for(identity.as_identity());
 
-    let result = reticulum_utils::rnx::execute(
-        &destination,
-        "printf hello-from-rnx",
-        &exec_options,
-    )
-    .await
-    .expect("remote execution");
+    let result =
+        reticulum_utils::rnx::execute(&destination, "printf hello-from-rnx", &exec_options)
+            .await
+            .expect("remote execution");
 
     assert!(result.executed, "command must have been executed");
     assert_eq!(result.retval, 0);
@@ -80,13 +71,10 @@ async fn rnx_remote_execution_roundtrip() {
 
 #[tokio::test]
 async fn rnsh_session_command_roundtrip() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 
-    let server_dir =
-        std::env::temp_dir().join(format!("rn-rnsh-server-{}", std::process::id()));
+    let server_dir = std::env::temp_dir().join(format!("rn-rnsh-server-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&server_dir);
     std::fs::create_dir_all(&server_dir).unwrap();
 
@@ -107,15 +95,12 @@ async fn rnsh_session_command_roundtrip() {
 
     let identity_hex = std::fs::read_to_string(server_dir.join("storage/identities/rnsh"))
         .expect("listener identity file");
-    let identity =
-        reticulum::identity::PrivateIdentity::new_from_hex_string(identity_hex.trim())
-            .expect("listener identity");
-    let destination =
-        reticulum::destination::DestinationName::new("rnsh", "shell")
-            .address_hash_for(identity.as_identity());
+    let identity = reticulum::identity::PrivateIdentity::new_from_hex_string(identity_hex.trim())
+        .expect("listener identity");
+    let destination = reticulum::destination::DestinationName::new("rnsh", "shell")
+        .address_hash_for(identity.as_identity());
 
-    let client_dir =
-        std::env::temp_dir().join(format!("rn-rnsh-client-{}", std::process::id()));
+    let client_dir = std::env::temp_dir().join(format!("rn-rnsh-client-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&client_dir);
     std::fs::create_dir_all(&client_dir).unwrap();
 
@@ -128,13 +113,9 @@ async fn rnsh_session_command_roundtrip() {
         udp_loopback: Some((5006, 5005)),
     };
 
-    let outcome = reticulum_utils::rnsh::run_command(
-        &destination,
-        "printf shell-output",
-        &options,
-    )
-    .await
-    .expect("session command");
+    let outcome = reticulum_utils::rnsh::run_command(&destination, "printf shell-output", &options)
+        .await
+        .expect("session command");
 
     assert_eq!(outcome.stdout, b"shell-output");
 

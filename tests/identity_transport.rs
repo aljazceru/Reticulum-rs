@@ -141,7 +141,9 @@ async fn single_destination_encrypted_exchange_with_ratchets() {
 
     let mut received = server.received_data_events();
     let mut announces = client.recv_announces().await;
-    server.send_announce(&destination, Some(b"app data fixture")).await;
+    server
+        .send_announce(&destination, Some(b"app data fixture"))
+        .await;
 
     let first_ratchet = wait_announce(&mut announces, &address, Duration::from_secs(10))
         .await
@@ -152,7 +154,10 @@ async fn single_destination_encrypted_exchange_with_ratchets() {
     // Known destinations and ratchets are populated from the announce.
     assert_eq!(client.known_destinations_len().await, 1);
     assert_eq!(client.get_ratchet(&address).await, Some(first_ratchet));
-    let ratchet_id = client.current_ratchet_id(&address).await.expect("ratchet id");
+    let ratchet_id = client
+        .current_ratchet_id(&address)
+        .await
+        .expect("ratchet id");
     assert_eq!(ratchet_id.len(), 10);
 
     // Recall returns the announced identity and app data.
@@ -271,9 +276,7 @@ async fn known_destinations_persist_across_restart() {
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&storage_dir);
-    let storage = Arc::new(FsStorage::new(
-        storage_dir.to_string_lossy().into_owned(),
-    ));
+    let storage = Arc::new(FsStorage::new(storage_dir.to_string_lossy().into_owned()));
 
     // Build the pair manually so the client shares the storage that the
     // restarted transport reloads from.
@@ -299,7 +302,10 @@ async fn known_destinations_persist_across_restart() {
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let destination = server
-        .add_destination(identity, DestinationName::new("example_utilities", "persisted"))
+        .add_destination(
+            identity,
+            DestinationName::new("example_utilities", "persisted"),
+        )
         .await;
     let address = destination.lock().await.desc.address_hash;
     server
@@ -308,7 +314,9 @@ async fn known_destinations_persist_across_restart() {
         .expect("server ratchets");
 
     let mut announces = client.recv_announces().await;
-    server.send_announce(&destination, Some(b"persisted app data")).await;
+    server
+        .send_announce(&destination, Some(b"persisted app data"))
+        .await;
     let announced_ratchet = wait_announce(&mut announces, &address, Duration::from_secs(10))
         .await
         .expect("announce")
@@ -325,14 +333,20 @@ async fn known_destinations_persist_across_restart() {
     restarted.load_known_destinations().await.expect("load");
     assert_eq!(restarted.known_destinations_len().await, 1);
 
-    let recalled = restarted.recall(&address).await.expect("recall after restart");
+    let recalled = restarted
+        .recall(&address)
+        .await
+        .expect("recall after restart");
     let expected = destination.lock().await.desc.identity;
     assert_eq!(recalled.to_hex_string(), expected.to_hex_string());
     assert_eq!(
         restarted.recall_app_data(&address).await.as_deref(),
         Some(b"persisted app data".as_ref())
     );
-    assert_eq!(restarted.get_ratchet(&address).await, Some(announced_ratchet));
+    assert_eq!(
+        restarted.get_ratchet(&address).await,
+        Some(announced_ratchet)
+    );
     let _ = std::fs::remove_dir_all(storage_dir);
 }
 
@@ -387,9 +401,7 @@ async fn destination_ratchets_are_signed_by_the_destination_and_reload() {
     let restarted = TransportConfig::new("ratchet-reader", &transport_identity)
         .set_storage(storage)
         .build();
-    let reloaded = restarted
-        .add_destination(destination_identity, name)
-        .await;
+    let reloaded = restarted.add_destination(destination_identity, name).await;
     restarted
         .enable_destination_ratchets(&address, path)
         .await
@@ -407,13 +419,18 @@ async fn ratchet_expiry() {
     let mut ratchets = KnownRatchets::new();
 
     let destination = AddressHash::new_from_slice(b"expiry-destinat");
-    ratchets.remember(&storage, destination, [9u8; 32], 1_000.0).unwrap();
+    ratchets
+        .remember(&storage, destination, [9u8; 32], 1_000.0)
+        .unwrap();
 
     let path = format!("{RATCHETS_DIR}/{}", destination.to_hex_string());
     assert!(storage.read(&path).is_some());
 
     // Not yet expired.
-    assert_eq!(ratchets.get(&storage, &destination, 1_000.0 + 100.0), Some([9u8; 32]));
+    assert_eq!(
+        ratchets.get(&storage, &destination, 1_000.0 + 100.0),
+        Some([9u8; 32])
+    );
 
     // After the expiry window the ratchet is gone.
     let expired = 1_000.0 + reticulum::identity::RATCHET_EXPIRY_SECS as f64;

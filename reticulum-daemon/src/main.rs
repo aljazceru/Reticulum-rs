@@ -7,8 +7,8 @@ use reticulum::iface::local::SharedInstanceAddress;
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::iface::udp::UdpInterface;
-use reticulum::transport::TransportConfig;
 use reticulum::storage::FsStorage;
+use reticulum::transport::TransportConfig;
 use tokio::signal;
 
 #[cfg(all(feature = "iface-auto", target_os = "linux"))]
@@ -47,7 +47,9 @@ fn parse_blackhole_sources(values: &[String]) -> Result<Vec<AddressHash>, String
         .iter()
         .map(|value| {
             if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!("invalid identity hash for blackhole source: {value}"));
+                return Err(format!(
+                    "invalid identity hash for blackhole source: {value}"
+                ));
             }
             AddressHash::new_from_hex_string(value)
                 .map_err(|_| format!("invalid identity hash for blackhole source: {value}"))
@@ -131,8 +133,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every destination derived from it — stays stable across restarts
     // (Phase 7.4). The daemon announces nothing by default.
     let identity_path = config_path.join(IDENTITY_FILE);
-    let (identity, created) = reticulum_utils::common::load_or_create_private_identity(&identity_path)
-        .map_err(|err| format!("could not load daemon identity: {err}"))?;
+    let (identity, created) =
+        reticulum_utils::common::load_or_create_private_identity(&identity_path)
+            .map_err(|err| format!("could not load daemon identity: {err}"))?;
     log::info!(
         "{} daemon identity {} at {}",
         if created { "Generated" } else { "Loaded" },
@@ -367,7 +370,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
-            InterfaceConfig::I2PInterface { peers, connectable, sam_address, .. } => {
+            InterfaceConfig::I2PInterface {
+                peers,
+                connectable,
+                sam_address,
+                ..
+            } => {
                 #[cfg(feature = "iface-i2p")]
                 {
                     let sam_addr = sam_address
@@ -433,8 +441,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             InterfaceConfig::BackboneInterface {
-                listen_ip, bind_port, block_fast_flapping, fast_flapping_threshold,
-                fast_flapping_grace, fast_flapping_block_time, ..
+                listen_ip,
+                bind_port,
+                block_fast_flapping,
+                fast_flapping_threshold,
+                fast_flapping_grace,
+                fast_flapping_block_time,
+                ..
             } => {
                 let addr = format!("{}:{}", listen_ip.trim_end_matches(':'), bind_port);
 
@@ -443,14 +456,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     fast_flapping_threshold
                         .map(|seconds| std::time::Duration::from_secs_f64(seconds.max(0.1)))
                         .unwrap_or(reticulum::iface::backbone::FAST_FLAP_THRESHOLD),
-                    fast_flapping_grace
-                        .unwrap_or(reticulum::iface::backbone::FAST_FLAP_GRACE),
+                    fast_flapping_grace.unwrap_or(reticulum::iface::backbone::FAST_FLAP_GRACE),
                     fast_flapping_block_time
                         .map(|minutes| std::time::Duration::from_secs_f64(minutes.max(0.1) * 60.0))
                         .unwrap_or(reticulum::iface::backbone::FAST_FLAP_EXPIRY),
                 );
 
-                log::info!("Enabling interface '{}': Backbone server on {}", iface.name, addr);
+                log::info!(
+                    "Enabling interface '{}': Backbone server on {}",
+                    iface.name,
+                    addr
+                );
                 let address = iface_manager.lock().await.spawn_named(
                     &iface.name,
                     reticulum::iface::backbone::BackboneServer::new(
@@ -462,9 +478,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 configure_iface(&iface_manager, &address, iface).await;
             }
-            InterfaceConfig::BackboneClientInterface { target_ip, target_port, .. } => {
+            InterfaceConfig::BackboneClientInterface {
+                target_ip,
+                target_port,
+                ..
+            } => {
                 let addr = format!("{}:{}", target_ip.trim_end_matches(':'), target_port);
-                log::info!("Enabling interface '{}': Backbone client to {}", iface.name, addr);
+                log::info!(
+                    "Enabling interface '{}': Backbone client to {}",
+                    iface.name,
+                    addr
+                );
                 let address = iface_manager.lock().await.spawn_named(
                     &iface.name,
                     reticulum::iface::backbone::BackboneClient::new(addr)
@@ -473,7 +497,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 configure_iface(&iface_manager, &address, iface).await;
             }
-            InterfaceConfig::RNodeInterface { port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock, flow_control, .. } => {
+            InterfaceConfig::RNodeInterface {
+                port,
+                tcp,
+                speed,
+                frequency,
+                bandwidth,
+                txpower,
+                spreadingfactor,
+                codingrate,
+                st_alock,
+                lt_alock,
+                flow_control,
+                ..
+            } => {
                 #[cfg(feature = "iface-rnode")]
                 {
                     let config = reticulum::iface::rnode::RnodeRadioConfig {
@@ -500,7 +537,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         #[cfg(feature = "iface-serial")]
                         {
-                            Some(reticulum::iface::rnode::RnodeInterface::serial(port, *speed, config))
+                            Some(reticulum::iface::rnode::RnodeInterface::serial(
+                                port, *speed, config,
+                            ))
                         }
                         #[cfg(not(feature = "iface-serial"))]
                         {
@@ -511,7 +550,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None
                         }
                     } else {
-                        log::error!("Interface '{}' (RNode) needs a port or tcp target", iface.name);
+                        log::error!(
+                            "Interface '{}' (RNode) needs a port or tcp target",
+                            iface.name
+                        );
                         None
                     };
 
@@ -529,14 +571,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 #[cfg(not(feature = "iface-rnode"))]
                 {
-                    let _ = (port, tcp, speed, frequency, bandwidth, txpower, spreadingfactor, codingrate, st_alock, lt_alock, flow_control);
+                    let _ = (
+                        port,
+                        tcp,
+                        speed,
+                        frequency,
+                        bandwidth,
+                        txpower,
+                        spreadingfactor,
+                        codingrate,
+                        st_alock,
+                        lt_alock,
+                        flow_control,
+                    );
                     log::warn!(
                         "Interface '{}' type 'RNodeInterface' requires building the daemon with --features iface-rnode",
                         iface.name
                     );
                 }
             }
-            InterfaceConfig::RNodeMultiInterface { port, tcp, speed, subinterfaces, .. } => {
+            InterfaceConfig::RNodeMultiInterface {
+                port,
+                tcp,
+                speed,
+                subinterfaces,
+                ..
+            } => {
                 #[cfg(feature = "iface-rnode")]
                 {
                     use reticulum::iface::rnode::{RnodeMultiInterface, RnodeVport};
@@ -573,7 +633,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         #[cfg(feature = "iface-serial")]
                         {
-                            Some(RnodeMultiInterface::serial(port, *speed, vports, iface_manager.clone()))
+                            Some(RnodeMultiInterface::serial(
+                                port,
+                                *speed,
+                                vports,
+                                iface_manager.clone(),
+                            ))
                         }
                         #[cfg(not(feature = "iface-serial"))]
                         {
@@ -584,7 +649,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None
                         }
                     } else {
-                        log::error!("Interface '{}' (RNodeMulti) needs a port or tcp target", iface.name);
+                        log::error!(
+                            "Interface '{}' (RNodeMulti) needs a port or tcp target",
+                            iface.name
+                        );
                         None
                     };
 
@@ -1070,11 +1138,9 @@ mod tests {
         let valid = vec!["00112233445566778899aabbccddeeff".to_string()];
         assert_eq!(parse_management_allowed(&valid).unwrap().len(), 1);
         assert!(parse_management_allowed(&[]).unwrap().is_empty());
-        assert!(parse_management_allowed(&[
-            valid[0].clone(),
-            "not-a-valid-hash".to_string(),
-        ])
-        .is_err());
+        assert!(
+            parse_management_allowed(&[valid[0].clone(), "not-a-valid-hash".to_string(),]).is_err()
+        );
     }
 
     #[cfg(feature = "iface-rnode")]

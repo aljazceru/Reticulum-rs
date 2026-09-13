@@ -43,7 +43,9 @@ impl std::fmt::Display for PipelineError {
                 write!(f, "Audio pipeline initialised with invalid source")
             }
             PipelineError::InvalidSink => write!(f, "Audio pipeline initialised with invalid sink"),
-            PipelineError::InvalidCodec => write!(f, "Audio pipeline initialised with invalid codec"),
+            PipelineError::InvalidCodec => {
+                write!(f, "Audio pipeline initialised with invalid codec")
+            }
         }
     }
 }
@@ -85,8 +87,7 @@ impl<S: Source + 'static, K: Sink + 'static> Pipeline<S, K> {
         codec_role: CodecRole,
         default_frame_ms: f64,
     ) -> Self {
-        let target_frame_ms =
-            crate::codecs::clamp_frame_ms(codec.as_ref(), default_frame_ms);
+        let target_frame_ms = crate::codecs::clamp_frame_ms(codec.as_ref(), default_frame_ms);
         let filters = filters
             .into_iter()
             .map(|f| Arc::new(Mutex::new(f)) as Arc<Mutex<Box<dyn Filter>>>)

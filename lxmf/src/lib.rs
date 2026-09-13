@@ -38,29 +38,30 @@ use reticulum_core::identity::Identity;
 /// The LXMF application name used for destination naming (`LXMF.APP_NAME`).
 pub const APP_NAME: &str = "lxmf";
 
+pub use crate::error::LxmfError;
 pub use crate::fields::{
     FieldValue, Fields, FIELD_AUDIO, FIELD_COMMANDS, FIELD_COMMENT, FIELD_CONTINUATION,
     FIELD_CUSTOM_DATA, FIELD_CUSTOM_META, FIELD_CUSTOM_TYPE, FIELD_DEBUG, FIELD_EMBEDDED_LXMS,
     FIELD_EVENT, FIELD_FILE_ATTACHMENTS, FIELD_GROUP, FIELD_ICON_APPEARANCE, FIELD_IMAGE,
-    FIELD_NON_SPECIFIC, FIELD_REACTION, FIELD_REPLY_QUOTE, FIELD_REPLY_TO, FIELD_RESULTS,
-    FIELD_RNR_REFS, FIELD_RENDERER, FIELD_TELEMETRY, FIELD_TELEMETRY_STREAM, FIELD_THREAD,
+    FIELD_NON_SPECIFIC, FIELD_REACTION, FIELD_RENDERER, FIELD_REPLY_QUOTE, FIELD_REPLY_TO,
+    FIELD_RESULTS, FIELD_RNR_REFS, FIELD_TELEMETRY, FIELD_TELEMETRY_STREAM, FIELD_THREAD,
     FIELD_TICKET, PN_META_AUTH_BAND, PN_META_CUSTOM, PN_META_NAME, PN_META_SYNC_STRATUM,
     PN_META_SYNC_THROTTLE, PN_META_UTIL_PRESSURE, PN_META_VERSION, SF_COMPRESSION,
 };
 pub use crate::message::{
-    full_hash, truncated_hash, LXMessage, TransportEncryption, COST_TICKET, CANCELLED,
-    DELIVERED, DESTINATION_LENGTH, DIRECT, ENCRYPTED_PACKET_MAX_CONTENT, ENCRYPTED_PACKET_MDU,
+    full_hash, truncated_hash, LXMessage, TransportEncryption, CANCELLED, COST_TICKET, DELIVERED,
+    DESTINATION_LENGTH, DIRECT, ENCRYPTED_PACKET_MAX_CONTENT, ENCRYPTED_PACKET_MDU,
     ENCRYPTION_DESCRIPTION_AES, ENCRYPTION_DESCRIPTION_EC, ENCRYPTION_DESCRIPTION_UNENCRYPTED,
     FAILED, GENERATING, LINK_PACKET_MAX_CONTENT, LINK_PACKET_MDU, LXMF_OVERHEAD, OPPORTUNISTIC,
-    OUTBOUND, PAPER, PAPER_MDU, PACKET, PLAIN_PACKET_MAX_CONTENT, PLAIN_PACKET_MDU, PROPAGATED,
-    QR_ERROR_CORRECTION, QR_MAX_STORAGE, REJECTED, RESOURCE, SENDING, SENT, SIGNATURE_INVALID,
-    SIGNATURE_LENGTH, SOURCE_UNKNOWN, STATES, TICKET_EXPIRY, TICKET_GRACE, TICKET_INTERVAL,
-    REPRESENTATIONS, TICKET_LENGTH, TICKET_RENEW, TIMESTAMP_SIZE, UNVERIFIED_REASONS,
-    UNKNOWN, URI_SCHEMA, VALID_METHODS,
+    OUTBOUND, PACKET, PAPER, PAPER_MDU, PLAIN_PACKET_MAX_CONTENT, PLAIN_PACKET_MDU, PROPAGATED,
+    QR_ERROR_CORRECTION, QR_MAX_STORAGE, REJECTED, REPRESENTATIONS, RESOURCE, SENDING, SENT,
+    SIGNATURE_INVALID, SIGNATURE_LENGTH, SOURCE_UNKNOWN, STATES, TICKET_EXPIRY, TICKET_GRACE,
+    TICKET_INTERVAL, TICKET_LENGTH, TICKET_RENEW, TIMESTAMP_SIZE, UNKNOWN, UNVERIFIED_REASONS,
+    URI_SCHEMA, VALID_METHODS,
 };
-pub use crate::error::LxmfError;
 
 pub use crate::peer::PeerData;
+pub use crate::router::PropagationTransferState;
 pub use crate::stamper::{
     generate_stamp, stamp_valid, stamp_value, stamp_workblock, WORKBLOCK_EXPAND_ROUNDS,
     WORKBLOCK_EXPAND_ROUNDS_PEERING, WORKBLOCK_EXPAND_ROUNDS_PN,
@@ -86,8 +87,12 @@ pub fn from_hex(hex: &str) -> Result<Vec<u8>, LxmfError> {
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     for pair in hex.as_bytes().chunks(2) {
-        let hi = (pair[0] as char).to_digit(16).ok_or(LxmfError::InvalidFormat)?;
-        let lo = (pair[1] as char).to_digit(16).ok_or(LxmfError::InvalidFormat)?;
+        let hi = (pair[0] as char)
+            .to_digit(16)
+            .ok_or(LxmfError::InvalidFormat)?;
+        let lo = (pair[1] as char)
+            .to_digit(16)
+            .ok_or(LxmfError::InvalidFormat)?;
         out.push((hi * 16 + lo) as u8);
     }
     Ok(out)
@@ -251,9 +256,7 @@ pub struct PropagationNodeInfo {
 /// Validate and parse propagation node announce data
 /// (`LXMF.pn_announce_data_is_valid` plus the field extraction performed by
 /// `LXMFPropagationAnnounceHandler.received_announce`).
-pub fn pn_announce_data_from_app_data(
-    app_data: Option<&[u8]>,
-) -> Option<PropagationNodeInfo> {
+pub fn pn_announce_data_from_app_data(app_data: Option<&[u8]>) -> Option<PropagationNodeInfo> {
     let app_data = app_data?;
     if app_data.is_empty() {
         return None;

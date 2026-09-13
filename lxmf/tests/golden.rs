@@ -32,7 +32,10 @@ fn propagation_container_lxmf_data(container: &[u8]) -> Vec<u8> {
     let FieldValue::Array(items) = value else {
         panic!("container must be an array")
     };
-    assert!(items[0].as_f64().is_some(), "container time must be a float");
+    assert!(
+        items[0].as_f64().is_some(),
+        "container time must be a float"
+    );
     let FieldValue::Array(inner) = &items[1] else {
         panic!("container messages must be an array")
     };
@@ -89,8 +92,11 @@ fn pack_fixture_message(
             .try_into()
             .unwrap(),
     );
-    let source_hash =
-        AddressHash::new(hex(fixture["source_hash"].as_str().unwrap()).try_into().unwrap());
+    let source_hash = AddressHash::new(
+        hex(fixture["source_hash"].as_str().unwrap())
+            .try_into()
+            .unwrap(),
+    );
 
     let mut message = LXMessage::new(
         destination_hash,
@@ -190,8 +196,8 @@ fn packed_messages_match_python_bytes() {
 #[test]
 fn unpack_python_bytes() {
     let g = golden();
-    let source_identity = *fixed_identity(g["identities"]["source"]["private_hex"].as_str().unwrap())
-        .as_identity();
+    let source_identity =
+        *fixed_identity(g["identities"]["source"]["private_hex"].as_str().unwrap()).as_identity();
     let source_hash = AddressHash::new(
         hex(g["identities"]["source"]["delivery_destination_hash"]
             .as_str()
@@ -235,7 +241,10 @@ fn unpack_python_bytes() {
         .expect("unpack");
         assert!(verified.signature_validated, "{name}");
         assert_eq!(verified.unverified_reason, None);
-        assert_eq!(verified.stamp.map(|s| to_hex(&s)).as_deref(), fixture["stamp"].as_str());
+        assert_eq!(
+            verified.stamp.map(|s| to_hex(&s)).as_deref(),
+            fixture["stamp"].as_str()
+        );
 
         // A mutated payload must fail signature validation (or fail to
         // parse entirely, which the Python router treats identically).
@@ -295,12 +304,7 @@ fn ticket_stamp_validates() {
         .find(|m| m["name"] == "ticket")
         .unwrap();
 
-    let message = pack_fixture_message(
-        fixture,
-        &source,
-        fixture["stamp"].as_str().map(hex),
-        None,
-    );
+    let message = pack_fixture_message(fixture, &source, fixture["stamp"].as_str().map(hex), None);
     let ticket = hex(fixture["ticket"].as_str().unwrap());
     let ticket_bytes: [u8; TICKET_LENGTH] = ticket.try_into().unwrap();
 
@@ -365,10 +369,8 @@ fn generate_stamp_and_validate() {
     let stamp = stamp.expect("stamp generated");
     assert!(value >= 8);
 
-    let workblock = stamper::stamp_workblock_with_rounds(
-        &material,
-        stamper::WORKBLOCK_EXPAND_ROUNDS_PEERING,
-    );
+    let workblock =
+        stamper::stamp_workblock_with_rounds(&material, stamper::WORKBLOCK_EXPAND_ROUNDS_PEERING);
     assert!(stamper::stamp_valid(&stamp, 8, &workblock));
     assert_eq!(stamper::stamp_value(&workblock, &stamp), value);
 
@@ -422,11 +424,17 @@ fn peer_data_matches_python() {
 
     let peer = PeerData::from_bytes(&bytes).expect("peer data");
     let repacked = peer.to_bytes();
-    assert_eq!(to_hex(&repacked), to_hex(&bytes), "peer round-trip mismatch");
+    assert_eq!(
+        to_hex(&repacked),
+        to_hex(&bytes),
+        "peer round-trip mismatch"
+    );
 
     // Spot-check parsed values against the fixture dictionary
     let expected = value_from_json(&g["peer"]["fields"]);
-    let FieldValue::Map(entries) = expected else { unreachable!() };
+    let FieldValue::Map(entries) = expected else {
+        unreachable!()
+    };
     for (key, value) in entries {
         let Some(key) = key.as_str() else { continue };
         match key {
@@ -444,7 +452,9 @@ fn peer_data_matches_python() {
                 assert_eq!(peer.propagation_sync_limit, value.as_int())
             }
             "handled_ids" => {
-                let FieldValue::Array(ids) = value else { unreachable!() };
+                let FieldValue::Array(ids) = value else {
+                    unreachable!()
+                };
                 assert_eq!(peer.handled_ids.len(), ids.len());
             }
             "metadata" => {
@@ -454,7 +464,9 @@ fn peer_data_matches_python() {
             "peering_key" => {
                 let peering_key = peer.peering_key.as_ref().expect("peering key");
                 assert_eq!(peering_key.value, 12);
-                let FieldValue::Array(items) = value else { unreachable!() };
+                let FieldValue::Array(items) = value else {
+                    unreachable!()
+                };
                 assert_eq!(peering_key.stamp, items[0].as_bin().unwrap());
             }
             _ => {}
@@ -538,8 +550,11 @@ fn paper_message_from_python_uri() {
     let paper = &g["paper"];
     let uri = paper["uri"].as_str().unwrap();
 
-    let destination_identity =
-        fixed_identity(g["identities"]["destination"]["private_hex"].as_str().unwrap());
+    let destination_identity = fixed_identity(
+        g["identities"]["destination"]["private_hex"]
+            .as_str()
+            .unwrap(),
+    );
 
     let paper_packed = hex(paper["paper_packed"].as_str().unwrap());
 
@@ -562,7 +577,10 @@ fn paper_message_from_python_uri() {
     );
     assert_eq!(message.title, hex(paper["title"].as_str().unwrap()));
     assert_eq!(message.content, hex(paper["content"].as_str().unwrap()));
-    assert_eq!(message.timestamp, Some(paper["timestamp"].as_f64().unwrap()));
+    assert_eq!(
+        message.timestamp,
+        Some(paper["timestamp"].as_f64().unwrap())
+    );
     assert_eq!(message.method, UNKNOWN);
 }
 
@@ -570,8 +588,11 @@ fn paper_message_from_python_uri() {
 fn paper_message_roundtrip_in_rust() {
     let g = golden();
     let source = fixed_identity(g["identities"]["source"]["private_hex"].as_str().unwrap());
-    let destination_identity =
-        fixed_identity(g["identities"]["destination"]["private_hex"].as_str().unwrap());
+    let destination_identity = fixed_identity(
+        g["identities"]["destination"]["private_hex"]
+            .as_str()
+            .unwrap(),
+    );
     let destination_public = *destination_identity.as_identity();
     let destination_hash = AddressHash::new(
         hex(g["identities"]["destination"]["delivery_destination_hash"]
@@ -614,8 +635,11 @@ fn propagation_container_from_python() {
     let g = golden();
     let prop = &g["propagation"];
 
-    let destination_identity =
-        fixed_identity(g["identities"]["destination"]["private_hex"].as_str().unwrap());
+    let destination_identity = fixed_identity(
+        g["identities"]["destination"]["private_hex"]
+            .as_str()
+            .unwrap(),
+    );
 
     // Unpack the propagation container: [time, [lxm_data]]
     let packed = hex(prop["propagation_packed"].as_str().unwrap());
@@ -634,9 +658,8 @@ fn propagation_container_from_python() {
     );
 
     // Decrypting the payload yields the original packed message tail
-    let decrypted =
-        lxmf::message::decrypt_for_identity(&destination_identity, &lxmf_data[16..])
-            .expect("decrypt");
+    let decrypted = lxmf::message::decrypt_for_identity(&destination_identity, &lxmf_data[16..])
+        .expect("decrypt");
     let packed_message = hex(prop["packed"].as_str().unwrap());
     assert_eq!(decrypted.as_slice(), &packed_message[16..]);
 }
@@ -659,16 +682,7 @@ fn constants_match_python() {
     assert_eq!(TICKET_EXPIRY, 21.0 * 24.0 * 60.0 * 60.0);
     assert_eq!(
         STATES,
-        [
-            GENERATING,
-            OUTBOUND,
-            SENDING,
-            SENT,
-            DELIVERED,
-            REJECTED,
-            CANCELLED,
-            FAILED
-        ]
+        [GENERATING, OUTBOUND, SENDING, SENT, DELIVERED, REJECTED, CANCELLED, FAILED]
     );
     assert_eq!(REPRESENTATIONS, [UNKNOWN, PACKET, RESOURCE]);
     assert_eq!(VALID_METHODS, [OPPORTUNISTIC, DIRECT, PROPAGATED, PAPER]);
@@ -685,8 +699,11 @@ async fn router_ingests_python_style_propagation_transfer() {
     // propagation node client would, with a locally generated PN stamp.
     let g = golden();
     let source = fixed_identity(g["identities"]["source"]["private_hex"].as_str().unwrap());
-    let destination_identity =
-        fixed_identity(g["identities"]["destination"]["private_hex"].as_str().unwrap());
+    let destination_identity = fixed_identity(
+        g["identities"]["destination"]["private_hex"]
+            .as_str()
+            .unwrap(),
+    );
     let destination_public = *destination_identity.as_identity();
     let destination_hash = delivery_destination_hash(&destination_public);
 
@@ -726,10 +743,8 @@ async fn router_ingests_python_style_propagation_transfer() {
     .pack(&mut container);
 
     // Router with delivery identity for the message destination
-    let storage = std::env::temp_dir().join(format!(
-        "lxmf-golden-propagation-{}",
-        std::process::id()
-    ));
+    let storage =
+        std::env::temp_dir().join(format!("lxmf-golden-propagation-{}", std::process::id()));
     let transport = Transport::new(TransportConfig::new(
         "test-pn-ingest",
         &destination_identity,

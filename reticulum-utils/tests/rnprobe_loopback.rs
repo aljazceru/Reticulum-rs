@@ -2,10 +2,8 @@
 
 #[tokio::test]
 async fn probe_loopback_measures_rtt() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
 
     let (destination, results) = reticulum_utils::rnprobe::run_loopback()
         .await

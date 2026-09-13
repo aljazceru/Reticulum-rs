@@ -79,17 +79,12 @@ pub async fn run(args: Args) -> Result<(), String> {
                     return Ok(());
                 };
                 let (read, write) = socket.into_split();
-                let _ = hosts_tx.send(Host { write: Box::new(write) });
+                let _ = hosts_tx.send(Host {
+                    write: Box::new(write),
+                });
                 let session_tx = bridge.clone();
                 tokio::spawn(async move {
-                    serve_stream(
-                        Box::new(read),
-                        session_tx,
-                        fw,
-                        flow,
-                        telemetry_ms,
-                    )
-                    .await;
+                    serve_stream(Box::new(read), session_tx, fw, flow, telemetry_ms).await;
                 });
             }
         }
@@ -180,8 +175,7 @@ async fn serve_stream(
     if telemetry_ms > 0 {
         let telemetry = reply_tx.clone();
         tokio::spawn(async move {
-            let mut tick =
-                tokio::time::interval(std::time::Duration::from_millis(telemetry_ms));
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(telemetry_ms));
             loop {
                 tick.tick().await;
                 let _ = telemetry.send(kiss_frame(CMD_STAT_RSSI, &[157 + 10]));
@@ -239,10 +233,9 @@ impl DeviceParser {
                     let _ = self.reply.send(kiss_frame(CMD_DETECT, &[DETECT_RESP]));
                     // Report major.minor with major 1 (e.g.
                     // --firmware 86 reports 1.86, like current devices).
-                    let _ = self.reply.send(kiss_frame(
-                        CMD_FW_VERSION,
-                        &[1u8, self.firmware as u8],
-                    ));
+                    let _ = self
+                        .reply
+                        .send(kiss_frame(CMD_FW_VERSION, &[1u8, self.firmware as u8]));
                     let _ = self.reply.send(kiss_frame(CMD_PLATFORM, &[0x80]));
                     let _ = self.reply.send(kiss_frame(CMD_MCU, &[0x81]));
                 }
@@ -260,16 +253,15 @@ impl DeviceParser {
                     // Quantize to the SX1262 frequency grid (32 Hz steps
                     // in Hz = x * 32), like real hardware echoes.
                     if payload.len() == 4 {
-                        let raw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        let raw =
+                            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                         let quantized = raw & !0x1F; // ~32 Hz granularity
-                        let _ = self.reply.send(kiss_frame(
-                            CMD_FREQUENCY,
-                            &quantized.to_be_bytes(),
-                        ));
+                        let _ = self
+                            .reply
+                            .send(kiss_frame(CMD_FREQUENCY, &quantized.to_be_bytes()));
                     }
                 }
-                CMD_BANDWIDTH | CMD_TXPOWER | CMD_SF | CMD_CR
-                | CMD_ST_ALOCK | CMD_LT_ALOCK => {
+                CMD_BANDWIDTH | CMD_TXPOWER | CMD_SF | CMD_CR | CMD_ST_ALOCK | CMD_LT_ALOCK => {
                     // Straight echo of accepted configuration.
                     let _ = self.reply.send(kiss_frame(command, &payload));
                 }

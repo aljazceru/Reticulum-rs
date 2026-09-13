@@ -48,7 +48,15 @@ pub struct ToneSource {
 
 impl ToneSource {
     pub fn new(frequency: f64, gain: f32) -> Self {
-        Self::configured(frequency, gain, true, EASE_TIME_MS, DEFAULT_FRAME_MS, 1, DEFAULT_SAMPLERATE)
+        Self::configured(
+            frequency,
+            gain,
+            true,
+            EASE_TIME_MS,
+            DEFAULT_FRAME_MS,
+            1,
+            DEFAULT_SAMPLERATE,
+        )
     }
 
     /// Full constructor mirroring the Python one
@@ -98,8 +106,7 @@ impl ToneSource {
             self.samplerate = sr;
         }
         self.target_frame_ms = target;
-        self.samples_per_frame =
-            ((target / 1000.0) * self.samplerate as f64).ceil() as usize;
+        self.samples_per_frame = ((target / 1000.0) * self.samplerate as f64).ceil() as usize;
     }
 
     pub fn start(&mut self) {
@@ -222,7 +229,9 @@ mod tests {
         assert!((crossings - 20).abs() <= 1, "crossings {crossings}");
 
         // amplitude bounded by the gain
-        let peak = (0..frame.frames()).map(|i| frame.sample(i, 0).abs()).fold(0.0f32, f32::max);
+        let peak = (0..frame.frames())
+            .map(|i| frame.sample(i, 0).abs())
+            .fold(0.0f32, f32::max);
         assert!(peak <= 0.5 && peak > 0.49, "peak {peak}");
     }
 
@@ -238,7 +247,9 @@ mod tests {
             let _ = t.generate();
         }
         let later = t.generate();
-        let peak = (0..later.frames()).map(|i| later.sample(i, 0).abs()).fold(0.0f32, f32::max);
+        let peak = (0..later.frames())
+            .map(|i| later.sample(i, 0).abs())
+            .fold(0.0f32, f32::max);
         assert!(peak > 0.9, "peak {peak}");
     }
 

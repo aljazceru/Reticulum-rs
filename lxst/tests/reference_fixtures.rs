@@ -148,7 +148,13 @@ fn parse_value(chars: &mut std::iter::Peekable<std::str::Chars>) -> Json {
         _ => {
             let mut num = String::new();
             while let Some(c) = chars.peek() {
-                if c.is_ascii_digit() || *c == '-' || *c == '+' || *c == '.' || *c == 'e' || *c == 'E' {
+                if c.is_ascii_digit()
+                    || *c == '-'
+                    || *c == '+'
+                    || *c == '.'
+                    || *c == 'e'
+                    || *c == 'E'
+                {
                     num.push(*c);
                     chars.next();
                 } else {
@@ -216,15 +222,11 @@ fn input_frame(fixture: &Json, name: &str) -> AudioFrame {
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect();
-    AudioFrame::from_interleaved(
-        samples,
-        input.get("channels").unwrap().as_num() as usize,
-    )
+    AudioFrame::from_interleaved(samples, input.get("channels").unwrap().as_num() as usize)
 }
 
 fn load_fixture() -> Json {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/reference.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/reference.json");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
     Json::parse(&text)
@@ -267,7 +269,13 @@ fn codec_type_lookup_matches_python() {
         expected.insert(k.clone(), v.as_bool());
     }
 
-    for (key, byte) in [("0x00", 0x00u8), ("0x01", 0x01), ("0x02", 0x02), ("0xff", 0xff), ("0x7f", 0x7f)] {
+    for (key, byte) in [
+        ("0x00", 0x00u8),
+        ("0x01", 0x01),
+        ("0x02", 0x02),
+        ("0xff", 0xff),
+        ("0x7f", 0x7f),
+    ] {
         let found = codec_type(byte).is_some();
         let want = *expected.get(key).unwrap();
         assert_eq!(
@@ -313,8 +321,7 @@ fn raw_encode_is_byte_exact() {
             }
         } else {
             assert_eq!(
-                encoded,
-                expected,
+                encoded, expected,
                 "frame={name} bitdepth={bitdepth} channels={channels}"
             );
         }
@@ -539,8 +546,14 @@ fn truncated_and_garbage_payloads() {
 
 #[test]
 fn registry_creates_available_codecs() {
-    assert_eq!(new_codec(CodecType::Raw).unwrap().codec_type(), CodecType::Raw);
-    assert_eq!(new_codec(CodecType::Null).unwrap().codec_type(), CodecType::Null);
+    assert_eq!(
+        new_codec(CodecType::Raw).unwrap().codec_type(),
+        CodecType::Raw
+    );
+    assert_eq!(
+        new_codec(CodecType::Null).unwrap().codec_type(),
+        CodecType::Null
+    );
 
     // Opus / Codec2 depend on cargo features
     match new_codec(CodecType::Opus) {

@@ -116,7 +116,9 @@ async fn sam_connect(sam_addr: &str) -> Result<TcpStream, RnsError> {
     let (mut reader, mut writer) = socket.split();
 
     writer
-        .write_all(format!("HELLO VERSION MIN={SAM_MIN_VERSION} MAX={SAM_MAX_VERSION}\n").as_bytes())
+        .write_all(
+            format!("HELLO VERSION MIN={SAM_MIN_VERSION} MAX={SAM_MAX_VERSION}\n").as_bytes(),
+        )
         .await
         .map_err(|_| RnsError::ConnectionError)?;
 
@@ -153,9 +155,8 @@ impl SamSession {
         let mut socket = sam_connect(sam_addr).await?;
         let destination;
 
-        let command = format!(
-            "SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION=TRANSIENT\n"
-        );
+        let command =
+            format!("SESSION CREATE STYLE=STREAM ID={session_id} DESTINATION=TRANSIENT\n");
 
         {
             let (mut reader, mut writer) = socket.split();
@@ -191,8 +192,10 @@ impl SamSession {
     pub async fn stream_connect(&self, destination: &str) -> Result<TcpStream, RnsError> {
         let mut socket = sam_connect(&self.sam_addr).await?;
 
-        let command =
-            format!("STREAM CONNECT ID={} DESTINATION={destination} SILENT=false\n", self.session_id);
+        let command = format!(
+            "STREAM CONNECT ID={} DESTINATION={destination} SILENT=false\n",
+            self.session_id
+        );
 
         {
             let (mut reader, mut writer) = socket.split();
@@ -250,8 +253,8 @@ impl SamSession {
 /// Base64 (I2P alphabet) decoding for destination handling.
 fn i2p_b64_decode(data: &str) -> Option<Vec<u8>> {
     let mut out = Vec::new();
-    let table: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-        .to_vec();
+    let table: Vec<u8> =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".to_vec();
 
     let mut acc: u32 = 0;
     let mut bits = 0;
@@ -436,8 +439,7 @@ impl I2pPeer {
 
                     let mut decoder = HdlcDecoder::new(HW_MTU);
                     let mut buffer = [0u8; 4096];
-                    let mut frames: std::vec::Vec<std::vec::Vec<u8>> =
-                        std::vec::Vec::new();
+                    let mut frames: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
 
                     loop {
                         let closed = tokio::select! {
@@ -538,7 +540,10 @@ impl I2pPeer {
                 break;
             }
 
-            log::info!("i2p_peer: tunnel lost, reconnecting in {}s", RECONNECT_WAIT.as_secs());
+            log::info!(
+                "i2p_peer: tunnel lost, reconnecting in {}s",
+                RECONNECT_WAIT.as_secs()
+            );
             tokio::time::sleep(RECONNECT_WAIT).await;
         }
 
@@ -647,12 +652,7 @@ impl I2pServer {
 
                         // Capture the server's access code for inheritance
                         // before locking the manager (no guard across await).
-                        let inherited = context
-                            .channel
-                            .ifac
-                            .read()
-                            .expect("ifac lock")
-                            .clone();
+                        let inherited = context.channel.ifac.read().expect("ifac lock").clone();
 
                         let mut manager = iface_manager.lock().await;
                         let address = manager.spawn(

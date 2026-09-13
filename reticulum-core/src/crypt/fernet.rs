@@ -1,12 +1,12 @@
 use core::cmp;
 use core::convert::From;
 
-use cipher::block_padding::Pkcs7;
 use aes::cipher::BlockDecryptMut;
 use aes::cipher::Key;
 use aes::cipher::Unsigned;
 use cbc::cipher::BlockEncryptMut;
 use cbc::cipher::KeyIvInit;
+use cipher::block_padding::Pkcs7;
 use crypto_common::{IvSizeUser, KeySizeUser, OutputSizeUser};
 use hmac::{Hmac, Mac};
 use rand_core::CryptoRngCore;
@@ -133,7 +133,9 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         // Required size: IV + padded ciphertext + HMAC. Checking only
         // against the fixed overhead let Channel-sized payloads expand
         // past the buffer and panic in the padding/slicing.
-        let padded_len = text.0.len().div_ceil(crate::packet::AES128_BLOCKSIZE) * crate::packet::AES128_BLOCKSIZE + IV_KEY_SIZE;
+        let padded_len = text.0.len().div_ceil(crate::packet::AES128_BLOCKSIZE)
+            * crate::packet::AES128_BLOCKSIZE
+            + IV_KEY_SIZE;
         let required = padded_len + HMAC_OUT_SIZE;
         if out_buf.len() < required {
             return Err(RnsError::InvalidArgument);
@@ -262,7 +264,6 @@ mod tests {
         assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
     }
 }
-
 
 /// Deterministic no-op RNG: fills with zeroes. Only valid where no
 /// randomness is actually consumed (decrypt/verify paths).

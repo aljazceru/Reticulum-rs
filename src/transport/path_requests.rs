@@ -6,8 +6,8 @@ use tokio::time::{Duration, Instant};
 
 use crate::destination::DestinationName;
 use crate::destination::PlainInputDestination;
-use crate::hash::ADDRESS_HASH_SIZE;
 use crate::hash::AddressHash;
+use crate::hash::ADDRESS_HASH_SIZE;
 use crate::identity::EmptyIdentity;
 use crate::packet::DestinationType;
 use crate::packet::Header;
@@ -207,14 +207,17 @@ impl PathRequests {
         }
     }
 
-
     /// Register a waiting discovery path request for `destination`
     /// (Python inserts `{"destination_hash", "timeout",
     /// "requesting_interfaces": [...]}`). A second request for the same
     /// destination while one is in flight is BATCHED: its interface is
     /// appended so the eventual path response reaches every requestor
     /// (Python 1.5.0 in-flight path request batching).
-    pub fn register_discovery(&mut self, destination: &AddressHash, requesting_iface: Option<AddressHash>) {
+    pub fn register_discovery(
+        &mut self,
+        destination: &AddressHash,
+        requesting_iface: Option<AddressHash>,
+    ) {
         let Some(iface) = requesting_iface else {
             return;
         };

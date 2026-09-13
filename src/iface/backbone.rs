@@ -83,7 +83,9 @@ impl FastFlapTable {
             return false;
         }
         match self.entries.get(remote) {
-            Some((_, _, flaps)) => *flaps > self.grace && now.duration_since(self.entries[remote].1) < self.expiry,
+            Some((_, _, flaps)) => {
+                *flaps > self.grace && now.duration_since(self.entries[remote].1) < self.expiry
+            }
             None => false,
         }
     }
@@ -318,7 +320,8 @@ impl BackboneClient {
                         let mut output = OutputBuffer::new(&mut buffer[..]);
                         if packet.serialize(&mut output).is_ok() {
                             let ifac = channel_ifac.read().expect("ifac lock").clone();
-                            let wire = crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
+                            let wire =
+                                crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
 
                             let mut framed = OutputBuffer::new(&mut hdlc_buffer[..]);
                             if Hdlc::encode(&wire, &mut framed).is_ok()
@@ -343,8 +346,11 @@ impl BackboneClient {
             let remote = inner.lock().unwrap().remote.clone().or(spawned_remote);
             if let (Some(table), Some(remote)) = (fast_flap, remote) {
                 let mut table = table.lock().await;
-                let flaps =
-                    table.account_disconnect(&remote, spawned_at.elapsed(), tokio::time::Instant::now());
+                let flaps = table.account_disconnect(
+                    &remote,
+                    spawned_at.elapsed(),
+                    tokio::time::Instant::now(),
+                );
                 if flaps > 0 {
                     log::debug!("backbone: {remote} fast-flap count {flaps}");
                 }
@@ -423,8 +429,7 @@ impl BackboneServer {
                 let fast_flap = fast_flap.clone();
                 let cancel = context.cancel.clone();
                 tokio::spawn(async move {
-                    let mut tick =
-                        tokio::time::interval(Duration::from_secs(60));
+                    let mut tick = tokio::time::interval(Duration::from_secs(60));
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
@@ -474,8 +479,7 @@ impl BackboneServer {
 
                 log::debug!("backbone_server: accepting connection from {remote_ip}");
 
-                let inherited =
-                    context.channel.ifac.read().expect("ifac lock").clone();
+                let inherited = context.channel.ifac.read().expect("ifac lock").clone();
 
                 let mut manager = iface_manager.lock().await;
                 let address = manager.spawn(

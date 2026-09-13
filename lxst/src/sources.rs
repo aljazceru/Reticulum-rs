@@ -37,16 +37,22 @@ pub trait Source: Send {
     fn channels(&self) -> Option<usize>;
 
     /// Nominal bit depth.
-    fn bitdepth(&self) -> Option<usize> { Some(32) }
+    fn bitdepth(&self) -> Option<usize> {
+        Some(32)
+    }
 
     /// Number of samples per emitted frame.
-    fn samples_per_frame(&self) -> Option<usize> { None }
+    fn samples_per_frame(&self) -> Option<usize> {
+        None
+    }
 
     /// Pull the next frame. `None` ends the stream.
     async fn next_frame(&mut self) -> Option<AudioFrame>;
 
     /// Whether the source considers itself running (Python `should_run`).
-    fn running(&self) -> bool { true }
+    fn running(&self) -> bool {
+        true
+    }
 }
 
 /// Default frame duration for stream-fed sources (Python
@@ -120,7 +126,11 @@ impl LineSource {
         self.gain_db = gain_db;
         self.ease_in = ease_in;
         self.skip = skip;
-        self.current_gain = if ease_in > 0.0 { 0.0 } else { Self::linear_gain(gain_db) };
+        self.current_gain = if ease_in > 0.0 {
+            0.0
+        } else {
+            Self::linear_gain(gain_db)
+        };
         self.eased = ease_in <= 0.0;
         self.skipped_samples = 0;
         self.elapsed_samples = 0;
@@ -263,17 +273,20 @@ pub struct WavFileSource {
 }
 
 impl WavFileSource {
-    pub fn open(path: &std::path::Path, target_frame_ms: f64, loop_playback: bool) -> Result<Self, crate::LxstError> {
+    pub fn open(
+        path: &std::path::Path,
+        target_frame_ms: f64,
+        loop_playback: bool,
+    ) -> Result<Self, crate::LxstError> {
         let mut reader = hound::WavReader::open(path)?;
         let spec = reader.spec();
         let samplerate = spec.sample_rate;
         let channels = spec.channels as usize;
 
         let samples: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .map(|s| s.unwrap_or(0.0))
-                .collect(),
+            hound::SampleFormat::Float => {
+                reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect()
+            }
             hound::SampleFormat::Int => {
                 let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
                 reader
@@ -283,8 +296,7 @@ impl WavFileSource {
             }
         };
 
-        let samples_per_frame =
-            ((target_frame_ms / 1000.0) * samplerate as f64).ceil() as usize;
+        let samples_per_frame = ((target_frame_ms / 1000.0) * samplerate as f64).ceil() as usize;
 
         Ok(Self {
             id: crate::common::new_source_id(),
@@ -305,8 +317,7 @@ impl WavFileSource {
         target_frame_ms: f64,
         loop_playback: bool,
     ) -> Self {
-        let samples_per_frame =
-            ((target_frame_ms / 1000.0) * samplerate as f64).ceil() as usize;
+        let samples_per_frame = ((target_frame_ms / 1000.0) * samplerate as f64).ceil() as usize;
         Self {
             id: crate::common::new_source_id(),
             samplerate,
@@ -333,7 +344,10 @@ impl WavFileSource {
     }
 
     pub fn sample_count(&self) -> usize {
-        self.samples.len().checked_div(self.channels.max(1)).unwrap_or(0)
+        self.samples
+            .len()
+            .checked_div(self.channels.max(1))
+            .unwrap_or(0)
     }
 }
 

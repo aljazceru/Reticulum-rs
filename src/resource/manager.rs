@@ -12,8 +12,10 @@ use crate::error::RnsError;
 use crate::hash::AddressHash;
 use crate::packet::Packet;
 
-use super::{IncomingResource, OutgoingResource, ResourceAdvertisement, ResourceEvent,
-            ResourceOptions, ResourceStatus, ResourceTx};
+use super::{
+    IncomingResource, OutgoingResource, ResourceAdvertisement, ResourceEvent, ResourceOptions,
+    ResourceStatus, ResourceTx,
+};
 
 /// Default cap for decompression of incoming resources.
 pub const DEFAULT_MAX_DECOMPRESSED_SIZE: usize = 5 * 1024 * 1024;
@@ -29,8 +31,7 @@ pub enum ResourceStrategy {
 }
 
 /// Callback deciding whether an advertised resource should be accepted.
-pub type ResourceAcceptCallback =
-    Arc<dyn Fn(&ResourceAdvertisement) -> bool + Send + Sync>;
+pub type ResourceAcceptCallback = Arc<dyn Fn(&ResourceAdvertisement) -> bool + Send + Sync>;
 
 /// Callback notified when an incoming advertisement was accepted.
 pub type ResourceStartedCallback = Arc<dyn Fn(&ResourceAdvertisement) + Send + Sync>;
@@ -47,8 +48,7 @@ pub struct RequestContext {
     pub requested_at: f64,
 }
 
-pub type RequestHandler =
-    Arc<dyn Fn(RequestContext) -> Option<Vec<u8>> + Send + Sync>;
+pub type RequestHandler = Arc<dyn Fn(RequestContext) -> Option<Vec<u8>> + Send + Sync>;
 
 /// Async request handler: awaited on the async packet task.
 pub type AsyncRequestHandler = Arc<
@@ -85,6 +85,8 @@ pub(crate) struct ResourceManager {
     pub out: HashMap<LinkId, Vec<OutgoingResource>>,
     pub incoming: HashMap<LinkId, Vec<IncomingResource>>,
     pub strategies: HashMap<LinkId, ResourceStrategy>,
+    /// Strategy for links without an explicit entry.
+    pub default_strategy: ResourceStrategy,
     pub accept_callbacks: HashMap<LinkId, ResourceAcceptCallback>,
     pub started_callbacks: HashMap<LinkId, ResourceStartedCallback>,
     /// Registered request handlers per destination hash, keyed by path hash.
@@ -115,7 +117,10 @@ pub enum RequestEvent {
         metadata: Option<Vec<u8>>,
     },
     /// Progress of a resource-backed response.
-    Progress { request_id: AddressHash, progress: f64 },
+    Progress {
+        request_id: AddressHash,
+        progress: f64,
+    },
     /// The request failed or was rejected.
     Failed { request_id: AddressHash },
 }
@@ -135,6 +140,7 @@ impl ResourceManager {
             out: HashMap::new(),
             incoming: HashMap::new(),
             strategies: HashMap::new(),
+            default_strategy: ResourceStrategy::None,
             accept_callbacks: HashMap::new(),
             started_callbacks: HashMap::new(),
             request_handlers: HashMap::new(),
@@ -154,23 +160,24 @@ impl ResourceManager {
         self.strategies.insert(link_id, strategy);
     }
 
-    pub fn resource_strategy(&self, link_id: LinkId) -> ResourceStrategy {
-        self.strategies.get(&link_id).copied().unwrap_or(ResourceStrategy::None)
+    /// Set the strategy used for links without an explicit entry
+    /// (applies to inbound links the application never saw).
+    pub fn set_default_resource_strategy(&mut self, strategy: ResourceStrategy) {
+        self.default_strategy = strategy;
     }
 
-    pub fn set_accept_callback(
-        &mut self,
-        link_id: LinkId,
-        callback: ResourceAcceptCallback,
-    ) {
+    pub fn resource_strategy(&self, link_id: LinkId) -> ResourceStrategy {
+        self.strategies
+            .get(&link_id)
+            .copied()
+            .unwrap_or(self.default_strategy)
+    }
+
+    pub fn set_accept_callback(&mut self, link_id: LinkId, callback: ResourceAcceptCallback) {
         self.accept_callbacks.insert(link_id, callback);
     }
 
-    pub fn set_started_callback(
-        &mut self,
-        link_id: LinkId,
-        callback: ResourceStartedCallback,
-    ) {
+    pub fn set_started_callback(&mut self, link_id: LinkId, callback: ResourceStartedCallback) {
         self.started_callbacks.insert(link_id, callback);
     }
 
@@ -254,7 +261,11 @@ impl ResourceManager {
             if !size_ok || !self.has_request_handlers(link) {
                 log::debug!(
                     "resource: rejecting request advertisement ({} handlers for this destination)",
-                    if self.has_request_handlers(link) { "oversized / no" } else { "no" }
+                    if self.has_request_handlers(link) {
+                        "oversized / no"
+                    } else {
+                        "no"
+                    }
                 );
                 let mut reject = IncomingResource::reject_packet_for(&adv, link);
                 tx.packets.append(&mut reject);
@@ -278,10 +289,12 @@ impl ResourceManager {
                 let mut reject = IncomingResource::reject_packet_for(&adv, link);
                 tx.packets.append(&mut reject);
                 if let Some(rid) = adv.request_id {
-                    self.request_events.send(RequestEventData {
-                        link_id: *link.id(),
-                        event: RequestEvent::Failed { request_id: rid },
-                    }).ok();
+                    self.request_events
+                        .send(RequestEventData {
+                            link_id: *link.id(),
+                            event: RequestEvent::Failed { request_id: rid },
+                        })
+                        .ok();
                 }
                 return tx;
             }
@@ -318,8 +331,7 @@ impl ResourceManager {
         adv: &ResourceAdvertisement,
         tx: &mut ResourceTx,
     ) {
-        let incoming = match IncomingResource::accept(advertisement_packet, &adv.pack(), link)
-        {
+        let incoming = match IncomingResource::accept(advertisement_packet, &adv.pack(), link) {
             Ok(r) => r,
             Err(err) => {
                 log::debug!("resource: could not accept resource: {err:?}");
@@ -399,11 +411,7 @@ impl ResourceManager {
     }
 
     /// Handle RESOURCE_REQ plaintext for a link.
-    pub fn handle_request_data(
-        &mut self,
-        link: &Link,
-        plaintext: &[u8],
-    ) -> ResourceTx {
+    pub fn handle_request_data(&mut self, link: &Link, plaintext: &[u8]) -> ResourceTx {
         let mut tx = ResourceTx::default();
         let prefix_offset = if plaintext.first() == Some(&super::HASHMAP_IS_EXHAUSTED) {
             1 + super::MAPHASH_LEN
@@ -440,11 +448,7 @@ impl ResourceManager {
 
     /// Handle a received resource part (unencrypted ciphertext chunk).
     /// Returns (tx, just_completed) for assembly handling.
-    pub fn handle_part(
-        &mut self,
-        link: &Link,
-        packet: &Packet,
-    ) -> (ResourceTx, bool) {
+    pub fn handle_part(&mut self, link: &Link, packet: &Packet) -> (ResourceTx, bool) {
         let mut tx = ResourceTx::default();
         let mut assembled = false;
 
@@ -530,7 +534,8 @@ impl ResourceManager {
                         assembly.last_activity = super::unix_time();
 
                         if is_final {
-                            let Some(complete) = self.split_assembly.remove(&resource.original_hash)
+                            let Some(complete) =
+                                self.split_assembly.remove(&resource.original_hash)
                             else {
                                 resource.status = ResourceStatus::Corrupt;
                                 let _ = self.events.send(ResourceEvent {
@@ -553,7 +558,11 @@ impl ResourceManager {
                             (None, None, None)
                         }
                     } else {
-                        (Some(data.clone()), resource.metadata.clone(), Some(data.clone()))
+                        (
+                            Some(data.clone()),
+                            resource.metadata.clone(),
+                            Some(data.clone()),
+                        )
                     };
 
                     let _ = self.events.send(ResourceEvent {
@@ -566,8 +575,13 @@ impl ResourceManager {
                         advertisement: Some(advertisement),
                     });
 
-                    let response_rid = if is_response && is_final { request_id } else { None };
-                    if let (Some(request_id), Some(full_data)) = (response_rid, full_data.as_ref()) {
+                    let response_rid = if is_response && is_final {
+                        request_id
+                    } else {
+                        None
+                    };
+                    if let (Some(request_id), Some(full_data)) = (response_rid, full_data.as_ref())
+                    {
                         let event = match unpack_response(full_data) {
                             Some((rid, response)) if rid == request_id => {
                                 // Retain for late awaiters before emitting.
@@ -601,7 +615,10 @@ impl ResourceManager {
                             None => RequestEvent::Failed { request_id },
                         };
                         self.request_events
-                            .send(RequestEventData { link_id: *link.id(), event })
+                            .send(RequestEventData {
+                                link_id: *link.id(),
+                                event,
+                            })
                             .ok();
                         self.pending_requests.remove(&request_id);
                     }
@@ -637,9 +654,7 @@ impl ResourceManager {
     pub fn handle_hashmap_update(&mut self, link: &Link, plaintext: &[u8]) -> ResourceTx {
         if let Some(resources) = self.incoming.get_mut(link.id()) {
             for resource in resources.iter_mut() {
-                if plaintext.len() >= 32
-                    && plaintext[..32] == resource.hash.as_slice()[..32]
-                {
+                if plaintext.len() >= 32 && plaintext[..32] == resource.hash.as_slice()[..32] {
                     resource.hashmap_update_packet(plaintext);
                     let mut tx = ResourceTx::default();
                     resource.request_next(link, &mut tx);
@@ -666,13 +681,15 @@ impl ResourceManager {
 
         if let Some(resources) = self.out.get_mut(link.id()) {
             for resource in resources.iter_mut() {
-                if resource.hash != resource_hash
-                    || resource.status == ResourceStatus::Complete
-                {
+                if resource.hash != resource_hash || resource.status == ResourceStatus::Complete {
                     continue;
                 }
                 if resource.validate_proof(proof_data) {
-                    completed_hashes.push((resource.hash, resource.progress(), resource.advertisement()));
+                    completed_hashes.push((
+                        resource.hash,
+                        resource.progress(),
+                        resource.advertisement(),
+                    ));
 
                     // Advertise the next segment of a split resource.
                     if resource.split && resource.segment_index < resource.total_segments {
@@ -744,6 +761,80 @@ impl ResourceManager {
         }
     }
 
+    /// Cancel an outgoing transfer on `link` (Python `Resource.cancel` from
+    /// the initiator): marks it `Failed`, sends the RESOURCE_ICL packet and
+    /// emits a `ResourceEvent` so callers learn the transfer was cancelled.
+    /// Split transfers cancel every segment of the logical resource.
+    pub fn cancel_outbound(&mut self, link: &Link, hash: &crate::hash::Hash) -> Option<ResourceTx> {
+        let resources = self.out.get_mut(link.id())?;
+        let mut tx = ResourceTx::default();
+        let mut cancelled = false;
+        let mut events: Vec<crate::hash::Hash> = Vec::new();
+        for resource in resources.iter_mut() {
+            if resource.original_hash == *hash || resource.hash == *hash {
+                if resource.status.is_concluded() {
+                    continue;
+                }
+                let event_hash = resource.hash;
+                resource.cancel_packet(link, &mut tx);
+                cancelled = true;
+                events.push(event_hash);
+            }
+        }
+        if !cancelled {
+            return None;
+        }
+        for event_hash in events {
+            let _ = self.events.send(ResourceEvent {
+                link_id: *link.id(),
+                hash: event_hash,
+                status: ResourceStatus::Failed,
+                progress: 0.0,
+                data: None,
+                metadata: None,
+                advertisement: None,
+            });
+        }
+        Some(tx)
+    }
+
+    /// Cancel an incoming transfer on `link` (Python `Resource.cancel` from
+    /// the receiver): marks it `Failed`, sends the RESOURCE_RCL packet and
+    /// emits a `ResourceEvent`. Returns the packets that must be transmitted.
+    pub fn cancel_inbound(&mut self, link: &Link, hash: &crate::hash::Hash) -> Option<ResourceTx> {
+        let resources = self.incoming.get_mut(link.id())?;
+        let mut tx = ResourceTx::default();
+        let mut cancelled = false;
+        let mut events: Vec<crate::hash::Hash> = Vec::new();
+        for resource in resources.iter_mut() {
+            if resource.original_hash == *hash || resource.hash == *hash {
+                if resource.status.is_concluded() {
+                    continue;
+                }
+                let event_hash = resource.hash;
+                resource.status = ResourceStatus::Failed;
+                resource.cancel_packet(link, &mut tx);
+                cancelled = true;
+                events.push(event_hash);
+            }
+        }
+        if !cancelled {
+            return None;
+        }
+        for event_hash in events {
+            let _ = self.events.send(ResourceEvent {
+                link_id: *link.id(),
+                hash: event_hash,
+                status: ResourceStatus::Failed,
+                progress: 0.0,
+                data: None,
+                metadata: None,
+                advertisement: None,
+            });
+        }
+        Some(tx)
+    }
+
     /// Handle RESOURCE_RCL (receiver reject) plaintext.
     pub fn handle_reject(&mut self, link: &Link, plaintext: &[u8]) {
         if plaintext.len() < 32 {
@@ -774,7 +865,13 @@ impl ResourceManager {
     /// Watchdog pass over all resources. Returns packets to send.
     pub fn check(&mut self, links: &HashMap<LinkId, Arc<Mutex<Link>>>) -> ResourceTx {
         let mut tx = ResourceTx::default();
-        let mut failed_events: Vec<(LinkId, crate::hash::Hash, ResourceStatus, f64, ResourceAdvertisement)> = Vec::new();
+        let mut failed_events: Vec<(
+            LinkId,
+            crate::hash::Hash,
+            ResourceStatus,
+            f64,
+            ResourceAdvertisement,
+        )> = Vec::new();
 
         let link_ids: Vec<LinkId> = self.out.keys().copied().collect();
         for link_id in link_ids {
@@ -783,9 +880,9 @@ impl ResourceManager {
             };
             let Ok(link) = link.try_lock() else { continue };
             if let Some(resources) = self.out.get_mut(&link_id) {
-                let any_active_snapshot = resources.iter().any(|r| {
-                    !r.status.is_concluded() && r.status != ResourceStatus::Queued
-                });
+                let any_active_snapshot = resources
+                    .iter()
+                    .any(|r| !r.status.is_concluded() && r.status != ResourceStatus::Queued);
                 let mut advertised_any = false;
                 let mut i = 0;
                 while i < resources.len() {
@@ -812,10 +909,21 @@ impl ResourceManager {
                             continue;
                         }
                         let failed = resource.check(&link, &mut tx);
-                        (resource.hash, failed, resource.progress(), resource.advertisement())
+                        (
+                            resource.hash,
+                            failed,
+                            resource.progress(),
+                            resource.advertisement(),
+                        )
                     };
                     if failed {
-                        failed_events.push((link_id, hash, ResourceStatus::Failed, progress, advertisement));
+                        failed_events.push((
+                            link_id,
+                            hash,
+                            ResourceStatus::Failed,
+                            progress,
+                            advertisement,
+                        ));
                     }
                     advertised_any |= tx_advertised_this_sweep;
                     i += 1;
@@ -839,10 +947,21 @@ impl ResourceManager {
                             continue;
                         }
                         let failed = resource.check(&link, &mut tx);
-                        (resource.hash, failed, resource.progress(), resource.advertisement_of())
+                        (
+                            resource.hash,
+                            failed,
+                            resource.progress(),
+                            resource.advertisement_of(),
+                        )
                     };
                     if failed {
-                        failed_events.push((link_id, hash, ResourceStatus::Failed, progress, advertisement));
+                        failed_events.push((
+                            link_id,
+                            hash,
+                            ResourceStatus::Failed,
+                            progress,
+                            advertisement,
+                        ));
                     }
                     i += 1;
                 }
@@ -874,9 +993,7 @@ impl ResourceManager {
                 resource.split
                     && matches!(
                         resource.status,
-                        ResourceStatus::Failed
-                            | ResourceStatus::Corrupt
-                            | ResourceStatus::Rejected
+                        ResourceStatus::Failed | ResourceStatus::Corrupt | ResourceStatus::Rejected
                     )
             })
             .map(|resource| resource.original_hash)
@@ -901,7 +1018,8 @@ impl ResourceManager {
         self.split_assembly.retain(|_, assembly| {
             // next_index == 1 means nothing was accepted yet.
             assembly.next_index > 0
-                && (assembly.data.len() as f64) < (assembly.data_size as f64) * 2.0 + SPLIT_ASSEMBLY_GRACE_BYTES
+                && (assembly.data.len() as f64)
+                    < (assembly.data_size as f64) * 2.0 + SPLIT_ASSEMBLY_GRACE_BYTES
                 && now < assembly.last_activity + SPLIT_ASSEMBLY_TIMEOUT
         });
     }
@@ -1008,11 +1126,8 @@ mod tests {
     fn link() -> Link {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         Link::new(
-            SingleInputDestination::new(
-                identity,
-                DestinationName::new("test", "resource.request"),
-            )
-            .desc,
+            SingleInputDestination::new(identity, DestinationName::new("test", "resource.request"))
+                .desc,
         )
     }
 
@@ -1031,7 +1146,10 @@ mod tests {
             vec![super::super::HASHMAP_IS_EXHAUSTED; 1 + super::super::MAPHASH_LEN + 31],
         ];
         for request in malformed {
-            assert!(manager.handle_request_data(&link, &request).packets.is_empty());
+            assert!(manager
+                .handle_request_data(&link, &request)
+                .packets
+                .is_empty());
             assert_eq!((manager.out.len(), manager.incoming.len()), before);
         }
 

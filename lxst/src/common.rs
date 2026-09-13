@@ -59,7 +59,10 @@ impl AudioFrame {
 
     /// Number of sample-rows (the first dimension of the Python array).
     pub fn frames(&self) -> usize {
-        self.samples.len().checked_div(self.channels.max(1)).unwrap_or(0)
+        self.samples
+            .len()
+            .checked_div(self.channels.max(1))
+            .unwrap_or(0)
     }
 
     /// `true` when the frame contains no samples.

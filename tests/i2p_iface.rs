@@ -127,9 +127,7 @@ async fn sam_bridge(port: u16, sessions: Sessions) {
                         }
 
                         let Some(mut connector) = rx.recv().await else {
-                            let _ = socket
-                                .write_all(b"STREAM STATUS RESULT=I2P_ERROR\n")
-                                .await;
+                            let _ = socket.write_all(b"STREAM STATUS RESULT=I2P_ERROR\n").await;
                             return;
                         };
 
@@ -143,9 +141,7 @@ async fn sam_bridge(port: u16, sessions: Sessions) {
                         }
 
                         // Let the connector know it is connected.
-                        let _ = connector
-                            .write_all(b"STREAM STATUS RESULT=OK\n")
-                            .await;
+                        let _ = connector.write_all(b"STREAM STATUS RESULT=OK\n").await;
 
                         // Splice accepter <-> connector.
                         let _ = tokio::io::copy_bidirectional(&mut socket, &mut connector).await;
@@ -187,9 +183,7 @@ async fn sam_bridge(port: u16, sessions: Sessions) {
                     }
 
                     _ => {
-                        let _ = socket
-                            .write_all(b"HELLO REPLY RESULT=NOVERSION\n")
-                            .await;
+                        let _ = socket.write_all(b"HELLO REPLY RESULT=NOVERSION\n").await;
                         return;
                     }
                 }
@@ -222,9 +216,7 @@ async fn sam_session_keeps_its_control_socket_open_until_drop() {
 
     drop(session);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-    while sessions.lock().await.contains_key("lifetime")
-        && tokio::time::Instant::now() < deadline
-    {
+    while sessions.lock().await.contains_key("lifetime") && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(!sessions.lock().await.contains_key("lifetime"));
@@ -247,7 +239,11 @@ async fn i2p_end_to_end_over_mock_sam() {
         let manager = a.iface_manager();
         let mut manager = manager.lock().await;
         manager.spawn(
-            I2pServer::new(sam_addr.clone(), String::from("session-a"), a.iface_manager()),
+            I2pServer::new(
+                sam_addr.clone(),
+                String::from("session-a"),
+                a.iface_manager(),
+            ),
             I2pServer::spawn,
         )
     };
@@ -266,7 +262,10 @@ async fn i2p_end_to_end_over_mock_sam() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!server_destination.is_empty(), "server session must come online");
+    assert!(
+        !server_destination.is_empty(),
+        "server session must come online"
+    );
 
     // Node B: initiator peer targeting A's destination.
     let identity_b = PrivateIdentity::new_from_rand(OsRng);

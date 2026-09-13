@@ -27,18 +27,18 @@ use crate::common::AudioFrame;
 mod null;
 mod raw;
 
-#[cfg(feature = "opus")]
-mod opus;
 #[cfg(feature = "codec2")]
 mod codec2_impl;
+#[cfg(feature = "opus")]
+mod opus;
 
 pub use null::Null;
 pub use raw::Raw;
 
-#[cfg(feature = "opus")]
-pub use opus::Opus;
 #[cfg(feature = "codec2")]
 pub use codec2_impl::Codec2;
+#[cfg(feature = "opus")]
+pub use opus::Opus;
 
 /// Codec registry header bytes (Python `LXST.Codecs.RAW/OPUS/CODEC2/NULL`).
 pub const RAW: u8 = 0x00;

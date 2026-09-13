@@ -5,9 +5,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use crate::common::{build_tool_transport, resolve_config_dir, ToolTransportOptions};
 use reticulum::hash::AddressHash;
 use reticulum::transport::Transport;
-use crate::common::{build_tool_transport, resolve_config_dir, ToolTransportOptions};
 
 /// Default probe payload size in bytes (Python `DEFAULT_PROBE_SIZE`).
 pub const DEFAULT_PROBE_SIZE: usize = 16;
@@ -103,13 +103,15 @@ pub async fn probe_with(
 /// Run a probe *server*: a transport that proves packets to its probe
 /// destination (what remote `rnprobe` instances probe against).
 pub async fn serve(config_dir: &Path, instance_name: &str) -> std::sync::Arc<Transport> {
-    let transport = std::sync::Arc::new(build_tool_transport(ToolTransportOptions {
-        config_dir,
-        instance_name,
-        enable_transport: false,
-        udp_loopback: Some((4997, 4996)),
-    })
-    .await);
+    let transport = std::sync::Arc::new(
+        build_tool_transport(ToolTransportOptions {
+            config_dir,
+            instance_name,
+            enable_transport: false,
+            udp_loopback: Some((4997, 4996)),
+        })
+        .await,
+    );
 
     let probe = transport.enable_probe_destination().await;
     transport.send_announce(&probe, None).await;
@@ -137,8 +139,7 @@ pub fn render_results(destination: &AddressHash, results: &[ProbeResult]) -> Str
 /// UDP loopback probe demo (`rn probe --loopback`): a probe server on
 /// the forward port and one probe against it. Returns the probed
 /// destination alongside the results.
-pub async fn run_loopback(
-) -> Result<(AddressHash, Vec<ProbeResult>), reticulum::error::RnsError> {
+pub async fn run_loopback() -> Result<(AddressHash, Vec<ProbeResult>), reticulum::error::RnsError> {
     let server = build_tool_transport(ToolTransportOptions {
         config_dir: resolve_config_dir(None).as_path(),
         instance_name: "rnprobe-server",

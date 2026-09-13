@@ -69,8 +69,11 @@ fn rust_config_dir(name: &str, listen: u16, forward: u16) -> PathBuf {
 /// Resolved from the crate manifest because the test binary's cwd is the
 /// crate dir while the Python partner runs with the Python repo as its cwd.
 fn py_config(name: &str) -> String {
-    let fixture = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/rns-py-configs"))
-        .join(name);
+    let fixture = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tests/rns-py-configs"
+    ))
+    .join(name);
     let dir = temp_dir(&format!("pycfg-{name}"));
     std::fs::copy(fixture.join("config"), dir.join("config")).expect("copy fixture config");
     dir.to_str().unwrap().to_string()
@@ -146,7 +149,9 @@ impl Drop for PyChild {
 
 fn test_file(dir: &Path, size: usize) -> PathBuf {
     let path = dir.join("interop.bin");
-    let data: Vec<u8> = (0..size).map(|i| ((i * 37 + i / 253) % 256) as u8).collect();
+    let data: Vec<u8> = (0..size)
+        .map(|i| ((i * 37 + i / 253) % 256) as u8)
+        .collect();
     std::fs::write(&path, data).unwrap();
     path
 }
@@ -177,10 +182,18 @@ async fn rust_sender_to_python_listener() {
     ])
     .await;
 
-    let line = PyChild::next_line_containing(&mut lines, "rncp listening on", Duration::from_secs(30))
-        .await
-        .expect("python listener did not report its destination");
-    let hash: String = line.split('<').nth(1).unwrap().split('>').next().unwrap().to_string();
+    let line =
+        PyChild::next_line_containing(&mut lines, "rncp listening on", Duration::from_secs(30))
+            .await
+            .expect("python listener did not report its destination");
+    let hash: String = line
+        .split('<')
+        .nth(1)
+        .unwrap()
+        .split('>')
+        .next()
+        .unwrap()
+        .to_string();
     let destination = reticulum_utils::common::parse_hash(&hash).expect("hash from python");
 
     let message = rncp::send(SendOptions {
@@ -197,10 +210,18 @@ async fn rust_sender_to_python_listener() {
     .expect("rust → python transfer");
 
     assert!(message.contains("copied to"), "{message}");
-    let saved = PyChild::next_line_containing(&mut lines, "Saved received file to", Duration::from_secs(30))
-        .await
-        .expect("python listener must save the file");
-    let saved_path = saved.split("Saved received file to ").nth(1).unwrap().trim();
+    let saved = PyChild::next_line_containing(
+        &mut lines,
+        "Saved received file to",
+        Duration::from_secs(30),
+    )
+    .await
+    .expect("python listener must save the file");
+    let saved_path = saved
+        .split("Saved received file to ")
+        .nth(1)
+        .unwrap()
+        .trim();
     assert_eq!(
         std::fs::read(saved_path).unwrap(),
         std::fs::read(&payload).unwrap(),
@@ -253,7 +274,10 @@ async fn python_sender_to_rust_listener() {
 
     // The Rust listener must have written the file with the announced name.
     let received = save_dir.join("interop.bin");
-    assert!(received.exists(), "rust listener must save the file ({done})");
+    assert!(
+        received.exists(),
+        "rust listener must save the file ({done})"
+    );
     assert_eq!(
         std::fs::read(&received).unwrap(),
         std::fs::read(&payload).unwrap()

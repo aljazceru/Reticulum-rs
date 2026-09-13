@@ -122,8 +122,7 @@ impl LinkTable {
         // Python: `extra_link_proof_timeout(ingress)` (an MTU-sized
         // transmission on slow interfaces; zero for typical IP links)
         // plus `ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, remaining_hops)`.
-        let proof_timeout =
-            now + ESTABLISHMENT_TIMEOUT_PER_HOP * remaining_hops.max(1) as u32;
+        let proof_timeout = now + ESTABLISHMENT_TIMEOUT_PER_HOP * remaining_hops.max(1) as u32;
 
         let entry = LinkEntry {
             next_hop,
@@ -153,6 +152,19 @@ impl LinkTable {
     /// transport working).
     pub fn contains_destination(&self, destination: &AddressHash) -> bool {
         self.0.contains_key(destination)
+    }
+
+    /// The interface a link-table entry was received on (toward the
+    /// initiator), falling back to the next-hop interface toward the
+    /// destination for relayed links.
+    pub fn iface_of(&self, link_id: &LinkId) -> Option<AddressHash> {
+        self.0.get(link_id).map(|e| {
+            if e.receiving_iface.is_empty() {
+                e.next_hop_iface
+            } else {
+                e.receiving_iface
+            }
+        })
     }
 
     /// Route a keepalive (request or response) on an intermediary link.

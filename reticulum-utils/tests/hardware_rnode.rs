@@ -31,11 +31,15 @@ use reticulum::transport::{Transport, TransportConfig};
 static HW_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn hw_port() -> Option<String> {
-    std::env::var("RETICULUM_HW_RNODE").ok().filter(|s| !s.is_empty())
+    std::env::var("RETICULUM_HW_RNODE")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 fn hw_tcp() -> Option<String> {
-    std::env::var("RETICULUM_HW_RNODE_TCP").ok().filter(|s| !s.is_empty())
+    std::env::var("RETICULUM_HW_RNODE_TCP")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 const RADIO: RnodeRadioConfig = RnodeRadioConfig {
@@ -62,8 +66,7 @@ async fn spawn_rnode(transport: &Arc<Transport>) -> reticulum::hash::AddressHash
         #[cfg(feature = "iface-serial")]
         {
             manager.spawn(
-                RnodeInterface::serial(port, 115200, RADIO)
-                    .with_manager(transport.iface_manager()),
+                RnodeInterface::serial(port, 115200, RADIO).with_manager(transport.iface_manager()),
                 RnodeInterface::spawn,
             )
         }
@@ -122,7 +125,8 @@ async fn hw_device_info_via_rnodeconf() {
     assert!(info.detected, "device must answer the detect burst");
     let (major, minor) = info.firmware.expect("firmware version");
     assert!(
-        major > REQUIRED_FW_VER_MAJ || (major >= REQUIRED_FW_VER_MAJ && minor >= REQUIRED_FW_VER_MIN),
+        major > REQUIRED_FW_VER_MAJ
+            || (major >= REQUIRED_FW_VER_MAJ && minor >= REQUIRED_FW_VER_MIN),
         "firmware {major}.{minor} below required {REQUIRED_FW_VER_MAJ}.{REQUIRED_FW_VER_MIN}"
     );
     assert!(info.platform.is_some(), "platform code must be reported");

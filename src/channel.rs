@@ -16,21 +16,21 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 
-use tokio::sync::{broadcast, Mutex, MutexGuard, mpsc};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard};
+use tokio::time::{sleep, Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use crate::destination::link::{
-    LinkEvent, LinkEventData, LinkId, LinkPayload, LinkStatus
-};
+use crate::destination::link::{LinkEvent, LinkEventData, LinkId, LinkPayload, LinkStatus};
 use crate::error::RnsError;
 use crate::hash::Hash;
-use crate::packet::{
-    PacketContext, PACKET_MDU
-};
+use crate::packet::{PacketContext, PACKET_MDU};
 
 #[cfg(not(test))]
-use crate::{destination::link::Link, packet::Packet, transport::{Transport, TransportHandler}};
+use crate::{
+    destination::link::Link,
+    packet::Packet,
+    transport::{Transport, TransportHandler},
+};
 
 #[cfg(test)]
 use mock::{Link, Packet, Transport, TransportHandler};
@@ -62,7 +62,7 @@ pub trait Message: Clone + Send + Sized + Sync + 'static {
 async fn outlet_send(
     link: &Arc<Mutex<Link>>,
     raw: &[u8],
-    transport: &Arc<Mutex<TransportHandler>>
+    transport: &Arc<Mutex<TransportHandler>>,
 ) -> (Packet, bool) {
     let mut packet;
     let active;
@@ -97,7 +97,6 @@ async fn outlet_resend(
     false
 }
 
-
 async fn outlet_is_usable(link: &Arc<Mutex<Link>>) -> bool {
     link.lock().await.status() == LinkStatus::Active
     // This diverges from the reference implementation. The value is
@@ -116,7 +115,7 @@ pub enum MessageStatus {
     /// but we have not received a delivery proof yet.
     Sent(u16),
     /// We have received proof that the message has been delivered.
-    Delivered
+    Delivered,
 }
 
 struct Envelope<M: Message> {
@@ -144,35 +143,23 @@ impl<M: Message> Envelope<M> {
     }
 }
 
-fn envelope_raw(
-    data: &[u8],
-    message_type: u16,
-    sequence: Option<u16>
-) -> Vec<u8> {
+fn envelope_raw(data: &[u8], message_type: u16, sequence: Option<u16>) -> Vec<u8> {
     let raw_size = data.len();
 
     let mut enveloped = Vec::<u8>::with_capacity(raw_size + 6);
 
-    enveloped.extend_from_slice(
-        message_type.to_be_bytes().as_slice()
-    );
+    enveloped.extend_from_slice(message_type.to_be_bytes().as_slice());
 
-    enveloped.extend_from_slice(
-        sequence.unwrap_or(0u16).to_be_bytes().as_slice()
-    );
+    enveloped.extend_from_slice(sequence.unwrap_or(0u16).to_be_bytes().as_slice());
 
-    enveloped.extend_from_slice(
-        (raw_size as u16).to_be_bytes().as_slice()
-    );
+    enveloped.extend_from_slice((raw_size as u16).to_be_bytes().as_slice());
 
     enveloped.extend_from_slice(data);
 
     enveloped
 }
 
-
-fn deenvelope_raw(data: &[u8]) -> Result<(u16, u16, u16), RnsError>
-{
+fn deenvelope_raw(data: &[u8]) -> Result<(u16, u16, u16), RnsError> {
     if data.len() < 6 {
         return Err(RnsError::ChannelError);
     }
@@ -191,13 +178,13 @@ fn message_raw<M: Message>(message: &M, sequence: Option<u16>) -> Vec<u8> {
     envelope_raw(packed.as_ref(), message_type, sequence)
 }
 
-fn packet_timeout_time(
-    rtt: Duration,
-    ring_len: usize,
-    tries: u16
-) -> Duration {
+fn packet_timeout_time(rtt: Duration, ring_len: usize, tries: u16) -> Duration {
     let rtt_f32 = rtt.as_secs_f32();
-    let rtt_factor = if rtt_f32 >= 0.01 { 2.5 * rtt_f32 } else { 0.025 };
+    let rtt_factor = if rtt_f32 >= 0.01 {
+        2.5 * rtt_f32
+    } else {
+        0.025
+    };
 
     let tries_factor = 1.5f32.powi(tries.saturating_sub(1) as i32);
     let total = tries_factor * rtt_factor * (ring_len as f32 + 1.5);
@@ -205,11 +192,10 @@ fn packet_timeout_time(
     Duration::from_secs_f32(total)
 }
 
-
 static WINDOW: u16 = 2;
 
 static WINDOW_MIN: u16 = 2;
-static WINDOW_MIN_LIMIT_MEDIUM: u16  = 5;
+static WINDOW_MIN_LIMIT_MEDIUM: u16 = 5;
 static WINDOW_MIN_LIMIT_FAST: u16 = 16;
 
 static WINDOW_MAX_SLOW: u16 = 5;
@@ -227,11 +213,10 @@ struct ChannelParams {
     pub max_tries: u16,
     pub fast_rate_rounds: u16,
     pub medium_rate_rounds: u16,
-    pub window: u16, 
+    pub window: u16,
     pub window_max: u16,
     pub window_min: u16,
 }
-
 
 impl ChannelParams {
     pub fn new(slow: bool) -> Self {
@@ -259,9 +244,8 @@ fn adjust_params(params: &mut MutexGuard<ChannelParams>, rtt: Duration) {
                 params.medium_rate_rounds = 0;
             } else {
                 params.medium_rate_rounds += 1;
-                if
-                    params.window_max < WINDOW_MAX_MEDIUM 
-                    && params.medium_rate_rounds == FAST_RATE_THRESHOLD 
+                if params.window_max < WINDOW_MAX_MEDIUM
+                    && params.medium_rate_rounds == FAST_RATE_THRESHOLD
                 {
                     params.window_max = WINDOW_MAX_MEDIUM;
                     params.window_min = WINDOW_MIN_LIMIT_MEDIUM;
@@ -269,9 +253,7 @@ fn adjust_params(params: &mut MutexGuard<ChannelParams>, rtt: Duration) {
             }
         } else {
             params.fast_rate_rounds += 1;
-            if
-                params.window_max < WINDOW_MAX_FAST
-                && params.fast_rate_rounds == FAST_RATE_THRESHOLD
+            if params.window_max < WINDOW_MAX_FAST && params.fast_rate_rounds == FAST_RATE_THRESHOLD
             {
                 params.window_max = WINDOW_MAX_FAST;
                 params.window_min = WINDOW_MIN_LIMIT_FAST;
@@ -279,7 +261,6 @@ fn adjust_params(params: &mut MutexGuard<ChannelParams>, rtt: Duration) {
         }
     }
 }
-
 
 fn watch_message_try(
     timeouts: mpsc::Sender<Hash>,
@@ -334,7 +315,6 @@ struct Inbound<M: Message> {
     link_id: LinkId,
 }
 
-
 impl<M: Message> Inbound<M> {
     fn new(link_id: LinkId) -> Self {
         Self {
@@ -366,7 +346,10 @@ impl<M: Message> Inbound<M> {
             let overflow = sequence.saturating_add(WINDOW_MAX);
 
             if overflow >= self.sequence || sequence > overflow {
-                log::trace!("channel({}): received packet out of sequence window", self.link_id);
+                log::trace!(
+                    "channel({}): received packet out of sequence window",
+                    self.link_id
+                );
                 return;
             }
         }
@@ -392,7 +375,6 @@ impl<M: Message> Inbound<M> {
     }
 }
 
-
 struct Outbound {
     transport: Weak<Mutex<TransportHandler>>,
     outlet: Arc<Mutex<Link>>,
@@ -407,7 +389,6 @@ struct Outbound {
     /// (for stream backpressure).
     last_pending: Option<Hash>,
 }
-
 
 impl Outbound {
     async fn new(
@@ -444,7 +425,7 @@ impl Outbound {
         self.cancel.clone()
     }
 
-    pub (crate) fn link_id(&self) -> LinkId {
+    pub(crate) fn link_id(&self) -> LinkId {
         self.link_id
     }
 
@@ -454,7 +435,7 @@ impl Outbound {
         }
 
         if !outlet_is_usable(&self.outlet).await {
-            return false
+            return false;
         }
 
         let outstanding = self.sent_messages.len();
@@ -520,11 +501,7 @@ impl Outbound {
             return;
         }
 
-        let sent = outlet_resend(
-            &self.outlet,
-            packet,
-            self.transport.clone()
-        ).await;
+        let sent = outlet_resend(&self.outlet, packet, self.transport.clone()).await;
 
         if !sent {
             log::error!(
@@ -556,12 +533,15 @@ impl Outbound {
             packet_hash,
             timeout,
             delivery,
-            self.cancel.clone()
+            self.cancel.clone(),
         );
     }
 
     async fn teardown(&mut self) {
-        log::info!("channel({}): message timed out, tearing down channel", self.link_id);
+        log::info!(
+            "channel({}): message timed out, tearing down channel",
+            self.link_id
+        );
 
         if let Some(transport) = self.transport.upgrade() {
             let result = transport.lock().await.link_close(self.link_id).await;
@@ -629,11 +609,10 @@ impl Outbound {
         Ok(packet_hash)
     }
 
-    pub async fn watch_delivery(
-        &mut self,
-        packet_hash: Hash
-    ) -> Option<broadcast::Receiver<bool>> {
-        self.sent_messages.get(&packet_hash).map(|s| s.delivered.subscribe())
+    pub async fn watch_delivery(&mut self, packet_hash: Hash) -> Option<broadcast::Receiver<bool>> {
+        self.sent_messages
+            .get(&packet_hash)
+            .map(|s| s.delivered.subscribe())
     }
 
     pub async fn get_status(&self, packet_hash: &Hash) -> MessageStatus {
@@ -645,7 +624,7 @@ impl Outbound {
                 } else {
                     MessageStatus::Sent(tries)
                 }
-            },
+            }
             None => {
                 if self.delivered.contains(packet_hash) {
                     MessageStatus::Delivered
@@ -656,7 +635,6 @@ impl Outbound {
         }
     }
 }
-
 
 async fn spawn_watch_outbound(
     outbound: Arc<Mutex<Outbound>>,
@@ -703,7 +681,6 @@ async fn spawn_watch_outbound(
     });
 }
 
-
 async fn spawn_receiver<M: Message>(
     mut rx: broadcast::Receiver<LinkPayload>,
     our_link_id: LinkId,
@@ -716,7 +693,7 @@ async fn spawn_receiver<M: Message>(
         let mut last_error_logged: Option<Instant> = None;
 
         loop {
-            tokio::select!{
+            tokio::select! {
                 received = rx.recv() => {
                     match received {
                         Ok(payload) => inbound.receive(payload.as_slice()).await,
@@ -750,7 +727,6 @@ async fn spawn_receiver<M: Message>(
     incoming
 }
 
-
 /// The main object.
 ///
 /// Notice that wrapping a [Link] into a [Channel] is a local action; it
@@ -764,7 +740,6 @@ pub struct Channel<M: Message> {
     outbound: Arc<Mutex<Outbound>>,
     incoming: broadcast::Sender<M>,
 }
-
 
 impl<M: Message> Clone for Channel<M> {
     fn clone(&self) -> Self {
@@ -789,11 +764,7 @@ impl<M: Message> Channel<M> {
     ) -> Result<(Self, broadcast::Receiver<M>), RnsError> {
         let (me_tx, me_rx) = mpsc::channel(16);
 
-        let outbound = Outbound::new(
-            Arc::clone(&link),
-            transport.get_handler(),
-            me_tx
-        ).await;
+        let outbound = Outbound::new(Arc::clone(&link), transport.get_handler(), me_tx).await;
 
         let link_id = outbound.link_id();
         let cancel = outbound.cancel();
@@ -802,18 +773,18 @@ impl<M: Message> Channel<M> {
 
         let outbound = Arc::new(Mutex::new(outbound));
 
-        spawn_watch_outbound(
-            Arc::clone(&outbound),
-            link_events.resubscribe(),
-            me_rx
-        ).await;
+        spawn_watch_outbound(Arc::clone(&outbound), link_events.resubscribe(), me_rx).await;
 
         let rx = transport.bind_link_to_channel(link_id).await?;
 
         let incoming = spawn_receiver(rx, link_id, cancel).await;
         let incoming_rx = incoming.subscribe();
 
-        let channel = Self { link, outbound, incoming };
+        let channel = Self {
+            link,
+            outbound,
+            incoming,
+        };
 
         Ok((channel, incoming_rx))
     }
@@ -829,7 +800,7 @@ impl<M: Message> Channel<M> {
     /// Get notified when a specific message's delivery is confirmed.
     pub async fn watch_message_delivery(
         &self,
-        packet_hash: Hash
+        packet_hash: Hash,
     ) -> Option<broadcast::Receiver<bool>> {
         self.outbound.lock().await.watch_delivery(packet_hash).await
     }
@@ -863,17 +834,15 @@ impl<M: Message> Channel<M> {
 
 #[cfg(test)]
 mod mock {
-    use alloc::sync::Arc;
     use alloc::collections::BTreeMap;
+    use alloc::sync::Arc;
 
     use rand_core::OsRng;
 
     use tokio::sync::{broadcast, Mutex};
     use tokio::time::Duration;
 
-    use crate::destination::link::{
-        LinkEvent, LinkEventData, LinkId, LinkPayload, LinkStatus
-    };
+    use crate::destination::link::{LinkEvent, LinkEventData, LinkId, LinkPayload, LinkStatus};
     use crate::error::RnsError;
     use crate::hash::{AddressHash, Hash};
     use crate::packet::{PacketContext, PacketDataBuffer};
@@ -891,7 +860,7 @@ mod mock {
             Self {
                 data: PacketDataBuffer::new_from_slice(raw),
                 id,
-                context: PacketContext::None
+                context: PacketContext::None,
             }
         }
 
@@ -907,7 +876,7 @@ mod mock {
             LinkEventData {
                 id: self.id,
                 address_hash: AddressHash::new_empty(),
-                event: LinkEvent::Proof(self.hash())
+                event: LinkEvent::Proof(self.hash()),
             }
         }
     }
@@ -925,7 +894,12 @@ mod mock {
             let id = LinkId::new_from_rand(OsRng);
             let rtt = Duration::from_millis(20);
             let tx = broadcast::Sender::new(16);
-            Self { id, rtt, status, tx }
+            Self {
+                id,
+                rtt,
+                status,
+                tx,
+            }
         }
 
         pub fn rtt(&self) -> &Duration {
@@ -993,14 +967,20 @@ mod mock {
             let link_id = *link.id();
             let link = Arc::new(Mutex::new(link));
 
-            self.handler.lock().await.links.lock().await.insert(link_id, link.clone());
+            self.handler
+                .lock()
+                .await
+                .links
+                .lock()
+                .await
+                .insert(link_id, link.clone());
 
             link
         }
 
         pub async fn bind_link_to_channel(
             &self,
-            link_id: LinkId
+            link_id: LinkId,
         ) -> Result<broadcast::Receiver<LinkPayload>, RnsError> {
             let mut channels = self.channel_table.lock().await;
 
@@ -1017,10 +997,9 @@ mod mock {
 
                     Ok(rx)
                 }
-                None => Err(RnsError::ChannelError)
+                None => Err(RnsError::ChannelError),
             }
         }
-
     }
 
     impl TransportHandler {
@@ -1051,7 +1030,7 @@ mod tests {
 
     #[test]
     fn test_envelope_raw() {
-        let data = vec![ 0x43, 0x11, 0x00 ];
+        let data = vec![0x43, 0x11, 0x00];
         let env = envelope_raw(data.as_slice(), 0x1000, Some(10));
 
         assert_eq!(
@@ -1078,14 +1057,19 @@ mod tests {
             let transport_a = transport_a;
             let transport_b = transport_b;
 
-            Self { link_a, link_b, transport_a, transport_b }
+            Self {
+                link_a,
+                link_b,
+                transport_a,
+                transport_b,
+            }
         }
     }
 
     #[derive(Clone, Debug, PartialEq)]
     enum TestMessage {
         Long(u64),
-        Short(u32)
+        Short(u32),
     }
 
     impl Message for TestMessage {
@@ -1106,7 +1090,7 @@ mod tests {
         fn pack(&self) -> Vec<u8> {
             match self {
                 Self::Long(x) => x.to_le_bytes().to_vec(),
-                Self::Short(x) => x.to_le_bytes().to_vec()
+                Self::Short(x) => x.to_le_bytes().to_vec(),
             }
         }
 
@@ -1122,15 +1106,15 @@ mod tests {
     async fn test_message_delivery() {
         let fixture = Fixture::new().await;
 
-        let (channel_a, _) = Channel::<TestMessage>::new(
-            &fixture.transport_a,
-            fixture.link_a.clone()
-        ).await.unwrap();
+        let (channel_a, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
 
-        let (_channel_b, mut incoming_b) = Channel::<TestMessage>::new(
-            &fixture.transport_b,
-            fixture.link_b.clone()
-        ).await.unwrap();
+        let (_channel_b, mut incoming_b) =
+            Channel::<TestMessage>::new(&fixture.transport_b, fixture.link_b.clone())
+                .await
+                .unwrap();
 
         let packet_hash = channel_a.send(&TestMessage::Short(1377)).await.unwrap();
 
@@ -1149,7 +1133,13 @@ mod tests {
             .await
             .expect("message not found in channel a");
 
-        fixture.link_b.lock().await.tx.send(packet.payload()).unwrap();
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packet.payload())
+            .unwrap();
 
         let incoming = incoming_b.recv().await.expect("expected incoming message");
         assert_eq!(incoming, TestMessage::Short(1377));
@@ -1174,10 +1164,10 @@ mod tests {
     async fn test_message_failure() {
         let fixture = Fixture::new().await;
 
-        let (channel_a, _) = Channel::<TestMessage>::new(
-            &fixture.transport_a,
-            fixture.link_a.clone()
-        ).await.unwrap();
+        let (channel_a, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
 
         let packet_hash = channel_a.send(&TestMessage::Short(1)).await.unwrap();
 
@@ -1191,10 +1181,7 @@ mod tests {
         let packets = fixture.transport_a.packets().await;
         assert_eq!(packets.len(), 5);
 
-        assert_eq!(
-            fixture.link_a.lock().await.status(),
-            LinkStatus::Closed
-        );
+        assert_eq!(fixture.link_a.lock().await.status(), LinkStatus::Closed);
 
         assert!(delivered.is_empty());
 
@@ -1206,10 +1193,10 @@ mod tests {
         let fixture = Fixture::new().await;
         fixture.link_a.lock().await.status = LinkStatus::Pending;
 
-        let (channel_a, _) = Channel::<TestMessage>::new(
-            &fixture.transport_a,
-            fixture.link_a.clone()
-        ).await.unwrap();
+        let (channel_a, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
 
         assert!(!channel_a.is_ready().await);
 
@@ -1238,20 +1225,26 @@ mod tests {
     async fn test_messages_ordering() {
         let fixture = Fixture::new().await;
 
-        let (channel_a, _) = Channel::<TestMessage>::new(
-            &fixture.transport_a,
-            fixture.link_a.clone()
-        ).await.unwrap();
+        let (channel_a, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
 
-        let (_channel_b, mut incoming_b) = Channel::<TestMessage>::new(
-            &fixture.transport_b,
-            fixture.link_b.clone()
-        ).await.unwrap();
+        let (_channel_b, mut incoming_b) =
+            Channel::<TestMessage>::new(&fixture.transport_b, fixture.link_b.clone())
+                .await
+                .unwrap();
 
         channel_a.send(&TestMessage::Short(1)).await.unwrap();
 
         let packets = fixture.transport_a.packets().await;
-        fixture.link_b.lock().await.tx.send(packets[0].payload()).unwrap();
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[0].payload())
+            .unwrap();
 
         let first = incoming_b.recv().await.unwrap();
         assert_eq!(first, TestMessage::Short(1));
@@ -1264,13 +1257,25 @@ mod tests {
         channel_a.send(&TestMessage::Short(3)).await.unwrap();
 
         let packets = fixture.transport_a.packets().await;
-        fixture.link_b.lock().await.tx.send(packets[2].payload()).unwrap();
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[2].payload())
+            .unwrap();
 
         // packets have been sent in wrong order:
         // third packet will be on hold until the second one has been received.
         assert!(incoming_b.is_empty());
 
-        fixture.link_b.lock().await.tx.send(packets[1].payload()).unwrap();
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[1].payload())
+            .unwrap();
 
         let second = incoming_b.recv().await.unwrap();
         let third = incoming_b.recv().await.unwrap();
@@ -1283,7 +1288,13 @@ mod tests {
         channel_a.send(&TestMessage::Short(4)).await.unwrap();
 
         let packets = fixture.transport_a.packets().await;
-        fixture.link_b.lock().await.tx.send(packets[3].payload()).unwrap();
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[3].payload())
+            .unwrap();
 
         let fourth = incoming_b.recv().await.unwrap();
         assert_eq!(fourth, TestMessage::Short(4));
@@ -1293,22 +1304,28 @@ mod tests {
     async fn test_missing_message() {
         let fixture = Fixture::new().await;
 
-        let (channel_a, _) = Channel::<TestMessage>::new(
-            &fixture.transport_a,
-            fixture.link_a.clone()
-        ).await.unwrap();
+        let (channel_a, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
 
-        let (_channel_b, incoming_b) = Channel::<TestMessage>::new(
-            &fixture.transport_b,
-            fixture.link_b.clone()
-        ).await.unwrap();
+        let (_channel_b, incoming_b) =
+            Channel::<TestMessage>::new(&fixture.transport_b, fixture.link_b.clone())
+                .await
+                .unwrap();
 
         channel_a.send(&TestMessage::Long(50)).await.unwrap();
         channel_a.send(&TestMessage::Long(50)).await.unwrap();
 
         let packets = fixture.transport_a.packets().await;
 
-        fixture.link_b.lock().await.tx.send(packets[1].payload()).unwrap(); //
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[1].payload())
+            .unwrap(); //
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 

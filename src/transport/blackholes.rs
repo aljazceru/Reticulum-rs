@@ -44,13 +44,21 @@ fn unix_now() -> f64 {
 
 impl Default for Blackholes {
     fn default() -> Self {
-        Self { entries: HashMap::new(), publish: false, now: unix_now }
+        Self {
+            entries: HashMap::new(),
+            publish: false,
+            now: unix_now,
+        }
     }
 }
 
 impl Blackholes {
     pub fn new(publish: bool) -> Self {
-        Self { entries: HashMap::new(), publish, now: unix_now }
+        Self {
+            entries: HashMap::new(),
+            publish,
+            now: unix_now,
+        }
     }
 
     /// Replace the clock used for expiry (tests).
@@ -69,7 +77,11 @@ impl Blackholes {
     ) {
         self.entries.insert(
             identity,
-            BlackholeEntry { source, until, reason },
+            BlackholeEntry {
+                source,
+                until,
+                reason,
+            },
         );
     }
 
@@ -103,9 +115,8 @@ impl Blackholes {
     pub fn clean(&mut self) -> usize {
         let now = (self.now)();
         let before = self.entries.len();
-        self.entries.retain(|_, entry| {
-            entry.until.is_none_or(|until| now < until)
-        });
+        self.entries
+            .retain(|_, entry| entry.until.is_none_or(|until| now < until));
         before - self.entries.len()
     }
 
@@ -123,9 +134,7 @@ impl Blackholes {
     }
 
     /// Parse a packed table; `None` when it is not the expected dict shape.
-    pub fn parse_table(
-        packed: &[u8],
-    ) -> Option<Vec<(AddressHash, BlackholeEntry)>> {
+    pub fn parse_table(packed: &[u8]) -> Option<Vec<(AddressHash, BlackholeEntry)>> {
         let mut cursor: &[u8] = packed;
         let count = rmp::decode::read_map_len(&mut cursor).ok()?;
         let mut out = Vec::new();
@@ -218,9 +227,7 @@ impl Blackholes {
                     source
                 }
             };
-            let Some(packed) =
-                storage.read(&format!("{BLACKHOLE_DIR}/{filename}"))
-            else {
+            let Some(packed) = storage.read(&format!("{BLACKHOLE_DIR}/{filename}")) else {
                 continue;
             };
             let Some(list) = Self::parse_table(&packed) else {
@@ -385,8 +392,9 @@ mod tests {
             && e.source == hash(9)
             && e.until == Some(1_800_000_000.5)
             && e.reason.as_deref() == Some("spam")));
-        assert!(parsed.iter().any(|(h, e)| *h == hash(2)
-            && e.until.is_none() && e.reason.is_none()));
+        assert!(parsed
+            .iter()
+            .any(|(h, e)| *h == hash(2) && e.until.is_none() && e.reason.is_none()));
     }
 
     #[test]
@@ -478,7 +486,10 @@ mod tests {
         assert_eq!(loaded, 1);
         assert!(fresh.is_blackholed(&hash(1)));
         assert!(!fresh.is_blackholed(&hash(2)));
-        assert_eq!(fresh.entries[&hash(1)].reason.as_deref(), Some("local entry"));
+        assert_eq!(
+            fresh.entries[&hash(1)].reason.as_deref(),
+            Some("local entry")
+        );
     }
 
     #[test]
@@ -510,10 +521,16 @@ mod tests {
         };
 
         storage
-            .write(&format!("{BLACKHOLE_DIR}/{}", allowed.to_hex_string()), &pack_for(allowed, None))
+            .write(
+                &format!("{BLACKHOLE_DIR}/{}", allowed.to_hex_string()),
+                &pack_for(allowed, None),
+            )
             .unwrap();
         storage
-            .write(&format!("{BLACKHOLE_DIR}/{}", disabled.to_hex_string()), &pack_for(disabled, None))
+            .write(
+                &format!("{BLACKHOLE_DIR}/{}", disabled.to_hex_string()),
+                &pack_for(disabled, None),
+            )
             .unwrap();
         storage
             .write(
@@ -535,32 +552,36 @@ mod tests {
         let own = hash(0xaa);
         let remote = hash(0xbb);
 
-        storage.write(&format!("{BLACKHOLE_DIR}/local"), &{
-            let mut packed = Vec::new();
-            rmp::encode::write_map_len(&mut packed, 1).ok();
-            rmp::encode::write_bin(&mut packed, hash(5).as_slice()).ok();
-            rmp::encode::write_map_len(&mut packed, 3).ok();
-            rmp::encode::write_str(&mut packed, "source").ok();
-            rmp::encode::write_bin(&mut packed, own.as_slice()).ok();
-            rmp::encode::write_str(&mut packed, "until").ok();
-            rmp::encode::write_nil(&mut packed).ok();
-            rmp::encode::write_str(&mut packed, "reason").ok();
-            rmp::encode::write_str(&mut packed, "local reason").ok();
-            packed
-        }).unwrap();
-        storage.write(&format!("{BLACKHOLE_DIR}/{remote}"), &{
-            let mut packed = Vec::new();
-            rmp::encode::write_map_len(&mut packed, 1).ok();
-            rmp::encode::write_bin(&mut packed, hash(5).as_slice()).ok();
-            rmp::encode::write_map_len(&mut packed, 3).ok();
-            rmp::encode::write_str(&mut packed, "source").ok();
-            rmp::encode::write_bin(&mut packed, remote.as_slice()).ok();
-            rmp::encode::write_str(&mut packed, "until").ok();
-            rmp::encode::write_nil(&mut packed).ok();
-            rmp::encode::write_str(&mut packed, "reason").ok();
-            rmp::encode::write_str(&mut packed, "remote reason").ok();
-            packed
-        }).unwrap();
+        storage
+            .write(&format!("{BLACKHOLE_DIR}/local"), &{
+                let mut packed = Vec::new();
+                rmp::encode::write_map_len(&mut packed, 1).ok();
+                rmp::encode::write_bin(&mut packed, hash(5).as_slice()).ok();
+                rmp::encode::write_map_len(&mut packed, 3).ok();
+                rmp::encode::write_str(&mut packed, "source").ok();
+                rmp::encode::write_bin(&mut packed, own.as_slice()).ok();
+                rmp::encode::write_str(&mut packed, "until").ok();
+                rmp::encode::write_nil(&mut packed).ok();
+                rmp::encode::write_str(&mut packed, "reason").ok();
+                rmp::encode::write_str(&mut packed, "local reason").ok();
+                packed
+            })
+            .unwrap();
+        storage
+            .write(&format!("{BLACKHOLE_DIR}/{remote}"), &{
+                let mut packed = Vec::new();
+                rmp::encode::write_map_len(&mut packed, 1).ok();
+                rmp::encode::write_bin(&mut packed, hash(5).as_slice()).ok();
+                rmp::encode::write_map_len(&mut packed, 3).ok();
+                rmp::encode::write_str(&mut packed, "source").ok();
+                rmp::encode::write_bin(&mut packed, remote.as_slice()).ok();
+                rmp::encode::write_str(&mut packed, "until").ok();
+                rmp::encode::write_nil(&mut packed).ok();
+                rmp::encode::write_str(&mut packed, "reason").ok();
+                rmp::encode::write_str(&mut packed, "remote reason").ok();
+                packed
+            })
+            .unwrap();
 
         let mut bh = Blackholes::new(false);
         assert_eq!(bh.reload(&storage, &own, &[remote]), 1);

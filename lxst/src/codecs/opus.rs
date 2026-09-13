@@ -190,9 +190,8 @@ impl Opus {
             let channels = self.sink_channels.unwrap_or(2).max(self.channels);
             self.decoder_channels = Some(channels);
             let rate = self.sink_samplerate.unwrap_or(48000);
-            let decoder =
-                Decoder::new(Self::sample_rate_enum(rate), Self::channels_enum(channels))
-                    .map_err(map_err)?;
+            let decoder = Decoder::new(Self::sample_rate_enum(rate), Self::channels_enum(channels))
+                .map_err(map_err)?;
             self.decoder = Some(decoder);
         }
         Ok(self.decoder.as_mut().unwrap())
@@ -350,10 +349,7 @@ mod tests {
         assert_eq!(c.frame_max_ms(), Some(60.0));
         assert_eq!(c.valid_frame_ms().unwrap().len(), 6);
         // 70ms target must clamp to 60, and 61 -> 60
-        assert_eq!(
-            crate::codecs::clamp_frame_ms(&c, 70.0),
-            60.0
-        );
+        assert_eq!(crate::codecs::clamp_frame_ms(&c, 70.0), 60.0);
         // 12ms snaps to 10 (closest of the valid list)
         assert_eq!(crate::codecs::clamp_frame_ms(&c, 12.0), 10.0);
     }

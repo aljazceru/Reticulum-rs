@@ -2,7 +2,7 @@ use alloc::boxed::Box;
 
 use core::{cmp::min, time::Duration};
 
-use ed25519_dalek::{Signature, SigningKey, Verifier, PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH};
+use ed25519_dalek::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, Signature, SigningKey, Verifier};
 #[cfg(feature = "std")]
 use rand_core::OsRng;
 use sha2::Digest;
@@ -11,10 +11,10 @@ use x25519_dalek::StaticSecret;
 use crate::{
     buffer::OutputBuffer,
     error::RnsError,
-    hash::{AddressHash, Hash, ADDRESS_HASH_SIZE, HASH_SIZE},
+    hash::{ADDRESS_HASH_SIZE, AddressHash, HASH_SIZE, Hash},
     identity::{DecryptIdentity, DerivedKey, EncryptIdentity, Identity, PrivateIdentity},
     packet::{
-        DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType, PACKET_MDU,
+        DestinationType, Header, PACKET_MDU, Packet, PacketContext, PacketDataBuffer, PacketType,
     },
     time::now,
 };
@@ -237,13 +237,18 @@ impl Link {
         // A link request may carry 3 bytes of MTU/mode signalling appended
         // after the ephemeral keys (Python `Link.mtu_from_lr_packet`).
         let mtu = if packet.data.len() >= PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE {
-            let sig = &packet.data.as_slice()[PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
+            let sig = &packet.data.as_slice()
+                [PUBLIC_KEY_LENGTH * 2..PUBLIC_KEY_LENGTH * 2 + LINK_MTU_SIZE];
             let value = ((sig[0] as usize) << 16) | ((sig[1] as usize) << 8) | (sig[2] as usize);
             let mtu = value & 0x1F_FFFF;
             if mtu != 0 && mtu < crate::packet::LINK_MTU_MIN {
                 return Err(RnsError::InvalidArgument);
             }
-            if mtu == 0 { crate::packet::PROTOCOL_MTU } else { mtu }
+            if mtu == 0 {
+                crate::packet::PROTOCOL_MTU
+            } else {
+                mtu
+            }
         } else {
             crate::packet::PROTOCOL_MTU
         };
@@ -315,11 +320,11 @@ impl Link {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create data packet for pending link");
-                return Err(RnsError::LinkNotReady)
+                return Err(RnsError::LinkNotReady);
             }
             LinkStatus::Closed => {
                 log::warn!("link: can't create data packet for closed link");
-                return Err(RnsError::LinkClosed)
+                return Err(RnsError::LinkClosed);
             }
             LinkStatus::Active | LinkStatus::Stale => {}
         }
@@ -361,24 +366,28 @@ impl Link {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create identify packet for pending link");
-                return Err(RnsError::LinkNotReady)
+                return Err(RnsError::LinkNotReady);
             }
             LinkStatus::Closed => {
                 log::warn!("link: can't create identify packet for closed link");
-                return Err(RnsError::LinkClosed)
+                return Err(RnsError::LinkClosed);
             }
             LinkStatus::Active | LinkStatus::Stale => {}
         }
         let pub_identity = identity.as_identity();
         let signed_data = [
-            self.id.as_slice(), pub_identity.public_key_bytes(), pub_identity.verifying_key_bytes()
-        ].concat();
+            self.id.as_slice(),
+            pub_identity.public_key_bytes(),
+            pub_identity.verifying_key_bytes(),
+        ]
+        .concat();
         let signature = identity.sign(&signed_data);
         let proof_data = [
             pub_identity.public_key_bytes(),
             pub_identity.verifying_key_bytes(),
-            &signature.to_bytes()[..]
-        ].concat();
+            &signature.to_bytes()[..],
+        ]
+        .concat();
         let mut data = PacketDataBuffer::new();
         let cipher_text_len = {
             let cipher_text = self.encrypt_with_rng(rng, &proof_data, data.accuire_buf_max())?;
@@ -395,7 +404,7 @@ impl Link {
             destination: self.id,
             transport: None,
             context: PacketContext::LinkIdentify,
-            data
+            data,
         })
     }
 
@@ -437,11 +446,11 @@ impl Link {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create data packet for pending link");
-                return Err(RnsError::LinkNotReady)
+                return Err(RnsError::LinkNotReady);
             }
             LinkStatus::Closed => {
                 log::warn!("link: can't create data packet for closed link");
-                return Err(RnsError::LinkClosed)
+                return Err(RnsError::LinkClosed);
             }
             LinkStatus::Active | LinkStatus::Stale => {}
         }
@@ -481,11 +490,11 @@ impl Link {
         match self.status {
             LinkStatus::Pending | LinkStatus::Handshake => {
                 log::warn!("link: can't create data packet for pending link");
-                return Err(RnsError::LinkNotReady)
+                return Err(RnsError::LinkNotReady);
             }
             LinkStatus::Closed => {
                 log::warn!("link: can't create data packet for closed link");
-                return Err(RnsError::LinkClosed)
+                return Err(RnsError::LinkClosed);
             }
             LinkStatus::Active | LinkStatus::Stale => {}
         }
@@ -512,12 +521,13 @@ impl Link {
     /// (Python `link.encrypt`). The Fernet token grows the data by
     /// `TOKEN_OVERHEAD` bytes plus block padding.
     #[cfg(feature = "std")]
-    pub fn encrypt_alloc(&self, text: &[u8], out_buf: &mut alloc::vec::Vec<u8>) -> Result<usize, RnsError> {
+    pub fn encrypt_alloc(
+        &self,
+        text: &[u8],
+        out_buf: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, RnsError> {
         let start = out_buf.len();
-        out_buf.resize(
-            start + text.len() + crate::packet::TOKEN_OVERHEAD + 64,
-            0,
-        );
+        out_buf.resize(start + text.len() + crate::packet::TOKEN_OVERHEAD + 64, 0);
         let chunk = self.encrypt_with_rng(OsRng, text, &mut out_buf[start..])?;
         let written = chunk.len();
         out_buf.truncate(start + written);
@@ -544,8 +554,7 @@ impl Link {
                 + crate::packet::HEADER_MINSIZE
                 + crate::packet::TOKEN_OVERHEAD,
         );
-        (mdu / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE)
-            .saturating_sub(1)
+        (mdu / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE).saturating_sub(1)
     }
 
     /// Maximum size of an unencrypted resource part chunk
@@ -588,7 +597,11 @@ impl Link {
     }
 
     pub fn message_proof(&self, hash: Hash) -> Packet {
-        log::trace!("link({}): creating proof for message hash {}", self.id, hash);
+        log::trace!(
+            "link({}): creating proof for message hash {}",
+            self.id,
+            hash
+        );
 
         let signature = self.priv_identity.sign(hash.as_slice());
 
@@ -752,7 +765,7 @@ impl Link {
         event_tx: &E,
         channel_tx: Option<&P>,
         packet: &Packet,
-        out_link: bool
+        out_link: bool,
     ) -> LinkHandleResult {
         if self.status != LinkStatus::Active {
             // Pending/handshaking links have an all-zero derived key until
@@ -773,13 +786,17 @@ impl Link {
         match packet.context {
             PacketContext::None => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) =
-                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
-                {
+                if let Ok(plain_text) = self.decrypt_with_rng(
+                    crate::crypt::fernet::ZeroRng,
+                    packet.data.as_slice(),
+                    &mut buffer[..],
+                ) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.touch();
-                    self.post_event(event_tx,
-                        LinkEvent::Data(Box::new(LinkPayload::new_from_slice(plain_text))));
+                    self.post_event(
+                        event_tx,
+                        LinkEvent::Data(Box::new(LinkPayload::new_from_slice(plain_text))),
+                    );
 
                     let proof = if self.proves_messages {
                         Some(self.message_proof(packet.hash()))
@@ -794,41 +811,61 @@ impl Link {
             }
             PacketContext::LinkIdentify => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) =
-                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
-                {
-                    log::trace!("link({}): link identify data {}B", self.id, plain_text.len());
+                if let Ok(plain_text) = self.decrypt_with_rng(
+                    crate::crypt::fernet::ZeroRng,
+                    packet.data.as_slice(),
+                    &mut buffer[..],
+                ) {
+                    log::trace!(
+                        "link({}): link identify data {}B",
+                        self.id,
+                        plain_text.len()
+                    );
                     self.touch();
                     if !out_link && plain_text.len() == PUBLIC_KEY_LENGTH * 2 + SIGNATURE_LENGTH {
                         let public_key = &plain_text[..PUBLIC_KEY_LENGTH];
                         let verifying_key = &plain_text[PUBLIC_KEY_LENGTH..PUBLIC_KEY_LENGTH * 2];
-                        let signed_data = [self.id().as_slice(), public_key, verifying_key].concat();
+                        let signed_data =
+                            [self.id().as_slice(), public_key, verifying_key].concat();
                         let signature = match Signature::from_slice(
-                            &plain_text[PUBLIC_KEY_LENGTH * 2..]
+                            &plain_text[PUBLIC_KEY_LENGTH * 2..],
                         ) {
                             Ok(signature) => signature,
                             Err(err) => {
                                 log::warn!(
                                     "link({}): link identify packet invalid signature bytes: {err}",
-                                    self.id());
-                                return LinkHandleResult::None
+                                    self.id()
+                                );
+                                return LinkHandleResult::None;
                             }
                         };
                         let identity = Identity::new_from_slices(public_key, verifying_key);
                         match identity.verify(&signed_data, &signature) {
                             Ok(()) => {
                                 if let Some(remote_id) = self.remote_identity.as_ref() {
-                                    log::debug!("link({}): link identity {} is valid but link is already identified as {}",
-                                        self.id(), identity.address_hash, remote_id.address_hash);
+                                    log::debug!(
+                                        "link({}): link identity {} is valid but link is already identified as {}",
+                                        self.id(),
+                                        identity.address_hash,
+                                        remote_id.address_hash
+                                    );
                                 } else {
-                                    log::debug!("link({}): link identified: {}",
-                                        self.id(), identity.address_hash);
+                                    log::debug!(
+                                        "link({}): link identified: {}",
+                                        self.id(),
+                                        identity.address_hash
+                                    );
                                     self.remote_identity = Some(identity);
-                                    self.post_event(event_tx, LinkEvent::RemoteIdentified(Box::new(identity)));
+                                    self.post_event(
+                                        event_tx,
+                                        LinkEvent::RemoteIdentified(Box::new(identity)),
+                                    );
                                 }
                             }
                             Err(err) => log::warn!(
-                                "link({}): identity verification failed: {err:?}", self.id())
+                                "link({}): identity verification failed: {err:?}",
+                                self.id()
+                            ),
                         }
                     }
                 } else {
@@ -849,9 +886,11 @@ impl Link {
             }
             PacketContext::LinkRTT if !out_link => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) =
-                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
-                {
+                if let Ok(plain_text) = self.decrypt_with_rng(
+                    crate::crypt::fernet::ZeroRng,
+                    packet.data.as_slice(),
+                    &mut buffer[..],
+                ) {
                     if let Ok(rtt) = rmp::decode::read_f64(&mut &plain_text[..]) {
                         // A hostile peer can encode NaN/infinite or
                         // enormous RTT values; clamp to a sane range
@@ -870,13 +909,17 @@ impl Link {
             }
             PacketContext::LinkClose => {
                 let mut buffer = [0u8; PACKET_MDU];
-                if let Ok(plain_text) =
-                    self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer[..])
-                {
+                if let Ok(plain_text) = self.decrypt_with_rng(
+                    crate::crypt::fernet::ZeroRng,
+                    packet.data.as_slice(),
+                    &mut buffer[..],
+                ) {
                     match plain_text[..].try_into() {
                         Err(err) => {
-                            log::error!("link({}): invalid decode link close payload: {err}",
-                                self.id)
+                            log::error!(
+                                "link({}): invalid decode link close payload: {err}",
+                                self.id
+                            )
                         }
                         Ok(dest_bytes) => {
                             let link_id = LinkId::new(dest_bytes);
@@ -892,9 +935,11 @@ impl Link {
             PacketContext::Channel => {
                 if let Some(channel_tx) = channel_tx {
                     let mut buffer = [0u8; PACKET_MDU];
-                    if let Ok(plain_text) =
-                        self.decrypt_with_rng(crate::crypt::fernet::ZeroRng, packet.data.as_slice(), &mut buffer)
-                    {
+                    if let Ok(plain_text) = self.decrypt_with_rng(
+                        crate::crypt::fernet::ZeroRng,
+                        packet.data.as_slice(),
+                        &mut buffer,
+                    ) {
                         log::trace!("link({}): data over channel {}B", self.id, plain_text.len());
                         self.request_time = now();
 
@@ -910,7 +955,10 @@ impl Link {
                         log::error!("link({}): can't decrypt channel packet", self.id);
                     }
                 } else {
-                    log::error!("link({}): received channel packet but have no channel", self.id);
+                    log::error!(
+                        "link({}): received channel packet but have no channel",
+                        self.id
+                    );
                 }
             }
             _ => {}
@@ -922,11 +970,9 @@ impl Link {
     fn handle_proof_packet<E: LinkEventSink>(
         &mut self,
         event_tx: &E,
-        packet: &Packet
+        packet: &Packet,
     ) -> LinkHandleResult {
-        if self.status == LinkStatus::Pending
-            && packet.context == PacketContext::LinkRequestProof
-        {
+        if self.status == LinkStatus::Pending && packet.context == PacketContext::LinkRequestProof {
             if let Ok(identity) = validate_proof_packet(&self.destination, &self.id, packet) {
                 log::debug!("link({}): has been proved", self.id);
 
@@ -946,7 +992,8 @@ impl Link {
             }
         }
 
-        if self.status == LinkStatus::Active && packet.context == PacketContext::None
+        if self.status == LinkStatus::Active
+            && packet.context == PacketContext::None
             && let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice())
         {
             self.post_event(event_tx, LinkEvent::Proof(hash));
@@ -969,11 +1016,11 @@ pub trait LinkExtHandlePacket<E: LinkEventSink, P: LinkPayloadSink> {
         event_tx: &E,
         channel_tx: Option<&P>,
         packet: &Packet,
-        out_link: bool
+        out_link: bool,
     ) -> LinkHandleResult;
 }
 
-impl <E: LinkEventSink> LinkExt<E> for Link {
+impl<E: LinkEventSink> LinkExt<E> for Link {
     fn prove(&mut self, event_tx: &E) -> Packet {
         log::debug!("link({}): prove", self.id);
 
@@ -1011,10 +1058,8 @@ impl <E: LinkEventSink> LinkExt<E> for Link {
 
     fn teardown(&mut self, event_tx: &E) -> Result<Option<Packet>, RnsError> {
         let packet = if self.status != LinkStatus::Pending && self.status != LinkStatus::Closed {
-            let mut packet = self.data_packet_with_rng(
-                self.id.as_slice(),
-                crate::crypt::fernet::ZeroRng,
-            )?;
+            let mut packet =
+                self.data_packet_with_rng(self.id.as_slice(), crate::crypt::fernet::ZeroRng)?;
             packet.context = PacketContext::LinkClose;
             Some(packet)
         } else {
@@ -1031,13 +1076,13 @@ impl <E: LinkEventSink> LinkExt<E> for Link {
     }
 }
 
-impl <E: LinkEventSink, P: LinkPayloadSink> LinkExtHandlePacket<E, P> for Link {
+impl<E: LinkEventSink, P: LinkPayloadSink> LinkExtHandlePacket<E, P> for Link {
     fn handle_packet(
         &mut self,
         event_tx: &E,
         channel_tx: Option<&P>,
         packet: &Packet,
-        out_link: bool
+        out_link: bool,
     ) -> LinkHandleResult {
         if packet.destination != self.id {
             return LinkHandleResult::None;
@@ -1099,10 +1144,7 @@ fn validate_proof_packet(
     Ok(identity)
 }
 
-fn validate_message_proof(
-    identity: &Identity,
-    data: &[u8]
-) -> Result<Hash, RnsError> {
+fn validate_message_proof(identity: &Identity, data: &[u8]) -> Result<Hash, RnsError> {
     if data.len() <= HASH_SIZE {
         return Err(RnsError::PacketError);
     }
@@ -1115,7 +1157,11 @@ fn validate_message_proof(
 
     let hash_slice = &data[..HASH_SIZE];
 
-    if identity.verifying_key.verify(hash_slice, &signature).is_ok() {
+    if identity
+        .verifying_key
+        .verify(hash_slice, &signature)
+        .is_ok()
+    {
         Ok(Hash::new(hash_slice.try_into().unwrap()))
     } else {
         Err(RnsError::IncorrectSignature)
@@ -1131,10 +1177,8 @@ mod mtu_tests {
     fn request_with_mtu(mtu: usize) -> (Packet, PrivateIdentity, DestinationDesc) {
         let peer = PrivateIdentity::new_from_rand(OsRng);
         let local = PrivateIdentity::new_from_rand(OsRng);
-        let destination = SingleInputDestination::new(
-            local.clone(),
-            DestinationName::new("test", "link.mtu"),
-        );
+        let destination =
+            SingleInputDestination::new(local.clone(), DestinationName::new("test", "link.mtu"));
         let mut data = PacketDataBuffer::new();
         data.safe_write(peer.as_identity().public_key.as_bytes());
         data.safe_write(peer.as_identity().verifying_key.as_bytes());
@@ -1178,10 +1222,8 @@ mod mtu_tests {
     #[test]
     fn local_mtu_and_size_accessors_are_defensive() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let destination = SingleInputDestination::new(
-            identity,
-            DestinationName::new("test", "link.local-mtu"),
-        );
+        let destination =
+            SingleInputDestination::new(identity, DestinationName::new("test", "link.local-mtu"));
         let mut link = Link::new(destination.desc);
 
         link.set_mtu(0);

@@ -44,8 +44,7 @@ async fn encode_pipeline_flows_source_to_sink() {
 async fn decode_pipeline_passes_decoded_frames() {
     let source = BufferSource::new(Some(48_000), frames_of(440.0, 48_000, 5, 240));
     let sink = BufferSink::new();
-    let pipeline =
-        Pipeline::decode(source, vec![], Box::new(Null::new()), sink);
+    let pipeline = Pipeline::decode(source, vec![], Box::new(Null::new()), sink);
 
     assert_eq!(pipeline.codec_role(), CodecRole::Decode);
     let task = pipeline.start();
@@ -102,7 +101,8 @@ async fn pipeline_applies_filters_before_encoding() {
 #[tokio::test]
 async fn pipeline_stops_on_cancel() {
     // A source that never ends: a tone source
-    let mut source = lxst::generators::ToneSource::configured(440.0, 0.5, false, 20.0, 20.0, 1, 48_000);
+    let mut source =
+        lxst::generators::ToneSource::configured(440.0, 0.5, false, 20.0, 20.0, 1, 48_000);
     source.start();
     let sink = BufferSink::new();
     let pipeline = Pipeline::encode(source, vec![], Box::new(Raw::new(None, 32)), sink);
@@ -184,7 +184,11 @@ async fn line_sink_drops_oldest_on_overflow() {
     // and the oldest frames were dropped: the first frame left carries a
     // late index
     let first = sink.digest().unwrap();
-    assert!(first.samples[0] >= 4.0, "first kept sample {}", first.samples[0]);
+    assert!(
+        first.samples[0] >= 4.0,
+        "first kept sample {}",
+        first.samples[0]
+    );
 }
 
 #[tokio::test]
@@ -193,8 +197,10 @@ async fn buffer_sink_backpressure_and_stop() {
     let source_id = lxst::common::new_source_id();
     sink.set_backpressure(Some(2));
     assert!(sink.can_receive(source_id).await);
-    sink.handle_frame(SinkFrame::Encoded(vec![1]), source_id).await;
-    sink.handle_frame(SinkFrame::Encoded(vec![2]), source_id).await;
+    sink.handle_frame(SinkFrame::Encoded(vec![1]), source_id)
+        .await;
+    sink.handle_frame(SinkFrame::Encoded(vec![2]), source_id)
+        .await;
     assert!(!sink.can_receive(source_id).await);
 
     sink.stop();
@@ -279,7 +285,10 @@ async fn wav_file_roundtrip() {
     while let Some(frame) = source.next_frame().await {
         collected.push(frame);
     }
-    let all: Vec<f32> = collected.iter().flat_map(|f| f.samples.iter().copied()).collect();
+    let all: Vec<f32> = collected
+        .iter()
+        .flat_map(|f| f.samples.iter().copied())
+        .collect();
     assert_eq!(all.len(), 400);
     assert!((all[0] - 0.0).abs() < 1e-6);
     assert!((all[150] - 0.1).abs() < 1e-6);
@@ -363,20 +372,10 @@ async fn bandpass_chain_in_pipeline() {
     let encoded = guard.encoded_frames();
     let mut decoder = Raw::new(None, 32);
     let decoded = decoder.decode(&encoded[0]).unwrap();
-    let rms = (decoded
-        .samples
-        .iter()
-        .map(|s| s * s)
-        .sum::<f32>()
-        / decoded.samples.len() as f32)
-        .sqrt();
+    let rms =
+        (decoded.samples.iter().map(|s| s * s).sum::<f32>() / decoded.samples.len() as f32).sqrt();
     // both tones sat in the (one-pole) stop band: substantial attenuation
     // of the 0.85-combined input amplitude
-    let input_rms = (samples.iter().map(|s| s * s).sum::<f32>()
-        / samples.len() as f32)
-        .sqrt();
-    assert!(
-        rms < input_rms * 0.35,
-        "rms {rms} vs input {input_rms}"
-    );
+    let input_rms = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt();
+    assert!(rms < input_rms * 0.35, "rms {rms} vs input {input_rms}");
 }

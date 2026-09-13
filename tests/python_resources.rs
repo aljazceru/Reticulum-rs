@@ -23,8 +23,7 @@ use reticulum::transport::{Transport, TransportConfig};
 #[allow(dead_code)]
 static RETICULUM_PYTHON_DIR: LazyLock<String> =
     LazyLock::new(|| std::env::var("RETICULUM_TEST_PYTHON_DIR").unwrap());
-static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static TEST_MUTEX: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 static INIT: std::sync::Once = std::sync::Once::new();
 
 fn setup() {
@@ -60,7 +59,11 @@ async fn spawn_partner(mode: &str, destination: Option<&str>, size: usize) -> Py
         .arg(mode)
         .arg("--size")
         .arg(size.to_string())
-        .args(destination.map(|d| vec!["--destination".to_string(), d.to_string()]).unwrap_or_default())
+        .args(
+            destination
+                .map(|d| vec!["--destination".to_string(), d.to_string()])
+                .unwrap_or_default(),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -113,12 +116,18 @@ async fn rust_transport(port: u16, forward: u16) -> Transport {
     transport
 }
 
-async fn wait_destination(transport: &Transport, hash: &AddressHash) -> reticulum::destination::DestinationDesc {
+async fn wait_destination(
+    transport: &Transport,
+    hash: &AddressHash,
+) -> reticulum::destination::DestinationDesc {
     transport.request_path(hash, None, None).await;
     let mut announces = transport.recv_announces().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "no announce from python");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no announce from python"
+        );
         let event = tokio::time::timeout_at(deadline, announces.recv())
             .await
             .expect("timeout")
@@ -129,12 +138,18 @@ async fn wait_destination(transport: &Transport, hash: &AddressHash) -> reticulu
     }
 }
 
-async fn link_to(transport: &Transport, desc: reticulum::destination::DestinationDesc) -> Arc<AsyncMutex<Link>> {
+async fn link_to(
+    transport: &Transport,
+    desc: reticulum::destination::DestinationDesc,
+) -> Arc<AsyncMutex<Link>> {
     let mut events = transport.out_link_events();
     let link = transport.link(desc).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        assert!(tokio::time::Instant::now() < deadline, "link not established");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "link not established"
+        );
         let event = tokio::time::timeout_at(deadline, events.recv())
             .await
             .expect("timeout")
@@ -161,7 +176,10 @@ async fn python_sends_resource_to_rust() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = rust_transport(4242, 4243).await;
     let destination = transport
-        .add_destination(identity, DestinationName::new("example_utilities", "interop.resource"))
+        .add_destination(
+            identity,
+            DestinationName::new("example_utilities", "interop.resource"),
+        )
         .await;
     let hash = destination.lock().await.desc.address_hash;
 
@@ -264,12 +282,17 @@ async fn python_request_to_rust() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = rust_transport(4242, 4243).await;
     let destination = transport
-        .add_destination(identity, DestinationName::new("example_utilities", "interop.request"))
+        .add_destination(
+            identity,
+            DestinationName::new("example_utilities", "interop.request"),
+        )
         .await;
     let hash = destination.lock().await.desc.address_hash;
 
     transport
-        .register_request_handler(&hash, "echo", |ctx| Some(reticulum::resource::msgpack_bin(&ctx.data)))
+        .register_request_handler(&hash, "echo", |ctx| {
+            Some(reticulum::resource::msgpack_bin(&ctx.data))
+        })
         .await;
 
     let partner = spawn_partner("request-client", Some(&hash.to_hex_string()), 5000).await;
@@ -283,7 +306,11 @@ async fn python_request_to_rust() {
     let response_line = next_line_containing(&mut lines, "response sha", Duration::from_secs(30))
         .await
         .expect("python did not get response");
-    let response_sha: String = response_line.split_whitespace().last().expect("sha").to_string();
+    let response_sha: String = response_line
+        .split_whitespace()
+        .last()
+        .expect("sha")
+        .to_string();
     assert_eq!(expected_sha, response_sha);
     log::info!("python received matching response");
 
@@ -308,7 +335,10 @@ async fn rust_request_to_python() {
     let link = link_to(&transport, desc).await;
 
     let payload: Vec<u8> = (0..3000u32).map(|i| (i % 247) as u8).collect();
-    let rid = transport.request(&link, "echo", &payload).await.expect("request");
+    let rid = transport
+        .request(&link, "echo", &payload)
+        .await
+        .expect("request");
 
     let response = transport
         .await_request_response(rid, Duration::from_secs(30))

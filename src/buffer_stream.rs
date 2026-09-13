@@ -78,7 +78,12 @@ impl StreamDataMessage {
             data = crate::resource::decompress(&data, MAX_CHUNK_LEN)?;
         }
 
-        Ok(Self { stream_id, data, eof, compressed })
+        Ok(Self {
+            stream_id,
+            data,
+            eof,
+            compressed,
+        })
     }
 }
 
@@ -218,8 +223,7 @@ impl BufferWriter {
             let mut channel = channel;
 
             // Wait for the channel to become ready before the first frame.
-            let ready_deadline = tokio::time::Instant::now()
-                + std::time::Duration::from_secs(30);
+            let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             while !channel.is_ready().await {
                 if tokio::time::Instant::now() > ready_deadline {
                     log::debug!("buffer_stream: channel never became ready");
@@ -244,25 +248,20 @@ impl BufferWriter {
                 // frame's delivery receipt before continuing (backpressure).
                 let mut offset = 0usize;
                 while offset < chunk.len() {
-                    let deadline = tokio::time::Instant::now()
-                        + std::time::Duration::from_secs(120);
+                    let deadline =
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
                     loop {
-                        match write_frame(&mut channel, stream_id, &chunk[offset..], false)
-                            .await
-                        {
+                        match write_frame(&mut channel, stream_id, &chunk[offset..], false).await {
                             Ok(processed) => {
                                 offset += processed;
                                 break;
                             }
                             Err(RnsError::LinkNotReady) | Err(RnsError::ChannelError) => {
                                 if tokio::time::Instant::now() > deadline {
-                                    log::debug!(
-                                        "buffer_stream: channel window never opened"
-                                    );
+                                    log::debug!("buffer_stream: channel window never opened");
                                     return;
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(20))
-                                    .await;
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                             }
                             Err(err) => {
                                 log::debug!("buffer_stream: write_frame failed: {err:?}");
@@ -370,9 +369,7 @@ async fn write_frame(
         compressed,
     };
     channel.send(&message).await?;
-    log::debug!(
-        "buffer_stream: frame of {processed} bytes queued (compressed={compressed})"
-    );
+    log::debug!("buffer_stream: frame of {processed} bytes queued (compressed={compressed})");
     Ok(processed)
 }
 
@@ -416,10 +413,7 @@ pub fn create_reader(
 }
 
 /// Create a writer (Python `Buffer.create_writer`).
-pub fn create_writer(
-    stream_id: u16,
-    channel: Channel<StreamDataMessage>,
-) -> BufferWriter {
+pub fn create_writer(stream_id: u16, channel: Channel<StreamDataMessage>) -> BufferWriter {
     BufferWriter::new(stream_id, channel)
 }
 
@@ -465,8 +459,7 @@ mod tests {
     #[test]
     fn compressed_roundtrip() {
         let data = vec![0xAB; 5000];
-        let (compressed, did) =
-            crate::resource::maybe_compress(&data, true, usize::MAX);
+        let (compressed, did) = crate::resource::maybe_compress(&data, true, usize::MAX);
         assert!(did);
         let msg = StreamDataMessage {
             stream_id: 7,

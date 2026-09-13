@@ -23,8 +23,8 @@ use alloc::vec::Vec;
 use hkdf::Hkdf;
 use sha2::Sha256;
 
-use crate::hash::Hash;
 use crate::error::RnsError;
+use crate::hash::Hash;
 use crate::identity::SigningKey;
 use reticulum_core::identity::Signer;
 
@@ -233,8 +233,8 @@ mod tests {
         assert!(key.strip(&tampered).is_none());
 
         // A different network name cannot unwrap.
-        let other = IfacKey::derive(Some("other-network"), Some("correct horse"), 8)
-            .expect("valid IFAC");
+        let other =
+            IfacKey::derive(Some("other-network"), Some("correct horse"), 8).expect("valid IFAC");
         assert!(other.strip(&wrapped).is_none());
 
         // Packets without the IFAC flag are rejected.

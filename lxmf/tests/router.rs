@@ -116,7 +116,10 @@ async fn direct_delivery_over_udp_with_receipt() {
 
     // Bob sends a direct message to Alice over a link
     let mut message = LXMessage::new(alice_delivery, bob_delivery, b"Hello", b"Hello from Bob!");
-    router_b.send(&mut message, &bob_identity).await.expect("send");
+    router_b
+        .send(&mut message, &bob_identity)
+        .await
+        .expect("send");
 
     // Alice receives and validates it
     let received = tokio::time::timeout(Duration::from_secs(20), async {
@@ -144,7 +147,7 @@ async fn direct_delivery_over_udp_with_receipt() {
     let receipt = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match events_b.recv().await.expect("event") {
-                LxmEvent::DeliveryReceipt { .. } => return ,
+                LxmEvent::DeliveryReceipt { .. } => return,
                 LxmEvent::SendFailed { reason, .. } => {
                     panic!("unexpected send failure: {reason:?}")
                 }
@@ -197,7 +200,10 @@ async fn send_to_unknown_destination_queues_and_fails_gracefully() {
 
     // Direct send to a destination we have no identity or path for
     let mut message = LXMessage::new(unknown, bob_delivery, b"t", b"no path");
-    router.send(&mut message, &bob_identity).await.expect("send");
+    router
+        .send(&mut message, &bob_identity)
+        .await
+        .expect("send");
     assert_eq!(message.state, lxmf::OUTBOUND);
 
     // The message is queued, no failure is emitted yet (delivery will be
@@ -298,7 +304,10 @@ async fn opportunistic_delivery_over_udp() {
     // Bob sends an opportunistic single-packet message
     let mut message = LXMessage::new(alice_delivery, bob_delivery, b"Opp", b"Opportunistic hello");
     message.desired_method = Some(OPPORTUNISTIC);
-    router_b.send(&mut message, &bob_identity).await.expect("send");
+    router_b
+        .send(&mut message, &bob_identity)
+        .await
+        .expect("send");
     assert_eq!(message.method, OPPORTUNISTIC);
 
     let received = tokio::time::timeout(Duration::from_secs(20), async {
@@ -346,7 +355,9 @@ async fn paper_uri_ingest() {
     // Bob writes a paper message for Alice
     let mut message = LXMessage::new(alice_delivery, bob_delivery, b"Paper", b"Out of band");
     message.destination_identity = Some(*alice_identity.as_identity());
-    message.pack_paper(&bob_identity, OsRng).expect("pack paper");
+    message
+        .pack_paper(&bob_identity, OsRng)
+        .expect("pack paper");
     let uri = message.as_uri().expect("uri");
 
     // The paper message is destined for Alice, not Bob. It is "ingested"
@@ -385,8 +396,7 @@ async fn propagation_node_announce_peering() {
     let client_identity = fixed_identity(BOB_KEY);
 
     let transport_pn = build_transport("pn", "127.0.0.1:41007", "127.0.0.1:41008").await;
-    let transport_client = build_transport("pn-client", "127.0.0.1:41008", "127.0.0.1:41007")
-        .await;
+    let transport_client = build_transport("pn-client", "127.0.0.1:41008", "127.0.0.1:41007").await;
 
     // A propagation node with a lower peering cost than the local maximum
     let router_pn = LxmRouter::new(
@@ -423,9 +433,7 @@ async fn propagation_node_announce_peering() {
     let announced = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match client_events.recv().await.expect("event") {
-                LxmEvent::Announce(AnnounceInfo::PropagationNode { info, .. }) => {
-                    return info
-                }
+                LxmEvent::Announce(AnnounceInfo::PropagationNode { info, .. }) => return info,
                 _ => continue,
             }
         }
@@ -475,22 +483,37 @@ async fn delivery_destination_registration() {
     .await;
 
     let delivery_hash = router.delivery_destination_hash().await.expect("delivery");
-    assert_eq!(delivery_hash, delivery_destination_hash(identity.as_identity()));
+    assert_eq!(
+        delivery_hash,
+        delivery_destination_hash(identity.as_identity())
+    );
     assert_eq!(router.inbound_stamp_cost().await, Some(12));
 
     // Stamp cost updates from announces are tracked
     let other = fixed_identity(BOB_KEY);
     let other_delivery = delivery_destination_hash(other.as_identity());
     router.update_stamp_cost(&other_delivery, Some(9)).await;
-    assert_eq!(router.get_outbound_stamp_cost(&other_delivery).await, Some(9));
+    assert_eq!(
+        router.get_outbound_stamp_cost(&other_delivery).await,
+        Some(9)
+    );
 
     // Tickets
-    let ticket = router.generate_ticket(&other_delivery).await.expect("ticket");
-    router.remember_ticket(&other_delivery, ticket.0, ticket.1).await;
+    let ticket = router
+        .generate_ticket(&other_delivery)
+        .await
+        .expect("ticket");
+    router
+        .remember_ticket(&other_delivery, ticket.0, ticket.1)
+        .await;
     let remembered = router.get_outbound_ticket(&other_delivery).await;
     assert_eq!(remembered, Some(ticket.1));
 
     // A ticket is not regenerated within the delivery interval
     let second = router.generate_ticket(&other_delivery).await;
-    assert_eq!(second.map(|t| t.1), Some(ticket.1), "ticket should be reused");
+    assert_eq!(
+        second.map(|t| t.1),
+        Some(ticket.1),
+        "ticket should be reused"
+    );
 }

@@ -10,8 +10,10 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::hdlc::HdlcDecoder;
 use reticulum::iface::ifac::IfacKey;
-use reticulum::packet::{DestinationType, Header, HeaderType, IfacFlag, Packet,
-    PacketContext, PacketDataBuffer, PacketType, PropagationType};
+use reticulum::packet::{
+    DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer,
+    PacketType, PropagationType,
+};
 
 /// Simple xorshift corpus generator (deterministic per seed).
 struct Corpus(u64);
@@ -83,7 +85,9 @@ fn valid_announce_survives_random_context() {
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let mut destination =
         SingleInputDestination::new(identity, DestinationName::new("prop", "announce"));
-    let announce = destination.announce(OsRng, Some(b"app data")).expect("announce");
+    let announce = destination
+        .announce(OsRng, Some(b"app data"))
+        .expect("announce");
 
     assert!(DestinationAnnounce::validate(&announce).is_ok());
 }

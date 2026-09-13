@@ -10,13 +10,11 @@ use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
 use crate::packet::{Packet, PacketContext, PacketType};
 
-use super::advertisement::{
-    ResourceAdvertisement, COLLISION_GUARD_SIZE, HASHMAP_MAX_LEN,
-};
+use super::advertisement::{ResourceAdvertisement, COLLISION_GUARD_SIZE, HASHMAP_MAX_LEN};
 use super::{
-    map_hash, maybe_compress, unix_time, ResourceStatus, ResourceTx, MAX_ADV_RETRIES,
-    MAX_EFFICIENT_SIZE, MAX_RETRIES, MAPHASH_LEN, RANDOM_HASH_SIZE, RESPONSE_MAX_GRACE_TIME,
-    SDU, SENDER_GRACE_TIME, WINDOW_MAX,
+    map_hash, maybe_compress, unix_time, ResourceStatus, ResourceTx, MAPHASH_LEN, MAX_ADV_RETRIES,
+    MAX_EFFICIENT_SIZE, MAX_RETRIES, RANDOM_HASH_SIZE, RESPONSE_MAX_GRACE_TIME, SDU,
+    SENDER_GRACE_TIME, WINDOW_MAX,
 };
 
 pub use super::ResourceOptions;
@@ -79,11 +77,7 @@ impl OutgoingResource {
     /// given), splitting, compressing, encrypting and hashing exactly like
     /// Python `RNS.Resource.__init__`.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        data: Vec<u8>,
-        link: &Link,
-        opts: ResourceOptions,
-    ) -> Result<Self, RnsError> {
+    pub fn new(data: Vec<u8>, link: &Link, opts: ResourceOptions) -> Result<Self, RnsError> {
         let mut metadata_blob = Vec::new();
         let mut has_metadata = false;
         let mut metadata_size = 0usize;
@@ -148,8 +142,11 @@ impl OutgoingResource {
         let split = total_segments > 1;
 
         // Compress (only beneficial compression is used)
-        let (prepared, compressed) =
-            maybe_compress(&segment_data, opts.auto_compress, super::AUTO_COMPRESS_MAX_SIZE);
+        let (prepared, compressed) = maybe_compress(
+            &segment_data,
+            opts.auto_compress,
+            super::AUTO_COMPRESS_MAX_SIZE,
+        );
 
         // Random hash prefix + payload
         let random_hash = Hash::new_from_rand(OsRng);
@@ -158,11 +155,7 @@ impl OutgoingResource {
         plaintext.extend_from_slice(&prepared);
 
         // Encrypt the whole stream with the link token
-        let sdu = if link.mtu() > 0 {
-            link.sdu()
-        } else {
-            SDU
-        };
+        let sdu = if link.mtu() > 0 { link.sdu() } else { SDU };
         let mut encrypted = Vec::with_capacity(plaintext.len() + super::PART_ENCRYPT_OVERHEAD);
         let cipher_len = link.encrypt_alloc(&plaintext, &mut encrypted)?;
         encrypted.truncate(cipher_len);
@@ -177,8 +170,10 @@ impl OutgoingResource {
         let mut hashmap = Vec::with_capacity(total_parts * MAPHASH_LEN);
         let mut collision_guard: Vec<[u8; MAPHASH_LEN]> = Vec::new();
 
-        let mut random_hash_bytes: [u8; RANDOM_HASH_SIZE] =
-            random_hash.as_slice()[..RANDOM_HASH_SIZE].try_into().unwrap();
+        let mut random_hash_bytes: [u8; RANDOM_HASH_SIZE] = random_hash.as_slice()
+            [..RANDOM_HASH_SIZE]
+            .try_into()
+            .unwrap();
 
         'hashmap: loop {
             parts.clear();
@@ -211,13 +206,14 @@ impl OutgoingResource {
             match regenerated_random {
                 Some(new_random) => {
                     // re-encrypt with the new random hash prefix
-                    plaintext.splice(..RANDOM_HASH_SIZE, new_random.as_slice()[..RANDOM_HASH_SIZE].iter().copied());
+                    plaintext.splice(
+                        ..RANDOM_HASH_SIZE,
+                        new_random.as_slice()[..RANDOM_HASH_SIZE].iter().copied(),
+                    );
                     encrypted.clear();
                     let cipher_len = link.encrypt_alloc(&plaintext, &mut encrypted)?;
                     encrypted.truncate(cipher_len);
-                    random_hash_bytes.copy_from_slice(
-                        &new_random.as_slice()[..RANDOM_HASH_SIZE],
-                    );
+                    random_hash_bytes.copy_from_slice(&new_random.as_slice()[..RANDOM_HASH_SIZE]);
                     continue 'hashmap;
                 }
                 None => break,
@@ -448,8 +444,7 @@ impl OutgoingResource {
                 }
             }
 
-            self.receiver_min_consecutive_height =
-                part_index.saturating_sub(1 + WINDOW_MAX);
+            self.receiver_min_consecutive_height = part_index.saturating_sub(1 + WINDOW_MAX);
 
             if !part_index.is_multiple_of(HASHMAP_MAX_LEN) {
                 log::error!("resource: sequencing error in hashmap update, cancelling");
@@ -563,6 +558,21 @@ impl OutgoingResource {
         self.status = ResourceStatus::Failed;
     }
 
+    /// Cancel this transfer as the initiator (Python `Resource.cancel`):
+    /// builds the RESOURCE_ICL packet, stops advertising/transferring and
+    /// returns the packets that must be transmitted.
+    pub fn cancel(&mut self, link: &Link) -> ResourceTx {
+        let mut tx = ResourceTx::default();
+        self.cancel_packet(link, &mut tx);
+        tx
+    }
+
+    /// The hash callers use to identify this segment's logical resource
+    /// (`original_hash` correlates split segments).
+    pub fn resource_hash(&self) -> crate::hash::Hash {
+        self.original_hash
+    }
+
     /// Watchdog state machine for the sender side. Returns packets to send
     /// and whether the resource should be removed.
     pub fn check(&mut self, link: &Link, tx: &mut ResourceTx) -> bool {
@@ -614,16 +624,14 @@ impl OutgoingResource {
                     let mut expected_proof = Vec::with_capacity(64);
                     expected_proof.extend_from_slice(self.hash.as_slice());
                     expected_proof.extend_from_slice(self.expected_proof.as_slice());
-                    let expected_packet_hash = crate::hash::Hash::new_from_slice(
-                        &{
-                            let mut hasher = crate::hash::Hash::generator();
-                            hasher.update([0x0f]);
-                            hasher.update(link.id().as_slice());
-                            hasher.update([PacketContext::ResourceProof as u8]);
-                            hasher.update(&expected_proof);
-                            hasher.finalize()
-                        },
-                    );
+                    let expected_packet_hash = crate::hash::Hash::new_from_slice(&{
+                        let mut hasher = crate::hash::Hash::generator();
+                        hasher.update([0x0f]);
+                        hasher.update(link.id().as_slice());
+                        hasher.update([PacketContext::ResourceProof as u8]);
+                        hasher.update(&expected_proof);
+                        hasher.finalize()
+                    });
                     if let Ok(cache_request) = link.context_packet(
                         expected_packet_hash.as_slice(),
                         PacketContext::CacheRequest,
@@ -646,8 +654,7 @@ impl OutgoingResource {
         if !self.split {
             return (self.sent_parts as f64 / self.parts.len() as f64).min(1.0);
         }
-        let max_parts_per_segment =
-            (MAX_EFFICIENT_SIZE as f64 / self.sdu as f64).ceil() as usize;
+        let max_parts_per_segment = (MAX_EFFICIENT_SIZE as f64 / self.sdu as f64).ceil() as usize;
         let processed_segments = self.segment_index - 1;
         let current_segment_parts = self.parts.len();
         let factor = if current_segment_parts < max_parts_per_segment {

@@ -406,7 +406,10 @@ mod tests {
 
     fn energy(frame: &AudioFrame, ch: usize) -> f32 {
         let n = frame.frames();
-        (0..n).map(|i| frame.sample(i, ch) * frame.sample(i, ch)).sum::<f32>() / n as f32
+        (0..n)
+            .map(|i| frame.sample(i, ch) * frame.sample(i, ch))
+            .sum::<f32>()
+            / n as f32
     }
 
     #[test]
@@ -505,7 +508,9 @@ mod tests {
         for _ in 0..5 {
             let out = agc.handle_frame(&quiet, 48_000);
             last_gain = energy(&out, 0) / energy(&quiet, 0);
-            peak = (0..out.frames()).map(|i| out.sample(i, 0).abs()).fold(0.0f32, f32::max);
+            peak = (0..out.frames())
+                .map(|i| out.sample(i, 0).abs())
+                .fold(0.0f32, f32::max);
         }
         let gain = last_gain;
         assert!(gain > 2.0, "agc gain only {gain}");
@@ -520,7 +525,9 @@ mod tests {
         let out = agc.handle_frame(&loud, 48_000);
         // attenuates toward the target level without exceeding the limit
         assert!(energy(&out, 0) < energy(&loud, 0));
-        let peak = (0..out.frames()).map(|i| out.sample(i, 0).abs()).fold(0.0f32, f32::max);
+        let peak = (0..out.frames())
+            .map(|i| out.sample(i, 0).abs())
+            .fold(0.0f32, f32::max);
         assert!(peak <= 0.76);
     }
 

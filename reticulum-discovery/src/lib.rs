@@ -22,8 +22,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use reticulum::destination::{DestinationName, SingleInputDestination};
 use reticulum::hash::{AddressHash, Hash};
-use reticulum::iface::tcp_client::TcpClient;
 use reticulum::identity::PrivateIdentity;
+use reticulum::iface::tcp_client::TcpClient;
 use reticulum::transport::Transport;
 
 /// LXMF stamp expand rounds used by interface discovery
@@ -80,7 +80,11 @@ fn is_hostname(hostname: &str) -> bool {
     let components: Vec<&str> = hostname.split('.').collect();
     // A trailing all-numeric label is not a hostname
     // (Python `re.match(r"[0-9]+$", ...)`).
-    if components.last().map(|c| !c.is_empty() && c.chars().all(|b| b.is_ascii_digit())) == Some(true) {
+    if components
+        .last()
+        .map(|c| !c.is_empty() && c.chars().all(|b| b.is_ascii_digit()))
+        == Some(true)
+    {
         return false;
     }
     let allowed = |label: &str| {
@@ -90,9 +94,7 @@ fn is_hostname(hostname: &str) -> bool {
         if label.starts_with('-') || label.ends_with('-') {
             return false;
         }
-        label
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     };
     components.iter().all(|c| allowed(c))
 }
@@ -189,17 +191,39 @@ impl InterfaceInfo {
 
         // type, transport, transport_id, impl, vers, name + 3 geo fields
         let mut field_count = 9;
-        if self.reachable_on.is_some() { field_count += 1; }
-        if self.port.is_some() { field_count += 1; }
-        if self.frequency.is_some() { field_count += 1; }
-        if self.bandwidth.is_some() { field_count += 1; }
-        if self.spreadingfactor.is_some() { field_count += 1; }
-        if self.codingrate.is_some() { field_count += 1; }
-        if self.channel.is_some() { field_count += 1; }
-        if self.modulation.is_some() { field_count += 1; }
-        if self.ifac_netname.is_some() { field_count += 1; }
-        if self.ifac_netkey.is_some() { field_count += 1; }
-        if self.operator_lxmf_address.is_some() { field_count += 1; }
+        if self.reachable_on.is_some() {
+            field_count += 1;
+        }
+        if self.port.is_some() {
+            field_count += 1;
+        }
+        if self.frequency.is_some() {
+            field_count += 1;
+        }
+        if self.bandwidth.is_some() {
+            field_count += 1;
+        }
+        if self.spreadingfactor.is_some() {
+            field_count += 1;
+        }
+        if self.codingrate.is_some() {
+            field_count += 1;
+        }
+        if self.channel.is_some() {
+            field_count += 1;
+        }
+        if self.modulation.is_some() {
+            field_count += 1;
+        }
+        if self.ifac_netname.is_some() {
+            field_count += 1;
+        }
+        if self.ifac_netkey.is_some() {
+            field_count += 1;
+        }
+        if self.operator_lxmf_address.is_some() {
+            field_count += 1;
+        }
 
         let mut out = Vec::new();
         mp::write_map_len(&mut out, field_count as u32).ok();
@@ -214,10 +238,22 @@ impl InterfaceInfo {
         mp::write_bin(&mut out, self.transport_id.as_slice()).ok();
 
         mp::write_uint(&mut out, KEY_TRANSPORT_IMPL).ok();
-        mp::write_str(&mut out, self.transport_impl.as_deref().unwrap_or(IMPLEMENTATION_NAME)).ok();
+        mp::write_str(
+            &mut out,
+            self.transport_impl
+                .as_deref()
+                .unwrap_or(IMPLEMENTATION_NAME),
+        )
+        .ok();
 
         mp::write_uint(&mut out, KEY_TRANSPORT_VERS).ok();
-        mp::write_str(&mut out, self.transport_vers.as_deref().unwrap_or(IMPLEMENTATION_VERSION)).ok();
+        mp::write_str(
+            &mut out,
+            self.transport_vers
+                .as_deref()
+                .unwrap_or(IMPLEMENTATION_VERSION),
+        )
+        .ok();
 
         mp::write_uint(&mut out, KEY_NAME).ok();
         match &self.name {
@@ -353,7 +389,7 @@ impl InterfaceInfo {
         let reachable_on = str_field(&KEY_REACHABLE_ON)?;
         if let Some(host) = &reachable_on {
             if !(is_ip_address(host) || is_hostname(host)) {
-            return None;
+                return None;
             }
         }
 
@@ -559,8 +595,6 @@ impl InterfaceAnnouncer {
 
     async fn job(self: Arc<Self>) {
         loop {
-            tokio::time::sleep(self.interval).await;
-
             let due = {
                 let mut interfaces = self.interfaces.write().await;
                 let now = tokio::time::Instant::now();
@@ -593,7 +627,11 @@ impl InterfaceAnnouncer {
                 })
             };
 
-            let Some(info) = due else { continue };
+            let Some(info) = due else {
+                // Nothing due: poll again after the interval.
+                tokio::time::sleep(self.interval).await;
+                continue;
+            };
 
             match build_discovery_payload(&info, self.stamp_value) {
                 Some(payload) => {
@@ -651,7 +689,9 @@ impl InterfaceDiscovery {
             .await;
 
         loop {
-            let Ok(event) = announces.recv().await else { return };
+            let Ok(event) = announces.recv().await else {
+                return;
+            };
 
             let payload = event.app_data.as_slice();
             if payload.is_empty() {
@@ -715,7 +755,9 @@ impl InterfaceDiscovery {
             log::debug!("discovery: removed {removed} stale discovered interfaces");
         }
         table.sort_by(|a, b| {
-            (a.value, a.last_heard).partial_cmp(&(b.value, b.last_heard)).unwrap_or(std::cmp::Ordering::Equal)
+            (a.value, a.last_heard)
+                .partial_cmp(&(b.value, b.last_heard))
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         table.clone()
     }
@@ -760,10 +802,9 @@ impl InterfaceDiscovery {
             let exists = {
                 let manager = self.transport.iface_manager();
                 let manager = manager.lock().await;
-                manager
-                    .stats()
-                    .iter()
-                    .any(|stat| stat.kind == "TcpClient" && stat.name.contains(&format!("{host}:{port}")))
+                manager.stats().iter().any(|stat| {
+                    stat.kind == "TcpClient" && stat.name.contains(&format!("{host}:{port}"))
+                })
             };
             if exists {
                 continue;
@@ -772,15 +813,13 @@ impl InterfaceDiscovery {
             let manager = self.transport.iface_manager();
             let mut manager = manager.lock().await;
             let address = format!("{host}:{port}");
-            let ifac_address = manager.spawn(
-                TcpClient::new(address.clone()),
-                TcpClient::spawn,
-            );
+            let ifac_address = manager.spawn(TcpClient::new(address.clone()), TcpClient::spawn);
             manager.set_iface_name(&ifac_address, &format!("discovered {address}"));
 
-            if let (Some(netname), Some(netkey)) =
-                (entry.info.ifac_netname.clone(), entry.info.ifac_netkey.clone())
-            {
+            if let (Some(netname), Some(netkey)) = (
+                entry.info.ifac_netname.clone(),
+                entry.info.ifac_netkey.clone(),
+            ) {
                 let _ = manager.set_iface_ifac(&ifac_address, Some(&netname), Some(&netkey), 8);
             }
 
@@ -849,10 +888,8 @@ impl BlackholeUpdater {
         loop {
             let sources = self.sources.read().await.clone();
             for source in sources {
-                let name = reticulum::destination::DestinationName::new(
-                    "rnstransport",
-                    "info.blackhole",
-                );
+                let name =
+                    reticulum::destination::DestinationName::new("rnstransport", "info.blackhole");
                 let destination_hash = name.address_hash_for(&SourceIdentity(source));
 
                 if !self
@@ -922,7 +959,10 @@ impl BlackholeUpdater {
 
         let own = self.transport.identity_hash().await;
         let blackholes = self.transport.blackholes();
-        let added = blackholes.write().await.merge_table(&response, publisher, own);
+        let added = blackholes
+            .write()
+            .await
+            .merge_table(&response, publisher, own);
 
         if added > 0 {
             log::debug!("blackhole updater: merged {added} blackholed identities");

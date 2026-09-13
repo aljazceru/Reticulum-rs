@@ -10,10 +10,8 @@ use reticulum::packet::Packet;
 
 fn announce_packet() -> Packet {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let mut destination = SingleInputDestination::new(
-        identity,
-        DestinationName::new("bench", "announce"),
-    );
+    let mut destination =
+        SingleInputDestination::new(identity, DestinationName::new("bench", "announce"));
 
     destination
         .announce(OsRng, Some(b"benchmark app data"))
@@ -29,13 +27,11 @@ fn bench_announce_validation(c: &mut Criterion) {
 }
 
 fn bench_ifac_wrap_unwrap(c: &mut Criterion) {
-    let key = IfacKey::derive(Some("bench-network"), Some("bench-passphrase"), 8)
-        .expect("valid IFAC");
+    let key =
+        IfacKey::derive(Some("bench-network"), Some("bench-passphrase"), 8).expect("valid IFAC");
     let raw: Vec<u8> = (0..500u16).map(|i| (i % 256) as u8).collect();
 
-    c.bench_function("ifac/wrap-500b", |b| {
-        b.iter(|| key.apply(&raw))
-    });
+    c.bench_function("ifac/wrap-500b", |b| b.iter(|| key.apply(&raw)));
 
     let wrapped = key.apply(&raw);
     c.bench_function("ifac/unwrap-500b", |b| {

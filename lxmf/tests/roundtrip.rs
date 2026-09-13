@@ -39,7 +39,10 @@ fn pack_unpack_roundtrip() {
         ]),
     );
     fields.insert(FIELD_THREAD, FieldValue::Bin(vec![0x11; 32]));
-    fields.insert(FIELD_CUSTOM_TYPE, FieldValue::Str("application/x-test".into()));
+    fields.insert(
+        FIELD_CUSTOM_TYPE,
+        FieldValue::Str("application/x-test".into()),
+    );
     fields.insert(FIELD_CUSTOM_DATA, FieldValue::Bin(vec![1, 2, 3, 255]));
     fields.insert(FIELD_DEBUG, FieldValue::Bool(true));
 
@@ -60,10 +63,9 @@ fn pack_unpack_roundtrip() {
     );
 
     let source_identity = *source.as_identity();
-    let unpacked = LXMessage::unpack_from_bytes_with(
-        message.packed.as_ref().unwrap(),
-        &|hash| (*hash == source_hash).then_some(source_identity),
-    )
+    let unpacked = LXMessage::unpack_from_bytes_with(message.packed.as_ref().unwrap(), &|hash| {
+        (*hash == source_hash).then_some(source_identity)
+    })
     .expect("unpack");
 
     assert!(unpacked.signature_validated);
@@ -129,7 +131,12 @@ fn outbound_ticket_stamp() {
 fn directory_persistence_roundtrip() {
     let (source, _destination, destination_hash, source_hash) = test_identities();
 
-    let mut message = LXMessage::new(destination_hash, source_hash, b"Persisted", b"Persisted content");
+    let mut message = LXMessage::new(
+        destination_hash,
+        source_hash,
+        b"Persisted",
+        b"Persisted content",
+    );
     message.timestamp = Some(1735689600.5);
     message.pack(&source).expect("pack");
     message.determine_transport_encryption();
@@ -288,11 +295,7 @@ fn fields_map_semantics() {
 
     // Non-u8 keys are rejected when unpacking
     let mut bad = Vec::new();
-    FieldValue::Map(vec![(
-        FieldValue::Int(0x1000),
-        FieldValue::Nil,
-    )])
-    .pack(&mut bad);
+    FieldValue::Map(vec![(FieldValue::Int(0x1000), FieldValue::Nil)]).pack(&mut bad);
     assert!(matches!(
         Fields::unpack(&mut bad.as_slice()),
         Err(LxmfError::UnsupportedFieldKey)
@@ -312,10 +315,7 @@ fn uri_and_base64_edge_cases() {
 
     // Padding is tolerated
     let padded = format!("{}==", encoded);
-    assert_eq!(
-        lxmf::message::base64_urlsafe_decode(&padded).unwrap(),
-        data
-    );
+    assert_eq!(lxmf::message::base64_urlsafe_decode(&padded).unwrap(), data);
 
     // as_uri requires a paper message
     let (source, _destination, destination_hash, source_hash) = test_identities();
@@ -346,13 +346,22 @@ fn pack_propagation_requires_identity() {
     // The container decrypts back to the packed message
     let mut rd: &[u8] = message.propagation_packed.as_ref().unwrap();
     let value = FieldValue::unpack(&mut rd).unwrap();
-    let FieldValue::Array(items) = value else { unreachable!() };
-    let FieldValue::Array(inner) = &items[1] else { unreachable!() };
-    let FieldValue::Bin(lxmf_data) = &inner[0] else { unreachable!() };
+    let FieldValue::Array(items) = value else {
+        unreachable!()
+    };
+    let FieldValue::Array(inner) = &items[1] else {
+        unreachable!()
+    };
+    let FieldValue::Bin(lxmf_data) = &inner[0] else {
+        unreachable!()
+    };
     assert_eq!(&lxmf_data[..16], destination_hash.as_slice());
 
     let decrypted = lxmf::message::decrypt_for_identity(&destination, &lxmf_data[16..]).unwrap();
-    assert_eq!(decrypted.as_slice(), &message.packed.as_ref().unwrap()[16..]);
+    assert_eq!(
+        decrypted.as_slice(),
+        &message.packed.as_ref().unwrap()[16..]
+    );
 
     // Propagation stamp generation uses the transient id as material
     let stamp = message

@@ -24,15 +24,13 @@ use reticulum::destination::link::{Link, LinkEvent, LinkEventData};
 use reticulum::destination::{DestinationDesc, DestinationName, SingleInputDestination};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
-use reticulum::resource::{
-    RequestContext, ResourceOptions, ResourceStatus, ResourceStrategy,
-};
+use reticulum::resource::{RequestContext, ResourceOptions, ResourceStatus, ResourceStrategy};
 use reticulum::transport::Transport;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::common::{
-    load_or_create_private_identity, prettyhexrep, resolve_config_dir, build_tool_transport,
+    build_tool_transport, load_or_create_private_identity, prettyhexrep, resolve_config_dir,
     ToolTransportOptions,
 };
 
@@ -104,11 +102,14 @@ pub fn unpack_metadata(data: &[u8]) -> Option<String> {
 /// Reduce a received filename to a safe basename
 /// (Python `os.path.basename` + save-path jail check).
 pub fn sanitize_filename(name: &str) -> String {
-    let basename = name.rsplit('/').next().unwrap_or("").rsplit('\\').next().unwrap_or("");
-    let cleaned: String = basename
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
+    let basename = name
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('\\')
+        .next()
+        .unwrap_or("");
+    let cleaned: String = basename.chars().filter(|c| !c.is_control()).collect();
     if cleaned.is_empty() {
         "rncp.incoming".to_string()
     } else {
@@ -183,14 +184,20 @@ pub fn parse_fetch_response(data: &[u8]) -> FetchResponse {
 // ---------------------------------------------------------------------------
 
 /// Load (or create) the persistent `rncp` identity for a config directory.
-pub fn rncp_identity(config_dir: &Path, explicit: Option<&Path>) -> Result<PrivateIdentity, String> {
+pub fn rncp_identity(
+    config_dir: &Path,
+    explicit: Option<&Path>,
+) -> Result<PrivateIdentity, String> {
     let path = explicit
         .map(Path::to_path_buf)
         .unwrap_or_else(|| config_dir.join("storage/identities").join(APP_NAME));
     let (identity, created) =
         load_or_create_private_identity(&path).map_err(|err| err.to_string())?;
     if created {
-        log::info!("No valid saved identity found, creating new at {}", path.display());
+        log::info!(
+            "No valid saved identity found, creating new at {}",
+            path.display()
+        );
     } else {
         log::info!("Loaded rncp identity from {}", path.display());
     }
@@ -248,8 +255,13 @@ impl Default for ServeOptions {
 }
 
 /// The hash the listener announces (`rncp.receive` for its identity).
-pub async fn serve_destination_hash(transport: &mut Transport, identity: &PrivateIdentity) -> AddressHash {
-    let destination = transport.add_destination(identity.clone(), destination_name()).await;
+pub async fn serve_destination_hash(
+    transport: &mut Transport,
+    identity: &PrivateIdentity,
+) -> AddressHash {
+    let destination = transport
+        .add_destination(identity.clone(), destination_name())
+        .await;
     let hash = destination.lock().await.desc.address_hash;
     hash
 }
@@ -262,7 +274,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), String> {
 
 /// Run the rncp listener until Ctrl-C or `shutdown` is cancelled
 /// (used by the loopback tests).
-pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationToken) -> Result<(), String> {
+pub async fn serve_with_shutdown(
+    options: ServeOptions,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
     let config_dir = resolve_config_dir(options.config_dir.as_deref());
     std::fs::create_dir_all(&config_dir).map_err(|err| err.to_string())?;
     std::fs::create_dir_all(&options.save_dir).map_err(|err| err.to_string())?;
@@ -293,12 +308,22 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
     {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while tokio::time::Instant::now() < deadline {
-            if transport.interface_stats().await.iter().any(|stats| stats.online) {
+            if transport
+                .interface_stats()
+                .await
+                .iter()
+                .any(|stats| stats.online)
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if !transport.interface_stats().await.iter().any(|stats| stats.online) {
+        if !transport
+            .interface_stats()
+            .await
+            .iter()
+            .any(|stats| stats.online)
+        {
             log::warn!("rncp: no interface came up within 15s; announcing anyway");
         }
     }
@@ -312,7 +337,10 @@ pub async fn serve_with_shutdown(options: ServeOptions, shutdown: CancellationTo
             .expect("rncp destination");
         let interval = options.announce_interval;
         transport.send_announce(&destination, None).await;
-        log::info!("rncp listening on {}", prettyhexrep(destination_hash.as_slice()));
+        log::info!(
+            "rncp listening on {}",
+            prettyhexrep(destination_hash.as_slice())
+        );
         println!(
             "Identity     : {}\nListening on : {}",
             prettyhexrep(identity.address_hash().as_slice()),
@@ -555,11 +583,15 @@ async fn connect(
     if !transport.has_path(destination).await {
         println!("Path to {} requested", prettyhexrep(destination.as_slice()));
     }
-    let desc: DestinationDesc = crate::rnpath::wait_for_destination(transport, destination, timeout)
-        .await
-        .ok_or_else(|| "Path not found".to_string())?;
+    let desc: DestinationDesc =
+        crate::rnpath::wait_for_destination(transport, destination, timeout)
+            .await
+            .ok_or_else(|| "Path not found".to_string())?;
     if !silent {
-        println!("Establishing link with {}", prettyhexrep(destination.as_slice()));
+        println!(
+            "Establishing link with {}",
+            prettyhexrep(destination.as_slice())
+        );
     }
 
     let mut events = transport.out_link_events();
@@ -592,7 +624,9 @@ async fn connect(
 
     // Accept incoming resources (fetch responses).
     let link_id = *link.lock().await.id();
-    transport.set_resource_strategy(link_id, ResourceStrategy::All).await;
+    transport
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
 
     Ok(link)
 }
@@ -620,7 +654,14 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
     .await;
 
     let identity = rncp_identity(&config_dir, options.identity_path.as_deref())?;
-    let link = connect(&transport, &options.destination, &identity, options.timeout, options.silent).await?;
+    let link = connect(
+        &transport,
+        &options.destination,
+        &identity,
+        options.timeout,
+        options.silent,
+    )
+    .await?;
 
     if !options.silent {
         println!("Advertising file resource");
@@ -690,7 +731,14 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
     .await;
 
     let identity = rncp_identity(&config_dir, options.identity_path.as_deref())?;
-    let link = connect(&transport, &options.destination, &identity, options.timeout, options.silent).await?;
+    let link = connect(
+        &transport,
+        &options.destination,
+        &identity,
+        options.timeout,
+        options.silent,
+    )
+    .await?;
 
     if !options.silent {
         println!("Requesting file from remote");
@@ -707,7 +755,9 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
     let response = transport
         .await_request_response(request_id, options.timeout)
         .await
-        .ok_or_else(|| "Fetch request failed due to an unknown error (probably not authorised)".to_string())?;
+        .ok_or_else(|| {
+            "Fetch request failed due to an unknown error (probably not authorised)".to_string()
+        })?;
 
     match parse_fetch_response(&response) {
         FetchResponse::Allowed => {}
@@ -744,7 +794,10 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
             .as_deref()
             .and_then(unpack_metadata)
             .unwrap_or_else(|| sanitize_filename(&options.file));
-        let dir = options.save_dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let dir = options
+            .save_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("."));
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         let path = unique_path(&dir, &name);
         std::fs::write(&path, &data).map_err(|err| err.to_string())?;
@@ -766,16 +819,16 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
 
 fn transfer_event_match(
     event: &reticulum::resource::ResourceEvent,
-    expected: &AddressHash,
+    expected: &reticulum::hash::Hash,
 ) -> Option<bool> {
     if let Some(advertisement) = event.advertisement.as_ref() {
-        let logical_match = AddressHash::new_from_hash(&advertisement.original_hash) == *expected;
+        let logical_match = advertisement.original_hash == *expected;
         if logical_match {
             return Some(advertisement.segment_index == advertisement.total_segments);
         }
 
         // Preserve the unsplit/initial direct-hash form for older peers.
-        let direct_match = AddressHash::new_from_hash(&event.hash) == *expected;
+        let direct_match = event.hash == *expected;
         if direct_match && advertisement.segment_index == 1 && advertisement.total_segments == 1 {
             return Some(true);
         }
@@ -785,7 +838,7 @@ fn transfer_event_match(
     // Initial unsplit events use the resource hash directly. Later split
     // events have a different hash and must carry the original hash in their
     // advertisement to be correlated.
-    (AddressHash::new_from_hash(&event.hash) == *expected).then_some(true)
+    (event.hash == *expected).then_some(true)
 }
 
 /// Wait for a sent resource to conclude, printing progress while it runs.
@@ -793,7 +846,7 @@ fn transfer_event_match(
 /// Progress lines are flushed so `\r` updates render live.
 pub async fn wait_for_transfer(
     events: &mut tokio::sync::broadcast::Receiver<reticulum::resource::ResourceEvent>,
-    resource_hash: &AddressHash,
+    resource_hash: &reticulum::hash::Hash,
     timeout: Duration,
     show_progress: bool,
 ) -> Result<(), String> {
@@ -857,7 +910,10 @@ pub fn new_identity() -> PrivateIdentity {
 
 /// Print the persistent rncp identity and the destination hash it listens
 /// on, then exit (Python `rncp.py -p/--print-identity`).
-pub async fn print_identity(config_dir: &Path, identity_path: Option<&Path>) -> Result<(String, String), String> {
+pub async fn print_identity(
+    config_dir: &Path,
+    identity_path: Option<&Path>,
+) -> Result<(String, String), String> {
     let identity = rncp_identity(config_dir, identity_path)?;
     let destination = SingleInputDestination::new(identity.clone(), destination_name());
     Ok((
@@ -902,7 +958,7 @@ mod tests {
 
     #[test]
     fn transfer_events_follow_original_hash_and_final_segment() {
-        let expected = AddressHash::new([1; 16]);
+        let expected = reticulum::hash::Hash::new([1; 32]);
         assert_eq!(
             transfer_event_match(&transfer_event(2, 1, 1, 2, true), &expected),
             Some(false)
@@ -965,8 +1021,14 @@ mod tests {
 
     #[test]
     fn fetch_response_parsing() {
-        assert_eq!(parse_fetch_response(&msgpack_bool(true)), FetchResponse::Allowed);
-        assert_eq!(parse_fetch_response(&msgpack_bool(false)), FetchResponse::NotFound);
+        assert_eq!(
+            parse_fetch_response(&msgpack_bool(true)),
+            FetchResponse::Allowed
+        );
+        assert_eq!(
+            parse_fetch_response(&msgpack_bool(false)),
+            FetchResponse::NotFound
+        );
         assert_eq!(
             parse_fetch_response(&msgpack_fetch_not_allowed()),
             FetchResponse::NotAllowed

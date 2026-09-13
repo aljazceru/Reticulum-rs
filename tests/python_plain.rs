@@ -29,21 +29,17 @@ async fn spawn_plain(send: Option<&str>, listen_secs: f64) -> Partner {
     spawn_plain_on("tests/rns-py-configs/udp-plain", send, listen_secs).await
 }
 
-async fn spawn_plain_on(
-    config: &str,
-    send: Option<&str>,
-    listen_secs: f64,
-) -> Partner {
+async fn spawn_plain_on(config: &str, send: Option<&str>, listen_secs: f64) -> Partner {
     let mut child = Command::new("python3")
         .arg("-u")
         .arg("tests/py-interop/plain.py")
         .arg("--config")
         .arg(config)
-        .args(send.map(|s| vec!["--send".to_string(), s.to_string()]).unwrap_or_default())
-        .args(vec![
-            "--listen-secs".to_string(),
-            listen_secs.to_string(),
-        ])
+        .args(
+            send.map(|s| vec!["--send".to_string(), s.to_string()])
+                .unwrap_or_default(),
+        )
+        .args(vec!["--listen-secs".to_string(), listen_secs.to_string()])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -62,7 +58,11 @@ async fn spawn_plain_on(
     Partner { child, lines: rx }
 }
 
-async fn wait_line(rx: &mut broadcast::Receiver<String>, needle: &str, secs: u64) -> Option<String> {
+async fn wait_line(
+    rx: &mut broadcast::Receiver<String>,
+    needle: &str,
+    secs: u64,
+) -> Option<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -87,7 +87,9 @@ async fn rust_broadcast_received_by_python() {
 
     // Wait for the Python broadcast destination to be up, plus a grace
     // period for its shared-instance interfaces to bind.
-    wait_line(&mut lines, "[PYI] destination", 15).await.expect("destination");
+    wait_line(&mut lines, "[PYI] destination", 15)
+        .await
+        .expect("destination");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let transport = TransportConfig::default().build();
@@ -131,9 +133,16 @@ async fn python_broadcast_received_by_rust() {
     let hash = destination.lock().await.desc.address_hash;
 
     let mut data_events = transport.received_data_events();
-    let partner = spawn_plain_on("tests/rns-py-configs/udp-plain2", Some("hello from python broadcast"), 5.0).await;
+    let partner = spawn_plain_on(
+        "tests/rns-py-configs/udp-plain2",
+        Some("hello from python broadcast"),
+        5.0,
+    )
+    .await;
     let mut lines = partner.lines.resubscribe();
-    wait_line(&mut lines, "[PYI] sent", 15).await.expect("python sent");
+    wait_line(&mut lines, "[PYI] sent", 15)
+        .await
+        .expect("python sent");
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut received = None;

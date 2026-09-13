@@ -79,8 +79,7 @@ pub fn pack_signalling(signals: &[u8]) -> Result<Vec<u8>, LxstError> {
                 "signal {s:#x} outside positive-fixint range"
             )));
         }
-        rmp::encode::write_pfix(&mut buf, s)
-            .map_err(|e| LxstError::WireFormat(e.to_string()))?;
+        rmp::encode::write_pfix(&mut buf, s).map_err(|e| LxstError::WireFormat(e.to_string()))?;
     }
     Ok(buf)
 }
@@ -614,9 +613,8 @@ impl Packetizer {
     /// Build the wire payload for one encoded frame (exposed for tests and
     /// for [`crate::call`]).
     pub fn frame_payload(&self, frame: &[u8]) -> Result<Vec<u8>, LxstError> {
-        let header = codec_header_byte(self.codec).ok_or(LxstError::UnsupportedCodec(
-            self.codec,
-        ))?;
+        let header =
+            codec_header_byte(self.codec).ok_or(LxstError::UnsupportedCodec(self.codec))?;
         let mut data = Vec::with_capacity(1 + frame.len());
         data.push(header);
         data.extend_from_slice(frame);
@@ -737,7 +735,9 @@ impl LinkSource {
     }
 
     /// Create a link source with a caller-provided codec instance.
-    pub fn with_codec_instance(codec: Option<Box<dyn Codec>>) -> (Self, mpsc::Receiver<LinkSourceEvent>) {
+    pub fn with_codec_instance(
+        codec: Option<Box<dyn Codec>>,
+    ) -> (Self, mpsc::Receiver<LinkSourceEvent>) {
         let (tx, rx) = mpsc::channel(256);
         let codec_type = codec.as_ref().map(|c| c.codec_type());
         let source = Self {
@@ -778,7 +778,8 @@ impl LinkSource {
     pub fn set_codec(&mut self, codec: Box<dyn Codec>) {
         self.codec_type = Some(codec.codec_type());
         self.codec = codec;
-        self.codec.set_sink_params(self.sink_samplerate, self.sink_channels);
+        self.codec
+            .set_sink_params(self.sink_samplerate, self.sink_channels);
     }
 
     /// Handle one raw packet payload (Python `LinkSource._packet`).
@@ -790,7 +791,10 @@ impl LinkSource {
         let msg = match unpack_message(data) {
             Ok(m) => m,
             Err(e) => {
-                let _ = self.events.send(LinkSourceEvent::DecodeError(e.to_string())).await;
+                let _ = self
+                    .events
+                    .send(LinkSourceEvent::DecodeError(e.to_string()))
+                    .await;
                 return 0;
             }
         };
@@ -820,10 +824,7 @@ impl LinkSource {
                             self.codec = c;
                             self.codec_type = Some(t);
                             switched = Some(t);
-                            let _ = self
-                                .events
-                                .send(LinkSourceEvent::CodecSwitched(t))
-                                .await;
+                            let _ = self.events.send(LinkSourceEvent::CodecSwitched(t)).await;
                         }
                         Err(e) => {
                             let _ = self
@@ -859,7 +860,10 @@ impl LinkSource {
                         }
                     }
                 } else {
-                    let _ = self.events.send(LinkSourceEvent::UnknownCodec(header)).await;
+                    let _ = self
+                        .events
+                        .send(LinkSourceEvent::UnknownCodec(header))
+                        .await;
                     continue;
                 }
             }
@@ -882,7 +886,10 @@ impl LinkSource {
         }
 
         if !msg.signals.is_empty() {
-            let _ = self.events.send(LinkSourceEvent::Signals(msg.signals)).await;
+            let _ = self
+                .events
+                .send(LinkSourceEvent::Signals(msg.signals))
+                .await;
         }
 
         frames

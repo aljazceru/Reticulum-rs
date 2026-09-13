@@ -14,12 +14,7 @@ use reticulum_discovery::{
     DiscoveredStatus, InterfaceAnnouncer, InterfaceDiscovery, InterfaceInfo,
 };
 
-async fn udp_bridge(
-    a: &Arc<Transport>,
-    b: &Arc<Transport>,
-    port_a: u16,
-    port_b: u16,
-) {
+async fn udp_bridge(a: &Arc<Transport>, b: &Arc<Transport>, port_a: u16, port_b: u16) {
     {
         let manager = a.iface_manager();
         let mut manager = manager.lock().await;
@@ -49,21 +44,13 @@ async fn udp_bridge(
 
 #[tokio::test]
 async fn discovery_announce_validate_and_autoconnect() {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
     let identity_a = PrivateIdentity::new_from_rand(OsRng);
     let identity_b = PrivateIdentity::new_from_rand(OsRng);
 
-    let a = Arc::new(
-        TransportConfig::new("disc-a", &identity_a)
-            .build(),
-    );
-    let b = Arc::new(
-        TransportConfig::new("disc-b", &identity_b)
-            .build(),
-    );
+    let a = Arc::new(TransportConfig::new("disc-a", &identity_a).build());
+    let b = Arc::new(TransportConfig::new("disc-b", &identity_b).build());
 
     // UDP bridge for the discovery announces.
     udp_bridge(&a, &b, 4432, 4433).await;
@@ -82,13 +69,7 @@ async fn discovery_announce_validate_and_autoconnect() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Low stamp value keeps the test fast.
-    let announcer = InterfaceAnnouncer::start(
-        &a,
-        &identity_a,
-        4,
-        Duration::from_millis(300),
-    )
-    .await;
+    let announcer = InterfaceAnnouncer::start(&a, &identity_a, 4, Duration::from_millis(300)).await;
 
     announcer
         .announce_interface(InterfaceInfo {
@@ -132,7 +113,10 @@ async fn discovery_announce_validate_and_autoconnect() {
         false
     }
     .await;
-    assert!(discovered, "discovery announce must be received and validated");
+    assert!(
+        discovered,
+        "discovery announce must be received and validated"
+    );
 
     let table = discovery.list().await;
     assert_eq!(table.len(), 1);
@@ -142,7 +126,10 @@ async fn discovery_announce_validate_and_autoconnect() {
 
     // Auto-connect to the discovered TCP interface.
     let connected = discovery.connect_discovered().await;
-    assert!(connected >= 1, "discovered TCP interface must be auto-connected");
+    assert!(
+        connected >= 1,
+        "discovered TCP interface must be auto-connected"
+    );
 
     let stats = b.interface_stats().await;
     assert!(

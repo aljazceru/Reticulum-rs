@@ -27,8 +27,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
 use reticulum::destination::link::{Link, LinkEvent, LinkEventData, LinkId};
-use reticulum::destination::{DestinationDesc, DestinationName, SingleInputDestination,
-    SingleOutputDestination};
+use reticulum::destination::{
+    DestinationDesc, DestinationName, SingleInputDestination, SingleOutputDestination,
+};
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::{Transport, TransportConfig};
 
@@ -156,11 +157,15 @@ impl CallEndpoint {
         identity: PrivateIdentity,
     ) -> Result<(Self, mpsc::Receiver<CallEvent>), LxstError> {
         let destination = match Arc::get_mut(&mut transport) {
-            Some(t) => t.add_destination(identity.clone(), call_endpoint_name()).await,
+            Some(t) => {
+                t.add_destination(identity.clone(), call_endpoint_name())
+                    .await
+            }
             None => {
                 return Err(LxstError::InvalidState(
                     "CallEndpoint::new requires sole ownership of the transport; \
-                     use with_destination() for an already-shared transport".into(),
+                     use with_destination() for an already-shared transport"
+                        .into(),
                 ))
             }
         };
@@ -228,8 +233,7 @@ impl CallEndpoint {
         sink_samplerate: Option<u32>,
         sink_channels: Option<usize>,
     ) -> Result<ActiveCallHandle, LxstError> {
-        let codec = new_codec(codec_type)
-            .map_err(|_| LxstError::UnsupportedCodec(codec_type))?;
+        let codec = new_codec(codec_type).map_err(|_| LxstError::UnsupportedCodec(codec_type))?;
         let (link_source, mut source_events) = LinkSource::with_codec_instance(Some(codec));
         let mut link_source = link_source;
         link_source.set_sink_params(sink_samplerate, sink_channels);
@@ -402,7 +406,9 @@ mod tests {
     use rand_core::OsRng;
     use reticulum::destination::link::LinkStatus;
 
-    async fn endpoint_named(name: &str) -> (Arc<Transport>, CallEndpoint, mpsc::Receiver<CallEvent>) {
+    async fn endpoint_named(
+        name: &str,
+    ) -> (Arc<Transport>, CallEndpoint, mpsc::Receiver<CallEvent>) {
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let transport = call_transport(&identity, name);
         let (endpoint, events) = CallEndpoint::new(transport, identity).await.unwrap();
@@ -433,8 +439,9 @@ mod tests {
         // otherwise calls could never be routed.
         let identity = PrivateIdentity::new_from_rand(OsRng);
         let transport = call_transport(&identity, "local");
-        let (endpoint, _events) =
-            CallEndpoint::new(transport, identity.clone()).await.unwrap();
+        let (endpoint, _events) = CallEndpoint::new(transport, identity.clone())
+            .await
+            .unwrap();
         let local_hash = endpoint.address_hash().await;
 
         let remote = RemoteCallDestination::for_identity(&identity);

@@ -88,7 +88,16 @@ impl StatusReport {
         // (Name, Status, Mode, Bitrate, TX, RX, ...).
         out.push_str(&format!(
             "{:<34} {:<12} {:<7} {:<8} {:<12} {:<10} {:<10} {:<20} {:<8} {:<16}\n",
-            "Name", "Type", "Status", "Mode", "Bitrate", "TX", "RX", "Announces", "PRs", "Violations"
+            "Name",
+            "Type",
+            "Status",
+            "Mode",
+            "Bitrate",
+            "TX",
+            "RX",
+            "Announces",
+            "PRs",
+            "Violations"
         ));
         out.push_str(&"-".repeat(150));
         out.push('\n');
@@ -118,10 +127,7 @@ impl StatusReport {
             self.queue_pressure.1[1],
             self.queue_pressure.1[2],
             self.queue_pressure.1[3],
-            self.queue_pressure
-                .2
-                .iter()
-                .sum::<u64>(),
+            self.queue_pressure.2.iter().sum::<u64>(),
         ));
 
         out.push('\n');

@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     hash::AddressHash,
-    packet::{
-        DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType,
-    },
+    packet::{DestinationType, Header, HeaderType, IfacFlag, Packet, PacketType, PropagationType},
 };
 
 /// Path expiry time (Python `Transport.PATHFINDER_E` = 1 week).
@@ -267,7 +265,10 @@ impl PathTable {
     /// Route a locally-originated packet toward its destination.
     /// Python `Transport.outbound` writes the packet's own hop count
     /// (0 for freshly created packets); relays add hops on receive.
-    pub fn handle_local_packet(&mut self, original_packet: &Packet) -> (Packet, Option<AddressHash>) {
+    pub fn handle_local_packet(
+        &mut self,
+        original_packet: &Packet,
+    ) -> (Packet, Option<AddressHash>) {
         let lookup = original_packet.destination;
 
         let entry = match self.map.get(&lookup).filter(|entry| !entry.unresponsive) {

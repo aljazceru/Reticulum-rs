@@ -12,30 +12,22 @@ use reticulum_utils::rnpath;
 async fn udp_pair(server_port: u16, client_port: u16) -> (Transport, Transport) {
     let server = TransportConfig::new("srv", &PrivateIdentity::new_from_rand(OsRng)).build();
     let client = TransportConfig::new("cli", &PrivateIdentity::new_from_rand(OsRng)).build();
-    server
-        .iface_manager()
-        .lock()
-        .await
-        .spawn(
-            UdpInterface::new(
-                format!("127.0.0.1:{server_port}"),
-                Some(format!("127.0.0.1:{client_port}")),
-                false,
-            ),
-            UdpInterface::spawn,
-        );
-    client
-        .iface_manager()
-        .lock()
-        .await
-        .spawn(
-            UdpInterface::new(
-                format!("127.0.0.1:{client_port}"),
-                Some(format!("127.0.0.1:{server_port}")),
-                false,
-            ),
-            UdpInterface::spawn,
-        );
+    server.iface_manager().lock().await.spawn(
+        UdpInterface::new(
+            format!("127.0.0.1:{server_port}"),
+            Some(format!("127.0.0.1:{client_port}")),
+            false,
+        ),
+        UdpInterface::spawn,
+    );
+    client.iface_manager().lock().await.spawn(
+        UdpInterface::new(
+            format!("127.0.0.1:{client_port}"),
+            Some(format!("127.0.0.1:{server_port}")),
+            false,
+        ),
+        UdpInterface::spawn,
+    );
     (server, client)
 }
 
@@ -104,7 +96,10 @@ async fn status_report_shows_paths_and_interfaces() {
     );
 
     let report = reticulum_utils::rnstatus::collect(&client, false).await;
-    assert!(report.paths.iter().any(|entry| entry.destination == dest_hash));
+    assert!(report
+        .paths
+        .iter()
+        .any(|entry| entry.destination == dest_hash));
     // One UDP interface on the client.
     assert_eq!(report.interfaces.len(), 1);
     assert_eq!(report.interfaces[0].status, "Up");

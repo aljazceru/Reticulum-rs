@@ -10,10 +10,10 @@
 //! `CommandExitedMessage`.
 
 use std::collections::HashSet;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use reticulum::channel::Message;
 use reticulum::destination::{DestinationName, ProofStrategy};
@@ -167,7 +167,12 @@ impl Message for RnshMessage {
     fn pack(&self) -> Vec<u8> {
         match self {
             Self::Noop => Vec::new(),
-            Self::WindowSize { rows, cols, hpix, vpix } => {
+            Self::WindowSize {
+                rows,
+                cols,
+                hpix,
+                vpix,
+            } => {
                 let tuple = rmpv::Value::Array(vec![
                     pack_opt_u32(*rows),
                     pack_opt_u32(*cols),
@@ -176,10 +181,18 @@ impl Message for RnshMessage {
                 ]);
                 rmpv_to_bytes(&tuple)
             }
-            Self::ExecuteCommand { cmdline, pipe_stdin, pipe_stdout, pipe_stderr, term } => {
+            Self::ExecuteCommand {
+                cmdline,
+                pipe_stdin,
+                pipe_stdout,
+                pipe_stderr,
+                term,
+            } => {
                 let cmdline = match cmdline {
                     Some(args) => rmpv::Value::Array(
-                        args.iter().map(|a| rmpv::Value::String(a.as_str().into())).collect(),
+                        args.iter()
+                            .map(|a| rmpv::Value::String(a.as_str().into()))
+                            .collect(),
                     ),
                     None => rmpv::Value::Nil,
                 };
@@ -200,7 +213,11 @@ impl Message for RnshMessage {
                 ]);
                 rmpv_to_bytes(&tuple)
             }
-            Self::StreamData { stream_id, eof, data } => {
+            Self::StreamData {
+                stream_id,
+                eof,
+                data,
+            } => {
                 // 2-byte big-endian header: id | eof<<15 (compression
                 // unsupported on this side).
                 let header = (stream_id & 0x3fff) | if *eof { 0x8000 } else { 0 };
@@ -209,7 +226,10 @@ impl Message for RnshMessage {
                 packed.extend_from_slice(data);
                 packed
             }
-            Self::VersionInfo { sw_version, protocol_version } => {
+            Self::VersionInfo {
+                sw_version,
+                protocol_version,
+            } => {
                 let tuple = rmpv::Value::Array(vec![
                     rmpv::Value::String(sw_version.as_str().into()),
                     (*protocol_version).into(),
@@ -238,8 +258,8 @@ impl Message for RnshMessage {
         match message_type {
             MSG_NOOP => Ok(Self::Noop),
             MSG_WINDOW_SIZE => {
-                let value: rmpv::Value =
-                    rmpv::decode::value::read_value(&mut &packed[..]).map_err(|_| RnsError::ChannelMessageTooBig)?;
+                let value: rmpv::Value = rmpv::decode::value::read_value(&mut &packed[..])
+                    .map_err(|_| RnsError::ChannelMessageTooBig)?;
                 let rmpv::Value::Array(items) = value else {
                     return Err(RnsError::ChannelMessageTooBig);
                 };
@@ -251,15 +271,17 @@ impl Message for RnshMessage {
                 })
             }
             MSG_EXECUTE_COMMAND => {
-                let value: rmpv::Value =
-                    rmpv::decode::value::read_value(&mut &packed[..]).map_err(|_| RnsError::ChannelMessageTooBig)?;
+                let value: rmpv::Value = rmpv::decode::value::read_value(&mut &packed[..])
+                    .map_err(|_| RnsError::ChannelMessageTooBig)?;
                 let rmpv::Value::Array(items) = value else {
                     return Err(RnsError::ChannelMessageTooBig);
                 };
                 let cmdline = match items.first() {
-                    Some(rmpv::Value::Array(args)) => {
-                        Some(args.iter().filter_map(unpack_opt_string).collect::<Vec<String>>())
-                    }
+                    Some(rmpv::Value::Array(args)) => Some(
+                        args.iter()
+                            .filter_map(unpack_opt_string)
+                            .collect::<Vec<String>>(),
+                    ),
                     _ => None,
                 };
                 Ok(Self::ExecuteCommand {
@@ -294,8 +316,8 @@ impl Message for RnshMessage {
                 })
             }
             MSG_VERSION_INFO => {
-                let value: rmpv::Value =
-                    rmpv::decode::value::read_value(&mut &packed[..]).map_err(|_| RnsError::ChannelMessageTooBig)?;
+                let value: rmpv::Value = rmpv::decode::value::read_value(&mut &packed[..])
+                    .map_err(|_| RnsError::ChannelMessageTooBig)?;
                 let rmpv::Value::Array(items) = value else {
                     return Err(RnsError::ChannelMessageTooBig);
                 };
@@ -308,8 +330,8 @@ impl Message for RnshMessage {
                 })
             }
             MSG_ERROR => {
-                let value: rmpv::Value =
-                    rmpv::decode::value::read_value(&mut &packed[..]).map_err(|_| RnsError::ChannelMessageTooBig)?;
+                let value: rmpv::Value = rmpv::decode::value::read_value(&mut &packed[..])
+                    .map_err(|_| RnsError::ChannelMessageTooBig)?;
                 let rmpv::Value::Array(items) = value else {
                     return Err(RnsError::ChannelMessageTooBig);
                 };
@@ -319,8 +341,8 @@ impl Message for RnshMessage {
                 })
             }
             MSG_COMMAND_EXITED => {
-                let value: rmpv::Value =
-                    rmpv::decode::value::read_value(&mut &packed[..]).map_err(|_| RnsError::ChannelMessageTooBig)?;
+                let value: rmpv::Value = rmpv::decode::value::read_value(&mut &packed[..])
+                    .map_err(|_| RnsError::ChannelMessageTooBig)?;
                 Ok(Self::CommandExited {
                     return_code: value.as_i64().map(|v| v as i32),
                 })
@@ -363,8 +385,7 @@ fn remote_authorized(
     allowed: &HashSet<AddressHash>,
     remote: Option<&Identity>,
 ) -> bool {
-    allow_all
-        || remote.is_some_and(|identity| allowed.contains(&identity.address_hash))
+    allow_all || remote.is_some_and(|identity| allowed.contains(&identity.address_hash))
 }
 
 /// Run an `rnsh` listener. Returns the announced destination hash; the
@@ -381,8 +402,8 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
     );
 
     let identity_path = options.config_dir.join("storage/identities/rnsh");
-    let (identity, _) = load_or_create_private_identity(&identity_path)
-        .map_err(|err| err.to_string())?;
+    let (identity, _) =
+        load_or_create_private_identity(&identity_path).map_err(|err| err.to_string())?;
 
     let destination = transport
         .add_destination(identity, DestinationName::new(APP_NAME, "shell"))
@@ -402,7 +423,9 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
     tokio::spawn(async move {
         let mut link_events = event_transport.in_link_events();
         loop {
-            let Ok(event) = link_events.recv().await else { return };
+            let Ok(event) = link_events.recv().await else {
+                return;
+            };
             match event.event {
                 reticulum::destination::link::LinkEvent::Activated if allow_all => {
                     start_session(
@@ -472,7 +495,9 @@ async fn start_session(
 
         while let Ok(message) = receiver.recv().await {
             match message {
-                RnshMessage::VersionInfo { protocol_version, .. } => {
+                RnshMessage::VersionInfo {
+                    protocol_version, ..
+                } => {
                     if protocol_version != PROTOCOL_VERSION {
                         let _ = send_when_ready(
                             &channel,
@@ -499,7 +524,11 @@ async fn start_session(
                     }
                     version_exchanged = true;
                 }
-                RnshMessage::ExecuteCommand { cmdline, pipe_stdin, .. } if version_exchanged => {
+                RnshMessage::ExecuteCommand {
+                    cmdline,
+                    pipe_stdin,
+                    ..
+                } if version_exchanged => {
                     let mut command = default_command.clone().unwrap_or_default();
                     match cmdline {
                         Some(remote) if !remote.is_empty() => {
@@ -529,14 +558,15 @@ async fn start_session(
                     builder.args(&command[1..]);
                     builder.stdout(std::process::Stdio::piped());
                     builder.stderr(std::process::Stdio::piped());
-                    builder.stdin(
-                        if pipe_stdin {
-                            std::process::Stdio::piped()
-                        } else {
-                            std::process::Stdio::null()
-                        },
+                    builder.stdin(if pipe_stdin {
+                        std::process::Stdio::piped()
+                    } else {
+                        std::process::Stdio::null()
+                    });
+                    builder.env(
+                        "TERM",
+                        std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
                     );
-                    builder.env("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm".into()));
 
                     match builder.spawn() {
                         Ok(spawned) => child = Some(spawned),
@@ -626,8 +656,11 @@ async fn start_session(
             tokio::spawn(async move {
                 let mut receiver = stdin_receiver;
                 while let Ok(message) = receiver.recv().await {
-                    if let RnshMessage::StreamData { stream_id: STREAM_ID_STDIN, data, eof } =
-                        message
+                    if let RnshMessage::StreamData {
+                        stream_id: STREAM_ID_STDIN,
+                        data,
+                        eof,
+                    } = message
                     {
                         if !data.is_empty() && stdin.write_all(&data).await.is_err() {
                             break;
@@ -646,11 +679,7 @@ async fn start_session(
 
         let status = child.wait().await;
         let return_code = status.ok().and_then(|s| s.code());
-        let _ = send_when_ready(
-            &channel,
-            RnshMessage::CommandExited { return_code },
-        )
-        .await;
+        let _ = send_when_ready(&channel, RnshMessage::CommandExited { return_code }).await;
     });
 }
 
@@ -741,8 +770,8 @@ pub async fn run_command(
     })
     .await;
     let identity_path = options.config_dir.join("storage/identities/rnsh");
-    let (client_identity, _) = load_or_create_private_identity(&identity_path)
-        .map_err(|err| err.to_string())?;
+    let (client_identity, _) =
+        load_or_create_private_identity(&identity_path).map_err(|err| err.to_string())?;
 
     if !transport
         .await_path(destination, Some(Duration::from_secs(15)), None)
@@ -796,7 +825,10 @@ pub async fn run_command(
     let mut peer_version = false;
     while !peer_version {
         match tokio::time::timeout_at(deadline, receiver.recv()).await {
-            Ok(Ok(RnshMessage::VersionInfo { sw_version, protocol_version })) => {
+            Ok(Ok(RnshMessage::VersionInfo {
+                sw_version,
+                protocol_version,
+            })) => {
                 log::info!(
                     "connected server version info: sw {sw_version}, proto {protocol_version}"
                 );
@@ -875,17 +907,27 @@ pub async fn run_command(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     while let Ok(Ok(message)) = tokio::time::timeout_at(deadline, receiver.recv()).await {
         match message {
-            RnshMessage::StreamData { stream_id: STREAM_ID_STDOUT, data, .. } => {
+            RnshMessage::StreamData {
+                stream_id: STREAM_ID_STDOUT,
+                data,
+                ..
+            } => {
                 outcome.stdout.extend_from_slice(&data);
             }
-            RnshMessage::StreamData { stream_id: STREAM_ID_STDERR, data, .. } => {
+            RnshMessage::StreamData {
+                stream_id: STREAM_ID_STDERR,
+                data,
+                ..
+            } => {
                 outcome.stderr.extend_from_slice(&data);
             }
             RnshMessage::CommandExited { return_code } => {
                 outcome.exit_code = return_code;
                 break;
             }
-            RnshMessage::Error { msg, fatal: true, .. } => {
+            RnshMessage::Error {
+                msg, fatal: true, ..
+            } => {
                 return Err(msg.unwrap_or_else(|| "remote error".into()));
             }
             RnshMessage::Error { .. } => {}
@@ -965,10 +1007,13 @@ mod tests {
         let packed = message.pack();
         assert_eq!(packed, vec![0x00, 0x01, 0xde, 0xad, 0xbe, 0xef]);
 
-        let unpacked =
-            RnshMessage::unpack(&packed, MSG_STREAM_DATA).expect("unpack stream data");
+        let unpacked = RnshMessage::unpack(&packed, MSG_STREAM_DATA).expect("unpack stream data");
         match unpacked {
-            RnshMessage::StreamData { stream_id, eof, data } => {
+            RnshMessage::StreamData {
+                stream_id,
+                eof,
+                data,
+            } => {
                 assert_eq!(stream_id, STREAM_ID_STDOUT);
                 assert!(!eof);
                 assert_eq!(data, vec![0xde, 0xad, 0xbe, 0xef]);
@@ -994,10 +1039,12 @@ mod tests {
         let packed = message.pack();
         // msgpack fixarray of 2 elements
         assert_eq!(packed[0], 0x92);
-        let unpacked =
-            RnshMessage::unpack(&packed, MSG_VERSION_INFO).expect("unpack version info");
+        let unpacked = RnshMessage::unpack(&packed, MSG_VERSION_INFO).expect("unpack version info");
         match unpacked {
-            RnshMessage::VersionInfo { sw_version, protocol_version } => {
+            RnshMessage::VersionInfo {
+                sw_version,
+                protocol_version,
+            } => {
                 assert_eq!(sw_version, "test");
                 assert_eq!(protocol_version, 1);
             }
@@ -1015,10 +1062,15 @@ mod tests {
             term: Some("xterm".into()),
         };
         let packed = message.pack();
-        let unpacked =
-            RnshMessage::unpack(&packed, MSG_EXECUTE_COMMAND).expect("unpack exec");
+        let unpacked = RnshMessage::unpack(&packed, MSG_EXECUTE_COMMAND).expect("unpack exec");
         match unpacked {
-            RnshMessage::ExecuteCommand { cmdline, pipe_stdin, pipe_stdout, pipe_stderr, term } => {
+            RnshMessage::ExecuteCommand {
+                cmdline,
+                pipe_stdin,
+                pipe_stdout,
+                pipe_stderr,
+                term,
+            } => {
                 assert_eq!(cmdline, Some(vec!["echo".into(), "hi".into()]));
                 assert!(pipe_stdin);
                 assert!(pipe_stdout);

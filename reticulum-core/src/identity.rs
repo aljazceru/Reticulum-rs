@@ -8,7 +8,7 @@ use rand_core::CryptoRngCore;
 #[cfg(feature = "std")]
 pub use rand_core::OsRng;
 
-use ed25519_dalek::{VerifyingKey, SIGNATURE_LENGTH};
+use ed25519_dalek::{SIGNATURE_LENGTH, VerifyingKey};
 
 pub use ed25519_dalek::ed25519::signature::Signer;
 pub use ed25519_dalek::{Signature, SigningKey};
@@ -20,7 +20,7 @@ pub use x25519_dalek::{PublicKey, StaticSecret};
 use crate::{
     crypt::fernet::{Fernet, PlainText, Token},
     error::RnsError,
-    hash::{AddressHash, Hash, HASH_SIZE},
+    hash::{AddressHash, HASH_SIZE, Hash},
 };
 
 /// X.25519 ratchet key size in bytes (Python `Identity.RATCHETSIZE // 8`).
@@ -221,7 +221,8 @@ impl Identity {
         );
 
         let token_len = {
-            let token = fernet.encrypt(PlainText::from(text), &mut out_buf[RATCHET_KEY_LENGTH..])?;
+            let token =
+                fernet.encrypt(PlainText::from(text), &mut out_buf[RATCHET_KEY_LENGTH..])?;
             token.len()
         };
 
@@ -627,7 +628,6 @@ impl DerivedKey {
 // Ratchets (Python `Identity._generate_ratchet`, `_remember_ratchet`,
 // `get_ratchet`, `current_ratchet_id`, `_get_ratchet_id`, `_clean_ratchets`)
 //***************************************************************************/
-
 /// Python `Identity._ratchet_public_bytes`: derive the public ratchet key
 /// from a private ratchet key.
 pub fn ratchet_public_from_private(
@@ -659,7 +659,6 @@ pub const SINGLE_TOKEN_PUB_OVERHEAD: usize = RATCHET_KEY_LENGTH;
 // `Identity.known_destinations` / `Identity._remember_ratchet` storage files;
 // file access lives in the `reticulum` crate).
 //***************************************************************************/
-
 /// The `uses` field of a known-destination entry (Python list index 4).
 /// `0` means never used, `-1` means data retained for the destination and
 /// any other value is the unix timestamp of the last use.
@@ -719,10 +718,8 @@ pub fn pack_known_destinations(
         rmp::encode::write_bin(&mut out, hash.as_slice()).map_err(|_| RnsError::OutOfMemory)?;
         rmp::encode::write_array_len(&mut out, 5).map_err(|_| RnsError::OutOfMemory)?;
         rmp::encode::write_f64(&mut out, entry.time).map_err(|_| RnsError::OutOfMemory)?;
-        rmp::encode::write_bin(&mut out, &entry.packet_hash)
-            .map_err(|_| RnsError::OutOfMemory)?;
-        rmp::encode::write_bin(&mut out, &entry.public_key)
-            .map_err(|_| RnsError::OutOfMemory)?;
+        rmp::encode::write_bin(&mut out, &entry.packet_hash).map_err(|_| RnsError::OutOfMemory)?;
+        rmp::encode::write_bin(&mut out, &entry.public_key).map_err(|_| RnsError::OutOfMemory)?;
         match &entry.app_data {
             Some(data) => {
                 rmp::encode::write_bin(&mut out, data).map_err(|_| RnsError::OutOfMemory)?
@@ -736,8 +733,7 @@ pub fn pack_known_destinations(
                 let _ = rmp::encode::write_sint(&mut out, 0).map_err(|_| RnsError::OutOfMemory)?;
             }
             DestinationUses::Retained => {
-                let _ =
-                    rmp::encode::write_sint(&mut out, -1).map_err(|_| RnsError::OutOfMemory)?;
+                let _ = rmp::encode::write_sint(&mut out, -1).map_err(|_| RnsError::OutOfMemory)?;
             }
             DestinationUses::LastUsed(time) => {
                 rmp::encode::write_f64(&mut out, time).map_err(|_| RnsError::OutOfMemory)?;
@@ -847,8 +843,7 @@ pub fn unpack_ratchet(bytes: &[u8]) -> Result<RatchetFileData, RnsError> {
 /// entry is the packed msgpack list of private ratchet keys.
 pub fn pack_ratchet_list(keys: &[[u8; RATCHET_KEY_LENGTH]]) -> Result<Vec<u8>, RnsError> {
     let mut out = Vec::new();
-    rmp::encode::write_array_len(&mut out, keys.len() as u32)
-        .map_err(|_| RnsError::OutOfMemory)?;
+    rmp::encode::write_array_len(&mut out, keys.len() as u32).map_err(|_| RnsError::OutOfMemory)?;
     for key in keys {
         rmp::encode::write_bin(&mut out, key).map_err(|_| RnsError::OutOfMemory)?;
     }
@@ -877,8 +872,7 @@ pub fn pack_destination_ratchets(
     let mut out = Vec::new();
     rmp::encode::write_map_len(&mut out, 2).map_err(|_| RnsError::OutOfMemory)?;
     rmp::encode::write_str(&mut out, "signature").map_err(|_| RnsError::OutOfMemory)?;
-    rmp::encode::write_bin(&mut out, &signature.to_bytes())
-        .map_err(|_| RnsError::OutOfMemory)?;
+    rmp::encode::write_bin(&mut out, &signature.to_bytes()).map_err(|_| RnsError::OutOfMemory)?;
     rmp::encode::write_str(&mut out, "ratchets").map_err(|_| RnsError::OutOfMemory)?;
     rmp::encode::write_bin(&mut out, &packed_ratchets).map_err(|_| RnsError::OutOfMemory)?;
 
@@ -923,7 +917,6 @@ pub fn unpack_destination_ratchets(
 //***************************************************************************/
 // Minimal msgpack reader matching Python `umsgpack` output shapes.
 //***************************************************************************/
-
 struct MsgReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -1072,15 +1065,14 @@ impl<'a> MsgReader<'a> {
             }
             0xd2 => {
                 let bytes = self.take(4)?;
-                Ok(Num::Int(i32::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3],
-                ]) as i64))
+                Ok(Num::Int(
+                    i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as i64,
+                ))
             }
             0xd3 => {
                 let bytes = self.take(8)?;
                 Ok(Num::Int(i64::from_be_bytes([
-                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
-                    bytes[7],
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
                 ])))
             }
             0xcb => {

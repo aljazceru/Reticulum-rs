@@ -47,14 +47,7 @@ pub const CANCELLED: u8 = 0xFE;
 pub const FAILED: u8 = 0xFF;
 /// All valid message states.
 pub const STATES: [u8; 8] = [
-    GENERATING,
-    OUTBOUND,
-    SENDING,
-    SENT,
-    DELIVERED,
-    REJECTED,
-    CANCELLED,
-    FAILED,
+    GENERATING, OUTBOUND, SENDING, SENT, DELIVERED, REJECTED, CANCELLED, FAILED,
 ];
 
 /// Message transport representations.
@@ -155,8 +148,7 @@ pub const LINK_PACKET_MAX_CONTENT: usize = LINK_PACKET_MDU - LXMF_OVERHEAD;
 /// Plain packet MDU (`RNS.Packet.PLAIN_MDU`).
 pub const PLAIN_PACKET_MDU: usize = 464;
 /// The max content length of a plain (unencrypted) single packet.
-pub const PLAIN_PACKET_MAX_CONTENT: usize =
-    PLAIN_PACKET_MDU - LXMF_OVERHEAD + DESTINATION_LENGTH;
+pub const PLAIN_PACKET_MAX_CONTENT: usize = PLAIN_PACKET_MDU - LXMF_OVERHEAD + DESTINATION_LENGTH;
 
 // Descriptive strings regarding transport encryption
 /// Transport encryption description for group destinations.
@@ -174,8 +166,7 @@ pub const QR_ERROR_CORRECTION: &str = "ERROR_CORRECT_L";
 /// Maximum QR code storage capacity.
 pub const QR_MAX_STORAGE: usize = 2953;
 /// Maximum paper message payload size, given the QR storage capacity.
-pub const PAPER_MDU: usize =
-    ((QR_MAX_STORAGE - (URI_SCHEMA.len() + "://".len())) * 6) / 8;
+pub const PAPER_MDU: usize = ((QR_MAX_STORAGE - (URI_SCHEMA.len() + "://".len())) * 6) / 8;
 
 /// Transport encryption description, mirroring the string values stored by
 /// the Python implementation in `LXMessage.transport_encryption`.
@@ -233,10 +224,8 @@ pub fn encrypt_for_identity<R: CryptoRngCore + Copy>(
     let ephemeral_pub = x25519_dalek::PublicKey::from(&ephemeral);
     let shared = ephemeral.diffie_hellman(&identity.public_key);
 
-    let derived = hkdf::Hkdf::<sha2::Sha256>::new(
-        Some(identity.address_hash.as_slice()),
-        shared.as_bytes(),
-    );
+    let derived =
+        hkdf::Hkdf::<sha2::Sha256>::new(Some(identity.address_hash.as_slice()), shared.as_bytes());
 
     let mut key = [0u8; 64];
     derived
@@ -261,10 +250,7 @@ pub fn encrypt_for_identity<R: CryptoRngCore + Copy>(
 /// Decrypt data produced by [`encrypt_for_identity`] (or by the Python
 /// `RNS.Identity.encrypt`) using the private identity owning the SINGLE
 /// destination. Ratchets are not supported.
-pub fn decrypt_for_identity(
-    identity: &PrivateIdentity,
-    data: &[u8],
-) -> Result<Vec<u8>, LxmfError> {
+pub fn decrypt_for_identity(identity: &PrivateIdentity, data: &[u8]) -> Result<Vec<u8>, LxmfError> {
     if data.len() <= 32 {
         return Err(LxmfError::InvalidFormat);
     }
@@ -303,8 +289,7 @@ pub fn decrypt_for_identity(
 /// Base64 (URL-safe, without padding) encoding of `data`, as used by the
 /// `lxm://` paper message URI format.
 pub fn base64_urlsafe_nopad(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -470,6 +455,15 @@ pub struct LXMessage {
     pub transport_encrypted: bool,
     /// Description of the transport encryption in use.
     pub transport_encryption: Option<TransportEncryption>,
+    /// The type of the target delivery destination, used by
+    /// [`LXMessage::determine_transport_encryption`] (Python
+    /// `LXMessage.__destination.type`). Defaults to `Single`: LXMF delivery
+    /// destinations are SINGLE destinations.
+    pub destination_type: reticulum_core::packet::DestinationType,
+    /// Explicit transport-encryption override set via
+    /// [`LXMessage::set_transport_encryption`]; when present it wins over
+    /// the automatic determination.
+    transport_encryption_override: Option<TransportEncryption>,
 }
 
 impl Default for LXMessage {
@@ -543,6 +537,8 @@ impl LXMessage {
             delivery_attempts: 0,
             transport_encrypted: false,
             transport_encryption: None,
+            destination_type: reticulum_core::packet::DestinationType::Single,
+            transport_encryption_override: None,
         }
     }
 
@@ -660,8 +656,7 @@ impl LXMessage {
         // self.payload = [timestamp, title, content, fields]
         let plain_payload = self.pack_payload(timestamp, None);
 
-        let mut hashed_part =
-            Vec::with_capacity(2 * DESTINATION_LENGTH + plain_payload.len());
+        let mut hashed_part = Vec::with_capacity(2 * DESTINATION_LENGTH + plain_payload.len());
         hashed_part.extend_from_slice(self.destination_hash.as_slice());
         hashed_part.extend_from_slice(self.source_hash.as_slice());
         hashed_part.extend_from_slice(&plain_payload);
@@ -690,9 +685,8 @@ impl LXMessage {
         let packed_payload = self.pack_payload(timestamp, stamp.as_deref());
         self.packed_payload = Some(packed_payload.clone());
 
-        let mut packed = Vec::with_capacity(
-            2 * DESTINATION_LENGTH + SIGNATURE_LENGTH + packed_payload.len(),
-        );
+        let mut packed =
+            Vec::with_capacity(2 * DESTINATION_LENGTH + SIGNATURE_LENGTH + packed_payload.len());
         packed.extend_from_slice(self.destination_hash.as_slice());
         packed.extend_from_slice(self.source_hash.as_slice());
         packed.extend_from_slice(&signature.to_bytes());
@@ -727,8 +721,7 @@ impl LXMessage {
         // If opportunistic delivery was requested, check that the message
         // will fit within packet size limits. LXMF delivery destinations
         // are always SINGLE type.
-        if self.desired_method == Some(OPPORTUNISTIC)
-            && content_size > ENCRYPTED_PACKET_MAX_CONTENT
+        if self.desired_method == Some(OPPORTUNISTIC) && content_size > ENCRYPTED_PACKET_MAX_CONTENT
         {
             log::debug!(
                 "Opportunistic delivery was requested for {}, but content of length {} exceeds packet size limit. Falling back to link-based delivery.",
@@ -778,9 +771,7 @@ impl LXMessage {
         self.desired_method = Some(PROPAGATED);
         self.pack_core(source)?;
 
-        let destination_identity = self
-            .destination_identity
-            .ok_or(LxmfError::PathUnknown)?;
+        let destination_identity = self.destination_identity.ok_or(LxmfError::PathUnknown)?;
         let packed = self.packed.as_ref().ok_or(LxmfError::NotPacked)?;
 
         // self.__pn_encrypted_data = self.__destination.encrypt(
@@ -865,9 +856,7 @@ impl LXMessage {
         self.desired_method = Some(PAPER);
         self.pack_core(source)?;
 
-        let destination_identity = self
-            .destination_identity
-            .ok_or(LxmfError::PathUnknown)?;
+        let destination_identity = self.destination_identity.ok_or(LxmfError::PathUnknown)?;
         let packed = self.packed.as_ref().ok_or(LxmfError::NotPacked)?;
 
         let encrypted =
@@ -900,8 +889,7 @@ impl LXMessage {
         if let Some(tickets) = tickets {
             for ticket in tickets {
                 if let Some(message_id) = self.message_id {
-                    let mut material =
-                        Vec::with_capacity(TICKET_LENGTH + HASH_SIZE);
+                    let mut material = Vec::with_capacity(TICKET_LENGTH + HASH_SIZE);
                     material.extend_from_slice(ticket);
                     material.extend_from_slice(message_id.as_slice());
                     let ticket_stamp = truncated_hash(&material);
@@ -937,11 +925,40 @@ impl LXMessage {
     }
 
     /// Determine the transport encryption description for the current
-    /// delivery method, mirroring `LXMessage.determine_transport_encryption`.
-    /// LXMF delivery destinations are always SINGLE type.
+    /// delivery method and destination type, mirroring
+    /// `LXMessage.determine_transport_encryption`:
+    ///
+    /// - `OPPORTUNISTIC`/`PROPAGATED`/`PAPER` to a `SINGLE` destination:
+    ///   Curve25519; to a `GROUP` destination: AES-128; anything else
+    ///   (e.g. `PLAIN`): unencrypted.
+    /// - `DIRECT`: always Curve25519 (link or single-destination delivery).
+    /// - anything else: unencrypted.
+    ///
+    /// An explicit override set via [`Self::set_transport_encryption`]
+    /// always wins.
     pub fn determine_transport_encryption(&mut self) {
+        if let Some(encryption) = self.transport_encryption_override.clone() {
+            self.transport_encrypted = encryption != TransportEncryption::Unencrypted;
+            self.transport_encryption = Some(encryption);
+            return;
+        }
+        use reticulum_core::packet::DestinationType;
         match self.method {
-            OPPORTUNISTIC | DIRECT | PROPAGATED | PAPER => {
+            OPPORTUNISTIC | PROPAGATED | PAPER => match self.destination_type {
+                DestinationType::Single => {
+                    self.transport_encrypted = true;
+                    self.transport_encryption = Some(TransportEncryption::Curve25519);
+                }
+                DestinationType::Group => {
+                    self.transport_encrypted = true;
+                    self.transport_encryption = Some(TransportEncryption::Aes128);
+                }
+                DestinationType::Plain | DestinationType::Link => {
+                    self.transport_encrypted = false;
+                    self.transport_encryption = Some(TransportEncryption::Unencrypted);
+                }
+            },
+            DIRECT => {
                 self.transport_encrypted = true;
                 self.transport_encryption = Some(TransportEncryption::Curve25519);
             }
@@ -950,6 +967,38 @@ impl LXMessage {
                 self.transport_encryption = Some(TransportEncryption::Unencrypted);
             }
         }
+    }
+
+    /// Explicitly override the transport-encryption description, bypassing
+    /// the automatic determination in
+    /// [`Self::determine_transport_encryption`]. Use this when the delivery
+    /// setup implies a different transport encryption than the destination
+    /// type suggests.
+    pub fn set_transport_encryption(&mut self, encryption: TransportEncryption) {
+        self.transport_encrypted = encryption != TransportEncryption::Unencrypted;
+        self.transport_encryption = Some(encryption.clone());
+        self.transport_encryption_override = Some(encryption);
+    }
+
+    /// Clear an explicit transport-encryption override so the automatic
+    /// determination applies again.
+    pub fn clear_transport_encryption_override(&mut self) {
+        self.transport_encryption_override = None;
+    }
+
+    /// The type of the target delivery destination
+    /// (Python `LXMessage.__destination.type`).
+    pub fn destination_type(&self) -> reticulum_core::packet::DestinationType {
+        self.destination_type
+    }
+
+    /// Set the type of the target delivery destination used by
+    /// [`Self::determine_transport_encryption`].
+    pub fn set_destination_type(
+        &mut self,
+        destination_type: reticulum_core::packet::DestinationType,
+    ) {
+        self.destination_type = destination_type;
     }
 
     /// Pack the persistence container produced by the Python
@@ -964,8 +1013,7 @@ impl LXMessage {
         rmp::encode::write_str(&mut out, "state").ok();
         rmp::encode::write_uint(&mut out, self.state as u64).ok();
         rmp::encode::write_str(&mut out, "lxmf_bytes").ok();
-        rmp::encode::write_bin_len(&mut out, self.packed.as_ref().unwrap().len() as u32)
-            .ok();
+        rmp::encode::write_bin_len(&mut out, self.packed.as_ref().unwrap().len() as u32).ok();
         out.extend_from_slice(self.packed.as_ref().unwrap());
         rmp::encode::write_str(&mut out, "transport_encrypted").ok();
         rmp::encode::write_bool(&mut out, self.transport_encrypted).ok();
@@ -986,7 +1034,10 @@ impl LXMessage {
 
     /// Write the packed message to `directory`, using an atomic
     /// rename as the Python `write_to_directory` does.
-    pub fn write_to_directory(&mut self, directory: &std::path::Path) -> Result<std::path::PathBuf, LxmfError> {
+    pub fn write_to_directory(
+        &mut self,
+        directory: &std::path::Path,
+    ) -> Result<std::path::PathBuf, LxmfError> {
         let hash = self.hash.ok_or(LxmfError::NotPacked)?;
         let file_name = crate::to_hex(hash.as_slice());
         let file_path = directory.join(&file_name);
@@ -994,11 +1045,7 @@ impl LXMessage {
         let mut random_bytes = [0u8; 8];
         use rand_core::RngCore;
         rand_core::OsRng.fill_bytes(&mut random_bytes);
-        let tmp_name = format!(
-            "{}.tmp.{}",
-            file_name,
-            crate::to_hex(&random_bytes)
-        );
+        let tmp_name = format!("{}.tmp.{}", file_name, crate::to_hex(&random_bytes));
         let tmp_path = directory.join(&tmp_name);
 
         let container = self.packed_container()?;
@@ -1068,8 +1115,7 @@ impl LXMessage {
             [2 * DESTINATION_LENGTH..2 * DESTINATION_LENGTH + SIGNATURE_LENGTH]
             .try_into()
             .unwrap();
-        let mut packed_payload =
-            &lxmf_bytes[2 * DESTINATION_LENGTH + SIGNATURE_LENGTH..];
+        let mut packed_payload = &lxmf_bytes[2 * DESTINATION_LENGTH + SIGNATURE_LENGTH..];
 
         // Unpack the payload array: [timestamp, title, content, fields
         // (, stamp)]
@@ -1129,12 +1175,7 @@ impl LXMessage {
         let destination_identity = resolver(&destination_hash);
         let source_identity = resolver(&source_hash);
 
-        let mut message = Self::new(
-            destination_hash,
-            source_hash,
-            &title_bytes,
-            &content_bytes,
-        );
+        let mut message = Self::new(destination_hash, source_hash, &title_bytes, &content_bytes);
         message.fields = fields;
         message.hash = Some(message_hash);
         message.message_id = message.hash;
@@ -1243,12 +1284,8 @@ impl LXMessage {
                 }
                 "transport_encryption" => {
                     transport_encryption = match value.as_str() {
-                        Some(ENCRYPTION_DESCRIPTION_AES) => {
-                            Some(TransportEncryption::Aes128)
-                        }
-                        Some(ENCRYPTION_DESCRIPTION_EC) => {
-                            Some(TransportEncryption::Curve25519)
-                        }
+                        Some(ENCRYPTION_DESCRIPTION_AES) => Some(TransportEncryption::Aes128),
+                        Some(ENCRYPTION_DESCRIPTION_EC) => Some(TransportEncryption::Curve25519),
                         Some(ENCRYPTION_DESCRIPTION_UNENCRYPTED) => {
                             Some(TransportEncryption::Unencrypted)
                         }
@@ -1274,5 +1311,140 @@ impl LXMessage {
         }
 
         Ok(message)
+    }
+}
+
+#[cfg(test)]
+mod transport_encryption_tests {
+    use super::*;
+    use reticulum_core::packet::DestinationType;
+
+    fn message_with(method: u8, destination_type: DestinationType) -> LXMessage {
+        let mut message = LXMessage::new(
+            AddressHash::new_empty(),
+            AddressHash::new_empty(),
+            b"title",
+            b"content",
+        );
+        message.method = method;
+        message.destination_type = destination_type;
+        message
+    }
+
+    #[test]
+    fn single_destinations_use_curve25519() {
+        // Python: OPPORTUNISTIC/PROPAGATED/PAPER to SINGLE -> EC.
+        for method in [OPPORTUNISTIC, PROPAGATED, PAPER] {
+            let mut message = message_with(method, DestinationType::Single);
+            message.determine_transport_encryption();
+            assert!(message.transport_encrypted);
+            assert_eq!(
+                message.transport_encryption,
+                Some(TransportEncryption::Curve25519),
+                "method {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_destinations_use_aes128() {
+        // Python: GROUP -> AES-128 for the packet-carried methods.
+        for method in [OPPORTUNISTIC, PROPAGATED, PAPER] {
+            let mut message = message_with(method, DestinationType::Group);
+            message.determine_transport_encryption();
+            assert!(message.transport_encrypted);
+            assert_eq!(
+                message.transport_encryption,
+                Some(TransportEncryption::Aes128),
+                "method {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_destinations_are_unencrypted() {
+        // Python: everything but SINGLE/GROUP (PLAIN, LINK) is reported
+        // unencrypted for opportunistic/propagated/paper delivery.
+        for method in [OPPORTUNISTIC, PROPAGATED, PAPER] {
+            let mut message = message_with(method, DestinationType::Plain);
+            message.determine_transport_encryption();
+            assert!(!message.transport_encrypted);
+            assert_eq!(
+                message.transport_encryption,
+                Some(TransportEncryption::Unencrypted),
+                "method {method}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_delivery_is_always_curve25519() {
+        // Python: DIRECT is always EC regardless of destination type.
+        for destination_type in [
+            DestinationType::Single,
+            DestinationType::Group,
+            DestinationType::Plain,
+            DestinationType::Link,
+        ] {
+            let mut message = message_with(DIRECT, destination_type);
+            message.determine_transport_encryption();
+            assert!(message.transport_encrypted, "{destination_type:?}");
+            assert_eq!(
+                message.transport_encryption,
+                Some(TransportEncryption::Curve25519)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_methods_are_unencrypted() {
+        let mut message = message_with(0x00, DestinationType::Single);
+        message.determine_transport_encryption();
+        assert!(!message.transport_encrypted);
+        assert_eq!(
+            message.transport_encryption,
+            Some(TransportEncryption::Unencrypted)
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins_over_determination() {
+        let mut message = message_with(OPPORTUNISTIC, DestinationType::Single);
+        message.set_transport_encryption(TransportEncryption::Aes128);
+        assert_eq!(
+            message.transport_encryption,
+            Some(TransportEncryption::Aes128)
+        );
+        assert!(message.transport_encrypted);
+
+        // Re-running the determination keeps the override.
+        message.determine_transport_encryption();
+        assert_eq!(
+            message.transport_encryption,
+            Some(TransportEncryption::Aes128)
+        );
+
+        // Clearing it restores the automatic result.
+        message.clear_transport_encryption_override();
+        message.determine_transport_encryption();
+        assert_eq!(
+            message.transport_encryption,
+            Some(TransportEncryption::Curve25519)
+        );
+    }
+
+    #[test]
+    fn unencrypted_override_marks_transport_unencrypted() {
+        let mut message = message_with(DIRECT, DestinationType::Single);
+        message.set_transport_encryption(TransportEncryption::Unencrypted);
+        assert!(!message.transport_encrypted);
+    }
+
+    #[test]
+    fn destination_type_defaults_to_single() {
+        // LXMF delivery destinations are SINGLE type.
+        let message = LXMessage::new(AddressHash::new_empty(), AddressHash::new_empty(), b"", b"");
+        assert_eq!(message.destination_type, DestinationType::Single);
+        assert_eq!(message.destination_type(), DestinationType::Single);
     }
 }

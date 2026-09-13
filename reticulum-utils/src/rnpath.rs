@@ -79,7 +79,12 @@ pub async fn wait_for_path(
 async fn path_result(transport: &Transport, destination: &AddressHash) -> Option<PathResult> {
     let hops = transport.hops_to(destination).await?;
     let (via, iface) = transport.next_hop(destination).await?;
-    Some(PathResult { destination: *destination, hops, via, iface })
+    Some(PathResult {
+        destination: *destination,
+        hops,
+        via,
+        iface,
+    })
 }
 
 /// Snapshot the path table, optionally filtered by destination and a max

@@ -39,7 +39,10 @@ pub fn to_i16(samples: &[f32]) -> Vec<i16> {
 
 /// Map i16 samples back to normalised f32.
 pub fn from_i16(samples: &[i16]) -> Vec<f32> {
-    samples.iter().map(|&s| s as f32 / TYPE_MAP_FACTOR).collect()
+    samples
+        .iter()
+        .map(|&s| s as f32 / TYPE_MAP_FACTOR)
+        .collect()
 }
 
 /// Convert interleaved normalised samples to interleaved i16 little-endian

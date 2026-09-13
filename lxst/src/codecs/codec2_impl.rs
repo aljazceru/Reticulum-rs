@@ -181,7 +181,10 @@ impl Codec for Codec2 {
             samples.extend(pcm.iter().map(|&s| s as f32 / TYPE_MAP_FACTOR));
         }
 
-        Ok(AudioFrame { samples, channels: 1 })
+        Ok(AudioFrame {
+            samples,
+            channels: 1,
+        })
     }
 
     fn channels(&self) -> Option<usize> {

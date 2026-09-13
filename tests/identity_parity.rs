@@ -36,7 +36,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The fixed Fernet IV pinned by the Python fixture generator.
-const FIXED_IV: [u8; 16] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+const FIXED_IV: [u8; 16] = [
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+];
 
 fn from_hex(hex: &str) -> Vec<u8> {
     (0..hex.len())
@@ -82,23 +84,33 @@ fn identity_file_round_trip_matches_python() {
     let meta = meta();
     let storage = MemoryStorage::new();
 
-    let identity =
-        PrivateIdentity::new_from_hex_string(meta["identity_prv_hex"].as_str().unwrap())
-            .expect("fixture identity");
+    let identity = PrivateIdentity::new_from_hex_string(meta["identity_prv_hex"].as_str().unwrap())
+        .expect("fixture identity");
 
     identity.to_file(&storage, "id_private").expect("to_file");
-    identity.pub_to_file(&storage, "id_public").expect("pub_to_file");
+    identity
+        .pub_to_file(&storage, "id_public")
+        .expect("pub_to_file");
 
     // Python `Identity.to_file` writes the raw 64 private key bytes.
-    assert_eq!(storage.read("id_private").unwrap(), fixture("identity_private.bin"));
-    assert_eq!(storage.read("id_public").unwrap(), fixture("identity_public.bin"));
+    assert_eq!(
+        storage.read("id_private").unwrap(),
+        fixture("identity_private.bin")
+    );
+    assert_eq!(
+        storage.read("id_public").unwrap(),
+        fixture("identity_public.bin")
+    );
 
     // Round-trip through the file format.
     let loaded = private_identity_from_file(&storage, "id_private").expect("from_file");
     assert_eq!(loaded.to_hex_string(), identity.to_hex_string());
 
     let public = identity_from_public_file(&storage, "id_public").expect("public from file");
-    assert_eq!(public.to_hex_string(), identity.as_identity().to_hex_string());
+    assert_eq!(
+        public.to_hex_string(),
+        identity.as_identity().to_hex_string()
+    );
 }
 
 #[test]
@@ -107,7 +119,9 @@ fn identity_file_fs_storage() {
     let storage = FsStorage::new(dir.display().to_string());
 
     let identity = PrivateIdentity::new_from_rand(rand_core::OsRng);
-    identity.to_file(&storage, "identities/self").expect("to_file");
+    identity
+        .to_file(&storage, "identities/self")
+        .expect("to_file");
 
     let loaded = private_identity_from_file(&storage, "identities/self").expect("from_file");
     assert_eq!(loaded.to_hex_string(), identity.to_hex_string());
@@ -136,13 +150,22 @@ fn known_destinations_fixture_byte_exact() {
         let expected = &meta["known_destinations"][hash.to_hex_string()];
 
         assert_eq!(entry.time, expected["time"].as_f64().unwrap());
-        assert_eq!(hex(&entry.packet_hash), expected["packet_hash"].as_str().unwrap());
-        assert_eq!(hex(&entry.public_key), expected["public_key"].as_str().unwrap());
+        assert_eq!(
+            hex(&entry.packet_hash),
+            expected["packet_hash"].as_str().unwrap()
+        );
+        assert_eq!(
+            hex(&entry.public_key),
+            expected["public_key"].as_str().unwrap()
+        );
 
         match &expected["app_data"] {
             serde_json::Value::Null => assert!(entry.app_data.is_none()),
             serde_json::Value::String(data) => {
-                assert_eq!(entry.app_data.as_deref(), Some(from_hex(data.as_str()).as_slice()))
+                assert_eq!(
+                    entry.app_data.as_deref(),
+                    Some(from_hex(data.as_str()).as_slice())
+                )
             }
             other => panic!("unexpected app_data fixture {other}"),
         }
@@ -156,10 +179,7 @@ fn known_destinations_fixture_byte_exact() {
             }
             serde_json::Value::Number(uses) => {
                 let last_used = uses.as_f64().expect("uses number");
-                assert_eq!(
-                    entry.uses,
-                    identity::DestinationUses::LastUsed(last_used)
-                );
+                assert_eq!(entry.uses, identity::DestinationUses::LastUsed(last_used));
             }
             other => panic!("unexpected uses fixture {other}"),
         }
@@ -241,8 +261,20 @@ fn known_destinations_remember_updates_entry() {
     let public_key: [u8; 64] = fixture("peer_public.bin").as_slice().try_into().unwrap();
     let mut packet_hash = [1u8; 32];
 
-    store.remember(packet_hash, destination_hash, public_key, Some(b"one".to_vec()), 100.0);
-    store.remember(packet_hash, destination_hash, public_key, Some(b"two".to_vec()), 200.0);
+    store.remember(
+        packet_hash,
+        destination_hash,
+        public_key,
+        Some(b"one".to_vec()),
+        100.0,
+    );
+    store.remember(
+        packet_hash,
+        destination_hash,
+        public_key,
+        Some(b"two".to_vec()),
+        200.0,
+    );
 
     let entry = store.get(&destination_hash).unwrap();
     assert_eq!(entry.time, 200.0);
@@ -253,7 +285,10 @@ fn known_destinations_remember_updates_entry() {
     packet_hash[0] = 9;
     store.remember(packet_hash, destination_hash, public_key, None, 300.0);
     let identity = store.recall(&destination_hash, 400.0).expect("identity");
-    assert_eq!(identity.address_hash, AddressHash::new_from_slice(&public_key[..64]));
+    assert_eq!(
+        identity.address_hash,
+        AddressHash::new_from_slice(&public_key[..64])
+    );
     assert_eq!(
         store.get(&destination_hash).unwrap().uses,
         identity::DestinationUses::LastUsed(400.0)
@@ -307,14 +342,20 @@ fn ratchet_file_fixture_byte_exact() {
     let data = identity::unpack_ratchet(&bytes).expect("unpack ratchet");
     let ratchet_meta = &meta["ratchet"];
 
-    assert_eq!(hex(&data.ratchet), ratchet_meta["public_hex"].as_str().unwrap());
+    assert_eq!(
+        hex(&data.ratchet),
+        ratchet_meta["public_hex"].as_str().unwrap()
+    );
     assert_eq!(data.received, ratchet_meta["received"].as_f64().unwrap());
 
     assert_eq!(identity::pack_ratchet(&data).unwrap(), bytes);
 
     // Ratchet id: SHA-256 of the public key, truncated to 10 bytes.
     let id = identity::ratchet_id(&data.ratchet);
-    assert_eq!(hex(&id.as_slice()[..10]), ratchet_meta["id_hex"].as_str().unwrap());
+    assert_eq!(
+        hex(&id.as_slice()[..10]),
+        ratchet_meta["id_hex"].as_str().unwrap()
+    );
 
     // Private key -> public key derivation.
     let private = from_hex(ratchet_meta["private_hex"].as_str().unwrap());
@@ -356,10 +397,16 @@ fn known_ratchets_remember_and_get() {
     assert_eq!(storage.list(RATCHETS_DIR).len(), 1);
 
     // In-memory and from-storage recall both work.
-    assert_eq!(ratchets.get(&storage, &destination_hash, received + 1.0), Some(public));
+    assert_eq!(
+        ratchets.get(&storage, &destination_hash, received + 1.0),
+        Some(public)
+    );
 
     let mut fresh = KnownRatchets::new();
-    assert_eq!(fresh.get(&storage, &destination_hash, received + 1.0), Some(public));
+    assert_eq!(
+        fresh.get(&storage, &destination_hash, received + 1.0),
+        Some(public)
+    );
 
     // Current ratchet id matches Python `Identity.current_ratchet_id`.
     let id = fresh
@@ -382,9 +429,18 @@ fn known_ratchets_clean() {
     let unknown = AddressHash::new_from_slice(b"unknown-destin");
     let corrupted = AddressHash::new_from_slice(b"corrupt-desti");
 
-    ratchets.remember(&storage, known, [1u8; 32], 1_000.0).unwrap();
-    ratchets.remember(&storage, unknown, [2u8; 32], 1_000.0).unwrap();
-    storage.write(&format!("{RATCHETS_DIR}/{}", corrupted.to_hex_string()), b"not msgpack").unwrap();
+    ratchets
+        .remember(&storage, known, [1u8; 32], 1_000.0)
+        .unwrap();
+    ratchets
+        .remember(&storage, unknown, [2u8; 32], 1_000.0)
+        .unwrap();
+    storage
+        .write(
+            &format!("{RATCHETS_DIR}/{}", corrupted.to_hex_string()),
+            b"not msgpack",
+        )
+        .unwrap();
 
     let removed = ratchets.clean(&storage, 2_000.0, |hash| hash == &known);
     assert_eq!(removed, 2);
@@ -413,7 +469,9 @@ fn destination_ratchet_file_fixture() {
     assert_eq!(ratchets.len(), 2);
 
     let packed = identity::pack_ratchet_list(&ratchets).unwrap();
-    peer_identity.verify(&packed, &signature).expect("signature must verify");
+    peer_identity
+        .verify(&packed, &signature)
+        .expect("signature must verify");
 
     // Saving with the same identity reproduces the fixture bytes.
     save_destination_ratchets(&storage, "dest.ratchets", &peer, &ratchets).unwrap();
@@ -431,16 +489,17 @@ fn destination_ratchet_file_fixture() {
     assert!(load_destination_ratchets(&storage, "tampered.ratchets", &peer_identity).is_err());
 
     // Missing file starts a fresh chain.
-    assert!(load_destination_ratchets(&storage, "missing.ratchets", &peer_identity)
-        .unwrap()
-        .is_empty());
+    assert!(
+        load_destination_ratchets(&storage, "missing.ratchets", &peer_identity)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
 fn destination_ratchet_retention() {
-    let mut ratchets: Vec<[u8; RATCHET_KEY_LENGTH]> = (0..600)
-        .map(|i| [i as u8; RATCHET_KEY_LENGTH])
-        .collect();
+    let mut ratchets: Vec<[u8; RATCHET_KEY_LENGTH]> =
+        (0..600).map(|i| [i as u8; RATCHET_KEY_LENGTH]).collect();
 
     clean_destination_ratchets(&mut ratchets, 512);
     assert_eq!(ratchets.len(), 512);
@@ -466,7 +525,9 @@ fn announce_ratchet_fixture() {
     assert!(packet.header.context_flag);
     assert_eq!(
         packet.destination.to_hex_string(),
-        meta["announce_ratchet"]["destination_hash"].as_str().unwrap()
+        meta["announce_ratchet"]["destination_hash"]
+            .as_str()
+            .unwrap()
     );
 
     let (destination, announce) =
@@ -474,11 +535,18 @@ fn announce_ratchet_fixture() {
 
     assert_eq!(
         hex(announce.ratchet.expect("ratchet present").as_slice()),
-        meta["announce_ratchet"]["ratchet_pub_hex"].as_str().unwrap()
+        meta["announce_ratchet"]["ratchet_pub_hex"]
+            .as_str()
+            .unwrap()
     );
     assert_eq!(
         announce.app_data.map(hex),
-        Some(meta["announce_ratchet"]["app_data"].as_str().unwrap().to_string())
+        Some(
+            meta["announce_ratchet"]["app_data"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        )
     );
 
     // The announced identity is the fixture identity.
@@ -508,7 +576,12 @@ fn announce_plain_fixture() {
     assert!(announce.ratchet.is_none());
     assert_eq!(
         announce.app_data.map(hex),
-        Some(meta["announce_plain"]["app_data"].as_str().unwrap().to_string())
+        Some(
+            meta["announce_plain"]["app_data"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        )
     );
 }
 
@@ -607,18 +680,19 @@ fn decrypt_python_ratchet_token() {
 #[test]
 fn encrypt_matches_python_token_byte_for_byte() {
     let meta = meta();
-    let identity = Identity::new_from_hex_string(
-        &hex(&PrivateIdentity::new_from_hex_string(meta["identity_prv_hex"].as_str().unwrap())
-            .unwrap()
-            .as_identity()
-            .to_bytes()),
+    let identity = Identity::new_from_hex_string(&hex(&PrivateIdentity::new_from_hex_string(
+        meta["identity_prv_hex"].as_str().unwrap(),
     )
+    .unwrap()
+    .as_identity()
+    .to_bytes()))
     .unwrap();
 
-    let ephemeral_bytes: [u8; 32] = from_hex(meta["encrypt"]["ephemeral_prv_hex"].as_str().unwrap())
-        .as_slice()
-        .try_into()
-        .unwrap();
+    let ephemeral_bytes: [u8; 32] =
+        from_hex(meta["encrypt"]["ephemeral_prv_hex"].as_str().unwrap())
+            .as_slice()
+            .try_into()
+            .unwrap();
     let ephemeral = reticulum::identity::StaticSecret::from(ephemeral_bytes);
 
     // The token carries the matching ephemeral public key.
@@ -638,15 +712,20 @@ fn encrypt_matches_python_token_byte_for_byte() {
     assert_eq!(token, fixture("encrypt_static.bin").as_slice());
 
     // Ratchet encryption too.
-    let ratchet_public_bytes: [u8; 32] =
-        from_hex(meta["ratchet"]["public_hex"].as_str().unwrap())
-            .as_slice()
-            .try_into()
-            .unwrap();
+    let ratchet_public_bytes: [u8; 32] = from_hex(meta["ratchet"]["public_hex"].as_str().unwrap())
+        .as_slice()
+        .try_into()
+        .unwrap();
     let ratchet_public = reticulum::identity::PublicKey::from(ratchet_public_bytes);
 
     let token = identity
-        .encrypt_with_ephemeral(rng, &ephemeral, &plaintext, Some(&ratchet_public), &mut out[..])
+        .encrypt_with_ephemeral(
+            rng,
+            &ephemeral,
+            &plaintext,
+            Some(&ratchet_public),
+            &mut out[..],
+        )
         .expect("encrypt");
     assert_eq!(token, fixture("encrypt_ratchet.bin").as_slice());
 }
@@ -658,12 +737,12 @@ fn encrypt_matches_python_token_byte_for_byte() {
 #[test]
 fn proof_vectors_validate() {
     let meta = meta();
-    let identity = Identity::new_from_hex_string(
-        &hex(&PrivateIdentity::new_from_hex_string(meta["identity_prv_hex"].as_str().unwrap())
-            .unwrap()
-            .as_identity()
-            .to_bytes()),
+    let identity = Identity::new_from_hex_string(&hex(&PrivateIdentity::new_from_hex_string(
+        meta["identity_prv_hex"].as_str().unwrap(),
     )
+    .unwrap()
+    .as_identity()
+    .to_bytes()))
     .unwrap();
 
     let packet_hash = from_hex(meta["proof"]["packet_hash_hex"].as_str().unwrap());
@@ -671,12 +750,16 @@ fn proof_vectors_validate() {
     // Explicit proof: packet hash + signature.
     let explicit = from_hex(meta["proof"]["explicit_hex"].as_str().unwrap());
     let signature = identity::Signature::from_slice(&explicit[32..]).unwrap();
-    identity.verify(&packet_hash, &signature).expect("explicit proof validates");
+    identity
+        .verify(&packet_hash, &signature)
+        .expect("explicit proof validates");
 
     // Implicit proof: signature only.
     let implicit = from_hex(meta["proof"]["implicit_hex"].as_str().unwrap());
     let signature = identity::Signature::from_slice(&implicit).unwrap();
-    identity.verify(&packet_hash, &signature).expect("implicit proof validates");
+    identity
+        .verify(&packet_hash, &signature)
+        .expect("implicit proof validates");
 
     // Tampered proofs must fail.
     let mut tampered = implicit.clone();

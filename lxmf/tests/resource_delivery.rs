@@ -2,9 +2,7 @@
 
 use std::time::Duration;
 
-use lxmf::router::{
-    AnnounceInfo, DeliveryConfig, LxmEvent, LxmRouter, RouterConfig,
-};
+use lxmf::router::{AnnounceInfo, DeliveryConfig, LxmEvent, LxmRouter, RouterConfig};
 use lxmf::{delivery_destination_hash, LXMessage, DIRECT};
 use rand_core::OsRng;
 use reticulum::destination::link::{LinkEvent, LinkStatus};
@@ -41,7 +39,6 @@ fn temp_storage(tag: &str) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn large_message_delivered_as_resource() {
-
     let alice_identity = fixed_identity(ALICE_KEY);
     let bob_identity = fixed_identity(BOB_KEY);
     let alice_delivery = delivery_destination_hash(alice_identity.as_identity());
@@ -113,7 +110,10 @@ async fn large_message_delivered_as_resource() {
     // as a resource transfer (Python `LXMessage.__as_resource`).
     let content: Vec<u8> = (0..3000u32).map(|i| b'a' + (i % 26) as u8).collect();
     let mut message = LXMessage::new(alice_delivery, bob_delivery, b"Big", &content);
-    router_b.send(&mut message, &bob_identity).await.expect("send");
+    router_b
+        .send(&mut message, &bob_identity)
+        .await
+        .expect("send");
 
     let received = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
@@ -200,9 +200,7 @@ async fn unrelated_destination_resources_are_not_ingested_as_lxmf() {
     let link_id = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let event = incoming_links.recv().await.expect("link event");
-            if event.address_hash == unrelated_hash
-                && matches!(event.event, LinkEvent::Activated)
-            {
+            if event.address_hash == unrelated_hash && matches!(event.event, LinkEvent::Activated) {
                 return event.id;
             }
         }

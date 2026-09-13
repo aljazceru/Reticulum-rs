@@ -19,7 +19,9 @@ fn key() -> [u8; reticulum::destination::GROUP_KEY_SIZE] {
 fn group_key_roundtrip() {
     let gk = GroupKey::from_bytes(key());
     let mut buffer = [0u8; 1024];
-    let token = gk.encrypt(b"group parity payload", &mut buffer[..]).unwrap();
+    let token = gk
+        .encrypt(b"group parity payload", &mut buffer[..])
+        .unwrap();
 
     // Token format: iv(16) || ciphertext(plaintext padded to AES blocks)
     // || hmac(32); 20 bytes pad to 32.
@@ -101,9 +103,7 @@ async fn group_transport_roundtrip_encrypted() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let name = DestinationName::new("grouptest", "channel");
-    let receiver = b
-        .add_group_destination(name)
-        .await;
+    let receiver = b.add_group_destination(name).await;
     receiver.lock().await.load_group_key(key());
 
     let mut received = b.received_data_events();

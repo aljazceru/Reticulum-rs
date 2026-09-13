@@ -46,7 +46,9 @@ fn test_file(dir: &std::path::Path, size: usize) -> PathBuf {
     let path = dir.join("payload.bin");
     // Deliberately poorly-compressible data so the resource engine moves the
     // full chunked stream.
-    let data: Vec<u8> = (0..size).map(|i| ((i * 31 + (i / 251) * 17) % 256) as u8).collect();
+    let data: Vec<u8> = (0..size)
+        .map(|i| ((i * 31 + (i / 251) * 17) % 256) as u8)
+        .collect();
     std::fs::write(&path, data).unwrap();
     path
 }
@@ -159,7 +161,10 @@ async fn send_split_file_over_udp_loopback() {
     let received = wait_for_file(&save_dir, "payload.bin", Duration::from_secs(20))
         .await
         .expect("received split file");
-    assert_eq!(std::fs::read(received).unwrap(), std::fs::read(payload).unwrap());
+    assert_eq!(
+        std::fs::read(received).unwrap(),
+        std::fs::read(payload).unwrap()
+    );
     assert!(!save_dir.join("rncp.incoming").exists());
 
     shutdown.cancel();

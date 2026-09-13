@@ -28,8 +28,8 @@ use crate::destination::DestinationName;
 use crate::destination::SingleInputDestination;
 use crate::hash::AddressHash;
 use crate::identity::PrivateIdentity;
-use crate::iface::InterfaceStats;
 use crate::iface::InterfaceManager;
+use crate::iface::InterfaceStats;
 use crate::transport::{
     PathTableSnapshotEntry, Transport, TransportConfig, TunnelTableSnapshotEntry,
 };
@@ -97,9 +97,7 @@ impl Reticulum {
 
     /// Request a path from the network (Python `RNS.Transport.request_path`).
     pub async fn request_path(&self, destination: &AddressHash) {
-        self.transport
-            .request_path(destination, None, None)
-            .await;
+        self.transport.request_path(destination, None, None).await;
     }
 
     /// Request a path and wait for it (Python `RNS.Transport.await_path`).
@@ -139,9 +137,7 @@ impl Reticulum {
 
     /// Enable the remote management destination
     /// (Python `enable_remote_management = Yes`).
-    pub async fn enable_remote_management(
-        &self,
-    ) -> Arc<Mutex<SingleInputDestination>> {
+    pub async fn enable_remote_management(&self) -> Arc<Mutex<SingleInputDestination>> {
         self.transport.enable_remote_management().await
     }
 
@@ -151,9 +147,7 @@ impl Reticulum {
     }
 
     /// Enable blackhole list publishing (Python `publish_blackhole = Yes`).
-    pub async fn enable_blackhole_publishing(
-        &self,
-    ) -> Arc<Mutex<SingleInputDestination>> {
+    pub async fn enable_blackhole_publishing(&self) -> Arc<Mutex<SingleInputDestination>> {
         self.transport.enable_blackhole_publishing().await
     }
 }

@@ -71,6 +71,12 @@ jobs:
           cargo test -p reticulum-core --all-targets --no-default-features --features="no_std"
           # bzip2 compression matrix for resources
           cargo test -p reticulum --features bz2 --test resource_transfer
+      - name: binding snapshot drift check
+        run: |
+          cargo build -p reticulum-ffi
+          cargo run -p uniffi-bindgen -- generate --no-format --library target/debug/libreticulum_ffi.so --language kotlin --out-dir reticulum-ffi/bindings/kotlin
+          cargo run -p uniffi-bindgen -- generate --no-format --library target/debug/libreticulum_ffi.so --language swift --out-dir reticulum-ffi/bindings/swift
+          git diff --exit-code -- reticulum-ffi/bindings
 
   windows-storage:
     runs-on: windows-latest
@@ -91,3 +97,26 @@ jobs:
         uses: arduino/setup-protoc@v3
       - name: test atomic storage replacement
         run: cargo test -p reticulum --lib storage::tests::filesystem_writes_replace_existing_files_and_clean_temporaries
+
+  benchmarks:
+    runs-on: ubuntu-latest
+    container: rust:1.95
+    needs: check
+    timeout-minutes: 20
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-all-crates: "true"
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95
+      - name: install build dependencies
+        run: apt-get update && apt-get install -y protobuf-compiler
+      - name: throughput floors (fail on regressions)
+        run: cargo test -p reticulum-actor --test perf_floor --release -- --nocapture
+      - name: criterion benchmarks (compile + run)
+        run: cargo bench -p reticulum-actor -- --quick

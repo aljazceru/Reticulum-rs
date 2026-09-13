@@ -181,7 +181,7 @@ pub enum ManagementRequest {
 }
 
 pub fn decode_management_request(data: &[u8]) -> ManagementRequest {
-    use rmpv::{Value, decode::read_value};
+    use rmpv::{decode::read_value, Value};
 
     let mut cursor = std::io::Cursor::new(data);
     let value = match read_value(&mut cursor) {

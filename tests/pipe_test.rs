@@ -11,21 +11,15 @@ use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum::{
-    destination::DestinationName,
-    identity::PrivateIdentity,
-    iface::pipe::PipeInterface,
-    packet::PacketType,
-    transport::TransportConfig,
+    destination::DestinationName, identity::PrivateIdentity, iface::pipe::PipeInterface,
+    packet::PacketType, transport::TransportConfig,
 };
 
 static INIT: Once = Once::new();
 
 fn setup() {
     INIT.call_once(|| {
-        env_logger::Builder::from_env(
-            env_logger::Env::default().default_filter_or("info"),
-        )
-        .init()
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init()
     });
 }
 
@@ -35,13 +29,13 @@ fn setup() {
 async fn pipe_echo_with_cat() {
     setup();
 
-    let transport =
-        TransportConfig::new("pipe", &PrivateIdentity::new_from_rand(OsRng)).build();
+    let transport = TransportConfig::new("pipe", &PrivateIdentity::new_from_rand(OsRng)).build();
 
-    transport.iface_manager().lock().await.spawn(
-        PipeInterface::new("/bin/cat"),
-        PipeInterface::spawn,
-    );
+    transport
+        .iface_manager()
+        .lock()
+        .await
+        .spawn(PipeInterface::new("/bin/cat"), PipeInterface::spawn);
 
     // let the subprocess come up
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -83,17 +77,12 @@ async fn pipe_echo_with_cat() {
 async fn pipe_respawns_after_exit() {
     setup();
 
-    let marker = std::env::temp_dir().join(format!(
-        "reticulum-pipe-respawn-{}.txt",
-        std::process::id()
-    ));
+    let marker =
+        std::env::temp_dir().join(format!("reticulum-pipe-respawn-{}.txt", std::process::id()));
     let _ = std::fs::remove_file(&marker);
 
-    let transport = TransportConfig::new(
-        "pipe-respawn",
-        &PrivateIdentity::new_from_rand(OsRng),
-    )
-    .build();
+    let transport =
+        TransportConfig::new("pipe-respawn", &PrivateIdentity::new_from_rand(OsRng)).build();
 
     // the command appends one marker line per start and exits shortly after;
     // growing marker count proves the respawn loop

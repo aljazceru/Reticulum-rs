@@ -591,11 +591,31 @@ fn convert_config(content: &str) -> String {
         // Quote unquoted string values (only for non-comments)
         if !converted.starts_with('#') {
             for key in [
-                "type", "remote", "target_host", "bind_host", "listen_ip", "forward_ip",
-                "peers", "instance_name", "port", "callsign", "parity", "loglevel",
-                "group_id", "discovery_scope", "multicast_address_type", "command",
-                "reachable_on", "sam_address", "tcp", "networkname", "network_name",
-                "passphrase", "pass_phrase", "devices", "ignored_devices",
+                "type",
+                "remote",
+                "target_host",
+                "bind_host",
+                "listen_ip",
+                "forward_ip",
+                "peers",
+                "instance_name",
+                "port",
+                "callsign",
+                "parity",
+                "loglevel",
+                "group_id",
+                "discovery_scope",
+                "multicast_address_type",
+                "command",
+                "reachable_on",
+                "sam_address",
+                "tcp",
+                "networkname",
+                "network_name",
+                "passphrase",
+                "pass_phrase",
+                "devices",
+                "ignored_devices",
                 "remote_management_allowed",
             ] {
                 converted = quote_if_needed(&converted, key);
@@ -1285,9 +1305,7 @@ codingrate = 5
 "#,
         );
 
-        assert!(migrated.contains(
-            "command = \"socat TCP:example.com:1234 STDIO\" # keep this"
-        ));
+        assert!(migrated.contains("command = \"socat TCP:example.com:1234 STDIO\" # keep this"));
         let config: Config = toml::from_str(&migrated).expect("migrated Config");
         assert!(config.reticulum.remote_management);
         assert!(config.reticulum.probe_destination);
@@ -1301,7 +1319,9 @@ codingrate = 5
             other => panic!("unexpected interface: {other:?}"),
         }
         match &config.interfaces[1].config {
-            InterfaceConfig::I2PInterface { peers, sam_address, .. } => {
+            InterfaceConfig::I2PInterface {
+                peers, sam_address, ..
+            } => {
                 assert_eq!(peers, &["peer one", "peer two"]);
                 assert_eq!(sam_address.as_deref(), Some("127.0.0.1:7656"));
             }
@@ -1311,10 +1331,8 @@ codingrate = 5
 
     #[test]
     fn config_rejects_ifac_sizes_above_ed25519_signature_length() {
-        let dir = std::env::temp_dir().join(format!(
-            "reticulum-config-ifac-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reticulum-config-ifac-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(

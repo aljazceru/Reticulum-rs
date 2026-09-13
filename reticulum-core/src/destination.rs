@@ -1,7 +1,7 @@
 pub mod link;
 pub mod link_map;
 
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey, SIGNATURE_LENGTH};
+use ed25519_dalek::{SIGNATURE_LENGTH, Signature, SigningKey, VerifyingKey};
 use rand_core::CryptoRngCore;
 use x25519_dalek::PublicKey;
 
@@ -12,8 +12,8 @@ use crate::{
     error::RnsError,
     hash::{AddressHash, Hash},
     identity::{
-        generate_ratchet, ratchet_public_from_private, EmptyIdentity, HashIdentity, Identity,
-        PrivateIdentity, RATCHET_KEY_LENGTH, PUBLIC_KEY_LENGTH,
+        EmptyIdentity, HashIdentity, Identity, PUBLIC_KEY_LENGTH, PrivateIdentity,
+        RATCHET_KEY_LENGTH, generate_ratchet, ratchet_public_from_private,
     },
     packet::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
@@ -96,10 +96,7 @@ impl DestinationName {
 
     /// The destination address hash for this name and an announcing
     /// identity (Python `Destination.hash_from_name_and_identity`).
-    pub fn address_hash_for<I: crate::identity::HashIdentity>(
-        &self,
-        identity: &I,
-    ) -> AddressHash {
+    pub fn address_hash_for<I: crate::identity::HashIdentity>(&self, identity: &I) -> AddressHash {
         create_address_hash(identity, self)
     }
 
@@ -151,7 +148,9 @@ impl DestinationAnnounce {
     /// `destination_hash || public_key || name_hash || random_hash || ratchet || app_data`,
     /// and that the announced destination hash actually belongs to the
     /// announced name hash and identity.
-    pub fn validate(packet: &Packet) -> Result<(SingleOutputDestination, AnnounceData<'_>), RnsError> {
+    pub fn validate(
+        packet: &Packet,
+    ) -> Result<(SingleOutputDestination, AnnounceData<'_>), RnsError> {
         if packet.header.packet_type != PacketType::Announce {
             return Err(RnsError::PacketError);
         }
@@ -407,7 +406,11 @@ impl Destination<PrivateIdentity, Input, Single> {
     /// Generate a fresh ratchet key at the front of the list if the
     /// rotation interval has elapsed (Python `Destination.rotate_ratchets`).
     /// Returns the new ratchet key when one was generated.
-    pub fn rotate_ratchets<R: CryptoRngCore + Copy>(&mut self, rng: R, now_secs: u64) -> Option<[u8; RATCHET_KEY_LENGTH]> {
+    pub fn rotate_ratchets<R: CryptoRngCore + Copy>(
+        &mut self,
+        rng: R,
+        now_secs: u64,
+    ) -> Option<[u8; RATCHET_KEY_LENGTH]> {
         let ratchets = self.ratchets.as_mut()?;
         if now_secs > self.latest_ratchet_time + self.ratchet_interval {
             let new_ratchet = generate_ratchet(rng);
@@ -422,11 +425,7 @@ impl Destination<PrivateIdentity, Input, Single> {
 
     /// Decrypt a SINGLE-destination data packet (Python `Destination.decrypt`):
     /// try the retained ratchet keys first, then the static identity key.
-    pub fn decrypt<'a>(
-        &self,
-        data: &[u8],
-        out_buf: &'a mut [u8],
-    ) -> Result<&'a [u8], RnsError> {
+    pub fn decrypt<'a>(&self, data: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
         let ratchets = self.ratchets.as_deref().unwrap_or(&[]);
         self.identity.decrypt(data, ratchets, out_buf)
     }
@@ -494,7 +493,11 @@ impl Destination<PrivateIdentity, Input, Single> {
 
         let rand_hash = Hash::new_from_rand(rng);
         let timestamp = now_secs.to_be_bytes();
-        let rand_hash = [&rand_hash.as_slice()[..RAND_HASH_LENGTH / 2], &timestamp[3..]].concat();
+        let rand_hash = [
+            &rand_hash.as_slice()[..RAND_HASH_LENGTH / 2],
+            &timestamp[3..],
+        ]
+        .concat();
 
         let pub_key = self.identity.as_identity().public_key_bytes();
         let verifying_key = self.identity.as_identity().verifying_key_bytes();
@@ -567,8 +570,8 @@ impl Destination<PrivateIdentity, Input, Single> {
     ) -> Option<([u8; RATCHET_KEY_LENGTH], [u8; RATCHET_KEY_LENGTH])> {
         let ratchets = self.ratchets.as_ref()?;
 
-        let rotate = ratchets.is_empty()
-            || now_secs > self.latest_ratchet_time + self.ratchet_interval;
+        let rotate =
+            ratchets.is_empty() || now_secs > self.latest_ratchet_time + self.ratchet_interval;
 
         if rotate {
             let new_ratchet = generate_ratchet(rng);
@@ -755,7 +758,9 @@ impl GroupKey {
         token: &[u8],
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], crate::error::RnsError> {
-        let verified = self.fernet.verify(crate::crypt::fernet::Token::from(token))?;
+        let verified = self
+            .fernet
+            .verify(crate::crypt::fernet::Token::from(token))?;
         self.fernet.decrypt(verified, out_buf).map(|p| p.as_slice())
     }
 }
@@ -889,10 +894,8 @@ mod tests {
     #[test]
     fn proof_strategy_defaults_to_none_and_can_be_overridden() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
-        let mut destination = SingleInputDestination::new(
-            identity,
-            DestinationName::new("test", "proof.default"),
-        );
+        let mut destination =
+            SingleInputDestination::new(identity, DestinationName::new("test", "proof.default"));
 
         assert_eq!(destination.proof_strategy(), ProofStrategy::None);
         destination.set_proof_strategy(ProofStrategy::All);

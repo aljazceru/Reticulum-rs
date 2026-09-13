@@ -12,8 +12,7 @@ use crate::hash::{AddressHash, Hash};
 pub const OVERHEAD: usize = 134;
 
 /// Number of map hashes that fit into a single link-MDU advertisement.
-pub const HASHMAP_MAX_LEN: usize =
-    (crate::packet::LINK_MDU - OVERHEAD) / super::MAPHASH_LEN;
+pub const HASHMAP_MAX_LEN: usize = (crate::packet::LINK_MDU - OVERHEAD) / super::MAPHASH_LEN;
 
 /// Window around the currently requested map region that the sender
 /// keeps searchable for part requests.
@@ -183,9 +182,7 @@ impl ResourceAdvertisement {
                         if data.len() != 16 {
                             return Err(RnsError::PacketError);
                         }
-                        request_id = Some(AddressHash::new(
-                            data.as_slice().try_into().unwrap(),
-                        ));
+                        request_id = Some(AddressHash::new(data.as_slice().try_into().unwrap()));
                     }
                 }
                 b'f' => flags = Some(read_uint(&mut cursor)? as u8),

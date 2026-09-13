@@ -59,8 +59,8 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
 
     // Identity persisted per-app like Python (`<storage>/identities/rnx`).
     let identity_path = options.config_dir.join("storage/identities/rnx");
-    let (identity, _) = load_or_create_private_identity(&identity_path)
-        .map_err(|err| err.to_string())?;
+    let (identity, _) =
+        load_or_create_private_identity(&identity_path).map_err(|err| err.to_string())?;
 
     let destination = transport
         .add_destination(identity, DestinationName::new(APP_NAME, "execute"))
@@ -170,23 +170,23 @@ pub async fn execute_request(data: &[u8]) -> Vec<u8> {
                 let _ = pipe.read_to_end(&mut stderr).await;
             }
             let status = child.wait().await.ok();
-            status.map(|status| std::process::Output { status, stdout, stderr })
+            status.map(|status| std::process::Output {
+                status,
+                stdout,
+                stderr,
+            })
         };
 
-        let output = match tokio::time::timeout(
-            Duration::from_secs(timeout_secs.max(1)),
-            wait,
-        )
-        .await
-        {
-            Ok(Some(output)) => Some(output),
-            // timed out: kill the child so it cannot linger.
-            Err(_) => {
-                let _ = child.start_kill();
-                None
-            }
-            _ => None,
-        };
+        let output =
+            match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), wait).await {
+                Ok(Some(output)) => Some(output),
+                // timed out: kill the child so it cannot linger.
+                Err(_) => {
+                    let _ = child.start_kill();
+                    None
+                }
+                _ => None,
+            };
 
         let concluded = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -299,10 +299,9 @@ pub async fn execute(
     let _ = tokio::time::timeout(Duration::from_secs(10), events.recv()).await;
 
     // Identify so the listener's allow list can match us.
-    let (client_identity, _) = load_or_create_private_identity(
-        &options.config_dir.join("storage/identities/rnx"),
-    )
-    .map_err(|err| err.to_string())?;
+    let (client_identity, _) =
+        load_or_create_private_identity(&options.config_dir.join("storage/identities/rnx"))
+            .map_err(|err| err.to_string())?;
     let identify = link.lock().await.identify(&client_identity);
     if let Ok(packet) = identify {
         transport.send_packet(packet).await;
@@ -329,8 +328,8 @@ pub async fn execute(
         .ok_or("no response from remote")?;
 
     let mut cursor = std::io::Cursor::new(&response);
-    let value = rmpv::decode::read_value(&mut cursor)
-        .map_err(|e| format!("invalid response: {e}"))?;
+    let value =
+        rmpv::decode::read_value(&mut cursor).map_err(|e| format!("invalid response: {e}"))?;
 
     let rmpv::Value::Array(items) = value else {
         return Err("invalid response shape".to_string());
