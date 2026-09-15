@@ -158,3 +158,80 @@ Build with `C6L_TCP_HOST=<laptop-ip>` to set the target.
 - `rnode-modem-core/` — protocol core (the critical fix)
 - `src/iface/rnode.rs` — host-side (detect validation, reset-on-open)
 - `src/iface.rs` — announces_sent counter fix
+
+---
+
+## SPI / Radio Findings (2026-09-15, deep debugging session)
+
+### Bugs found and fixed
+
+1. **TCXO command byte order** — `SetDio3AsTcxoClock` (opcode 0x97)
+   parameter order is `voltage[15:8], voltage[7:0], timeout[15:8],
+   timeout[7:0]` (voltage FIRST, datasheet Table 11-8). We had timeout
+   first, which sent the timeout value (0x0500 = 12800 × 10mV = 128V!)
+   as the TCXO voltage. The SX1262 rejected it and went into permanent
+   BUSY.
+
+2. **TCXO voltage encoding** — the voltage is in 10 mV steps: 3.0 V →
+   `300` (0x012C), not `3000`. The formula `(v * 10.0) as u32 * 100`
+   produced 3000 = 30 V. Correct: `(v * 100.0) as u32`.
+
+3. **ESP32-C6 IO_MUX base address** — the IO_MUX peripheral is at
+   `0x6009_0000` (from PAC `esp32c6::IO_MUX`), NOT `0x6000_9000`. The
+   `gpio[]` register array starts at offset `+0x04` (after `pin_ctrl`),
+   so GPIO N's IO_MUX register is at `0x6009_0004 + N*4`.
+
+4. **ESP32-C6 GPIO register offsets** (from PAC RegisterBlock field
+   order):
+   - `bt_select` at +0x00 (NOT GPIO_OUT!)
+   - `out` (GPIO_OUT) at +0x04
+   - `out_w1ts` at +0x08, `out_w1tc` at +0x0C
+   - `enable` at +0x20, `in_` (GPIO_IN) at +0x3C
+
+5. **ESP32-C6 SPI2 (GPSPI2) register offsets** (from PAC field docs,
+   base 0x6008_1000):
+   - `USER` at +0x10, `USER1` at +0x14, `USER2` at +0x18
+   - `MS_DLEN` at +0x1C, `MISC` at +0x20
+   - `DIN_MODE` at +0x24, `DIN_NUM` at +0x28, `DOUT_MODE` at +0x2C
+   - `W[0..16]` FIFO at +0x98..0xD8
+
+6. **SPI USER register garbage phases** — the default USER register had
+   `USR_DUMMY` (bit 29) and `USR_ADDR` (bit 30) set, and `DOUTDIN`
+   (bit 0) clear. This means the SPI inserted dummy cycles and an
+   address phase between the opcode and data, garbling all multi-byte
+   commands. Fixed by writing:
+   ```rust
+   (user | (1<<0)) & !((1<<29) | (1<<30) | (1<<31))
+   ```
+
+### Current state
+
+- `GetStatus` (single-byte transfer) works — returns valid SX1262
+  status 0xD2 (mode 5 = RX, cmd_status 1 = data available).
+- All init steps complete without SPI errors.
+- BUSY pad (GPIO19) reads HIGH even after a fresh power-cycle. The
+  radio still responds to GetStatus, so we bypass BUSY gating.
+- The SX1262 does NOT process multi-byte write commands (SetStandby,
+  SetRfFrequency, etc.) — the mode never changes from RX.
+- Multi-byte reads (IRQ status, buffer) return the status byte 0xD2
+  for every byte instead of actual data.
+- Meshtastic (ESP-IDF SPI driver + RadioLib) works perfectly on the
+  same hardware with the same pins, confirming the hardware is OK.
+
+### Root cause hypothesis
+
+The esp-hal 1.1.2 SPI driver on ESP32-C6 generates multi-byte SPI
+transactions differently from ESP-IDF's `spi_master` driver in a way
+that the SX1262 does not recognize. The SPI register configuration
+looks correct (verified full-duplex, no dummy/addr/command phases,
+2 MHz, Mode 0, MSB first), but the actual signal timing or FIFO
+handling may differ subtly.
+
+### Next steps
+
+1. Compare SPI signal generation between esp-hal and ESP-IDF at the
+   register level (clock gating, FIFO thresholds, `update()` sync).
+2. Consider writing a minimal SPI driver using direct PAC register
+   access that mirrors ESP-IDF's `spi_master` behavior exactly.
+3. File upstream issues: esp-hal (SPI register defaults leave dummy/
+   addr phases enabled) and/or the TCXO command byte order bug is ours.
