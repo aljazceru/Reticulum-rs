@@ -305,3 +305,41 @@ Possible causes to investigate with an oscilloscope:
 4. **Alternative: use Arduino framework**: Build the firmware with
    the Arduino framework (like Meshtastic) instead of esp-hal, trading
    some control for proven SPI compatibility.
+
+---
+
+## ROOT CAUSE FOUND: SSD1306 SPI Bus Contention (2026-09-16)
+
+### The problem
+
+The M5Stack Unit C6L has TWO devices on the same SPI bus:
+- SX1262 LoRa radio (CS=GPIO23)
+- SSD1306 OLED display (CS=GPIO6, DC=GPIO18, RESET=GPIO15)
+
+If GPIO6 (OLED CS) is not driven HIGH, the SSD1306 is SELECTED and
+drives the shared MISO line. This causes bus contention with the
+SX1262's MISO output, corrupting all SPI reads AND writes.
+
+### The fix
+
+Before any SPI communication with the SX1262, configure the SSD1306
+control pins to fully disable the OLED:
+```rust
+// GPIO 6 (CS) = OUTPUT HIGH (deselect)
+// GPIO 18 (DC) = OUTPUT HIGH
+// GPIO 15 (RESET) = OUTPUT LOW (hold in reset)
+```
+
+### Evidence
+
+Before fix: MISO reads 0xF6 (SSD1306 data, NOT valid SX1262 status)
+After fix: MISO reads 0xD2 (valid SX1262 status: mode=5 RX, RSSI=-105)
+
+The 0xF6 was the SSD1306's output on MISO, not the SX1262. This
+misled ALL previous debugging efforts.
+
+### Remaining issue
+
+SX1262 write commands still appear not to be processed (radio stays
+in Meshtastic's RX mode). Reads work (valid status/RSSI). The radio
+may be in a stuck BUSY state from the earlier 30V TCXO command.
