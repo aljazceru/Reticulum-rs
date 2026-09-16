@@ -75,57 +75,78 @@ fn lora_rx() -> anyhow::Result<()> {
 
     println!("SPI ready");
 
-    // === INIT ===
+    // === INIT — exact RNode firmware sequence (markqvist/RNode_Firmware sx126x.cpp) ===
     read!(&mut [0x00u8]); wait!(5000);  // NOP
     read!(&mut [0x80u8, 0x00]); wait!(5000);  // SetStandby(STBY_RC)
-    
-    // Enable TCXO (3.0V, 5ms timeout) — CRITICAL for correct frequency!
-    // Without TCXO, internal RC oscillator has ±5% error = ±43 MHz at 867.5 MHz!
-    // Using multi-byte write (cmd!) which works for all writes.
-    cmd!(&mut [0x97u8, 0x06, 0x00, 0x01, 0x40]); // TCXO 3.0V, delay=320*15.625us=5ms
+
+    // Calibrate all (RNode: MASK_CALIBRATE_ALL = 0x7F)
+    read!(&mut [0x89u8, 0x7F]); wait!(5000);
+
+    // Image calibration for 863-870 MHz (RNode: 0xD7, 0xDB)
+    read!(&mut [0x98u8, 0xD7, 0xDB]); wait!(5000);
+
+    // Enable TCXO 3.0V (M5Stack C6L variant: SX126X_DIO3_TCXO_VOLTAGE 3.0), timeout 0x0000FF
+    cmd!(&mut [0x97u8, 0x06, 0x00, 0x00, 0xFF]);
     wait!(50000); // Wait for TCXO to stabilize
-    
-    // Verify reads still work after TCXO
-    let mut sw_tcxo = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00];
-    read!(&mut sw_tcxo);
-    println!("After TCXO: [3]={:02x} [4]={:02x} [5]={:02x}", sw_tcxo[3], sw_tcxo[4], sw_tcxo[5]);
-    
-    read!(&mut [0x8Au8, 0x01]); wait!(5000);  // SetPacketType
+
+    read!(&mut [0x8Au8, 0x01]); wait!(5000);  // SetPacketType(LoRa)
     read!(&mut [0x86u8, 0x36, 0x38, 0x00, 0x00]); wait!(5000);  // SetRfFreq(867.5MHz)
-    read!(&mut [0x8Bu8, 0x09, 0x04, 0x01, 0x00]); wait!(5000);  // SetModParams
-    // IQ COMPENSATION FIX (datasheet section 15.4 — REQUIRED!)
-    // Read register 0x0736, set/clear bit 2 based on IQ polarity
-    // For STANDARD IQ (0x00): OR with 0x04
-    // For INVERTED IQ (0x01): AND with 0xFB
-    let mut iq_reg = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
-    read!(&mut iq_reg);
-    let iq_val = iq_reg[4];
-    let fixed_iq = (iq_val | 0x04) as u8;  // Standard IQ fix
-    println!("IQ reg 0x0736: read=0x{:02x} -> write=0x{:02x}", iq_val, fixed_iq);
-    
-    // Write back the fixed IQ register
-    read!(&mut [0x0Du8, 0x07, 0x36, fixed_iq]); wait!(5000);
-    
-    // SetPacketParams with STANDARD IQ (0x00)
-    read!(&mut [0x8Cu8, 0x00, 0x08, 0x00, 0xFF, 0x00, 0x00]); wait!(5000);  // PktParams(std IQ)
-    // Write RadioLib/RNode private sync word [0x10, 0x20]
-    read!(&mut [0x0Du8, 0x07, 0x40, 0x10, 0x20]); wait!(5000);
-    read!(&mut [0x9Du8, 0x01]); wait!(5000);  // SetDio2AsRfSwitch
+
+    // RNode sync word: hardcoded [0x14, 0x24] (sx126x.cpp setSyncWord())
+    read!(&mut [0x0Du8, 0x07, 0x40, 0x14]); wait!(5000);
+    read!(&mut [0x0Du8, 0x07, 0x41, 0x24]); wait!(5000);
+
+    // DIO2 as RF switch (RNode Heltec V3: DIO2_AS_RF_SWITCH = true)
+    read!(&mut [0x9Du8, 0x01]); wait!(5000);
+
+    // LNA boost DISABLED — caused constant -73dBm noise floor on C6L
+    // (RNode uses it on Heltec but C6L has ESP32-C6 RF leakage too close)
+
+    read!(&mut [0x8Bu8, 0x09, 0x04, 0x01, 0x00]); wait!(5000);  // SetModParams(SF9, BW125, CR4/5, LDRO off)
+
+    // optimizeModemSensitivity (RNode: reg 0x0889 bit 2 SET for BW < 500 kHz)
+    // READ-MODIFY-WRITE: preserve other bits!
+    let mut ms = [0x1Du8, 0x08, 0x89, 0x00, 0x00];
+    read!(&mut ms);
+    let ms_val = ms[4];
+    read!(&mut [0x0Du8, 0x08, 0x89, ms_val | 0x04]); wait!(5000);
+    println!("0x0889: read=0x{:02x} -> write=0x{:02x}", ms_val, ms_val | 0x04);
+
+    // SetPacketParams — RNode sends 9 bytes: preamble=18, explicit, len=255, CRC ON, std IQ
+    read!(&mut [0x8Cu8, 0x00, 0x12, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
+
+    // SX1262 errata 15.4: IQ fix must run AFTER EVERY SetPacketParams call!
+    // Standard IQ (0x00) -> reg 0x0736 bit 2 SET — READ-MODIFY-WRITE!
+    let mut iq2 = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
+    read!(&mut iq2);
+    let iq2_val = iq2[4];
+    read!(&mut [0x0Du8, 0x07, 0x36, iq2_val | 0x04]); wait!(5000);
+    println!("0x0736: read=0x{:02x} -> write=0x{:02x}", iq2_val, iq2_val | 0x04);
+
+    // SetPaConfig: PADutyCycle=0x04, HPMax=0x07, DeviceSel=0x00 (SX1262), PALut=0x01
+    read!(&mut [0x95u8, 0x04, 0x07, 0x00, 0x01]); wait!(5000);
+    // SetTxParams: 14 dBm, ramp 40us
+    read!(&mut [0x8Eu8, 0x0E, 0x02]); wait!(5000);
+    // OCP 140mA (RNode OCP_TUNED default 0x38 = 140mA)
+    read!(&mut [0x0Du8, 0x08, 0xE7, 0x38]); wait!(5000);
+    // Tx clamp config errata 15.2: set bits 4-1
+    let mut clamp = [0x1Du8, 0x08, 0xD8, 0x00, 0x00];
+    read!(&mut clamp);
+    read!(&mut [0x0Du8, 0x08, 0xD8, clamp[4] | 0x1E]); wait!(5000);
+
+    // Buffer base addresses TX=0 RX=0
+    read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
+
+    // SetRegulatorMode DC-DC (opcode 0x96, value 0x01) — power efficiency
+    read!(&mut [0x96u8, 0x01]); wait!(5000);
+
     read!(&mut [0x08u8, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00]); wait!(5000);  // SetDioIrq
     read!(&mut [0x02u8, 0x03, 0xFF]); wait!(5000);  // ClearIrq
 
-    // Full readback diagnostic — print ALL buffer positions
-    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00];
+    // Verify sync word after full init
+    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00];
     read!(&mut sw);
-    println!("SyncWord full dump: [0]={:02x} [1]={:02x} [2]={:02x} [3]={:02x} [4]={:02x} [5]={:02x} [6]={:02x} [7]={:02x}",
-        sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
-    // The actual data likely starts at buf[3] (after opcode + 2 addr bytes)
-
-    // Set buffer base addresses (TX=0, RX=0) — CRITICAL for packet reception!
-    read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
-    
-    // Set RX gain to boosted mode (improves sensitivity)
-    read!(&mut [0x96u8, 0x01]); wait!(5000);  // SetRxGain boosted
+    println!("SyncWord: [{:02x}, {:02x}] (want 14,24)", sw[4], sw[5]);
     
     // SetRx
     cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
@@ -153,43 +174,60 @@ fn lora_rx() -> anyhow::Result<()> {
             let flags = ((irq[2] as u16) << 8) | irq[3] as u16;
 
             if flags & 0x0002 != 0 { // RxDone!
-                // Read packet length
-                let mut rbs = [0x13u8, 0x00, 0x00, 0x00];
+                // GetRxBufferStatus: [opcode, dummy, dummy, len, rxOffset]
+                let mut rbs = [0x13u8, 0x00, 0x00, 0x00, 0x00];
                 read_safe!(&mut rbs);
-                let len = rbs[2] as usize;
+                let len = rbs[3] as usize;
+                let rx_off = rbs[4] as usize;
 
                 if len > 0 && len < 256 {
                     let read_len = len.min(64);
-                    let mut pkt = [0u8; 3 + 64];
+                    // ReadBuffer: opcode + 2 dummies + payload
+                    let mut pkt = [0u8; 4 + 64];
                     pkt[0] = 0x1E; // ReadBuffer
-                    pkt[1] = 0x00;
-                    pkt[2] = 0x00;
-                    read_safe!(&mut pkt[..3 + read_len]);
+                    read_safe!(&mut pkt[..4 + read_len]);
 
                     pkt_count += 1;
 
-                    // Read RSSI/SNR
-                    let mut ps = [0x14u8, 0x00, 0x00, 0x00];
+                    // GetPacketStatus: [opcode, dummy, rssi, snr]
+                    let mut ps = [0x14u8, 0x00, 0x00, 0x00, 0x00];
                     read_safe!(&mut ps);
                     let rssi = -(ps[2] as i16) / 2;
                     let snr = ps[3] as i8;
 
-                    println!("*** RX #{}: {}B {:02x?} RSSI={}dBm SNR={}dB IRQ={:04x} ***",
-                        pkt_count, len, &pkt[3..3 + read_len], rssi, snr, flags);
+                    println!("*** RX #{}: len={} off={} rssi={} snr={} ***",
+                        pkt_count, len, rx_off, rssi, snr);
+                    // Full FIFO dump with positions (read 24 bytes from addr 0)
+                    let mut dump = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                    read_safe!(&mut dump);
+                    let mut line = String::new();
+                    for (i, b) in dump.iter().enumerate().skip(1) {
+                        line.push_str(&format!("{:02x} ", b));
+                    }
+                    println!("FIFO[0..24] from buf[1]: {}", line);
                 }
 
-                // Clear IRQ and restart RX (multi-byte writes)
+                // Clear IRQ, reset FIFO pointers, restart RX
                 cmd!(&mut [0x02u8, 0x03, 0xFF]);
+                cmd!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]);  // SetBufferBaseAddress(0,0)
                 cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
             } else if flags & 0x0040 != 0 { // CrcError
                 println!("CRC ERROR flags={:04x}", flags);
                 cmd!(&mut [0x02u8, 0x03, 0xFF]);
                 cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
+            } else if flags != 0 {
+                // Log interesting IRQs (PreambleDetected=0x04, SyncWordValid=0x08, HeaderValid=0x10)
+                if flags & 0x000C != 0 || flags & 0x0010 != 0 {
+                    println!("IRQ {:04x} (pre={:?} sync={:?} hdr={:?})", flags,
+                        flags & 0x0004 != 0, flags & 0x0008 != 0, flags & 0x0010 != 0);
+                }
+                cmd!(&mut [0x02u8, 0x03, 0xFF]);  // clear all latched IRQs
             }
 
-            // Check DIO1 for comparison
-            let dio1_state = dio1.is_high();
-            if dio1_state {
+            // DIO1 debug (rate-limited)
+            if dio1.is_high() && loop_n % 5000000 == 0 {
                 println!("DIO1=HIGH flags={:04x}", flags);
             }
         }
@@ -198,9 +236,13 @@ fn lora_rx() -> anyhow::Result<()> {
         if loop_n % 500000 == 0 {
             telem_n += 1;
             // Safe RSSI read
-            let mut rssi_buf = [0x15u8, 0x00, 0x00];
+            let mut rssi_buf = [0x15u8, 0x00, 0x00, 0x00];
             read_safe!(&mut rssi_buf);
             rssi_val = -(rssi_buf[2] as i16) / 2;
+            if telem_n <= 3 {
+                println!("RSSI raw bytes: {:02x} {:02x} {:02x} {:02x}",
+                    rssi_buf[0], rssi_buf[1], rssi_buf[2], rssi_buf[3]);
+            }
 
             println!("TELEM#{}: pkts={} dio1={} rssi={}", 
                 telem_n, pkt_count, if dio1.is_high() { "H" } else { "L" }, rssi_val);
@@ -210,35 +252,67 @@ fn lora_rx() -> anyhow::Result<()> {
         if loop_n % 100000000 == 0 && loop_n > 0 {
             println!("TX cycle...");
             
-            // Go to standby first
-            cmd!(&mut [0x80u8, 0x00]);
+            // Go to standby first (byte-by-byte like RNode)
+            read!(&mut [0x80u8, 0x00]);
             wait!(10000);
-            
-            // Write HELLO to TX buffer
-            let mut wr_buf = [0u8; 7];
-            wr_buf[0] = 0x0E; // WriteBuffer
-            wr_buf[1] = 0x00; // offset 0
-            wr_buf[2] = b'H';
-            wr_buf[3] = b'E';
-            wr_buf[4] = b'L';
-            wr_buf[5] = b'L';
-            wr_buf[6] = b'O';
-            read!(&mut wr_buf);
+
+            // SetPacketParams with ACTUAL payload length (1 header + 5 data = 6)
+            // RNode wire format: [header(seq<<4), payload...]
+            read!(&mut [0x8Cu8, 0x00, 0x12, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00]);
+            wait!(5000);
+            // re-apply IQ errata fix (SetPacketParams resets reg 0x0736)
+            let mut iqt = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
+            read!(&mut iqt);
+            cmd!(&mut [0x0Du8, 0x07, 0x36, iqt[4] | 0x04]);
             wait!(5000);
             
-            // Set TX buffer address
+            // Write RNode-format packet: header byte (seq=1, no split) + HELLO
+            read!(&mut [0x0Eu8, 0x00, 0x10, b'H', b'E', b'L', b'L', b'O']);
+            wait!(5000);
+
+            // DIAGNOSTIC: read FIFO back to verify the write landed
+            {
+                let mut chk = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+                read!(&mut chk);
+                println!("FIFO check: {:02x?} (want 10 48 45 4c 4c 4f)",
+                    &chk[3..9]);
+            }
+            
+            // Set buffer base addresses (TX=0, RX=0)
             read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]);
             wait!(5000);
             
-            // SetTx with 5s timeout
-            read!(&mut [0x83u8, 0x00, 0x00, 0x13, 0x88]);
-            wait!(50000); // Wait for TX
-            
-            println!("TX done!");
+            // SetTx(0x000000) = single TX mode, no timeout (exactly like RNode endPacket)
+            read!(&mut [0x83u8, 0x00, 0x00, 0x00, 0x00]);
+            // Poll for TxDone IRQ with mode diagnostics
+            let mut tx_ok = false;
+            let mut printed = 0;
+            for i in 0..300 {
+                let mut ti = [0x12u8, 0x00, 0x00, 0x00];
+                read_safe!(&mut ti);
+                let tflags = ((ti[2] as u16) << 8) | ti[3] as u16;
+                let mut gs = [0xC0u8, 0x00];
+                read_safe!(&mut gs);
+                let mode = (gs[0] >> 4) & 0x7;
+                if i % 50 == 0 && printed < 6 {
+                    println!("TX poll: mode={} flags={:04x}", mode, tflags);
+                    printed += 1;
+                }
+                if tflags & 0x0001 != 0 { tx_ok = true; println!("TX poll: TxDone! mode={}", mode); break; }
+                if tflags & 0x0004 != 0 { println!("TX poll: TIMEOUT flag mode={}", mode); break; }
+                unsafe { esp_idf_sys::vTaskDelay(1); }
+            }
+            println!("TX done! irq_ok={}", tx_ok);
             
             // Clear IRQ and go back to RX
-            read!(&mut [0x02u8, 0x03, 0xFF]);
+            cmd!(&mut [0x02u8, 0x03, 0xFF]);
             wait!(5000);
+            // restore RX packet params (payload len 255) for RX explicit mode
+            cmd!(&mut [0x8Cu8, 0x00, 0x12, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00]);
+            wait!(5000);
+            let mut iqr = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
+            read!(&mut iqr);
+            cmd!(&mut [0x0Du8, 0x07, 0x36, iqr[4] | 0x04]);
             cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
             wait!(10000);
         }
