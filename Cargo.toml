@@ -41,6 +41,7 @@ sha2 = "0.10.8"
 hkdf = "0.12"
 
 # serial ports for Serial/KISS/AX.25 KISS interfaces
+libc = { version = "0.2", optional = true }
 tokio-serial = { version = "5.4", default-features = false, features = ["rt"], optional = true }
 
 # socket setup for AutoInterface IPv6 multicast
@@ -59,7 +60,7 @@ fernet-aes128 = ["reticulum-core/fernet-aes128"]
 python-tests = []
 bz2 = ["dep:bzip2"]
 # Serial-family interfaces (SerialInterface, KISSInterface, AX25KISSInterface)
-iface-serial = ["dep:tokio-serial"]
+iface-serial = ["dep:tokio-serial", "dep:libc"]
 # PipeInterface (subprocess stdin/stdout)
 iface-pipe = []
 # AutoInterface (IPv6 link-local multicast peering)
@@ -88,8 +89,13 @@ members = [
   "reticulum-utils",
   "reticulum-actor",
   "reticulum-ffi",
+  "rnode-modem-core",
   "uniffi-bindgen"
 ]
+
+# Embedded firmware crates pull esp-hal/esp-wifi and only build for their
+# MCU targets; keep them out of host workspace builds with their own lockfile.
+exclude = ["firmware"]
 
 [[bench]]
 name = "hot_paths"

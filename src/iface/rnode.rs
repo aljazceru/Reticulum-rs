@@ -554,6 +554,29 @@ impl RnodeLink {
             }
             match tokio_serial::SerialStream::open(&builder) {
                 Ok(port) => {
+                    // Python `RNodeInterface` connect resets the device via
+                    // a DTR/RTS transition; the ESP32 native USB-Serial/
+                    // JTAG peripheral hardware-resets the same way. Toggle
+                    // the lines so every connection starts from a clean
+                    // protocol state (also re-enumerates wedged CDC ports).
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::io::AsRawFd;
+                        // Sequence matched to what pyserial/`rnodeconf`
+                        // produce: DTR clear + RTS asserted pulses the
+                        // reset line, then both settle high.
+                        let fd = port.as_raw_fd();
+                        let reset: libc::c_int = libc::TIOCM_RTS;
+                        let run: libc::c_int = libc::TIOCM_DTR | libc::TIOCM_RTS;
+                        unsafe {
+                            libc::ioctl(fd, libc::TIOCMSET, &reset);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        unsafe {
+                            libc::ioctl(fd, libc::TIOCMSET, &run);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1000));
+                    }
                     let (reader, writer) = tokio::io::split(port);
                     return Ok(Self {
                         reader: Box::new(reader),
@@ -618,6 +641,11 @@ pub async fn detect_and_validate(
     let mut buffer = [0u8; 4096];
 
     // Detection phase: collect detect/fw/platform/mcu responses.
+    // Answers may arrive split across reads (serial timing, TCP
+    // segmentation), so the seen-flags accumulate across iterations.
+    let mut firmware_seen = false;
+    let mut platform_seen = false;
+    let mut mcu_seen = false;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if tokio::time::Instant::now() > deadline {
@@ -633,7 +661,6 @@ pub async fn detect_and_validate(
             return Err(RnsError::ConnectionError);
         }
 
-        let mut firmware_seen = false;
         {
             let shared = shared.clone();
             parser.feed(&buffer[..read], |event| {
@@ -644,14 +671,24 @@ pub async fn detect_and_validate(
                         shared.firmware = Some((major, minor));
                         firmware_seen = true;
                     }
-                    RnodeEvent::Platform(platform) => shared.platform = Some(platform),
-                    RnodeEvent::Mcu(mcu) => shared.mcu = Some(mcu),
+                    RnodeEvent::Platform(platform) => {
+                        shared.platform = Some(platform);
+                        platform_seen = true;
+                    }
+                    RnodeEvent::Mcu(mcu) => {
+                        shared.mcu = Some(mcu);
+                        mcu_seen = true;
+                    }
                     _ => {}
                 }
             });
         }
 
-        if firmware_seen {
+        // The detect burst queries detect, firmware, platform and MCU;
+        // answers may arrive split across reads (serial timing, TCP
+        // segmentation). Wait for the full set before proceeding, the
+        // deadline above bounds the wait.
+        if firmware_seen && platform_seen && mcu_seen {
             break;
         }
     }

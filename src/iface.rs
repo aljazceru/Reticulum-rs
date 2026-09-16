@@ -931,6 +931,7 @@ impl InterfaceManager {
             if should_send && !iface.stop.is_cancelled() {
                 // Egress airtime budgeting for forwarded announces
                 // (Python announce cap + `Interface.announce_queue`).
+                // Locally originated announces (hops == 0) are always sent.
                 if is_announce && message.packet.header.hops > 0 {
                     let now = tokio::time::Instant::now();
                     let size = control::packet_wire_len(&message.packet);
@@ -943,14 +944,18 @@ impl InterfaceManager {
                             false
                         }
                     });
-                    // Announce traffic stats (Python `Interface.sent_announce`).
-                    if allowed.unwrap_or(false) {
-                        iface.stats.count_announce_tx(size);
-                    }
 
                     if !allowed.unwrap_or(true) {
                         continue;
                     }
+                }
+
+                // Announce traffic stats (Python `Transport.outbound` calls
+                // `interface.sent_announce` for every transmitted announce,
+                // including locally originated ones).
+                if is_announce {
+                    let size = control::packet_wire_len(&message.packet);
+                    iface.stats.count_announce_tx(size);
                 }
 
                 let _ = iface.tx_send.send(message).await;
@@ -1094,6 +1099,37 @@ mod tests {
         manager.stop_iface(&address);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(manager.stats().is_empty());
+    }
+
+    #[tokio::test]
+    async fn locally_originated_announce_counts_announces_sent() {
+        // Python `Transport.outbound` calls `interface.sent_announce` for
+        // every transmitted announce, including locally originated ones
+        // (hops == 0). Regression test: own announces must show up in the
+        // `announces_sent` counter.
+        let mut manager = InterfaceManager::new(16);
+        let address = manager.spawn_named("announce iface", TestIface, test_worker);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let mut packet = Packet::default();
+        packet.header.packet_type = PacketType::Announce;
+        packet.header.hops = 0;
+
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Broadcast(None),
+                packet,
+            })
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let stats = &manager.stats()[0];
+        assert_eq!(stats.sent, 1);
+        assert_eq!(stats.announces_sent, 1);
+        assert_eq!(stats.announce_bytes_sent, 19);
+
+        manager.stop_iface(&address);
     }
 
     #[test]
