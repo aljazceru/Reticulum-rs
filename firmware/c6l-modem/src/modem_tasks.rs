@@ -302,6 +302,9 @@ pub async fn modem_task(hal: SendHal, task_spawner: embassy_executor::SendSpawne
     USB_SID.store(usb_sid as u32, core::sync::atomic::Ordering::Relaxed);
     esp_println::println!("MODEM: session {}", usb_sid);
 
+    // Note: SPI pins are in IO_MUX direct mode (MCU_SEL=0) which provides the
+    // fastest, most direct connection to the SX1262. Do NOT switch to GPIO
+    // matrix mode (MCU_SEL=1) — that breaks MISO input routing.
     esp_println::println!("MODEM: entering loop");
 
     let txq = TXQ.init(TxQueue::new());
