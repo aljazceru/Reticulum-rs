@@ -8,3 +8,5 @@ rust-analyzer.log
 
 # hardware test artifacts: flash backups, firmware images (keep on disk)
 hw-backup/
+firmware/c6l-modem-idf/.embuild/
+firmware/c6l-modem-idf/target/
