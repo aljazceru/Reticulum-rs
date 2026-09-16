@@ -49,7 +49,7 @@ const USER_USR_MISO: u32 = 1 << 28;
 /// Good default USER value: full-duplex, MOSI+MISO phases only, CS
 /// setup/hold enabled, no dummy/address/command phases, no QPI/OPI.
 const USER_FULL_DUPLEX: u32 =
-    USER_DOUTDIN | USER_CS_HOLD | USER_CS_SETUP | USER_USR_MOSI | USER_USR_MISO;
+    USER_DOUTDIN | USER_USR_MOSI | USER_USR_MISO;
 
 #[inline(always)]
 fn read(reg: usize) -> u32 {
@@ -110,13 +110,12 @@ pub fn transfer(buf: &mut [u8]) -> Result<(), &'static str> {
     write(DIN_NUM, 0);
     write(DOUT_MODE, 0); // no MOSI delay
 
-    // 3. Fill TX FIFO. The transfer data is right-aligned in the FIFO
-    // words and byte order within each word is BIG-ENDIAN so that the
-    // first byte of the buffer lands in the highest used bits and is
-    // shifted out first (MSB-first mode). For a 4-byte chunk [A,B,C,D]:
-    // W = A<<24 | B<<16 | C<<8 | D. For a 2-byte chunk [A,B]: W = A<<8 | B.
-    // For a 1-byte chunk [A]: W = A. (The esp-hal little-endian packing
-    // reverses the byte order for multi-byte MSB-first transfers.)
+    // 3. Fill TX FIFO with RIGHT-ALIGNED BIG-ENDIAN packing.
+    // In MSB-first mode the SPI transmits the MSB of the data field
+    // (bit MS_DLEN) first. For an N-byte transfer [A,B,C,...]:
+    //   A goes at bits [8N-1 : 8(N-1)] (sent FIRST — the opcode),
+    //   B at the next lower position, ..., last byte at bits [7:0].
+    // Examples: [A] → W=A; [A,B] → W=A<<8|B; [A,B,C,D] → W=A<<24|B<<16|C<<8|D.
     for (i, chunk) in buf.chunks(4).enumerate() {
         let l = chunk.len();
         let mut word: u32 = 0;
@@ -206,15 +205,21 @@ pub fn gpio_read(pin: u32) -> u32 {
 pub fn bitbang_claim_pins() {
     unsafe {
         for &pin in &[PIN_SCK, PIN_MOSI, PIN_MISO] {
-            // IO_MUX: set MCU_SEL=1 (GPIO function), preserve other bits.
+            // 1. IO_MUX: set MCU_SEL=1 (GPIO function via GPIO matrix)
             let reg = (IO_MUX_BASE + pin as usize * 4) as *mut u32;
             let cur = core::ptr::read_volatile(reg);
-            core::ptr::write_volatile(reg, (cur & !0x1F) | 1);
+            core::ptr::write_volatile(reg, (cur & !0x1F) | 1 | (1 << 5)); // MCU_SEL=1, FUN_IE=1
+            // 2. GPIO matrix: set OUT_SEL=128 (GPIO_OUT_REG controls the pad)
+            let func_out = (0x6009_1000 + 0x554 + pin as usize * 4) as *mut u32;
+            core::ptr::write_volatile(func_out, 128);
         }
-        // Enable output for SCK and MOSI.
+        // 3. GPIO_ENABLE: enable output for SCK and MOSI, disable for MISO
         let en = core::ptr::read_volatile(GPIO_ENABLE as *const u32);
-        core::ptr::write_volatile(GPIO_ENABLE as *mut u32, en | (1 << PIN_SCK) | (1 << PIN_MOSI));
-        // Idle levels: SCK low (Mode 0), MOSI low.
+        core::ptr::write_volatile(
+            GPIO_ENABLE as *mut u32,
+            (en | (1 << PIN_SCK) | (1 << PIN_MOSI)) & !(1 << PIN_MISO),
+        );
+        // Idle levels
         gpio_clr(PIN_SCK);
         gpio_clr(PIN_MOSI);
     }
@@ -234,14 +239,12 @@ pub fn bitbang_transfer(buf: &mut [u8]) {
                 gpio_clr(PIN_MOSI);
             }
             // Small setup delay (~1 µs at 160 MHz: ~160 nops).
-            let mut d = 0u32; while d < 40 { d += 1; }
-            // Rising edge: slave samples MOSI, we sample MISO.
+            let mut d = 0u32; while d < 10 { d += 1; }
             gpio_set(PIN_SCK);
-            let mut d = 0u32; while d < 40 { d += 1; }
+            let mut d = 0u32; while d < 10 { d += 1; }
             rx = (rx << 1) | gpio_read(PIN_MISO) as u8;
-            // Falling edge.
             gpio_clr(PIN_SCK);
-            let mut d = 0u32; while d < 40 { d += 1; }
+            let mut d = 0u32; while d < 10 { d += 1; }
         }
         *byte = rx;
     }

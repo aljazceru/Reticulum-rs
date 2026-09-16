@@ -189,15 +189,19 @@ where
     fn force_full_duplex(&self) {}
 
     /// Drive the SX1262 NCS (GPIO23) LOW via GPIO_OUT_W1TC.
+    /// Includes a ~250ns settle delay (datasheet: 50ns CS setup minimum).
     #[inline]
-    fn cs_low(&mut self) {
+    pub fn cs_low(&mut self) {
         unsafe { core::ptr::write_volatile(0x6009_100C as *mut u32, 1 << 23) };
+        let mut d = 0u32; while d < 40 { d += 1; } // ~250ns at 160MHz
     }
 
     /// Drive the SX1262 NCS (GPIO23) HIGH via GPIO_OUT_W1TS.
+    /// Includes a ~250ns settle delay (datasheet: 50ns CS hold minimum).
     #[inline]
-    fn cs_high(&mut self) {
+    pub fn cs_high(&mut self) {
         unsafe { core::ptr::write_volatile(0x6009_1008 as *mut u32, 1 << 23) };
+        let mut d = 0u32; while d < 40 { d += 1; } // ~250ns at 160MHz
     }
 
     fn wait_ready(&mut self) -> Result<(), RadioError> {
@@ -216,21 +220,22 @@ where
         Ok(())
     }
 
-    fn cmd(&mut self, opcode: u8, payload: &[u8]) -> Result<(), RadioError> {
+    pub fn cmd(&mut self, opcode: u8, payload: &[u8]) -> Result<(), RadioError> {
         self.wait_ready()?;
-        let len = 1 + payload.len().min(11);
-        let mut frame = [0u8; 12];
-        frame[0] = opcode;
-        frame[1..len].copy_from_slice(&payload[..len - 1]);
+        // Split-byte approach: each byte is a separate 1-byte SPI transfer
+        // with CS held LOW throughout. The SX1262 sees the full command
+        // as one transaction (CS stays LOW) but each byte is clocked
+        // independently — avoiding any multi-byte FIFO issues.
         self.cs_low();
-        let r = crate::raw_spi::transfer(&mut frame[..len]);
+        let mut op = [opcode];
+        crate::raw_spi::transfer(&mut op).map_err(|_| RadioError::Spi)?;
+        for chunk in payload.chunks(1) {
+            let mut byte = [chunk[0]];
+            crate::raw_spi::transfer(&mut byte).map_err(|_| RadioError::Spi)?;
+        }
         self.cs_high();
-        // The SX1262 needs time to process each command. Without BUSY
-        // feedback (pad reads HIGH on this board), use a fixed ~100µs
-        // settle delay — enough for any SX1262 command (datasheet: most
-        // complete in <50µs, calibrate takes up to 1ms handled by init).
         let mut d = 0u32; while d < 8_000 { d += 1; }
-        r.map_err(|_| RadioError::Spi)
+        Ok(())
     }
 
     /// Read-type command: send `opcode`, clock `out.len()` NOP/status
@@ -238,19 +243,19 @@ where
     /// callers index accordingly (datasheet 13.3).
     fn cmd_read(&mut self, opcode: u8, out: &mut [u8]) -> Result<(), RadioError> {
         self.wait_ready()?;
-        // Give the SX1262 time to finish processing the previous command
-        // before we clock the read — its data path needs the settle time.
         let mut pre = 0u32; while pre < 8_000 { pre += 1; }
-        let len = 1 + out.len();
-        let mut frame = [OP_NOP; 9];
-        frame[0] = opcode;
         self.cs_low();
-        let r = crate::raw_spi::transfer(&mut frame[..len]);
+        // Send opcode as 1-byte transfer
+        let mut op = [opcode];
+        crate::raw_spi::transfer(&mut op).map_err(|_| RadioError::Spi)?;
+        // Read each output byte as separate 1-byte transfer (NOP send)
+        for b in out.iter_mut() {
+            let mut byte = [0u8];
+            crate::raw_spi::transfer(&mut byte).map_err(|_| RadioError::Spi)?;
+            *b = byte[0];
+        }
         self.cs_high();
-        // Settle delay for the SX1262 to update its status/data path.
         let mut d = 0u32; while d < 8_000 { d += 1; }
-        r.map_err(|_| RadioError::Spi)?;
-        out.copy_from_slice(&frame[1..1 + out.len()]);
         Ok(())
     }
 
@@ -273,6 +278,108 @@ where
         for _ in 0..10 {
             let _ = self.bus.write(&[OP_NOP]);
         }
+    }
+
+    /// Force a brownout reset of the SX1262 by sinking current from
+    /// all GPIO pins simultaneously — this discharges the 3.3V rail's
+    /// bulk capacitors enough to trigger the radio's power-on reset.
+    /// (No RST pin on this board; USB hub "power cycling" doesn't cut VBUS.)
+    pub fn force_brownout_reset(&mut self) {
+        // 1. Configure all safe GPIOs as outputs driving LOW
+        //    (this creates a load on the 3.3V rail through pull-ups and
+        //     the SX1262's own I/O, discharging its supply capacitors)
+        unsafe {
+            // Set GPIO_ENABLE for all pins 0-30
+            let en_addr = 0x6009_1020 as *mut u32;
+            core::ptr::write_volatile(en_addr, 0x7FFF_FFFF);
+            // Drive all GPIO_OUT LOW
+            let out_addr = 0x6009_1004 as *mut u32;
+            core::ptr::write_volatile(out_addr, 0x0000_0000);
+            // Also clear via W1TC for good measure
+            core::ptr::write_volatile(0x6009_100C as *mut u32, 0x7FFF_FFFF);
+        }
+        // 2. Wait for capacitors to discharge (~500ms)
+        for _ in 0..5_000_000 { core::hint::black_box(()); }
+        // 3. Release: set all pins back to input (high-Z)
+        unsafe {
+            let en_addr = 0x6009_1020 as *mut u32;
+            core::ptr::write_volatile(en_addr, 0x0000_0000);
+        }
+        // 4. Wait for the radio to boot (~10ms)
+        for _ in 0..1_000_000 { core::hint::black_box(()); }
+    }
+
+    /// Full init via GPIO bit-banging (bypasses the SPI peripheral entirely).
+    /// Tests whether the SX1262 responds correctly to manual SPI.
+    pub fn init_bitbang(&mut self, delay: &esp_hal::delay::Delay) -> Result<(), RadioError> {
+        // Claim SPI pins for GPIO control
+        crate::raw_spi::bitbang_claim_pins();
+
+        // Helper: send a command via bit-bang with CS control
+        macro_rules! bb_cmd {
+            ($opcode:expr, $payload:expr) => {{
+                crate::raw_spi::gpio_clr(23); // CS LOW
+                let mut buf = [0u8; 8];
+                buf[0] = $opcode;
+                for (i, &b) in $payload.iter().enumerate() {
+                    buf[i + 1] = b;
+                }
+                crate::raw_spi::bitbang_transfer(&mut buf[..1 + $payload.len()]);
+                crate::raw_spi::gpio_set(23); // CS HIGH
+                // Wait for command to process (~100µs)
+                for _ in 0..8000 { core::hint::black_box(()); }
+            }};
+        }
+
+        // Helper: read status via bit-bang
+        let bb_status = || -> u8 {
+            crate::raw_spi::gpio_clr(23);
+            let mut buf = [0xC0u8];
+            crate::raw_spi::bitbang_transfer(&mut buf);
+            crate::raw_spi::gpio_set(23);
+            for _ in 0..2000 { core::hint::black_box(()); }
+            buf[0]
+        };
+
+        // Full init sequence via bit-bang
+        let st0 = bb_status();
+        esp_println::println!("BB: initial status={:x}", st0);
+
+        // NOP to reset SPI state
+        crate::raw_spi::gpio_clr(23);
+        let mut nop = [0x00u8];
+        crate::raw_spi::bitbang_transfer(&mut nop);
+        crate::raw_spi::gpio_set(23);
+        for _ in 0..4000 { core::hint::black_box(()); }
+
+        // SetStandby(STBY_RC) = [0x80, 0x00]
+        bb_cmd!(0x80, [0x00u8]);
+        let st1 = bb_status();
+        esp_println::println!("BB: after standby={:x}", st1);
+
+        // SetRfFrequency(867.5 MHz) = [0x86, freq_be]
+        let freq: u32 = ((867_500_000u64 * (1u64 << 25)) / 32_000_000) as u32;
+        bb_cmd!(0x86, freq.to_be_bytes());
+        let st2 = bb_status();
+        esp_println::println!("BB: after freq={:x}", st2);
+
+        // SetPacketType(LoRa) = [0x88, 0x01]
+        bb_cmd!(0x88, [0x01u8]);
+
+        // SetRx(continuous) = [0x82, 0xFF, 0xFF, 0xFF]
+        bb_cmd!(0x82, [0xFFu8, 0xFF, 0xFF]);
+        let st3 = bb_status();
+        esp_println::println!("BB: after setrx={:x}", st3);
+
+        // Read IRQ status via bit-bang: [0x12, NOP, NOP]
+        crate::raw_spi::gpio_clr(23);
+        let mut irq_buf = [0x12u8, 0x00, 0x00];
+        crate::raw_spi::bitbang_transfer(&mut irq_buf);
+        crate::raw_spi::gpio_set(23);
+        esp_println::println!("BB: irq=[{:02x},{:02x},{:02x}]", irq_buf[0], irq_buf[1], irq_buf[2]);
+
+        let _ = delay;
+        Ok(())
     }
 
     pub fn init(&mut self, delay: &esp_hal::delay::Delay) -> Result<(), RadioError> {
@@ -360,7 +467,7 @@ where
                 cfg.preamble_syms as u8,
                 0x00, // explicit header
                 0xFF, // dynamic payload length
-                0x01, // LoRa CRC on
+                0x00, // LoRa CRC OFF — RNode/Reticulum handles integrity at protocol level
                 0x00, // standard IQ
             ],
         )?;
@@ -390,6 +497,13 @@ where
     pub fn start_rx(&mut self) -> Result<(), RadioError> {
         self.cmd(OP_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x80])?;
         self.clear_irq()?;
+        // Map RxDone + TxDone to DIO1 so the modem task's edge interrupt fires.
+        let irq_mask: u16 = 0x03FF; // all common IRQs
+        let dio1_mask: u16 = 0x0002 | 0x0001; // RxDone + TxDone
+        let mut params = [0u8; 8];
+        params[0..2].copy_from_slice(&irq_mask.to_be_bytes());
+        params[2..4].copy_from_slice(&dio1_mask.to_be_bytes());
+        self.cmd(0x98, &params)?; // OP_SET_DIO_IRQ_PARAMS
         self.cmd(OP_SET_RX, &[0xFF, 0xFF, 0xFF])?; // continuous
         Ok(())
     }

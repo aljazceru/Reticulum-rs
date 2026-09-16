@@ -180,7 +180,7 @@ pub struct RtosHal {
 pub fn split(peris: Peripherals) -> (ModemHal, WifiHal, RtosHal) {
     let spi = Spi::new(
         peris.SPI2,
-        SpiConfig::default().with_frequency(esp_hal::time::Rate::from_mhz(2)),
+        SpiConfig::default().with_frequency(esp_hal::time::Rate::from_khz(100)),
     )
     .expect("spi config")
     .with_sck(peris.GPIO20)
@@ -302,6 +302,49 @@ pub async fn modem_task(hal: SendHal, task_spawner: embassy_executor::SendSpawne
     USB_SID.store(usb_sid as u32, core::sync::atomic::Ordering::Relaxed);
     esp_println::println!("MODEM: session {}", usb_sid);
 
+
+
+
+    // CRITICAL: Deselect the SSD1306 OLED (shares SPI bus with SX1262!)
+    // The M5Stack Unit C6L has the SSD1306 on the same SPI pins
+    // (SCK=20, MOSI=21, MISO=22) with its CS on GPIO 6. If GPIO 6
+    // floats LOW, the OLED is selected and drives MISO, causing bus
+    // contention with the SX1262 — this was the root cause of all the
+    // "status byte echo" behavior (0xF6 is the SSD1306, not the SX1262).
+    {
+        // Configure GPIO 6 as output, drive HIGH (deselect OLED)
+        let en = unsafe { core::ptr::read_volatile(0x6009_1020 as *const u32) };
+        unsafe { core::ptr::write_volatile(0x6009_1020 as *mut u32, en | (1 << 6)) };
+        unsafe { core::ptr::write_volatile(0x6009_1008 as *mut u32, 1 << 6) };
+        // Also deselect DC (GPIO 18) and assert OLED reset (GPIO 15)
+        let en2 = unsafe { core::ptr::read_volatile(0x6009_1020 as *const u32) };
+        unsafe { core::ptr::write_volatile(0x6009_1020 as *mut u32, en2 | (1 << 18) | (1 << 15)) };
+        unsafe { core::ptr::write_volatile(0x6009_1008 as *mut u32, (1 << 18) | (1 << 6)) }; // DC high, CS high
+        unsafe { core::ptr::write_volatile(0x6009_100C as *mut u32, 1 << 15) }; // RESET low (hold OLED in reset)
+        esp_println::println!("OLED: deselected (CS=6 HIGH, DC=18 HIGH, RST=15 LOW)");
+    // VERIFY: read back GPIO states
+    {
+        let out: u32 = unsafe { core::ptr::read_volatile(0x6009_1004 as *const u32) };
+        let en: u32 = unsafe { core::ptr::read_volatile(0x6009_1020 as *const u32) };
+        let g6 = (out >> 6) & 1;
+        let g6e = (en >> 6) & 1;
+        let g18 = (out >> 18) & 1;
+        let g15 = (out >> 15) & 1;
+        esp_println::println!("GPIO-VERIFY: cs6={} en6={} dc18={} rst15={}", g6, g6e, g18, g15);
+    }
+    }
+    // Force ALL SPI pins to GPIO MATRIX mode (MCU_SEL=1). The GPIO matrix
+    // routing was set up by with_sck/mosi/miso but wasn't active because
+    // the default MCU_SEL=0 (IO_MUX direct) took priority.
+    {
+        for &addr in &[0x60090054u32, 0x60090058, 0x6009005C] {
+            let reg = addr as *mut u32;
+            let cur = unsafe { core::ptr::read_volatile(reg) };
+            unsafe { core::ptr::write_volatile(reg, (cur & !0x1F) | 1) };
+        }
+        let i22: u32 = unsafe { core::ptr::read_volatile(0x6009005C as *const u32) };
+        esp_println::println!("IOMUX-GM: all pins MCU_SEL=1, miso full={:x}", i22);
+    }
     // Initialize the SPI bus with ESP-IDF-equivalent defaults
     crate::raw_spi::bus_init();
     // Note: SPI pins are in IO_MUX direct mode (MCU_SEL=0) which provides the
@@ -357,7 +400,7 @@ pub async fn modem_task(hal: SendHal, task_spawner: embassy_executor::SendSpawne
             let irq_st = radio.irq_status().unwrap_or(0);
             let rssi = radio.current_rssi().unwrap_or(0);
             let pin = irq.is_high();
-            use alloc::format; let st = radio.get_status().unwrap_or(0); let mode = (st >> 3) & 0x7; // SX1262 status: mode at bits [5:3]
+            use alloc::format; let st = radio.get_status().unwrap_or(0); let mode = (st >> 4) & 0x7; // RadioLib: mode at bits [6:4]
         // Raw SPI probe: send GetIrqStatus opcode + 3 NOPs via transfer_in_place
         
         
@@ -367,6 +410,31 @@ pub async fn modem_task(hal: SendHal, task_spawner: embassy_executor::SendSpawne
                 "RT: irq={:04x} rssi={} mode={}",
                 irq_st, rssi, mode
             );
+            // TEST: standby → clear → read (should stay 0 in standby, no RX noise)
+            let _ = radio.cmd(0x80, &[0x00]); // SetStandby(STBY_RC)
+            let mut d = 0u32; while d < 16_000 { d += 1; } // 200µs
+            let stby_mode = (radio.get_status().unwrap_or(0) >> 4) & 7;
+            let _ = radio.clear_irq();
+            d = 0; while d < 16_000 { d += 1; }
+            let cleared = radio.irq_status().unwrap_or(0xFFFF);
+            esp_println::println!("RT: stby_mode={} after_clear={:04x}", stby_mode, cleared);
+            // Back to RX
+            let _ = radio.start_rx();
+            // SPLIT-BYTE TEST: send SetStandby as two 1-byte transfers under one CS
+            if loop_n % 40 == 20 { // alternate with the clear test
+                radio.cs_low();
+                let mut op = [0x80u8];
+                let _ = crate::raw_spi::transfer(&mut op);
+                let mut param = [0x00u8];
+                let _ = crate::raw_spi::transfer(&mut param);
+                radio.cs_high();
+                let mut d = 0u32; while d < 8_000 { d += 1; }
+                let after_sb = radio.get_status().unwrap_or(0);
+                let sb_mode = (after_sb >> 4) & 0x7;
+                esp_println::println!("RT: after_setstandby mode={} (was {})", sb_mode, mode);
+                // Go back to RX
+                let _ = radio.start_rx();
+            }
             // Print esp-rtos diagnostic counters
             let d = &esp_rtos::RTOS_DIAG;
             esp_println::println!(
