@@ -2,7 +2,7 @@ use esp_idf_hal::spi::{config::Config, config::DriverConfig, SpiDeviceDriver};
 use esp_println::println;
 
 fn main() -> anyhow::Result<()> {
-    println!("c6l-modem-idf: LoRa RX v6 (hybrid SPI)");
+    println!("c6l-modem-idf: LoRa RX v7 (IRQ polling)");
     let handle = std::thread::Builder::new()
         .stack_size(65536)
         .spawn(|| { if let Err(e) = lora_rx() { println!("Error: {:?}", e); } })
@@ -28,7 +28,7 @@ fn lora_rx() -> anyhow::Result<()> {
         &Config::new().baudrate(2_000_000.into()),
     )?;
 
-    // WRITE macro: multi-byte single transaction (works for writes!)
+    // WRITE: multi-byte single transaction
     macro_rules! cmd {
         ($buf:expr) => {{
             cs.set_low()?;
@@ -38,7 +38,7 @@ fn lora_rx() -> anyhow::Result<()> {
         }};
     }
 
-    // READ macro: byte-by-byte (works for reads!)
+    // READ: byte-by-byte separate transactions
     macro_rules! read {
         ($buf:expr) => {{
             cs.set_low()?;
@@ -55,61 +55,180 @@ fn lora_rx() -> anyhow::Result<()> {
         }};
     }
 
-    // Busy-wait delay
     macro_rules! wait {
         ($c:expr) => { for _ in 0..$c { std::thread::yield_now(); } };
     }
 
+    // Error-safe read (inline, no macro, can't crash the loop)
+    macro_rules! read_safe {
+        ($buf:expr) => {{
+            let _ = cs.set_low();
+            for i in 0..$buf.len() {
+                let mut b = [$buf[i]];
+                if spi.transfer_in_place(&mut b).is_ok() {
+                    $buf[i] = b[0];
+                }
+            }
+            let _ = cs.set_high();
+        }};
+    }
+
     println!("SPI ready");
 
-    // === INIT: multi-byte writes ===
-    cmd!(&mut [0x00u8]); // NOP
-    wait!(5000);
-    cmd!(&mut [0x80u8, 0x00]); // SetStandby(STBY_RC)
-    wait!(5000);
-    cmd!(&mut [0x8Au8, 0x01]); // SetPacketType(LoRa)
-    wait!(5000);
-    cmd!(&mut [0x86u8, 0x36, 0x38, 0x00, 0x00]); // SetRfFreq(867.5MHz)
-    wait!(5000);
-    cmd!(&mut [0x8Bu8, 0x09, 0x04, 0x01, 0x00]); // SF9, BW125, CR4/5
-    wait!(5000);
-    cmd!(&mut [0x8Cu8, 0x00, 0x08, 0x00, 0xFF, 0x01, 0x00]); // PktParams
-    wait!(5000);
-    cmd!(&mut [0x0Du8, 0x07, 0x40, 0x14, 0x24]); // SyncWord
-    wait!(5000);
-    cmd!(&mut [0x9Du8, 0x01]); // SetDio2AsRfSwitch
-    wait!(5000);
-    cmd!(&mut [0x08u8, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00]); // IRQ on DIO1
-    wait!(5000);
-    cmd!(&mut [0x02u8, 0x03, 0xFF]); // ClearIrqStatus
-    wait!(5000);
+    // === INIT ===
+    read!(&mut [0x00u8]); wait!(5000);  // NOP
+    read!(&mut [0x80u8, 0x00]); wait!(5000);  // SetStandby(STBY_RC)
+    
+    // Enable TCXO (3.0V, 5ms timeout) — CRITICAL for correct frequency!
+    // Without TCXO, internal RC oscillator has ±5% error = ±43 MHz at 867.5 MHz!
+    // Using multi-byte write (cmd!) which works for all writes.
+    cmd!(&mut [0x97u8, 0x06, 0x00, 0x01, 0x40]); // TCXO 3.0V, delay=320*15.625us=5ms
+    wait!(50000); // Wait for TCXO to stabilize
+    
+    // Verify reads still work after TCXO
+    let mut sw_tcxo = [0x1Du8, 0x07, 0x40, 0x00, 0x00];
+    read!(&mut sw_tcxo);
+    println!("After TCXO: sync[4]=0x{:02x} (0x14=OK)", sw_tcxo[4]);
+    
+    read!(&mut [0x8Au8, 0x01]); wait!(5000);  // SetPacketType
+    read!(&mut [0x86u8, 0x36, 0x38, 0x00, 0x00]); wait!(5000);  // SetRfFreq
+    read!(&mut [0x8Bu8, 0x09, 0x04, 0x01, 0x00]); wait!(5000);  // SetModParams
+    read!(&mut [0x8Cu8, 0x00, 0x08, 0x00, 0xFF, 0x00, 0x00]); wait!(5000);  // PktParams
+    // Write private sync word 0x1424
+    read!(&mut [0x0Du8, 0x07, 0x40, 0x14, 0x24]); wait!(5000);
+    read!(&mut [0x9Du8, 0x01]); wait!(5000);  // SetDio2AsRfSwitch
+    read!(&mut [0x08u8, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00]); wait!(5000);  // SetDioIrq
+    read!(&mut [0x02u8, 0x03, 0xFF]); wait!(5000);  // ClearIrq
 
-    // === VERIFY: byte-by-byte reads ===
-    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00];
+    // Verify
+    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00];
     read!(&mut sw);
-    println!("Sync word: 0x{:02x} (expect 0x14)", sw[4]);
+    println!("SyncWord MSB: 0x{:02x} (0x14), LSB: 0x{:02x} (0x24)", sw[4], sw[5]);
 
-    // === SetRx: multi-byte write ===
+    // Set buffer base addresses (TX=0, RX=0) — CRITICAL for packet reception!
+    read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
+    
+    // Set RX gain to boosted mode (improves sensitivity)
+    read!(&mut [0x96u8, 0x01]); wait!(5000);  // SetRxGain boosted
+    
+    // SetRx
     cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
     wait!(50000);
 
-    // Verify mode with byte-by-byte read
     let mut st = [0xC0u8, 0x00];
     read!(&mut st);
     let mode = (st[0] >> 4) & 0x7;
-    println!("Mode: {} ({})", mode, if mode == 5 { "RX - WORKING!" } else if mode == 2 { "STANDBY" } else { "?" });
+    println!("Mode: {} ({})", mode, if mode == 5 { "RX" } else { "?" });
+    println!("=== LISTENING ===");
 
-    println!("=== LISTENING 867.5 MHz BW125 SF9 ===");
+    // === RX LOOP: poll IRQ status via safe reads ===
+    let mut pkt_count = 0u32;
+    let mut loop_n: u32 = 0;
+    let mut telem_n: u32 = 0;
+    let mut rssi_val: i16 = 0;
 
-    // === RX LOOP ===
-    // SIMPLE LOOP TEST: just counter + vTaskDelay + print
-    let mut tick: u32 = 0;
     loop {
-        tick += 1;
-        if tick % 100000 == 0 {
-            println!("TICK {}", tick);
+        loop_n += 1;
+
+        // Poll IRQ status every 50000 iterations (~7ms at 7M/sec)
+        if loop_n % 50000 == 0 {
+            let mut irq = [0x12u8, 0x00, 0x00, 0x00];
+            read_safe!(&mut irq);
+            let flags = ((irq[2] as u16) << 8) | irq[3] as u16;
+
+            if flags & 0x0002 != 0 { // RxDone!
+                // Read packet length
+                let mut rbs = [0x13u8, 0x00, 0x00, 0x00];
+                read_safe!(&mut rbs);
+                let len = rbs[2] as usize;
+
+                if len > 0 && len < 256 {
+                    let read_len = len.min(64);
+                    let mut pkt = [0u8; 3 + 64];
+                    pkt[0] = 0x1E; // ReadBuffer
+                    pkt[1] = 0x00;
+                    pkt[2] = 0x00;
+                    read_safe!(&mut pkt[..3 + read_len]);
+
+                    pkt_count += 1;
+
+                    // Read RSSI/SNR
+                    let mut ps = [0x14u8, 0x00, 0x00, 0x00];
+                    read_safe!(&mut ps);
+                    let rssi = -(ps[2] as i16) / 2;
+                    let snr = ps[3] as i8;
+
+                    println!("*** RX #{}: {}B {:02x?} RSSI={}dBm SNR={}dB IRQ={:04x} ***",
+                        pkt_count, len, &pkt[3..3 + read_len], rssi, snr, flags);
+                }
+
+                // Clear IRQ and restart RX (multi-byte writes)
+                cmd!(&mut [0x02u8, 0x03, 0xFF]);
+                cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
+            } else if flags & 0x0040 != 0 { // CrcError
+                println!("CRC ERROR flags={:04x}", flags);
+                cmd!(&mut [0x02u8, 0x03, 0xFF]);
+                cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
+            }
+
+            // Check DIO1 for comparison
+            let dio1_state = dio1.is_high();
+            if dio1_state {
+                println!("DIO1=HIGH flags={:04x}", flags);
+            }
         }
-        if tick % 50000 == 0 {
+
+        // Telemetry every ~500000 iterations (~0.7 seconds)
+        if loop_n % 500000 == 0 {
+            telem_n += 1;
+            // Safe RSSI read
+            let mut rssi_buf = [0x15u8, 0x00, 0x00];
+            read_safe!(&mut rssi_buf);
+            rssi_val = -(rssi_buf[2] as i16) / 2;
+
+            println!("TELEM#{}: pkts={} dio1={} rssi={}", 
+                telem_n, pkt_count, if dio1.is_high() { "H" } else { "L" }, rssi_val);
+        }
+
+        // Periodic TX every ~10 seconds (100_000_000 iterations at ~10M/sec)
+        if loop_n % 100000000 == 0 && loop_n > 0 {
+            println!("TX cycle...");
+            
+            // Go to standby first
+            cmd!(&mut [0x80u8, 0x00]);
+            wait!(10000);
+            
+            // Write HELLO to TX buffer
+            let mut wr_buf = [0u8; 7];
+            wr_buf[0] = 0x0E; // WriteBuffer
+            wr_buf[1] = 0x00; // offset 0
+            wr_buf[2] = b'H';
+            wr_buf[3] = b'E';
+            wr_buf[4] = b'L';
+            wr_buf[5] = b'L';
+            wr_buf[6] = b'O';
+            read!(&mut wr_buf);
+            wait!(5000);
+            
+            // Set TX buffer address
+            read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]);
+            wait!(5000);
+            
+            // SetTx with 5s timeout
+            read!(&mut [0x83u8, 0x00, 0x00, 0x13, 0x88]);
+            wait!(50000); // Wait for TX
+            
+            println!("TX done!");
+            
+            // Clear IRQ and go back to RX
+            read!(&mut [0x02u8, 0x03, 0xFF]);
+            wait!(5000);
+            cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
+            wait!(10000);
+        }
+        
+        // Yield to IDLE (prevent watchdog)
+        if loop_n % 100000 == 0 {
             unsafe { esp_idf_sys::vTaskDelay(1); }
         }
     }
