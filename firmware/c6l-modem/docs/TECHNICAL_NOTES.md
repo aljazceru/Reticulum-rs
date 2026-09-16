@@ -235,3 +235,73 @@ handling may differ subtly.
    access that mirrors ESP-IDF's `spi_master` behavior exactly.
 3. File upstream issues: esp-hal (SPI register defaults leave dummy/
    addr phases enabled) and/or the TCXO command byte order bug is ours.
+
+---
+
+## Deep Debugging Session Summary (2026-09-16)
+
+### What was verified working
+
+1. **SPI data path (loopback test)**: Routed MISO to read from GPIO21
+   (MOSI pad). Sent [0x1D,0x07,0x40,0x00] and received identical data.
+   GPSPI2 FIFO packing confirmed correct (right-aligned big-endian).
+
+2. **IO_MUX direct mode**: SPI pins (20/21/22) use MCU_SEL=0 (IO_MUX
+   direct). This bypasses the GPIO matrix entirely. Switching to
+   MCU_SEL=1 (GPIO matrix) breaks MISO (reads 0xFF).
+
+3. **SPI configuration**: Mode 0, 2 MHz, 50% duty cycle, MSB first,
+   full-duplex (DOUTDIN=1), no dummy/address/command phases.
+
+4. **GPIO matrix routing** (when active): SCK=signal 63 (FSPICLK),
+   MOSI=signal 65 (FSPID). Verified via FUNC_OUT_SEL_CFG reads.
+
+5. **SX1262 responds**: CS LOW → MISO carries 0xF6 (status byte).
+   CS HIGH → MISO reads 0xFF (floating).
+
+### What doesn't work
+
+- SX1262 does not process multi-byte SPI commands
+- Status byte stays at 0xF6 (bits [5:3]=110=TX mode from Meshtastic)
+- All read commands return status byte echo (not actual data)
+- Radio never enters RX mode (our SetRx command not processed)
+- No LoRa packet reception
+
+### Status byte format (corrected)
+
+From SX1262 datasheet section 13.3:
+- Bits [7:6]: reserved (11)
+- Bits [5:3]: circuit mode (2=STBY_RC, 3=STBY_XOSC, 4=FS, 5=RX, 6=TX)
+- Bits [2:1]: command status (1=data available, 2=in progress, 3=timeout)
+- Bit [0]: reserved (0)
+
+Common error: mode is at bits [5:3], NOT [6:4].
+
+### Root cause (unknown)
+
+Despite verified-correct SPI data reaching the SX1262's MOSI pin,
+the chip does not recognize or process our commands. Meshtastic
+(ESP-IDF spi_master + RadioLib) works on identical hardware.
+
+Possible causes to investigate with an oscilloscope:
+1. Clock edge timing (sample point vs. data valid window)
+2. CS setup/hold timing relative to first/last clock edge
+3. Signal rise/fall times and overshoot
+4. Ground bounce or crosstalk between SPI lines
+
+### Recommended next steps
+
+1. **Oscilloscope comparison**: Capture SPI waveforms (SCK, MOSI, CS)
+   from both our firmware and Meshtastic running on the same board.
+   Compare timing, voltage levels, and edge characteristics.
+
+2. **Try esp-idf-sys**: Use the `esp-idf-sys` crate to call ESP-IDF's
+   `spi_master` driver directly from Rust, bypassing both esp-hal and
+   our raw driver. This would use the exact same driver as Meshtastic.
+
+3. **Port RadioLib**: Compile RadioLib's SX126x driver as a static
+   library and link it into our firmware, using its proven SPI wrapper.
+
+4. **Alternative: use Arduino framework**: Build the firmware with
+   the Arduino framework (like Meshtastic) instead of esp-hal, trading
+   some control for proven SPI compatibility.
