@@ -65,6 +65,26 @@ fn write(reg: usize, val: u32) {
 ///
 /// On return, `buf` contains the data received on MISO while the
 /// original contents were shifted out on MOSI.
+/// Initialize the SPI bus to match ESP-IDF's spi_master defaults.
+/// Call once after Spi::new() but before any transfers.
+pub fn bus_init() {
+    // Ensure master mode (SLAVE register = 0)
+    write(BASE + 0xE0, 0); // SLAVE
+    // Clear any stale address
+    write(BASE + 0x04, 0); // ADDR
+    // MISC: enable CS0, disable CS1-5, normal clock
+    write(BASE + 0x20, 0); // MISC
+    // Clear DMA configuration (CPU-controlled FIFO mode)
+    let dma = read(BASE + 0x30); // DMA_CONF
+    write(BASE + 0x30, dma & !((1 << 27) | (1 << 28))); // clear DMA_RX_ENA, DMA_TX_ENA
+    // USER: set full-duplex with proper defaults
+    write(USER, USER_FULL_DUPLEX);
+    // USER1: CS setup/hold times (ESP-IDF default: 0 for both)
+    write(USER1, 0);
+    // USER2: no command
+    write(USER2, 0);
+}
+
 pub fn transfer(buf: &mut [u8]) -> Result<(), &'static str> {
     let len = buf.len();
     if len == 0 || len > 64 {
