@@ -100,32 +100,21 @@ pub fn transfer(buf: &mut [u8]) -> Result<(), &'static str> {
         }
     }
 
-    // 2. Configure the transfer.
-    write(USER, USER_FULL_DUPLEX);
-    write(USER1, 0); // no CS timing overrides, no addr bits
-    write(USER2, 0); // no command phase
-    write(ADDR, 0); // clear any stale address
+    // 2. Set data length (this is ALL the per-transaction config we do,
+    //    matching ESP-IDF's spi_device_polling_transmit for single bytes).
     write(MS_DLEN, (len as u32) * 8 - 1);
-    write(DIN_MODE, 0); // no MISO delay
-    write(DIN_NUM, 0);
-    write(DOUT_MODE, 0); // no MOSI delay
 
-    // 3. Fill TX FIFO with RIGHT-ALIGNED BIG-ENDIAN packing.
-    // In MSB-first mode the SPI transmits the MSB of the data field
-    // (bit MS_DLEN) first. For an N-byte transfer [A,B,C,...]:
-    //   A goes at bits [8N-1 : 8(N-1)] (sent FIRST — the opcode),
-    //   B at the next lower position, ..., last byte at bits [7:0].
-    // Examples: [A] → W=A; [A,B] → W=A<<8|B; [A,B,C,D] → W=A<<24|B<<16|C<<8|D.
+
+    // 3. Fill TX FIFO (little-endian: byte 0 at bits [7:0], matching ESP-IDF).
     for (i, chunk) in buf.chunks(4).enumerate() {
-        let l = chunk.len();
         let mut word: u32 = 0;
         for (j, &b) in chunk.iter().enumerate() {
-            word |= (b as u32) << ((l - 1 - j) * 8);
+            word |= (b as u32) << (j * 8);
         }
         write(W + i * 4, word);
     }
 
-    // 4. Sync configuration into the SPI clock domain (UPDATE pulse).
+    // 4. Sync (UPDATE pulse — this is what ESP-IDF does before each transfer).
     let cmd = read(CMD);
     write(CMD, cmd | CMD_UPDATE);
     t = 0;
@@ -136,10 +125,10 @@ pub fn transfer(buf: &mut [u8]) -> Result<(), &'static str> {
         }
     }
 
-    // Clear stale transfer-done interrupt.
-    write(DMA_INT_CLR, 1 << 9); // SPI_TRANS_DONE_INT
+    // Clear stale interrupt.
+    write(DMA_INT_CLR, 1 << 9);
 
-    // 5. Start the transfer.
+    // 5. Start.
     write(CMD, CMD_USR);
 
     t = 0;
@@ -150,12 +139,11 @@ pub fn transfer(buf: &mut [u8]) -> Result<(), &'static str> {
         }
     }
 
-    // 6. Drain RX FIFO (right-aligned big-endian, matching TX packing).
+    // 6. Read RX FIFO (little-endian, matching ESP-IDF).
     for (i, chunk) in buf.chunks_mut(4).enumerate() {
-        let l = chunk.len();
         let word = read(W + i * 4);
         for (j, b) in chunk.iter_mut().enumerate() {
-            *b = ((word >> ((l - 1 - j) * 8)) & 0xFF) as u8;
+            *b = ((word >> (j * 8)) & 0xFF) as u8;
         }
     }
 

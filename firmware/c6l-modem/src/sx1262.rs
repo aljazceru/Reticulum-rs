@@ -205,16 +205,14 @@ where
     }
 
     fn wait_ready(&mut self) -> Result<(), RadioError> {
-        // GPIO19 reads HIGH on this board even after power-cycle while the
-        // radio demonstrably responds to SPI (pre-init GetStatus returns
-        // valid status). The BUSY pad is likely not connected to GPIO19
-        // (board wiring difference from the Meshtastic variant). Poll very
-        // briefly and fall through — commands work regardless.
+        // BUSY now reads correctly (MCU_SEL=1 on GPIO19). Wait for it to
+        // go LOW before sending commands — the SX1262 ignores writes while
+        // BUSY is HIGH. Generous timeout (100ms) matching RadioLib.
         let mut waited = 0u32;
-        while self.busy_raw() {
+        while self.busy.is_high().unwrap_or(false) {
             waited += 1;
-            if waited > 100 {
-                break;
+            if waited > 8_000_000 {
+                return Err(RadioError::Busy);
             }
         }
         Ok(())
@@ -222,19 +220,18 @@ where
 
     pub fn cmd(&mut self, opcode: u8, payload: &[u8]) -> Result<(), RadioError> {
         self.wait_ready()?;
-        // Split-byte approach: each byte is a separate 1-byte SPI transfer
-        // with CS held LOW throughout. The SX1262 sees the full command
-        // as one transaction (CS stays LOW) but each byte is clocked
-        // independently — avoiding any multi-byte FIFO issues.
-        self.cs_low();
-        let mut op = [opcode];
-        crate::raw_spi::transfer(&mut op).map_err(|_| RadioError::Spi)?;
-        for chunk in payload.chunks(1) {
-            let mut byte = [chunk[0]];
-            crate::raw_spi::transfer(&mut byte).map_err(|_| RadioError::Spi)?;
-        }
-        self.cs_high();
-        let mut d = 0u32; while d < 8_000 { d += 1; }
+        let len = 1 + payload.len().min(11);
+        let mut frame = [0u8; 12];
+        frame[0] = opcode;
+        frame[1..len].copy_from_slice(&payload[..len - 1]);
+        // Use the ESP32 HAL SPI driver (ExclusiveDevice) instead of raw_spi.
+        // The HAL's fill_fifo + start_operation path might handle something
+        // our raw driver misses (bit ordering, FIFO management, etc.).
+        self.bus
+            .transfer_in_place(&mut frame[..len])
+            .map_err(|_| RadioError::Spi)?;
+        // Generous settle delay
+        for _ in 0..80_000 { core::hint::black_box(()); }
         Ok(())
     }
 
@@ -243,19 +240,15 @@ where
     /// callers index accordingly (datasheet 13.3).
     fn cmd_read(&mut self, opcode: u8, out: &mut [u8]) -> Result<(), RadioError> {
         self.wait_ready()?;
-        let mut pre = 0u32; while pre < 8_000 { pre += 1; }
-        self.cs_low();
-        // Send opcode as 1-byte transfer
-        let mut op = [opcode];
-        crate::raw_spi::transfer(&mut op).map_err(|_| RadioError::Spi)?;
-        // Read each output byte as separate 1-byte transfer (NOP send)
-        for b in out.iter_mut() {
-            let mut byte = [0u8];
-            crate::raw_spi::transfer(&mut byte).map_err(|_| RadioError::Spi)?;
-            *b = byte[0];
-        }
-        self.cs_high();
-        let mut d = 0u32; while d < 8_000 { d += 1; }
+        let len = 2 + out.len();
+        let mut frame = [0u8; 10];
+        frame[0] = opcode;
+        frame[1] = 0x00; // status byte slot
+        self.bus
+            .transfer_in_place(&mut frame[..len])
+            .map_err(|_| RadioError::Spi)?;
+        // Data starts after opcode + status byte
+        out.copy_from_slice(&frame[2..2 + out.len()]);
         Ok(())
     }
 
@@ -396,16 +389,10 @@ where
         // voltage, which put the SX1262 into permanent BUSY.
         let tcxo = (volts_units << 16) | timeout_units;
         let bytes = tcxo.to_be_bytes();
-        self.cmd(OP_DIO3_TCXO_CTRL, &bytes)
-            .map_err(|e| {
-                match e {
-                    RadioError::Busy => esp_println::println!("init: tcxo BUSY-timeout"),
-                    RadioError::Spi => esp_println::println!("init: tcxo SPI-error"),
-                }
-                e
-            })?;
-        delay.delay_millis(20);
-        esp_println::println!("init: tcxo ok");
+        // Send TCXO command with CORRECT byte order (voltage first!)
+        self.cmd(OP_DIO3_TCXO_CTRL, &bytes)?;
+        delay.delay_millis(100); // Wait for TCXO to stabilize (generous)
+        esp_println::println!("init: tcxo sent");
 
         self.cmd(OP_SET_STANDBY, &[STANDBY_XOSC])
             .map_err(|e| {
@@ -419,7 +406,7 @@ where
         self.cmd(OP_REGULATOR_MODE, &[0x01])?; // DC-DC
         esp_println::println!("init: regulator ok");
         self.cmd(OP_CALIBRATE, &[0x7F])?;
-        delay.delay_millis(10);
+        delay.delay_millis(50);
         esp_println::println!("init: calib ok");
         self.cmd(OP_CALIBRATE_IMAGE, &[0xD7, 0xDB])?; // 863–870 MHz
         esp_println::println!("init: calib image ok");
@@ -617,12 +604,11 @@ where
     }
 
     pub fn get_status(&mut self) -> Result<u8, RadioError> {
-        self.wait_ready()?;
+        // GetStatus can be sent at ANY time (datasheet 14.3). No BUSY wait.
         let mut buf = [0xC0u8];
         self.cs_low();
         let r = crate::raw_spi::transfer(&mut buf);
         self.cs_high();
-        let mut d = 0u32; while d < 8_000 { d += 1; }
         r.map_err(|_| RadioError::Spi)?;
         Ok(buf[0])
     }

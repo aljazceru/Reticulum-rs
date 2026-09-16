@@ -41,6 +41,24 @@ fn main() -> ! {
 
     let (mut modem_hal, wifi_hal, rtos_hal) = modem_tasks::split(peris);
 
+    // CRITICAL: Deselect the SSD1306 OLED BEFORE any SPI communication!
+    // The M5Stack Unit C6L has the SSD1306 on the same SPI bus (SCK=20,
+    // MOSI=21, MISO=22) with CS on GPIO 6. If GPIO 6 floats LOW, the OLED
+    // drives MISO and corrupts all SX1262 communication.
+    {
+        // GPIO 6 (CS) = OUTPUT HIGH (deselect)
+        let en = unsafe { core::ptr::read_volatile(0x6009_1020 as *const u32) };
+        unsafe { core::ptr::write_volatile(0x6009_1020 as *mut u32, en | (1 << 6) | (1 << 18) | (1 << 15)) };
+        unsafe { core::ptr::write_volatile(0x6009_1008 as *mut u32, (1 << 6) | (1 << 18)) }; // CS,DC HIGH
+        unsafe { core::ptr::write_volatile(0x6009_100C as *mut u32, 1 << 15) }; // RESET LOW
+    }
+    // CRITICAL: Disable the SPI hardware's CS outputs (CS0-CS5)!
+    // The GPSPI2's CS0 is on GPIO 6 (same as SSD1306 CS). By default,
+    // the SPI hardware drives CS0, overriding our GPIO writes. Setting
+    // CS0_DIS-CS5_DIS in the MISC register frees GPIO 6 for our control.
+    unsafe { core::ptr::write_volatile(0x6008_1020 as *mut u32, 0x3F) }; // disable CS0-CS5
+    esp_println::println!("OLED: deselected + SPI CS outputs disabled");
+
     // Radio bring-up: wait for the SX1262 power-on sequence, then init.
     esp_hal::delay::Delay::new().delay_millis(50);
 
