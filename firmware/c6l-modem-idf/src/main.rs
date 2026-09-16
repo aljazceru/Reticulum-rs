@@ -86,24 +86,40 @@ fn lora_rx() -> anyhow::Result<()> {
     wait!(50000); // Wait for TCXO to stabilize
     
     // Verify reads still work after TCXO
-    let mut sw_tcxo = [0x1Du8, 0x07, 0x40, 0x00, 0x00];
+    let mut sw_tcxo = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00];
     read!(&mut sw_tcxo);
-    println!("After TCXO: sync[4]=0x{:02x} (0x14=OK)", sw_tcxo[4]);
+    println!("After TCXO: [3]={:02x} [4]={:02x} [5]={:02x}", sw_tcxo[3], sw_tcxo[4], sw_tcxo[5]);
     
     read!(&mut [0x8Au8, 0x01]); wait!(5000);  // SetPacketType
-    read!(&mut [0x86u8, 0x36, 0x38, 0x00, 0x00]); wait!(5000);  // SetRfFreq
+    read!(&mut [0x86u8, 0x36, 0x38, 0x00, 0x00]); wait!(5000);  // SetRfFreq(867.5MHz)
     read!(&mut [0x8Bu8, 0x09, 0x04, 0x01, 0x00]); wait!(5000);  // SetModParams
-    read!(&mut [0x8Cu8, 0x00, 0x08, 0x00, 0xFF, 0x00, 0x00]); wait!(5000);  // PktParams
-    // Write private sync word 0x1424
-    read!(&mut [0x0Du8, 0x07, 0x40, 0x14, 0x24]); wait!(5000);
+    // IQ COMPENSATION FIX (datasheet section 15.4 — REQUIRED!)
+    // Read register 0x0736, set/clear bit 2 based on IQ polarity
+    // For STANDARD IQ (0x00): OR with 0x04
+    // For INVERTED IQ (0x01): AND with 0xFB
+    let mut iq_reg = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
+    read!(&mut iq_reg);
+    let iq_val = iq_reg[4];
+    let fixed_iq = (iq_val | 0x04) as u8;  // Standard IQ fix
+    println!("IQ reg 0x0736: read=0x{:02x} -> write=0x{:02x}", iq_val, fixed_iq);
+    
+    // Write back the fixed IQ register
+    read!(&mut [0x0Du8, 0x07, 0x36, fixed_iq]); wait!(5000);
+    
+    // SetPacketParams with STANDARD IQ (0x00)
+    read!(&mut [0x8Cu8, 0x00, 0x08, 0x00, 0xFF, 0x00, 0x00]); wait!(5000);  // PktParams(std IQ)
+    // Write RadioLib/RNode private sync word [0x10, 0x20]
+    read!(&mut [0x0Du8, 0x07, 0x40, 0x10, 0x20]); wait!(5000);
     read!(&mut [0x9Du8, 0x01]); wait!(5000);  // SetDio2AsRfSwitch
     read!(&mut [0x08u8, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00]); wait!(5000);  // SetDioIrq
     read!(&mut [0x02u8, 0x03, 0xFF]); wait!(5000);  // ClearIrq
 
-    // Verify
-    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00];
+    // Full readback diagnostic — print ALL buffer positions
+    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00];
     read!(&mut sw);
-    println!("SyncWord MSB: 0x{:02x} (0x14), LSB: 0x{:02x} (0x24)", sw[4], sw[5]);
+    println!("SyncWord full dump: [0]={:02x} [1]={:02x} [2]={:02x} [3]={:02x} [4]={:02x} [5]={:02x} [6]={:02x} [7]={:02x}",
+        sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
+    // The actual data likely starts at buf[3] (after opcode + 2 addr bytes)
 
     // Set buffer base addresses (TX=0, RX=0) — CRITICAL for packet reception!
     read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
