@@ -200,3 +200,45 @@ mobile-smoke:
 	@rc=0; 	for feature in none $(FFI_FEATURE_MATRIX); do 		if [ "$$feature" = "none" ]; then feats=""; else feats="$$feature"; fi; 		echo "--- host check: reticulum-ffi [$$feats]"; 		$(CARGO) check -p reticulum-ffi $$( [ -n "$$feats" ] && echo --features $$feats ) || rc=1; 	done; 	if command -v $(CARGO_NDK) >/dev/null 2>&1; then 		for feature in $(FFI_FEATURE_MATRIX); do 			echo "--- android check: reticulum-ffi [--features $$feature]"; 			$(CARGO_NDK) build -p reticulum-ffi --library 				--targets $(ANDROID_SMOKE_TARGETS) 				--features $$feature || rc=1; 		done; 	else 		echo "Warning: cargo-ndk not found; skipping Android matrix."; 	fi; 	if command -v xcrun >/dev/null 2>&1 && xcrun --show-sdk-path --sdk iphoneos >/dev/null 2>&1; then 		for target in $(APPLE_SMOKE_TARGETS); do 			echo "--- apple check: reticulum-ffi [$$target]"; 			rustup target add $$target 2>/dev/null || true; 			$(CARGO) check -p reticulum-ffi --target $$target || rc=1; 		done; 	else 		echo "Warning: Apple toolchains not found; skipping iOS matrix."; 	fi; 	if [ $$rc -ne 0 ]; then echo "=== Mobile smoke FAILED ==="; exit 1; fi; 	echo "=== Mobile smoke OK ==="
 
 .PHONY: mobile-smoke
+
+# -----------------------------------------------------------------------------
+# ESP32-C6 modem firmware (M5Stack Unit C6L)
+# -----------------------------------------------------------------------------
+
+C6_PORT         ?= /dev/ttyACM1
+C6_DIR          := firmware/c6l-modem
+C6_ELF          := $(C6_DIR)/target/riscv32imac-unknown-none-elf/release/c6l-modem
+
+c6-build:
+	cd $(C6_DIR) && $(CARGO) build --release
+
+# Byte-exact backup of whatever runs on the board today (do this first!).
+c6-backup:
+	esptool --port $(C6_PORT) --chip esp32c6 read_flash 0x0 0x400000 \
+		c6l_backup_$$(date +%Y%m%d_%H%M).bin
+
+# espflash attaches the correct bootloader + partition table.
+c6-flash: c6-build
+	espflash flash --chip esp32c6 --port $(C6_PORT) $(C6_ELF)
+
+# Host-side verification against the flashed board (KISS detect + radio
+# config validation + packet RX log).
+c6-verify:
+	$(CARGO) run --example rnode_listen --features "iface-rnode,iface-serial" -- \
+		--port $(C6_PORT)
+
+# -----------------------------------------------------------------------------
+# C6L modem firmware testing
+# -----------------------------------------------------------------------------
+
+c6-acceptance:
+	python3 firmware/c6l-modem/tests/acceptance.py --port $(C6_PORT)
+
+c6-stability:
+	python3 firmware/c6l-modem/tests/stability.py --port $(C6_PORT) --cycles 5
+
+c6-soak:
+	bash firmware/c6l-modem/tests/soak.sh $(C6_PORT) 115
+
+c6-test: c6-acceptance c6-stability c6-soak
+	@echo "=== all c6l-modem tests passed ==="

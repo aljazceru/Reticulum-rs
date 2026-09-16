@@ -41,10 +41,24 @@ jobs:
           rustup target add thumbv7em-none-eabihf
           cargo check -p reticulum-core --no-default-features --features no_std --target thumbv7em-none-eabihf
 
-  test:
+  embedded-firmware:
     runs-on: ubuntu-latest
     container: rust:1.95
-    needs: check
+    timeout-minutes: 15
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "firmware/c6l-modem"
+      - name: install riscv target
+        run: rustup target add riscv32imac-unknown-none-elf
+      - name: build c6l modem firmware
+        run: cargo build --manifest-path firmware/c6l-modem/Cargo.toml --release
+      - name: modem-core no_std check
+        run: cargo check -p rnode-modem-core --no-default-features --target riscv32imac-unknown-none-elf
+
+  test:
     timeout-minutes: 15
     env:
       RETICULUM_TEST_PYTHON_DIR: /opt/Reticulum
