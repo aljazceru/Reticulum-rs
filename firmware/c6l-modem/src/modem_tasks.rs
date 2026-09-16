@@ -303,6 +303,7 @@ pub async fn modem_task(hal: SendHal, task_spawner: embassy_executor::SendSpawne
     esp_println::println!("MODEM: session {}", usb_sid);
 
     esp_println::println!("MODEM: entering loop");
+
     let txq = TXQ.init(TxQueue::new());
     let txq: &mut TxQueue = unsafe { &mut *(txq as *const TxQueue as *mut TxQueue) };
 
@@ -351,11 +352,16 @@ pub async fn modem_task(hal: SendHal, task_spawner: embassy_executor::SendSpawne
             let irq_st = radio.irq_status().unwrap_or(0);
             let rssi = radio.current_rssi().unwrap_or(0);
             let pin = irq.is_high();
-            use alloc::format; let st = radio.get_status().unwrap_or(0); let mode = (st >> 4) & 0x7;
+            use alloc::format; let st = radio.get_status().unwrap_or(0); let mode = (st >> 3) & 0x7; // SX1262 status: mode at bits [5:3]
         // Raw SPI probe: send GetIrqStatus opcode + 3 NOPs via transfer_in_place
         
         
             modem.protocol.stats.rssi = rssi;
+            // Radio telemetry: print IRQ/RSSI/mode for debugging
+            esp_println::println!(
+                "RT: irq={:04x} rssi={} mode={}",
+                irq_st, rssi, mode
+            );
             // Print esp-rtos diagnostic counters
             let d = &esp_rtos::RTOS_DIAG;
             esp_println::println!(

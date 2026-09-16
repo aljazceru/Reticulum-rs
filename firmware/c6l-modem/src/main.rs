@@ -15,6 +15,7 @@ use esp_hal::{clock::CpuClock, Config};
 
 mod board;
 mod modem_tasks;
+mod raw_spi;
 mod sessions;
 mod sx1262;
 mod wifi;
@@ -40,78 +41,9 @@ fn main() -> ! {
 
     let (mut modem_hal, wifi_hal, rtos_hal) = modem_tasks::split(peris);
 
-    // Radio bring-up before the scheduler starts
-    {
-        let gpio_in: u32 = unsafe { core::ptr::read_volatile(0x6009_103C as *const u32) };
-        let bit19 = (gpio_in >> 19) & 1;
-        let bit7 = (gpio_in >> 7) & 1;
-        let bit22 = (gpio_in >> 22) & 1;
-        let bit23 = (gpio_in >> 23) & 1;
-        esp_println::println!("GPIO raw: 19(busy)={} 7(irq)={} 22(miso)={} 23(cs)={}", bit19, bit7, bit22, bit23);
-    }
-    // The SX1262 raises BUSY during its power-on sequence (~ms). Wait for
-        // the chip to settle before touching SPI (no RST pin on this board).
-        // Scan all GPIO inputs to find which pins are HIGH at boot
-        // (BUSY should be LOW when radio is idle; IRQ/DIO1 LOW; CS HIGH)
-        let gin: u32 = unsafe { core::ptr::read_volatile(0x6009_103C as *const u32) };
-        let mut highs = alloc::string::String::new();
-        for bit in 0..=30u32 {
-            if (gin >> bit) & 1 == 1 {
-                if !highs.is_empty() { highs.push(' '); }
-                highs.push_str(&alloc::format!("{}", bit));
-            }
-        }
-        esp_println::println!("GPIO high at boot: [{}]", highs);
+    // Radio bring-up: wait for the SX1262 power-on sequence, then init.
+    esp_hal::delay::Delay::new().delay_millis(50);
 
-        let gpio_out_cs: u32 = unsafe { core::ptr::read_volatile(0x6009_1004 as *const u32) };
-        let gpio_en_cs: u32 = unsafe { core::ptr::read_volatile(0x6009_1020 as *const u32) };
-        // Also check IO_MUX for GPIO23 (correct base 0x60090000, offset 0x04 + 23*4)
-        let iomux_cs: u32 = unsafe { core::ptr::read_volatile(0x60090060 as *const u32) };
-        esp_println::println!(
-            "CS-hal: out={} en={} iomux={:x} mcu_sel={}",
-            (gpio_out_cs >> 23) & 1, (gpio_en_cs >> 23) & 1, iomux_cs, iomux_cs & 0x1F
-        );
-    {
-        let cmd: u32 = unsafe { core::ptr::read_volatile(0x6008_1000 as *const u32) };
-        let ctrl: u32 = unsafe { core::ptr::read_volatile(0x6008_1008 as *const u32) };
-        let clock: u32 = unsafe { core::ptr::read_volatile(0x6008_100C as *const u32) };
-        let user: u32 = unsafe { core::ptr::read_volatile(0x6008_1010 as *const u32) };
-        let user1: u32 = unsafe { core::ptr::read_volatile(0x6008_1014 as *const u32) };
-        let user2: u32 = unsafe { core::ptr::read_volatile(0x6008_1018 as *const u32) };
-        let ms_dlen: u32 = unsafe { core::ptr::read_volatile(0x6008_101C as *const u32) };
-        esp_println::println!(
-            "SPI-REGS: cmd={:x} ctrl={:x} clk={:x} user={:x} u1={:x} u2={:x} dlen={:x}",
-            cmd, ctrl, clock, user, user1, user2, ms_dlen
-        );
-        // Mode bits in CTRL: C_POL(bit 3?), C_PHASE(bit 2?), wait for actual C6 layout
-        // USER: doutdin(bit 6?), usr_miso(bit 28), usr_mosi(bit 27)
-    }
-        let iomux19: u32 = unsafe { core::ptr::read_volatile(0x60090050 as *const u32) };
-        let gpio_in19: u32 = unsafe { core::ptr::read_volatile(0x6009_103C as *const u32) };
-        let bit19 = (gpio_in19 >> 19) & 1;
-        esp_println::println!(
-            "BUSY-19: in={} iomux={:x} wpu={} wpd={}",
-            bit19, iomux19, (iomux19 >> 6) & 1, (iomux19 >> 7) & 1
-        );
-        let gpio_out3: u32 = unsafe { core::ptr::read_volatile(0x6009_1004 as *const u32) };
-        let gpio_in3: u32 = unsafe { core::ptr::read_volatile(0x6009_103C as *const u32) };
-        let gpio_en3: u32 = unsafe { core::ptr::read_volatile(0x6009_1020 as *const u32) };
-        let func23: u32 = unsafe { core::ptr::read_volatile(0x6009_15B0 as *const u32) };
-        // GPIO_PIN[n] register: offset 0x74 + n*4 for C6 (pad driver config)
-        let pin23: u32 = unsafe { core::ptr::read_volatile((0x6009_1000 + 0x74 + 23 * 4) as *const u32) };
-        esp_println::println!(
-            "CS-all: out={} in={} en={} func={:x} pin={:x}",
-            (gpio_out3 >> 23) & 1, (gpio_in3 >> 23) & 1, (gpio_en3 >> 23) & 1, func23, pin23
-        );
-        // ESP32-C6 IO_MUX registers: 0x60009000 + gpio_num * 4
-        let iomux20: u32 = unsafe { core::ptr::read_volatile((0x60090004 + 20 * 4) as *const u32) };
-        let iomux23: u32 = unsafe { core::ptr::read_volatile((0x60090004 + 23 * 4) as *const u32) };
-        esp_println::println!("IO_MUX: gpio20={:08x} gpio23={:08x}", iomux20, iomux23);
-        {
-            let st = modem_hal.radio.get_status_noinit();
-            esp_println::println!("pre-init GetStatus: {:x}", st);
-        }
-        esp_hal::delay::Delay::new().delay_millis(100); // BOOT-DELAY
         match modem_hal.radio.init(&esp_hal::delay::Delay::new()) {
         Ok(()) => {
             esp_println::println!("radio: SX1262 init ok");

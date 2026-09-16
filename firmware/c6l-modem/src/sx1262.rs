@@ -184,32 +184,20 @@ where
         self.busy.is_high().unwrap_or(true)
     }
 
-    /// Force GPSPI2 USER register into clean full-duplex mode.
-    ///
-    /// esp-hal 1.1.2's `setup_full_duplex()` claims to clear USR_DUMMY /
-    /// USR_ADDR and set DOUTDIN, but the register reads back with bits
-    /// 29 (USR_DUMMY) and 30 (USR_ADDR) set and bit 0 (DOUTDIN) clear —
-    /// the SPI then inserts dummy cycles and an address phase between
-    /// the opcode and the data, garbling every multi-byte command.
+    /// No-op: the raw SPI driver configures the peripheral per-transfer.
     #[inline]
-    fn force_full_duplex(&self) {
-        const SPI2_USER: *mut u32 = 0x6008_1010 as *mut u32; // USER at offset 0x10
-        const USR_DUMMY: u32 = 1 << 29;
-        const USR_ADDR: u32 = 1 << 30;
-        const USR_COMMAND: u32 = 1 << 31;
-        const DOUTDIN: u32 = 1 << 0;
-        unsafe {
-            let user = core::ptr::read_volatile(SPI2_USER);
-            core::ptr::write_volatile(
-                SPI2_USER,
-                (user | DOUTDIN) & !(USR_DUMMY | USR_ADDR | USR_COMMAND),
-            );
-            // Clear MISO input delay (DIN_MODE) — the ESP32-C6 defaults to
-            // DIN0_MODE=3 which delays MISO sampling and garbles all reads.
-            // SPI2_DIN_MODE at offset 0x30 from base.
-            core::ptr::write_volatile((0x6008_1000 + 0x24) as *mut u32, 0); // DIN_MODE
-            core::ptr::write_volatile((0x6008_1000 + 0x28) as *mut u32, 0); // DIN_NUM
-        }
+    fn force_full_duplex(&self) {}
+
+    /// Drive the SX1262 NCS (GPIO23) LOW via GPIO_OUT_W1TC.
+    #[inline]
+    fn cs_low(&mut self) {
+        unsafe { core::ptr::write_volatile(0x6009_100C as *mut u32, 1 << 23) };
+    }
+
+    /// Drive the SX1262 NCS (GPIO23) HIGH via GPIO_OUT_W1TS.
+    #[inline]
+    fn cs_high(&mut self) {
+        unsafe { core::ptr::write_volatile(0x6009_1008 as *mut u32, 1 << 23) };
     }
 
     fn wait_ready(&mut self) -> Result<(), RadioError> {
@@ -229,32 +217,39 @@ where
     }
 
     fn cmd(&mut self, opcode: u8, payload: &[u8]) -> Result<(), RadioError> {
-        self.force_full_duplex();
         self.wait_ready()?;
         let len = 1 + payload.len().min(11);
         let mut frame = [0u8; 12];
         frame[0] = opcode;
         frame[1..len].copy_from_slice(&payload[..len - 1]);
-        // Single SPI transaction under one CS assertion — the SX1262
-        // expects the full opcode+payload with CS held LOW throughout.
-        self.bus
-            .transfer_in_place(&mut frame[..len])
-            .map_err(|_| RadioError::Spi)
+        self.cs_low();
+        let r = crate::raw_spi::transfer(&mut frame[..len]);
+        self.cs_high();
+        // The SX1262 needs time to process each command. Without BUSY
+        // feedback (pad reads HIGH on this board), use a fixed ~100µs
+        // settle delay — enough for any SX1262 command (datasheet: most
+        // complete in <50µs, calibrate takes up to 1ms handled by init).
+        let mut d = 0u32; while d < 8_000 { d += 1; }
+        r.map_err(|_| RadioError::Spi)
     }
 
     /// Read-type command: send `opcode`, clock `out.len()` NOP/status
     /// bytes back. `out[0]` is the radio status byte where applicable —
     /// callers index accordingly (datasheet 13.3).
     fn cmd_read(&mut self, opcode: u8, out: &mut [u8]) -> Result<(), RadioError> {
-        self.force_full_duplex();
         self.wait_ready()?;
+        // Give the SX1262 time to finish processing the previous command
+        // before we clock the read — its data path needs the settle time.
+        let mut pre = 0u32; while pre < 8_000 { pre += 1; }
         let len = 1 + out.len();
         let mut frame = [OP_NOP; 9];
         frame[0] = opcode;
-        // Single transaction: opcode + NOP bytes for reading data.
-        self.bus
-            .transfer_in_place(&mut frame[..len])
-            .map_err(|_| RadioError::Spi)?;
+        self.cs_low();
+        let r = crate::raw_spi::transfer(&mut frame[..len]);
+        self.cs_high();
+        // Settle delay for the SX1262 to update its status/data path.
+        let mut d = 0u32; while d < 8_000 { d += 1; }
+        r.map_err(|_| RadioError::Spi)?;
         out.copy_from_slice(&frame[1..1 + out.len()]);
         Ok(())
     }
@@ -474,65 +469,13 @@ where
         Ok(data[0])
     }
 
-    /// Raw SPI probe: GetIrqStatus as a 4-byte transfer_in_place.
-    /// Returns [MISO@opcode, MISO@nop0, MISO@nop1, MISO@nop2].
-    /// Round-trip test: write [0xAA, 0xBB, 0xCC] to the data buffer at
-    /// offset 0, then read 3 bytes back. Returns the read-back bytes.
-    pub fn buffer_roundtrip(&mut self) -> [u8; 3] {
-        let mut result = [0u8; 3];
-        // Write pattern to buffer offset 0
-        let _ = self.cmd(OP_WRITE_BUFFER, &[0x00, 0xAA, 0xBB, 0xCC]);
-        // Read 3 bytes from buffer offset 0
-        if self.wait_ready().is_ok() {
-            use embedded_hal::spi::Operation;
-            let cmd = [OP_READ_BUFFER, 0x00];
-            let mut ops = [
-                Operation::Write(&cmd[..]),
-                Operation::Read(&mut result[..]),
-            ];
-            let _ = self.bus.transaction(&mut ops);
-        }
-        result
-    }
-
-    /// Write-effect test: read status, set standby, read status again.
-    /// If the mode changes, our writes ARE reaching the SX1262.
-    pub fn write_effect_test(&mut self) -> (u8, u8, u8) {
-        let before = self.get_status().unwrap_or(0);
-        self.force_full_duplex();
-        // NOP burst: reset SX1262 SPI state machine (datasheet 14.4)
-        for _ in 0..5 {
-            let mut nop = [0x00u8];
-            let _ = self.bus.transfer_in_place(&mut nop);
-        }
-        // SetStandby(STBY_RC): 2-byte transaction, same method as GetStatus
-        let mut cmd_buf = [OP_SET_STANDBY, STANDBY_RC];
-        let _ = self.bus.transfer_in_place(&mut cmd_buf);
-        esp_println::println!("sb_rx=[{:02x},{:02x}]", cmd_buf[0], cmd_buf[1]);
-        // Small delay for the command to take effect
-        let after = self.get_status().unwrap_or(0);
-        // Try once more after a delay (maybe the status lags)
-        let mut delay_count = 0u32;
-        while delay_count < 100_000 {
-            delay_count += 1;
-        }
-        let after2 = self.get_status().unwrap_or(0);
-        // Go back to RX so the modem keeps working
-        let _ = self.start_rx();
-        (before, after, after2)
-    }
-
-    pub fn spi_probe_2b(&mut self) -> [u8; 4] {
-        let _ = self.wait_ready();
-        let mut frame = [0x12u8, 0x00, 0x00, 0x00];
-        let _ = self.bus.transfer_in_place(&mut frame);
-        frame
-    }
 
     /// GetStatus without BUSY wait — for pre-init diagnostics.
     pub fn get_status_noinit(&mut self) -> u8 {
         let mut buf = [0xC0u8];
-        let _ = self.bus.transfer_in_place(&mut buf);
+        self.cs_low();
+        let _ = crate::raw_spi::transfer(&mut buf);
+        self.cs_high();
         buf[0]
     }
 
@@ -560,14 +503,13 @@ where
     }
 
     pub fn get_status(&mut self) -> Result<u8, RadioError> {
-        self.force_full_duplex();
         self.wait_ready()?;
-        // GetStatus: single-byte transaction, MISO carries the status
-        // while MOSI sends the opcode.
         let mut buf = [0xC0u8];
-        self.bus
-            .transfer_in_place(&mut buf)
-            .map_err(|_| RadioError::Spi)?;
+        self.cs_low();
+        let r = crate::raw_spi::transfer(&mut buf);
+        self.cs_high();
+        let mut d = 0u32; while d < 8_000 { d += 1; }
+        r.map_err(|_| RadioError::Spi)?;
         Ok(buf[0])
     }
 
