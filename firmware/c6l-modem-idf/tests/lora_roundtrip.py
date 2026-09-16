@@ -73,7 +73,7 @@ def rnode_side():
     # 4. Monitor RX while TXing
     def monitor():
         t_start = time.time(); buf = bytearray()
-        while time.time() - t_start < 40:
+        while time.time() - t_start < 50:
             try: d = h.read(4096)
             except Exception: return
             if d:
