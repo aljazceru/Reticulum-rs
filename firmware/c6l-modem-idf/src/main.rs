@@ -210,11 +210,12 @@ impl Radio {
         if flags & 0x0002 == 0 {
             // Do NOT clear latched preamble/header flags here: clearing
             // during an active reception ABORTS the packet (hardware-
-            // verified). Latched flags are harmless; start_rx clears
-            // everything after each received packet.
+            // verified). Latched flags are harmless.
             return Ok(false);
         }
-        // GetRxBufferStatus: len@3, offset@4
+        // GetRxBufferStatus: len@3 (byte-by-byte framing shifts Semtech's
+        // nominal len@2 by one — hardware-verified; the @4 slot does NOT
+        // hold a usable offset in this framing)
         let mut rbs = [0x13u8, 0x00, 0x00, 0x00, 0x00];
         self.xfer(&mut rbs)?;
         let len = rbs[3] as usize;
@@ -222,7 +223,7 @@ impl Radio {
         if len > 0 && len < 256 {
             let read_len = len.min(240);
             let mut pkt = [0u8; 4 + 240];
-            pkt[0] = 0x1E; // ReadBuffer: opcode + addr + dummy + data@3
+            pkt[0] = 0x1E; // ReadBuffer from FIFO address 0
             self.xfer(&mut pkt[..4 + read_len])?;
             let data = &pkt[3..3 + read_len];
             // RNode wire format: first byte is the header (seq<<4|flags)
@@ -230,8 +231,12 @@ impl Radio {
             out.extend_from_slice(payload);
             got = !payload.is_empty();
         }
-        // restart RX for the next packet
-        self.start_rx()?;
+        // RX-continuous mode AUTO-REARMS after each packet: do NOT issue
+        // SetRx/packet-params here — the reconfigure race was dropping
+        // ~half of all packets (codex-reviewed). Reset the FIFO pointers
+        // so the next packet lands at 0, and clear only the RxDone bit.
+        self.cmd(&mut [0x8F, 0x00, 0x00, 0x00, 0x00])?; // SetBufferBaseAddress(0,0)
+        self.cmd(&mut [0x02, 0x00, 0x02])?; // ClearIrqStatus(RxDone only)
         Ok(got)
     }
 
@@ -290,17 +295,25 @@ impl Radio {
             let _ = done;
             self.xfer(&mut [0x02, 0x03, 0xFF])?; // clear IRQs
         }
-        // Post-TX restore, mirroring RNode's endPacket -> receive():
-        // explicit standby first, settle, then a full RX re-arm.
+        // Post-TX restore (codex-reviewed): explicit standby, settle, then
+        // a VERIFIED RX entry — SetRx can be silently rejected while the
+        // chip is busy, leaving it in standby (the "deaf until TX" bug).
         self.xfer(&mut [0x80, 0x00])?; // SetStandby(STBY_RC)
         self.delay_ms(20);
-        self.start_rx()?;
-        // And once more after a settle — the RF switch/PA ramp-down on
-        // this module needs real time before reception is reliable
-        // (empirical: alternating TX/RX lost every other packet with a
-        // single SetRx).
-        self.delay_ms(50);
-        self.start_rx()?;
+        for attempt in 0..3 {
+            self.start_rx()?;
+            self.delay_ms(10);
+            let mut st = [0xC0u8, 0x00];
+            self.xfer(&mut st)?;
+            let mode = (st[0] >> 4) & 0x7;
+            if mode == 5 {
+                let _ = attempt;
+                return Ok(());
+            }
+            // not in RX — re-issue standby then SetRx again
+            self.xfer(&mut [0x80, 0x00])?;
+            self.delay_ms(10);
+        }
         Ok(())
     }
 

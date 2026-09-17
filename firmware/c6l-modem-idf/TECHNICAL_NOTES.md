@@ -114,3 +114,40 @@ ESP32 resets do NOT clear it (no NRESET pin on the C6L). Recovery:
 2. If not: flash Meshtastic, let it boot 5s, re-flash our firmware.
 If espflash cannot attach after Meshtastic: esptool elf2image the ELF
 and write bootloader/partition-table/app at 0x0/0x8000/0x10000.
+
+---
+
+## 2026-09-17 (evening): codex-assisted isolation — modem exonerated
+
+Codex CLI review of the driver flagged two datasheet violations, both fixed:
+1. **Post-RxDone reconfiguration removed**: RX-continuous mode AUTO-REARMS
+   after each packet; our `start_rx()` after every reception raced the
+   modem and dropped packets. Now: SetBufferBaseAddress(0,0) +
+   ClearIrqStatus(RxDone only).
+2. **Verified post-TX RX entry**: SetRx can be silently rejected while
+   the chip is busy — now GetStatus-checked (mode==5) with retry.
+   (Note: an attempted ReadBuffer-with-returned-offset change REGRESSED
+   payload alignment — the byte-by-byte framing does not expose the
+   offset where expected; reverted to proven read-from-0.)
+
+### The complete isolation matrix (all same radios, same config)
+| Who drives the RNode | Payload | C6L reception |
+|---|---|---|
+| test script, 4-5s spacing | 6-13B | 10/10 |
+| test script, 0.6s spacing | 6B / 125B | 19/20 |
+| test script, rnsd's captured frames | 132-135B | **5/5** |
+| **rnsd (live)** | its own 131B | **~40-50%** |
+| rnsd (live, RNode freshly KISS-reset) | same | ~40% |
+
+The alternating timeout/valid pattern persists across every C6L
+firmware change AND RNode resets — the loss is exclusively correlated
+with rnsd-a's live process driving the Heltec (its readLoop + flow-
+control timing vs RNode fw 1.86's TX queue/CSMA). The C6L modem
+itself receives essentially 100% of what the RNode actually puts on
+the air under any other driver.
+
+### Next steps (need hardware/tools beyond this session)
+- Logic analyzer on the Heltec's serial during live-rnsd probes vs
+  scripted replays (compare CMD_READY timing + TX patterns)
+- Or try a different RNode firmware version on the Heltec
+- Or an SDR capture at 867.5 during both driving modes
