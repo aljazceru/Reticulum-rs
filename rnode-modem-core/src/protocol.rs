@@ -139,42 +139,76 @@ impl Protocol {
                 }
             }
             CMD_RADIO_STATE if !payload.is_empty() => {
-                self.params.radio_on = payload[0] == RADIO_STATE_ON;
-                out.replies.push(kiss_frame(CMD_RADIO_STATE, &payload[..1]));
-                out.ops.push(if self.params.radio_on {
-                    RadioOp::RadioOn
+                if payload[0] == 0xFF {
+                    // Query: report current state (RNode `kiss_indicate_radiostate`)
+                    let state = if self.params.radio_on { RADIO_STATE_ON } else { RADIO_STATE_OFF };
+                    out.replies.push(kiss_frame(CMD_RADIO_STATE, &[state]));
                 } else {
-                    RadioOp::RadioOff
-                });
+                    self.params.radio_on = payload[0] == RADIO_STATE_ON;
+                    out.replies.push(kiss_frame(CMD_RADIO_STATE, &payload[..1]));
+                    out.ops.push(if self.params.radio_on {
+                        RadioOp::RadioOn
+                    } else {
+                        RadioOp::RadioOff
+                    });
+                }
             }
             CMD_FREQUENCY if payload.len() == 4 => {
-                let raw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let quantized = quantize_frequency(raw);
-                self.params.frequency = quantized;
-                out.replies
-                    .push(kiss_frame(CMD_FREQUENCY, &quantized.to_be_bytes()));
-                out.ops.push(RadioOp::Configure(self.params.clone()));
+                // 0xFFFFFFFF is a QUERY (RNode firmware `kiss_indicate_frequency`):
+                // report the current value without changing anything.
+                if payload.iter().all(|&b| b == 0xFF) {
+                    out.replies.push(kiss_frame(
+                        CMD_FREQUENCY,
+                        &self.params.frequency.to_be_bytes(),
+                    ));
+                } else {
+                    let raw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    let quantized = quantize_frequency(raw);
+                    self.params.frequency = quantized;
+                    out.replies
+                        .push(kiss_frame(CMD_FREQUENCY, &quantized.to_be_bytes()));
+                    out.ops.push(RadioOp::Configure(self.params.clone()));
+                }
             }
             CMD_BANDWIDTH if payload.len() == 4 => {
-                let bw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                self.params.bandwidth = bw;
-                out.replies.push(kiss_frame(CMD_BANDWIDTH, &bw.to_be_bytes()));
-                out.ops.push(RadioOp::Configure(self.params.clone()));
+                if payload.iter().all(|&b| b == 0xFF) {
+                    out.replies.push(kiss_frame(
+                        CMD_BANDWIDTH,
+                        &self.params.bandwidth.to_be_bytes(),
+                    ));
+                } else {
+                    let bw = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    self.params.bandwidth = bw;
+                    out.replies.push(kiss_frame(CMD_BANDWIDTH, &bw.to_be_bytes()));
+                    out.ops.push(RadioOp::Configure(self.params.clone()));
+                }
             }
             CMD_TXPOWER if !payload.is_empty() => {
-                self.params.txpower = payload[0];
-                out.replies.push(kiss_frame(CMD_TXPOWER, &[payload[0]]));
-                out.ops.push(RadioOp::Configure(self.params.clone()));
+                if payload[0] == 0xFF {
+                    out.replies.push(kiss_frame(CMD_TXPOWER, &[self.params.txpower]));
+                } else {
+                    self.params.txpower = payload[0];
+                    out.replies.push(kiss_frame(CMD_TXPOWER, &[payload[0]]));
+                    out.ops.push(RadioOp::Configure(self.params.clone()));
+                }
             }
             CMD_SF if !payload.is_empty() => {
-                self.params.sf = payload[0];
-                out.replies.push(kiss_frame(CMD_SF, &[payload[0]]));
-                out.ops.push(RadioOp::Configure(self.params.clone()));
+                if payload[0] == 0xFF {
+                    out.replies.push(kiss_frame(CMD_SF, &[self.params.sf]));
+                } else {
+                    self.params.sf = payload[0];
+                    out.replies.push(kiss_frame(CMD_SF, &[payload[0]]));
+                    out.ops.push(RadioOp::Configure(self.params.clone()));
+                }
             }
             CMD_CR if !payload.is_empty() => {
-                self.params.cr = payload[0];
-                out.replies.push(kiss_frame(CMD_CR, &[payload[0]]));
-                out.ops.push(RadioOp::Configure(self.params.clone()));
+                if payload[0] == 0xFF {
+                    out.replies.push(kiss_frame(CMD_CR, &[self.params.cr]));
+                } else {
+                    self.params.cr = payload[0];
+                    out.replies.push(kiss_frame(CMD_CR, &[payload[0]]));
+                    out.ops.push(RadioOp::Configure(self.params.clone()));
+                }
             }
             CMD_ST_ALOCK if payload.len() == 2 => {
                 let cch = u16::from_be_bytes([payload[0], payload[1]]);
@@ -326,6 +360,41 @@ mod tests {
         }
         let out = p.handle(CMD_DATA, &[0x01]);
         assert!(out.ops.is_empty(), "transmit must be blocked under lock");
+    }
+
+    #[test]
+    fn ff_payload_queries_report_current_values() {
+        // Python RNS validateRadioState queries each parameter with 0xFF
+        // payloads and expects the CURRENT value echoed, unchanged.
+        let mut p = protocol();
+        p.handle(CMD_FREQUENCY, &867_500_000u32.to_be_bytes());
+        p.handle(CMD_BANDWIDTH, &125_000u32.to_be_bytes());
+        p.handle(CMD_SF, &[9]);
+        p.handle(CMD_CR, &[5]);
+        p.handle(CMD_TXPOWER, &[14]);
+        p.handle(CMD_RADIO_STATE, &[RADIO_STATE_ON]);
+
+        let q = p.handle(CMD_FREQUENCY, &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(q.ops.len(), 0, "query must not reconfigure");
+        assert_eq!(q.replies[0], kiss_frame(CMD_FREQUENCY, &867_500_000u32.to_be_bytes()));
+
+        let q = p.handle(CMD_BANDWIDTH, &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_eq!(q.ops.len(), 0);
+        assert_eq!(q.replies[0], kiss_frame(CMD_BANDWIDTH, &125_000u32.to_be_bytes()));
+
+        for (cmd, val) in [(CMD_SF, 9u8), (CMD_CR, 5), (CMD_TXPOWER, 14)] {
+            let q = p.handle(cmd, &[0xFF]);
+            assert_eq!(q.ops.len(), 0);
+            assert_eq!(q.replies[0], kiss_frame(cmd, &[val]));
+        }
+
+        let q = p.handle(CMD_RADIO_STATE, &[0xFF]);
+        assert_eq!(q.ops.len(), 0);
+        assert_eq!(q.replies[0], kiss_frame(CMD_RADIO_STATE, &[RADIO_STATE_ON]));
+
+        // and the radio is still on / params unchanged
+        assert!(p.params.radio_on);
+        assert_eq!(p.params.frequency, 867_500_000);
     }
 
     #[test]

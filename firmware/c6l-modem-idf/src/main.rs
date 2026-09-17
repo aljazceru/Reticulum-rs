@@ -105,7 +105,9 @@ impl Radio {
         Ok(())
     }
     fn delay_ms(&self, ms: u32) {
-        unsafe { esp_idf_sys::vTaskDelay(ms) }
+        // vTaskDelay takes TICKS (100Hz => 1 tick = 10ms)
+        let ticks = (ms / 10).max(1);
+        unsafe { esp_idf_sys::vTaskDelay(ticks) }
     }
 
     /// Full RNode-matching init at the given parameters.
@@ -198,10 +200,10 @@ impl Radio {
         self.xfer(&mut irq)?;
         let flags = ((irq[2] as u16) << 8) | irq[3] as u16;
         if flags & 0x0002 == 0 {
-            if flags != 0 {
-                // clear non-RX latched flags (preamble/header detected etc.)
-                self.cmd(&mut [0x02, 0x03, 0xFF])?;
-            }
+            // Do NOT clear latched preamble/header flags here: clearing
+            // during an active reception ABORTS the packet (hardware-
+            // verified). Latched flags are harmless; start_rx clears
+            // everything after each received packet.
             return Ok(false);
         }
         // GetRxBufferStatus: len@3, offset@4
@@ -273,9 +275,8 @@ impl Radio {
                     done = true;
                     break;
                 }
-                if tflags & 0x0004 != 0 {
-                    break; // timeout flag
-                }
+                // NOTE: 0x0004 is PreambleDetected (latches under
+                // interference) — do NOT treat it as a TX timeout.
                 self.delay_ms(10);
             }
             let _ = done;
@@ -379,6 +380,12 @@ fn modem_run() -> anyhow::Result<()> {
                 for frame in fed.to_others.iter() {
                     tx_buf.extend_from_slice(frame);
                 }
+            }
+            // Flush replies NOW: RNS validates config echoes within 250ms
+            // of sending them; radio re-inits take longer than that.
+            if !tx_buf.is_empty() {
+                usb_write_direct(&tx_buf);
+                tx_buf.clear();
             }
             for op in fed.ops {
                 apply_op(&mut radio, &mut modem, &mut params, op)?;
