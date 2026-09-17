@@ -26,17 +26,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static SAW_KISS: AtomicBool = AtomicBool::new(false);
 
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+static LOOP_COUNT: AtomicU32 = AtomicU32::new(0);
+
 fn main() {
     println!("c6l-modem v2.0 (KISS/RNode)");
+    // Watchdog thread: detects modem thread hangs
+    std::thread::Builder::new()
+        .stack_size(16384)
+        .spawn(|| {
+            let mut last = 0u32;
+            let mut beats = 0u32;
+            loop {
+                unsafe { esp_idf_sys::vTaskDelay(200) }; // 2s
+                let cur = LOOP_COUNT.load(AtomicOrdering::Relaxed);
+                beats += 1;
+                if cur == last && beats > 3 {
+                    println!("[WDT] MODEM THREAD HUNG at loop {} ({}s) — rebooting", cur, beats * 2);
+                    unsafe { esp_idf_sys::esp_restart() };
+                }
+                last = cur;
+            }
+        })
+        .unwrap();
     let handle = std::thread::Builder::new()
         .stack_size(65536)
         .spawn(|| {
             if let Err(e) = modem_run() {
-                println!("modem error: {:?}", e);
+                println!("modem error: {:?} — rebooting", e);
+                unsafe { esp_idf_sys::esp_restart() };
             }
         })
         .unwrap();
     handle.join().unwrap();
+    // If we get here the modem thread exited — reboot to recover
+    unsafe { esp_idf_sys::esp_restart() };
 }
 
 // ---- Radio driver ----
@@ -126,15 +150,15 @@ impl Radio {
         self.xfer(&mut [0x00])?; // NOP
         self.delay_ms(2);
         self.xfer(&mut [0x80, 0x00])?; // SetStandby(STBY_RC)
-        self.delay_ms(2);
-        self.xfer(&mut [0x89, 0x7F])?; // Calibrate all
+        self.delay_ms(10); // let the PLL/TCXO settle from any previous state
+        // TCXO FIRST (RadioLib order: accurate clock before calibration)
+        self.cmd(&mut [0x97, 0x06, 0x00, 0x00, 0xFF])?;
+        self.delay_ms(50);
+        self.xfer(&mut [0x89, 0x7F])?; // Calibrate all (on TCXO reference)
         self.delay_ms(5);
         // Image calibration 863-870 MHz
         self.xfer(&mut [0x98, 0xD7, 0xDB])?;
         self.delay_ms(5);
-        // TCXO 3.0V (C6L variant), timeout 65535*15.625us
-        self.cmd(&mut [0x97, 0x06, 0x00, 0x00, 0xFF])?;
-        self.delay_ms(50);
         self.xfer(&mut [0x8A, 0x01])?; // SetPacketType(LoRa)
         self.delay_ms(2);
         self.xfer(&mut [0x86, f3, f2, f1, f0])?; // SetRfFrequency
@@ -213,17 +237,21 @@ impl Radio {
             // verified). Latched flags are harmless.
             return Ok(false);
         }
-        // GetRxBufferStatus: len@3 (byte-by-byte framing shifts Semtech's
-        // nominal len@2 by one — hardware-verified; the @4 slot does NOT
-        // hold a usable offset in this framing)
+        // GetRxBufferStatus: standard Semtech layout —
+        // buf[0]=opcode, buf[1]=dummy, buf[2]=LENGTH, buf[3]=OFFSET.
+        // (We previously read length from buf[3] — it "worked" because
+        // the first packet's length == offset; they diverge once the
+        // FIFO write pointer advances.)
         let mut rbs = [0x13u8, 0x00, 0x00, 0x00, 0x00];
         self.xfer(&mut rbs)?;
-        let len = rbs[3] as usize;
+        let len = rbs[2] as usize;
+        let rx_offset = rbs[3];
         let mut got = false;
         if len > 0 && len < 256 {
             let read_len = len.min(240);
             let mut pkt = [0u8; 4 + 240];
-            pkt[0] = 0x1E; // ReadBuffer from FIFO address 0
+            pkt[0] = 0x1E; // ReadBuffer
+            pkt[1] = rx_offset; // read from the packet's ACTUAL offset
             self.xfer(&mut pkt[..4 + read_len])?;
             let data = &pkt[3..3 + read_len];
             // RNode wire format: first byte is the header (seq<<4|flags)
@@ -231,12 +259,16 @@ impl Radio {
             out.extend_from_slice(payload);
             got = !payload.is_empty();
         }
-        // RX-continuous mode AUTO-REARMS after each packet: do NOT issue
-        // SetRx/packet-params here — the reconfigure race was dropping
-        // ~half of all packets (codex-reviewed). Reset the FIFO pointers
-        // so the next packet lands at 0, and clear only the RxDone bit.
-        self.cmd(&mut [0x8F, 0x00, 0x00, 0x00, 0x00])?; // SetBufferBaseAddress(0,0)
+        // Post-RX: absolute minimum — clear RxDone and re-enter RX.
+        // CRITICAL: do NOT call SetBufferBaseAddress here! The modem is
+        // concurrently writing the next packet to the FIFO; resetting the
+        // base address mid-reception corrupts the state machine and kills
+        // the radio (hardware-verified: pure-RX one-way test died after
+        // 12 packets with the buffer reset, survives without it).
+        // The SX1262 FIFO auto-wraps at 256 bytes; we read relative to
+        // whatever offset GetRxBufferStatus reports.
         self.cmd(&mut [0x02, 0x00, 0x02])?; // ClearIrqStatus(RxDone only)
+        self.cmd(&mut [0x82, 0xFF, 0xFF, 0xFF])?; // SetRx continuous
         Ok(got)
     }
 
@@ -295,25 +327,13 @@ impl Radio {
             let _ = done;
             self.xfer(&mut [0x02, 0x03, 0xFF])?; // clear IRQs
         }
-        // Post-TX restore (codex-reviewed): explicit standby, settle, then
-        // a VERIFIED RX entry — SetRx can be silently rejected while the
-        // chip is busy, leaving it in standby (the "deaf until TX" bug).
-        self.xfer(&mut [0x80, 0x00])?; // SetStandby(STBY_RC)
-        self.delay_ms(20);
-        for attempt in 0..3 {
-            self.start_rx()?;
-            self.delay_ms(10);
-            let mut st = [0xC0u8, 0x00];
-            self.xfer(&mut st)?;
-            let mode = (st[0] >> 4) & 0x7;
-            if mode == 5 {
-                let _ = attempt;
-                return Ok(());
-            }
-            // not in RX — re-issue standby then SetRx again
-            self.xfer(&mut [0x80, 0x00])?;
-            self.delay_ms(10);
-        }
+        // Post-TX: absolute minimum recovery — ClearIrq + SetRx only.
+        // The chip auto-transitions to standby after TX; a direct SetRx
+        // should re-enter RX. All elaborate recovery attempts (standby,
+        // sleep+restart, verified mode) either didn't help or made it worse.
+        self.xfer(&mut [0x02, 0x03, 0xFF])?; // ClearIrq
+        self.delay_ms(5);
+        self.cmd(&mut [0x82, 0xFF, 0xFF, 0xFF])?; // SetRx continuous
         Ok(())
     }
 
@@ -375,6 +395,7 @@ fn modem_run() -> anyhow::Result<()> {
     }
     println!("usb driver ok");
 
+    let mut config_dirty = false;
     let mut modem = Modem::new(Protocol::new(MCU_ESP32_C6));
     let usb = modem.add_session();
     let mut tx_buf: Vec<u8> = Vec::new();
@@ -382,6 +403,7 @@ fn modem_run() -> anyhow::Result<()> {
 
     let mut usb_in = [0u8; 64];
     loop {
+        LOOP_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
         // ---- read host bytes (10 ms timeout tick) ----
         let n = unsafe {
             esp_idf_sys::usb_serial_jtag_read_bytes(
@@ -416,7 +438,18 @@ fn modem_run() -> anyhow::Result<()> {
                 tx_buf.clear();
             }
             for op in fed.ops {
-                apply_op(&mut radio, &mut modem, &mut params, op)?;
+                apply_op(&mut radio, &mut modem, &mut params, &mut config_dirty, op)?;
+            }
+        }
+
+        // Apply a pending config change once the burst has settled
+        // (config commands arrive within 1ms; re-init 5 loops later).
+        if config_dirty {
+            config_dirty = false;
+            unsafe { esp_idf_sys::vTaskDelay(5) }; // 50ms quiet period
+            if config_dirty == false {
+                // only re-init if no new config arrived during the wait
+                radio.init(&params.clone())?;
             }
         }
 
@@ -445,22 +478,39 @@ fn apply_op(
     radio: &mut impl RadioOps,
     _modem: &mut Modem,
     params: &mut RadioParams,
+    config_dirty: &mut bool,
     op: RadioOp,
 ) -> anyhow::Result<()> {
     match op {
+        // rnsd sends freq/bw/txp/sf/cr/state as a 1ms burst. Each used to
+        // trigger a FULL radio re-init (calibrate + TCXO + callsign TX);
+        // the six-deep storm of re-inits hard-wedged the SX1262 (dead SPI,
+        // only power cycle recovers) and degraded RX before dying. Now:
+        // config commands only mark params dirty; ONE re-init runs on
+        // RadioOn/RadioOff (always last in the burst) or lazily in the
+        // main loop.
         RadioOp::Configure(p) => {
             *params = p;
-            radio.reconfigure(params)?;
+            *config_dirty = true;
         }
         RadioOp::RadioOn => {
             params.radio_on = true;
+            *config_dirty = true;
             radio.reconfigure(params)?;
+            *config_dirty = false;
         }
         RadioOp::RadioOff => {
             params.radio_on = false;
             radio.reconfigure(params)?;
+            *config_dirty = false;
         }
         RadioOp::Transmit(data) => {
+            // Apply any pending config before transmitting (e.g. a
+            // frequency change followed immediately by data).
+            if *config_dirty {
+                radio.reconfigure(params)?;
+                *config_dirty = false;
+            }
             radio.transmit_pub(&data)?;
             _modem.protocol.tx_complete(data.len());
         }
