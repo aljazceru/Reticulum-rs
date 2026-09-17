@@ -176,6 +176,14 @@ impl Radio {
         self.xfer(&mut [0x02, 0x03, 0xFF])?; // ClearIrq
         if p.radio_on {
             self.start_rx()?;
+            // HARDWARE QUIRK (empirical): after a full re-init the RX
+            // front end stays dead (RSSI -127, nothing received) until
+            // one SetTx->TxDone cycle runs — the trailing start_rx of a
+            // transmission is what reliably re-arms reception. Real RNodes
+            // mask this because RNS sends its id_callsign packet right
+            // after radio-on. Mirror that: one header-only packet per
+            // reconfigure.
+            self.transmit(&[])?;
         }
         Ok(())
     }
