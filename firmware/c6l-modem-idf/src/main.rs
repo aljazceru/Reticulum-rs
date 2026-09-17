@@ -1,22 +1,312 @@
-use esp_idf_hal::spi::{config::Config, config::DriverConfig, SpiDeviceDriver};
+//! c6l-modem-idf v2: RNode-compatible KISS modem for the M5Stack Unit C6L.
+//!
+//! One std thread owns everything (single-radio, half-duplex):
+//!   USB-Serial-JTAG <-> rnode-modem-core (KISS protocol) <-> SX1262
+//!
+//! Radio driver conventions verified on hardware (see TECHNICAL_NOTES.md):
+//! - byte-by-byte SPI with CS (GPIO23) held LOW for the whole command
+//! - RNode init sequence: calibrate, image-cal, TCXO 3.0V, sync [0x14,0x24],
+//!   preamble 18, CRC on, IQ-errata RMW after EVERY SetPacketParams
+//! - SetTx(0x000000) single-shot; TX length via SetPacketParams
+//! - RNode wire format: [header(seq<<4|flags), payload...]
+//! - ReadBuffer data at buf[3]; GetRxBufferStatus len@3 off@4
+
+use esp_idf_hal::gpio::PinDriver;
+use esp_idf_hal::peripherals::Peripherals;
+use esp_idf_hal::spi::{config::Config, config::DriverConfig, SpiDeviceDriver, SpiSingleDeviceDriver};
 use esp_println::println;
 
-fn main() -> anyhow::Result<()> {
-    println!("c6l-modem-idf: LoRa RX v7 (IRQ polling)");
+use rnode_modem_core::frame::FEND;
+use rnode_modem_core::modem::Modem;
+use rnode_modem_core::protocol::{Protocol, RadioOp};
+use rnode_modem_core::radio::RadioParams;
+use rnode_modem_core::MCU_ESP32_C6;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static SAW_KISS: AtomicBool = AtomicBool::new(false);
+
+fn main() {
+    println!("c6l-modem v2.0 (KISS/RNode)");
     let handle = std::thread::Builder::new()
         .stack_size(65536)
-        .spawn(|| { if let Err(e) = lora_rx() { println!("Error: {:?}", e); } })
+        .spawn(|| {
+            if let Err(e) = modem_run() {
+                println!("modem error: {:?}", e);
+            }
+        })
         .unwrap();
     handle.join().unwrap();
-    Ok(())
 }
 
-fn lora_rx() -> anyhow::Result<()> {
-    let peripherals = esp_idf_hal::peripherals::Peripherals::take()?;
+// ---- Radio driver ----
+fn bandwidth_code(bw: u32) -> u8 {
+    match bw {
+        0..=7_800 => 0x00,
+        7_801..=10_400 => 0x08,
+        10_401..=15_600 => 0x01,
+        15_601..=20_800 => 0x09,
+        20_801..=31_250 => 0x02,
+        31_251..=41_700 => 0x0A,
+        41_701..=62_500 => 0x03,
+        62_501..=125_000 => 0x04,
+        125_001..=250_000 => 0x05,
+        _ => 0x06,
+    }
+}
+
+fn esp_random() -> u32 {
+    unsafe { esp_idf_sys::esp_random() }
+}
+
+/// USB-Serial-JTAG direct TX (esp-println's backend for the C6).
+/// FIFO 0x6000_F000 (u32 per byte), CONF 0x6000_F004:
+/// bit0 write = flush, bit1 clear = FIFO full.
+fn usb_write_direct(bytes: &[u8]) {
+    const FIFO: *mut u32 = 0x6000_F000 as *mut u32;
+    const CONF: *mut u32 = 0x6000_F004 as *mut u32;
+    unsafe {
+        for &b in bytes {
+            let mut timeout = 50_000usize;
+            while (CONF.read_volatile() & 0b010) == 0 {
+                if timeout == 0 {
+                    return; // no host draining — drop the rest
+                }
+                timeout -= 1;
+            }
+            FIFO.write_volatile(b as u32);
+        }
+        CONF.write_volatile(0b001); // flush
+    }
+}
+
+struct Radio {
+    cs: PinDriver<'static, esp_idf_hal::gpio::InputOutput>,
+    spi: SpiSingleDeviceDriver<'static>,
+    last_params: RadioParams,
+}
+
+impl Radio {
+    fn cmd(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.cs.set_low()?;
+        let r = self.spi.transfer_in_place(buf);
+        self.cs.set_high()?;
+        r?;
+        Ok(())
+    }
+    fn xfer(&mut self, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.cs.set_low()?;
+        for i in 0..buf.len() {
+            let mut b = [buf[i]];
+            self.spi.transfer_in_place(&mut b)?;
+            buf[i] = b[0];
+        }
+        self.cs.set_high()?;
+        Ok(())
+    }
+    fn delay_ms(&self, ms: u32) {
+        unsafe { esp_idf_sys::vTaskDelay(ms) }
+    }
+
+    /// Full RNode-matching init at the given parameters.
+    fn init(&mut self, p: &RadioParams) -> anyhow::Result<()> {
+        self.last_params = p.clone();
+        let freq = p.frequency.max(1);
+        let rf = ((freq as u64) << 25) / 32_000_000;
+        let f3 = (rf >> 24) as u8;
+        let f2 = ((rf >> 16) & 0xFF) as u8;
+        let f1 = ((rf >> 8) & 0xFF) as u8;
+        let f0 = (rf & 0xFF) as u8;
+        let bw_code = bandwidth_code(p.bandwidth);
+        let sf = p.sf.clamp(5, 12);
+        let cr = p.cr.clamp(5, 8) - 4;
+
+        self.xfer(&mut [0x00])?; // NOP
+        self.delay_ms(2);
+        self.xfer(&mut [0x80, 0x00])?; // SetStandby(STBY_RC)
+        self.delay_ms(2);
+        self.xfer(&mut [0x89, 0x7F])?; // Calibrate all
+        self.delay_ms(5);
+        // Image calibration 863-870 MHz
+        self.xfer(&mut [0x98, 0xD7, 0xDB])?;
+        self.delay_ms(5);
+        // TCXO 3.0V (C6L variant), timeout 65535*15.625us
+        self.cmd(&mut [0x97, 0x06, 0x00, 0x00, 0xFF])?;
+        self.delay_ms(50);
+        self.xfer(&mut [0x8A, 0x01])?; // SetPacketType(LoRa)
+        self.delay_ms(2);
+        self.xfer(&mut [0x86, f3, f2, f1, f0])?; // SetRfFrequency
+        self.delay_ms(2);
+        // RNode sync word [0x14, 0x24]
+        self.xfer(&mut [0x0D, 0x07, 0x40, 0x14])?;
+        self.xfer(&mut [0x0D, 0x07, 0x41, 0x24])?;
+        self.xfer(&mut [0x9D, 0x01])?; // DIO2 as RF switch
+        self.xfer(&mut [0x8B, sf, bw_code, cr, 0x00])?; // ModParams (LDRO off)
+        self.delay_ms(2);
+        // optimizeModemSensitivity: reg 0x0889 bit 2 SET (read-modify-write!)
+        let mut ms = [0x1D, 0x08, 0x89, 0x00, 0x00];
+        self.xfer(&mut ms)?;
+        self.xfer(&mut [0x0D, 0x08, 0x89, ms[4] | 0x04])?;
+        // PacketParams: preamble 18, explicit, len 0xFF, CRC on, std IQ (+3 unused)
+        self.xfer(&mut [0x8C, 0x00, 0x12, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00])?;
+        self.delay_ms(2);
+        // IQ errata 15.4 (RMW) — SetPacketParams resets this register
+        let mut iq = [0x1D, 0x07, 0x36, 0x00, 0x00];
+        self.xfer(&mut iq)?;
+        self.xfer(&mut [0x0D, 0x07, 0x36, iq[4] | 0x04])?;
+        // Buffer base TX=0 RX=0
+        self.xfer(&mut [0x8F, 0x00, 0x00, 0x00, 0x00])?;
+        // Regulator DC-DC
+        self.xfer(&mut [0x96, 0x01])?;
+        // PA config: SX1262 high power
+        self.xfer(&mut [0x95, 0x04, 0x07, 0x00, 0x01])?;
+        // TX power + ramp 40us
+        let txp = p.txpower.min(22);
+        self.xfer(&mut [0x8E, txp, 0x02])?;
+        // OCP 140mA
+        self.xfer(&mut [0x0D, 0x08, 0xE7, 0x38])?;
+        // TX clamp errata (RMW)
+        let mut clamp = [0x1D, 0x08, 0xD8, 0x00, 0x00];
+        self.xfer(&mut clamp)?;
+        self.xfer(&mut [0x0D, 0x08, 0xD8, clamp[4] | 0x1E])?;
+        // IRQ: enable all, route none to DIO1 (we poll)
+        self.xfer(&mut [0x08, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00])?;
+        self.xfer(&mut [0x02, 0x03, 0xFF])?; // ClearIrq
+        if p.radio_on {
+            self.start_rx()?;
+        }
+        Ok(())
+    }
+
+    fn start_rx(&mut self) -> anyhow::Result<()> {
+        // RX packet params (payload len 0xFF) + IQ fix, then SetRx continuous
+        self.xfer(&mut [0x8C, 0x00, 0x12, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00])?;
+        let mut iq = [0x1D, 0x07, 0x36, 0x00, 0x00];
+        self.xfer(&mut iq)?;
+        self.xfer(&mut [0x0D, 0x07, 0x36, iq[4] | 0x04])?;
+        self.xfer(&mut [0x8F, 0x00, 0x00, 0x00, 0x00])?; // FIFO pointers 0,0
+        self.xfer(&mut [0x02, 0x03, 0xFF])?; // clear latched IRQs
+        self.delay_ms(10); // let the chip settle (post-TX shutdown)
+        self.cmd(&mut [0x82, 0xFF, 0xFF, 0xFF])?; // SetRx continuous
+        Ok(())
+    }
+
+    /// Poll IRQ flags; on RxDone read the packet and return it
+    /// (RNode header byte stripped).
+    fn poll_rx(&mut self, out: &mut Vec<u8>) -> anyhow::Result<bool> {
+        let mut irq = [0x12u8, 0x00, 0x00, 0x00];
+        self.xfer(&mut irq)?;
+        let flags = ((irq[2] as u16) << 8) | irq[3] as u16;
+        if flags & 0x0002 == 0 {
+            if flags != 0 {
+                // clear non-RX latched flags (preamble/header detected etc.)
+                self.cmd(&mut [0x02, 0x03, 0xFF])?;
+            }
+            return Ok(false);
+        }
+        // GetRxBufferStatus: len@3, offset@4
+        let mut rbs = [0x13u8, 0x00, 0x00, 0x00, 0x00];
+        self.xfer(&mut rbs)?;
+        let len = rbs[3] as usize;
+        let mut got = false;
+        if len > 0 && len < 256 {
+            let read_len = len.min(240);
+            let mut pkt = [0u8; 4 + 240];
+            pkt[0] = 0x1E; // ReadBuffer: opcode + addr + dummy + data@3
+            self.xfer(&mut pkt[..4 + read_len])?;
+            let data = &pkt[3..3 + read_len];
+            // RNode wire format: first byte is the header (seq<<4|flags)
+            let payload = if data.len() > 1 { &data[1..] } else { &[][..] };
+            out.extend_from_slice(payload);
+            got = !payload.is_empty();
+        }
+        // restart RX for the next packet
+        self.start_rx()?;
+        Ok(got)
+    }
+
+    /// Transmit with RNode wire format (header + payload), honoring
+    /// split packets for payloads > 254 bytes.
+    fn transmit(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        const FLAG_SPLIT: u8 = 0x01;
+        const CHUNK: usize = 254; // max payload per LoRa packet
+
+        let mut seq: u8 = 0;
+        let chunks: Vec<&[u8]> = if payload.len() <= CHUNK {
+            vec![payload]
+        } else {
+            seq = (esp_random() & 0x0F) as u8;
+            vec![&payload[..CHUNK], &payload[CHUNK..]]
+        };
+        let split = payload.len() > CHUNK;
+
+        for chunk in chunks {
+            let header = (seq << 4) | if split { FLAG_SPLIT } else { 0 };
+            let total = 1 + chunk.len();
+            // standby
+            self.xfer(&mut [0x80, 0x00])?;
+            self.delay_ms(2);
+            // TX packet params with the ACTUAL length
+            self.xfer(&mut [
+                0x8C, 0x00, 0x12, 0x00, total as u8, 0x01, 0x00, 0x00, 0x00, 0x00,
+            ])?;
+            let mut iq = [0x1D, 0x07, 0x36, 0x00, 0x00];
+            self.xfer(&mut iq)?;
+            self.xfer(&mut [0x0D, 0x07, 0x36, iq[4] | 0x04])?;
+            // WriteBuffer: opcode + offset + [header, data...]
+            let mut wr = [0u8; 2 + 1 + CHUNK];
+            wr[0] = 0x0E;
+            wr[1] = 0x00;
+            wr[2] = header;
+            wr[3..3 + chunk.len()].copy_from_slice(chunk);
+            self.xfer(&mut wr[..3 + chunk.len()])?;
+            self.xfer(&mut [0x8F, 0x00, 0x00, 0x00, 0x00])?;
+            // SetTx(0x000000) single-shot (RNode endPacket)
+            self.xfer(&mut [0x83, 0x00, 0x00, 0x00, 0x00])?;
+            // wait for TxDone (airtime up to ~1.3s at SF12)
+            let mut done = false;
+            for _ in 0..150 {
+                let mut ti = [0x12u8, 0x00, 0x00, 0x00];
+                self.xfer(&mut ti)?;
+                let tflags = ((ti[2] as u16) << 8) | ti[3] as u16;
+                if tflags & 0x0001 != 0 {
+                    done = true;
+                    break;
+                }
+                if tflags & 0x0004 != 0 {
+                    break; // timeout flag
+                }
+                self.delay_ms(10);
+            }
+            let _ = done;
+            self.xfer(&mut [0x02, 0x03, 0xFF])?; // clear IRQs
+        }
+        // Post-TX: restore RX. (The earlier "chip refuses SetRx after TX"
+        // diagnosis was polluted by a GPIO19 IO_MUX bug — retest plain.)
+        self.delay_ms(5);
+        self.start_rx()?;
+        Ok(())
+    }
+
+    /// Read the last packet's RSSI/SNR (GetPacketStatus).
+    fn packet_status(&mut self) -> anyhow::Result<(i16, i8)> {
+        let mut ps = [0x14u8, 0x00, 0x00, 0x00, 0x00];
+        self.xfer(&mut ps)?;
+        Ok((-(ps[2] as i16) / 2, ps[3] as i8))
+    }
+}
+
+
+fn modem_run() -> anyhow::Result<()> {
+    let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
-    let mut cs = esp_idf_hal::gpio::PinDriver::input_output(pins.gpio23, esp_idf_hal::gpio::Pull::Floating)?;
+    let mut cs = PinDriver::input_output(pins.gpio23, esp_idf_hal::gpio::Pull::Floating)?;
     cs.set_high()?;
-    let mut dio1 = esp_idf_hal::gpio::PinDriver::input(pins.gpio7, esp_idf_hal::gpio::Pull::Down)?;
+    let _dio1 = PinDriver::input(pins.gpio7, esp_idf_hal::gpio::Pull::Down)?;
+    // NOTE: GPIO19 (SX1262 BUSY) is a flash-shared pin on ESP32-C6. Taking
+    // it via the HAL *and* rewriting its IO_MUX register broke the radio
+    // RX entirely (hardware-verified) — so we deliberately do NOT touch it.
+    // The driver relies on command settle delays instead of BUSY polling.
 
     let mut spi = SpiDeviceDriver::new_single(
         peripherals.spi2,
@@ -28,298 +318,133 @@ fn lora_rx() -> anyhow::Result<()> {
         &Config::new().baudrate(2_000_000.into()),
     )?;
 
-    // WRITE: multi-byte single transaction
-    macro_rules! cmd {
-        ($buf:expr) => {{
-            cs.set_low()?;
-            let r = spi.transfer_in_place($buf);
-            cs.set_high()?;
-            r?
-        }};
+
+
+    // ---- Modem core + USB session ----
+    let mut params = RadioParams::default();
+    params.frequency = 867_500_000;
+    params.bandwidth = 125_000;
+    params.sf = 9;
+    params.cr = 5;
+    params.txpower = 14;
+    params.radio_on = true;
+
+    let mut radio = Radio { cs, spi, last_params: params.clone() };
+    radio.init(&params)?;
+    println!("radio up");
+
+    // Install the USB-Serial-JTAG driver (the console output path does NOT
+    // install it; read_bytes/write_bytes need the driver's buffers/ISR).
+    let mut usb_cfg = esp_idf_sys::usb_serial_jtag_driver_config_t {
+        rx_buffer_size: 2048,
+        tx_buffer_size: 2048,
+    };
+    let usb_r = unsafe { esp_idf_sys::usb_serial_jtag_driver_install(&mut usb_cfg) };
+    if usb_r != 0 {
+        println!("usb driver install failed: {}", usb_r);
+        return Err(anyhow::anyhow!("usb_serial_jtag_driver_install: {}", usb_r));
     }
+    println!("usb driver ok");
 
-    // READ: byte-by-byte separate transactions
-    macro_rules! read {
-        ($buf:expr) => {{
-            cs.set_low()?;
-            let result: Result<(), esp_idf_hal::spi::SpiError> = (|| {
-                for i in 0..$buf.len() {
-                    let mut byte = [$buf[i]];
-                    spi.transfer_in_place(&mut byte)?;
-                    $buf[i] = byte[0];
-                }
-                Ok(())
-            })();
-            cs.set_high()?;
-            result?
-        }};
-    }
+    let mut modem = Modem::new(Protocol::new(MCU_ESP32_C6));
+    let usb = modem.add_session();
+    let mut tx_buf: Vec<u8> = Vec::new();
+    let mut rx_payload: Vec<u8> = Vec::new();
 
-    macro_rules! wait {
-        ($c:expr) => { for _ in 0..$c { std::thread::yield_now(); } };
-    }
-
-    // Error-safe read (inline, no macro, can't crash the loop)
-    macro_rules! read_safe {
-        ($buf:expr) => {{
-            let _ = cs.set_low();
-            for i in 0..$buf.len() {
-                let mut b = [$buf[i]];
-                if spi.transfer_in_place(&mut b).is_ok() {
-                    $buf[i] = b[0];
-                }
-            }
-            let _ = cs.set_high();
-        }};
-    }
-
-    println!("SPI ready");
-
-    // === INIT — exact RNode firmware sequence (markqvist/RNode_Firmware sx126x.cpp) ===
-    read!(&mut [0x00u8]); wait!(5000);  // NOP
-    read!(&mut [0x80u8, 0x00]); wait!(5000);  // SetStandby(STBY_RC)
-
-    // Calibrate all (RNode: MASK_CALIBRATE_ALL = 0x7F)
-    read!(&mut [0x89u8, 0x7F]); wait!(5000);
-
-    // Image calibration for 863-870 MHz (RNode: 0xD7, 0xDB)
-    read!(&mut [0x98u8, 0xD7, 0xDB]); wait!(5000);
-
-    // Enable TCXO 3.0V (M5Stack C6L variant: SX126X_DIO3_TCXO_VOLTAGE 3.0), timeout 0x0000FF
-    cmd!(&mut [0x97u8, 0x06, 0x00, 0x00, 0xFF]);
-    wait!(50000); // Wait for TCXO to stabilize
-
-    read!(&mut [0x8Au8, 0x01]); wait!(5000);  // SetPacketType(LoRa)
-    read!(&mut [0x86u8, 0x36, 0x38, 0x00, 0x00]); wait!(5000);  // SetRfFreq(867.5MHz)
-
-    // RNode sync word: hardcoded [0x14, 0x24] (sx126x.cpp setSyncWord())
-    read!(&mut [0x0Du8, 0x07, 0x40, 0x14]); wait!(5000);
-    read!(&mut [0x0Du8, 0x07, 0x41, 0x24]); wait!(5000);
-
-    // DIO2 as RF switch (RNode Heltec V3: DIO2_AS_RF_SWITCH = true)
-    read!(&mut [0x9Du8, 0x01]); wait!(5000);
-
-    // LNA boost DISABLED — caused constant -73dBm noise floor on C6L
-    // (RNode uses it on Heltec but C6L has ESP32-C6 RF leakage too close)
-
-    read!(&mut [0x8Bu8, 0x09, 0x04, 0x01, 0x00]); wait!(5000);  // SetModParams(SF9, BW125, CR4/5, LDRO off)
-
-    // optimizeModemSensitivity (RNode: reg 0x0889 bit 2 SET for BW < 500 kHz)
-    // READ-MODIFY-WRITE: preserve other bits!
-    let mut ms = [0x1Du8, 0x08, 0x89, 0x00, 0x00];
-    read!(&mut ms);
-    let ms_val = ms[4];
-    read!(&mut [0x0Du8, 0x08, 0x89, ms_val | 0x04]); wait!(5000);
-    println!("0x0889: read=0x{:02x} -> write=0x{:02x}", ms_val, ms_val | 0x04);
-
-    // SetPacketParams — RNode sends 9 bytes: preamble=18, explicit, len=255, CRC ON, std IQ
-    read!(&mut [0x8Cu8, 0x00, 0x12, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
-
-    // SX1262 errata 15.4: IQ fix must run AFTER EVERY SetPacketParams call!
-    // Standard IQ (0x00) -> reg 0x0736 bit 2 SET — READ-MODIFY-WRITE!
-    let mut iq2 = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
-    read!(&mut iq2);
-    let iq2_val = iq2[4];
-    read!(&mut [0x0Du8, 0x07, 0x36, iq2_val | 0x04]); wait!(5000);
-    println!("0x0736: read=0x{:02x} -> write=0x{:02x}", iq2_val, iq2_val | 0x04);
-
-    // SetPaConfig: PADutyCycle=0x04, HPMax=0x07, DeviceSel=0x00 (SX1262), PALut=0x01
-    read!(&mut [0x95u8, 0x04, 0x07, 0x00, 0x01]); wait!(5000);
-    // SetTxParams: 14 dBm, ramp 40us
-    read!(&mut [0x8Eu8, 0x0E, 0x02]); wait!(5000);
-    // OCP 140mA (RNode OCP_TUNED default 0x38 = 140mA)
-    read!(&mut [0x0Du8, 0x08, 0xE7, 0x38]); wait!(5000);
-    // Tx clamp config errata 15.2: set bits 4-1
-    let mut clamp = [0x1Du8, 0x08, 0xD8, 0x00, 0x00];
-    read!(&mut clamp);
-    read!(&mut [0x0Du8, 0x08, 0xD8, clamp[4] | 0x1E]); wait!(5000);
-
-    // Buffer base addresses TX=0 RX=0
-    read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]); wait!(5000);
-
-    // SetRegulatorMode DC-DC (opcode 0x96, value 0x01) — power efficiency
-    read!(&mut [0x96u8, 0x01]); wait!(5000);
-
-    read!(&mut [0x08u8, 0x00, 0x3F, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00]); wait!(5000);  // SetDioIrq
-    read!(&mut [0x02u8, 0x03, 0xFF]); wait!(5000);  // ClearIrq
-
-    // Verify sync word after full init
-    let mut sw = [0x1Du8, 0x07, 0x40, 0x00, 0x00, 0x00];
-    read!(&mut sw);
-    println!("SyncWord: [{:02x}, {:02x}] (want 14,24)", sw[4], sw[5]);
-    
-    // SetRx
-    cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
-    wait!(50000);
-
-    let mut st = [0xC0u8, 0x00];
-    read!(&mut st);
-    let mode = (st[0] >> 4) & 0x7;
-    println!("Mode: {} ({})", mode, if mode == 5 { "RX" } else { "?" });
-    println!("=== LISTENING ===");
-
-    // === RX LOOP: poll IRQ status via safe reads ===
-    let mut pkt_count = 0u32;
-    let mut loop_n: u32 = 0;
-    let mut telem_n: u32 = 0;
-    let mut rssi_val: i16 = 0;
-
+    let mut usb_in = [0u8; 64];
     loop {
-        loop_n += 1;
-
-        // Poll IRQ status every 50000 iterations (~7ms at 7M/sec)
-        if loop_n % 50000 == 0 {
-            let mut irq = [0x12u8, 0x00, 0x00, 0x00];
-            read_safe!(&mut irq);
-            let flags = ((irq[2] as u16) << 8) | irq[3] as u16;
-
-            if flags & 0x0002 != 0 { // RxDone!
-                // GetRxBufferStatus: [opcode, dummy, dummy, len, rxOffset]
-                let mut rbs = [0x13u8, 0x00, 0x00, 0x00, 0x00];
-                read_safe!(&mut rbs);
-                let len = rbs[3] as usize;
-                let rx_off = rbs[4] as usize;
-
-                if len > 0 && len < 256 {
-                    let read_len = len.min(64);
-                    // ReadBuffer: opcode + 2 dummies + payload
-                    let mut pkt = [0u8; 4 + 64];
-                    pkt[0] = 0x1E; // ReadBuffer
-                    read_safe!(&mut pkt[..4 + read_len]);
-
-                    pkt_count += 1;
-
-                    // GetPacketStatus: [opcode, dummy, rssi, snr]
-                    let mut ps = [0x14u8, 0x00, 0x00, 0x00, 0x00];
-                    read_safe!(&mut ps);
-                    let rssi = -(ps[2] as i16) / 2;
-                    let snr = ps[3] as i8;
-
-                    println!("*** RX #{}: len={} off={} rssi={} snr={} ***",
-                        pkt_count, len, rx_off, rssi, snr);
-                    // Full FIFO dump with positions (read 24 bytes from addr 0)
-                    let mut dump = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-                    read_safe!(&mut dump);
-                    let mut line = String::new();
-                    for (i, b) in dump.iter().enumerate().skip(1) {
-                        line.push_str(&format!("{:02x} ", b));
-                    }
-                    println!("FIFO[0..24] from buf[1]: {}", line);
+        // ---- read host bytes (10 ms timeout tick) ----
+        let n = unsafe {
+            esp_idf_sys::usb_serial_jtag_read_bytes(
+                usb_in.as_mut_ptr() as *mut _,
+                usb_in.len() as u32,
+                0, // non-blocking: the driver's timeout does not fire
+                   // reliably (blocks until data!); poll instead, then
+                   // vTaskDelay(1) at the loop tail for cadence.
+            )
+        };
+        if n > 0 {
+            let data: &[u8] = &usb_in[..n as usize];
+            if !SAW_KISS.load(Ordering::Relaxed) && data.contains(&FEND) {
+                SAW_KISS.store(true, Ordering::Relaxed);
+            }
+            let fed = modem.feed(usb, data);
+            for frame in fed.to_sender.iter() {
+                tx_buf.extend_from_slice(frame);
+            }
+            // to_others = fan-out to OTHER host links (WiFi-TCP sessions).
+            // With a single USB session there are no others — sending it
+            // back would echo the host's own data (not half-duplex!).
+            if modem.session_ids().len() > 1 {
+                for frame in fed.to_others.iter() {
+                    tx_buf.extend_from_slice(frame);
                 }
-
-                // Clear IRQ, reset FIFO pointers, restart RX
-                cmd!(&mut [0x02u8, 0x03, 0xFF]);
-                cmd!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]);  // SetBufferBaseAddress(0,0)
-                cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
-            } else if flags & 0x0040 != 0 { // CrcError
-                println!("CRC ERROR flags={:04x}", flags);
-                cmd!(&mut [0x02u8, 0x03, 0xFF]);
-                cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
-            } else if flags != 0 {
-                // Log interesting IRQs (PreambleDetected=0x04, SyncWordValid=0x08, HeaderValid=0x10)
-                if flags & 0x000C != 0 || flags & 0x0010 != 0 {
-                    println!("IRQ {:04x} (pre={:?} sync={:?} hdr={:?})", flags,
-                        flags & 0x0004 != 0, flags & 0x0008 != 0, flags & 0x0010 != 0);
-                }
-                cmd!(&mut [0x02u8, 0x03, 0xFF]);  // clear all latched IRQs
             }
-
-            // DIO1 debug (rate-limited)
-            if dio1.is_high() && loop_n % 5000000 == 0 {
-                println!("DIO1=HIGH flags={:04x}", flags);
+            for op in fed.ops {
+                apply_op(&mut radio, &mut modem, &mut params, op)?;
             }
         }
 
-        // Telemetry every ~500000 iterations (~0.7 seconds)
-        if loop_n % 500000 == 0 {
-            telem_n += 1;
-            // Safe RSSI read
-            let mut rssi_buf = [0x15u8, 0x00, 0x00, 0x00];
-            read_safe!(&mut rssi_buf);
-            rssi_val = -(rssi_buf[2] as i16) / 2;
-            if telem_n <= 3 {
-                println!("RSSI raw bytes: {:02x} {:02x} {:02x} {:02x}",
-                    rssi_buf[0], rssi_buf[1], rssi_buf[2], rssi_buf[3]);
+        // ---- poll radio ----
+        rx_payload.clear();
+        if radio.poll_rx(&mut rx_payload)? {
+            let (rssi, snr) = radio.packet_status().unwrap_or((0, 0));
+            modem.protocol.stats.rssi = rssi;
+            modem.protocol.stats.snr = snr as f32;
+            for frame in modem.radio_rx(&rx_payload) {
+                tx_buf.extend_from_slice(&frame);
             }
-
-            println!("TELEM#{}: pkts={} dio1={} rssi={}", 
-                telem_n, pkt_count, if dio1.is_high() { "H" } else { "L" }, rssi_val);
         }
 
-        // Periodic TX every ~10 seconds (100_000_000 iterations at ~10M/sec)
-        if loop_n % 100000000 == 0 && loop_n > 0 {
-            println!("TX cycle...");
-            
-            // Go to standby first (byte-by-byte like RNode)
-            read!(&mut [0x80u8, 0x00]);
-            wait!(10000);
-
-            // SetPacketParams with ACTUAL payload length (1 header + 5 data = 6)
-            // RNode wire format: [header(seq<<4), payload...]
-            read!(&mut [0x8Cu8, 0x00, 0x12, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00]);
-            wait!(5000);
-            // re-apply IQ errata fix (SetPacketParams resets reg 0x0736)
-            let mut iqt = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
-            read!(&mut iqt);
-            cmd!(&mut [0x0Du8, 0x07, 0x36, iqt[4] | 0x04]);
-            wait!(5000);
-            
-            // Write RNode-format packet: header byte (seq=1, no split) + HELLO
-            read!(&mut [0x0Eu8, 0x00, 0x10, b'H', b'E', b'L', b'L', b'O']);
-            wait!(5000);
-
-            // DIAGNOSTIC: read FIFO back to verify the write landed
-            {
-                let mut chk = [0x1Eu8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-                read!(&mut chk);
-                println!("FIFO check: {:02x?} (want 10 48 45 4c 4c 4f)",
-                    &chk[3..9]);
-            }
-            
-            // Set buffer base addresses (TX=0, RX=0)
-            read!(&mut [0x8Fu8, 0x00, 0x00, 0x00, 0x00]);
-            wait!(5000);
-            
-            // SetTx(0x000000) = single TX mode, no timeout (exactly like RNode endPacket)
-            read!(&mut [0x83u8, 0x00, 0x00, 0x00, 0x00]);
-            // Poll for TxDone IRQ with mode diagnostics
-            let mut tx_ok = false;
-            let mut printed = 0;
-            for i in 0..300 {
-                let mut ti = [0x12u8, 0x00, 0x00, 0x00];
-                read_safe!(&mut ti);
-                let tflags = ((ti[2] as u16) << 8) | ti[3] as u16;
-                let mut gs = [0xC0u8, 0x00];
-                read_safe!(&mut gs);
-                let mode = (gs[0] >> 4) & 0x7;
-                if i % 50 == 0 && printed < 6 {
-                    println!("TX poll: mode={} flags={:04x}", mode, tflags);
-                    printed += 1;
-                }
-                if tflags & 0x0001 != 0 { tx_ok = true; println!("TX poll: TxDone! mode={}", mode); break; }
-                if tflags & 0x0004 != 0 { println!("TX poll: TIMEOUT flag mode={}", mode); break; }
-                unsafe { esp_idf_sys::vTaskDelay(1); }
-            }
-            println!("TX done! irq_ok={}", tx_ok);
-            
-            // Clear IRQ and go back to RX
-            cmd!(&mut [0x02u8, 0x03, 0xFF]);
-            wait!(5000);
-            // restore RX packet params (payload len 255) for RX explicit mode
-            cmd!(&mut [0x8Cu8, 0x00, 0x12, 0x00, 0xFF, 0x01, 0x00, 0x00, 0x00, 0x00]);
-            wait!(5000);
-            let mut iqr = [0x1Du8, 0x07, 0x36, 0x00, 0x00];
-            read!(&mut iqr);
-            cmd!(&mut [0x0Du8, 0x07, 0x36, iqr[4] | 0x04]);
-            cmd!(&mut [0x82u8, 0xFF, 0xFF, 0xFF]);
-            wait!(10000);
+        // ---- write host bytes (direct EP1 FIFO, like esp-println) ----
+        if !tx_buf.is_empty() {
+            usb_write_direct(&tx_buf);
+            tx_buf.clear();
         }
-        
-        // Yield to IDLE (prevent watchdog)
-        if loop_n % 100000 == 0 {
-            unsafe { esp_idf_sys::vTaskDelay(1); }
-        }
+
+        unsafe { esp_idf_sys::vTaskDelay(1); } // 10ms cadence, feeds the watchdog
     }
 }
+
+fn apply_op(
+    radio: &mut impl RadioOps,
+    _modem: &mut Modem,
+    params: &mut RadioParams,
+    op: RadioOp,
+) -> anyhow::Result<()> {
+    match op {
+        RadioOp::Configure(p) => {
+            *params = p;
+            radio.reconfigure(params)?;
+        }
+        RadioOp::RadioOn => {
+            params.radio_on = true;
+            radio.reconfigure(params)?;
+        }
+        RadioOp::RadioOff => {
+            params.radio_on = false;
+            radio.reconfigure(params)?;
+        }
+        RadioOp::Transmit(data) => {
+            radio.transmit_pub(&data)?;
+            _modem.protocol.tx_complete(data.len());
+        }
+    }
+    Ok(())
+}
+
+// Small trait indirection so apply_op can live outside modem_run
+trait RadioOps {
+    fn reconfigure(&mut self, p: &RadioParams) -> anyhow::Result<()>;
+    fn transmit_pub(&mut self, data: &[u8]) -> anyhow::Result<()>;
+}
+
+impl RadioOps for Radio {
+    fn reconfigure(&mut self, p: &RadioParams) -> anyhow::Result<()> {
+        self.init(p)
+    }
+    fn transmit_pub(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.transmit(data)
+    }
+}
+

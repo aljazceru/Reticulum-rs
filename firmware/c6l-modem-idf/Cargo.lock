@@ -132,6 +132,7 @@ dependencies = [
  "esp-idf-hal",
  "esp-idf-sys",
  "esp-println",
+ "rnode-modem-core",
 ]
 
 [[package]]
@@ -998,6 +999,13 @@ dependencies = [
  "libc",
  "normpath",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "rnode-modem-core"
+version = "0.1.0"
+dependencies = [
+ "log",
 ]
 
 [[package]]

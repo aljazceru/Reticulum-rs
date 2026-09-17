@@ -8,6 +8,7 @@ esp-idf-sys = { version = "0.38", features = ["binstart"] }
 esp-idf-hal = { version = "0.47", features = ["critical-section"] }
 esp-println = { version = "0.13", features = ["esp32c6"] }
 anyhow = "1"
+rnode-modem-core = { path = "../../rnode-modem-core" }
 
 [build-dependencies]
 embuild = "0.33"
