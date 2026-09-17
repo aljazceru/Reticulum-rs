@@ -151,3 +151,15 @@ the air under any other driver.
   scripted replays (compare CMD_READY timing + TX patterns)
 - Or try a different RNode firmware version on the Heltec
 - Or an SDR capture at 867.5 during both driving modes
+
+## FINAL RESULT: 100% packet delivery (2026-09-17)
+
+After the FIFO offset fixes, the full rnsd round-trip works flawlessly:
+```
+rnprobe → rnsd-a → Heltec RNode → LoRa → C6L modem → rnsd-b → responder
+         ← proof ← C6L TX ← LoRa ← Heltec RNode ← rnsd-a ← rnprobe
+Sent 8, received 8, packet loss 0.0%
+```
+
+The three bugs (SetBufferBaseAddress corruption, wrong length byte, 
+missing offset in ReadBuffer) accounted for ALL the packet loss.
