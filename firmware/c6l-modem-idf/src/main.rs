@@ -290,9 +290,16 @@ impl Radio {
             let _ = done;
             self.xfer(&mut [0x02, 0x03, 0xFF])?; // clear IRQs
         }
-        // Post-TX: restore RX. (The earlier "chip refuses SetRx after TX"
-        // diagnosis was polluted by a GPIO19 IO_MUX bug — retest plain.)
-        self.delay_ms(5);
+        // Post-TX restore, mirroring RNode's endPacket -> receive():
+        // explicit standby first, settle, then a full RX re-arm.
+        self.xfer(&mut [0x80, 0x00])?; // SetStandby(STBY_RC)
+        self.delay_ms(20);
+        self.start_rx()?;
+        // And once more after a settle — the RF switch/PA ramp-down on
+        // this module needs real time before reception is reliable
+        // (empirical: alternating TX/RX lost every other packet with a
+        // single SetRx).
+        self.delay_ms(50);
         self.start_rx()?;
         Ok(())
     }

@@ -80,7 +80,7 @@ t_rnode.start()
 time.sleep(4)  # let the RNode come up
 
 # ---------- C6L side (KISS host client) ----------
-c = serial.Serial('/dev/ttyACM2', 115200, timeout=1.0)
+c = serial.Serial('/dev/ttyACM1', 115200, timeout=1.0)
 # Hardware reset like a real host (DTR/RTS toggle)
 c.dtr = False; c.rts = True; time.sleep(0.15); c.rts = False; c.dtr = True
 time.sleep(2.5)

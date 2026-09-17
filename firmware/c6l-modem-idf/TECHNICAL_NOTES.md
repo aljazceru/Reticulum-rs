@@ -74,3 +74,43 @@ C6L→RNode `HELLO`.
 `tests/lora_roundtrip.py [freq_hz]` — configures the RNode on ttyUSB1,
 prints C6L RX on ttyACM2, expects `hello` ×5 and the RNode receiving
 `HELLO`.
+
+---
+
+## 2026-09-17 (later): rnsd integration + RX loss analysis
+
+### Working
+- rnode-modem-core: RNode 0xFF-query semantics (RNS validateRadioState passes)
+- `delay_ms` tick conversion + reply-before-op flush (RNS 250ms validation window)
+- rnsd brings the C6L up on both nodes; announces B->A + path discovery over LoRa
+- Full app round trip proven by replay: rnsd's exact 131-byte probe frame,
+  replayed through the RNode, reached the responder over the air and the
+  proof returned ("Valid reply", responder `*** RECEIVED`)
+- KISS acceptance 10/10 incl. 212-byte payloads
+
+### The remaining blocker: ~50% per-packet RX loss on the C6L
+Measured with rnprobe x8: A's RNode transmits every probe (airtime
+verified) but the C6L delivers only ~half to rnsd. Pattern is roughly
+alternating — consistent with the modem being deaf for a window after
+its own TX (proofs), though slower announces only marginally improved
+it. With single-shot probes that means "timed out"; LXMF's transport
+retries would eventually deliver, but multi-packet link handshakes
+(rnx) don't complete.
+
+Suspected causes to investigate next (in order):
+1. RX processing latency: byte-by-byte SPI FIFO reads (~131 bytes =
+   ~5ms of bit-banged CS-held transfers) + 10ms poll cadence may
+   collide with the next packet's preamble in busier traffic.
+   -> move to multi-byte FIFO reads (works for WriteBuffer) or
+      DIO1-driven processing.
+2. The post-TX recovery: currently standby + 2x start_rx with 20/50ms
+   settles — improved 2/8 -> 3/8 but not fixed.
+3. RF switch (DIO2) settling after PA ramp-down.
+
+### Recovery procedure (hardware-verified)
+The SX1262 occasionally wedges (no boot console, no KISS response).
+ESP32 resets do NOT clear it (no NRESET pin on the C6L). Recovery:
+1. Unplug/replug USB (full power cycle) — usually enough.
+2. If not: flash Meshtastic, let it boot 5s, re-flash our firmware.
+If espflash cannot attach after Meshtastic: esptool elf2image the ELF
+and write bootloader/partition-table/app at 0x0/0x8000/0x10000.
