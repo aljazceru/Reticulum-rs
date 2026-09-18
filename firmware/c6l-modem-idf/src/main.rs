@@ -22,6 +22,11 @@ use rnode_modem_core::protocol::{Protocol, RadioOp};
 use rnode_modem_core::radio::RadioParams;
 use rnode_modem_core::MCU_ESP32_C6;
 
+mod bus;
+mod console;
+mod tcp_bridge;
+mod wifi;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static SAW_KISS: AtomicBool = AtomicBool::new(false);
