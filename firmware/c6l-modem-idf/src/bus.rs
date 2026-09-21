@@ -54,7 +54,7 @@ impl Bus {
     pub fn register(self: &Arc<Self>) -> SessionGuard {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
         let (tx, rx) = sync_channel(OUT_BOUND);
-        self.out.lock().unwrap().insert(id, tx);
+        self.out.lock().expect("bus out map poisoned").insert(id, tx);
         SessionGuard {
             id,
             rx,
@@ -71,7 +71,7 @@ impl Bus {
     /// Deliver one outbound frame to a session. False when the session is
     /// gone or its queue is full (frame dropped — never block the modem).
     pub fn send_out(&self, id: u64, frame: &[u8]) -> bool {
-        let tx = self.out.lock().unwrap().get(&id).cloned();
+        let tx = self.out.lock().expect("bus out map poisoned").get(&id).cloned();
         match tx {
             Some(tx) => tx.try_send(frame.to_vec()).is_ok(),
             None => false,
@@ -84,7 +84,7 @@ impl Bus {
         let txs: Vec<SyncSender<Vec<u8>>> = self
             .out
             .lock()
-            .unwrap()
+            .expect("bus out map poisoned")
             .iter()
             .filter(|(id, _)| **id != except)
             .map(|(_, tx)| tx.clone())
@@ -92,13 +92,6 @@ impl Bus {
         for tx in txs {
             let _ = tx.try_send(frame.to_vec());
         }
-    }
-
-    /// Currently registered bus session ids, sorted.
-    pub fn session_ids(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self.out.lock().unwrap().keys().copied().collect();
-        ids.sort_unstable();
-        ids
     }
 }
 
@@ -111,7 +104,15 @@ pub struct SessionGuard {
 
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.bus.out.lock().unwrap().remove(&self.id);
+        self.bus.out.lock().expect("bus out map poisoned").remove(&self.id);
+        // Blocking send (NOT try_send): it can only stall while the
+        // inbound queue is full (256 deep — bounded, worst case ~1.6 s
+        // during an SF12 TX; the modem drains 32 msgs/10 ms tick). A lost
+        // Leave would leave a phantom session in the modem's parser table
+        // forever (unbounded growth over reconnect cycles). The session-
+        // count slot is already released by this point (in tcp_bridge,
+        // SessionSlot drops before the `guard` parameter — function
+        // params drop last), so new clients are never blocked by it.
         let _ = self.bus.in_tx.send(InMsg::Leave(self.id));
     }
 }

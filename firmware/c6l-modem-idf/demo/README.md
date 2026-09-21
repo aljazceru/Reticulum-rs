@@ -43,3 +43,25 @@ different room / power bank, away from the rfsight node.
 - Bidirectional LoRa data (RNode wire format incl. split packets)
 - RNS detect + validateRadioState + interface Up on both nodes
 - Announce propagation + path discovery over the air
+
+## C6L WiFi-TCP bridge
+
+The same firmware also speaks KISS over WiFi: clients on the LAN
+connect to the C6L on TCP port 7633 and reach LoRa peers through the
+SX1262 — no USB cable.
+
+- Build/flash with credentials baked in: `C6L_WIFI_SSID=mynet
+  C6L_WIFI_PASSWORD=secret cargo +esp flash --release` (or your usual
+  flash command). Gotcha: cargo does NOT rebuild on env-var change
+  alone — `touch src/main.rs` after editing them, or the old
+  credentials stay in the binary.
+- The console prints the DHCP address once associated; clients connect
+  to `tcp://<that-ip>:7633`. For rnsd's RNodeInterface the URI must be
+  `tcp://<that-ip>` with NO port — RNS hardcodes target port 7633 and
+  treats a `:port` suffix as part of the hostname.
+- Max 2 concurrent TCP sessions; USB KISS keeps working in parallel.
+- rnsd: `cp c6l-tcp-rnsd.config ~/demo/node-b/config` — RNodeInterface
+  with a `tcp://` port URI (NOT TCPClientInterface; see BRIDGE_PLAN).
+- Acceptance over WiFi (same 10-check flow as the USB test, RNode still
+  on /dev/ttyUSB1):
+  `python3 tests/tcp_kiss_acceptance.py <c6l_ip>`

@@ -8,8 +8,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static SAW_KISS: AtomicBool = AtomicBool::new(false);
 
 /// Mark that KISS traffic has started (first FEND seen on any session).
+/// Acts only on the false -> true transition; idempotent afterwards.
 pub fn mark_kiss() {
-    SAW_KISS.store(true, Ordering::Relaxed);
+    // swap() returns the previous value: act exactly once, on the first
+    // FEND, so concurrent callers can't repeat the C-side shutdown.
+    if !SAW_KISS.swap(true, Ordering::Relaxed) {
+        // `clog!` only gates Rust-side prints; the ESP-IDF C stack
+        // (wifi/netif/lwIP event logging via ESP_LOGx) writes to the
+        // SAME USB-Serial-JTAG wire as the KISS stream. A connect/
+        // disconnect ESP_LOGI would corrupt the stream just like a bare
+        // println!, so silence ALL C-side tags once KISS starts.
+        unsafe {
+            esp_idf_sys::esp_log_level_set(
+                b"*\0".as_ptr().cast::<core::ffi::c_char>(),
+                esp_idf_sys::esp_log_level_t_ESP_LOG_NONE,
+            );
+        }
+    }
 }
 
 /// True while printing to the console is still safe.

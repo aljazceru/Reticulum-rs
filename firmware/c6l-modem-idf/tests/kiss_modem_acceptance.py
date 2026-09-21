@@ -4,7 +4,7 @@
 """
 import serial, time, threading, sys
 
-FEND, FESC, TFESC, TFEND = 0xC0, 0xDB, 0xDC, 0xDD
+FEND, FESC, TFEND, TFESC = 0xC0, 0xDB, 0xDC, 0xDD
 
 def frame(cmd, payload=b''):
     out = bytearray([FEND, cmd])
@@ -19,7 +19,7 @@ def unescape(data):
     out = bytearray(); esc = False
     for b in data:
         if esc:
-            out.append(TFEND if b == 0xDC else TFESC if b == 0xDD else b); esc = False
+            out.append(FEND if b == TFEND else FESC if b == TFESC else b); esc = False
         elif b == FESC: esc = True
         else: out.append(b)
     return bytes(out)
@@ -50,7 +50,7 @@ def rnode_side():
     h.reset_input_buffer()
     print('>>> RNode configured + radio ON, listening', flush=True)
     t0 = time.time(); buf = bytearray()
-    while time.time() - t0 < 45:
+    while time.time() - t0 < 60:
         try: d = h.read(4096)
         except Exception: return
         if d:
@@ -83,7 +83,19 @@ time.sleep(4)  # let the RNode come up
 c = serial.Serial('/dev/ttyACM1', 115200, timeout=1.0)
 # Hardware reset like a real host (DTR/RTS toggle)
 c.dtr = False; c.rts = True; time.sleep(0.15); c.rts = False; c.dtr = True
-time.sleep(2.5)
+# Boot-settle: wifi::start() blocks the modem up to ~15s for DHCP, so a
+# fixed 2.5s settle lands inside that window — early detect writes then
+# outlive the reply timeouts (and used to stall in the USB-JTAG FIFO
+# entirely). Don't wait on a console line — 'radio up' is empirically
+# unreliable (eaten by the USB-JTAG TX path). Probe readiness instead:
+# detect bursts until the modem actually answers.
+t0 = time.time(); ready = False
+while time.time() - t0 < 30 and not ready:
+    c.write(frame(0x08, bytes([0x73]))); c.flush()
+    d = c.read(4096)
+    if b'\x08\x46' in d or b'\xc0\x08\x46' in d: ready = True
+    else: time.sleep(0.5)
+print(f'>>> C6L boot wait: {time.time()-t0:.1f}s (modem ready: {ready})', flush=True)
 c.reset_input_buffer()
 
 def read_frames(sec):

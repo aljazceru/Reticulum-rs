@@ -2,11 +2,11 @@
 ## Reviewed and approved by Codex CLI and Grok CLI
 
 ## Objective
-Devices on the WiFi LAN connect to the C6L via TCP (RNode KISS on port 4990)
+Devices on the WiFi LAN connect to the C6L via TCP (RNode KISS on port 7633)
 and reach LoRa peers through the SX1262 radio. This is the product.
 
 ```
-[Phone/Laptop on WiFi] ←TCP:4990→ [C6L: WiFi STA + LoRa]
+[Phone/Laptop on WiFi] ←TCP:7633→ [C6L: WiFi STA + LoRa]
                                         ⇅ 867.5 MHz
                               [Heltec RNode ←USB→ Laptop rnsd/nomadnet]
 ```
@@ -18,7 +18,7 @@ and reach LoRa peers through the SX1262 radio. This is the product.
 |---|---|---|
 | modem (existing) | 64 KB | Modem, SX1262 SPI, USB-Serial-JTAG, radio loop |
 | wifi bring-up | 16 KB | esp_wifi STA + DHCP + reconnect loop |
-| tcp-accept | 16 KB | TcpListener on 0.0.0.0:4990, spawn sessions |
+| tcp-accept | 16 KB | TcpListener on 0.0.0.0:7633, spawn sessions |
 | tcp-session × 2 max | 8 KB each | one TcpStream, KISS parser, channels to modem |
 
 ### Data flow
@@ -46,7 +46,7 @@ Radio RX → modem.radio_rx(data) → frames for ALL sessions → fan-out
 9. Wait for GOT_IP event → print the DHCP address
 
 ### TCP listener
-- `std::net::TcpListener::bind("0.0.0.0:4990")` after DHCP
+- `std::net::TcpListener::bind("0.0.0.0:7633")` after DHCP
 - `TCP_NODELAY` on all accepted streams (KISS is tiny frames)
 - Non-blocking reads from dedicated session threads (NOT in the modem loop)
 - Max 2 concurrent sessions (one laptop + one debug client)
@@ -58,7 +58,7 @@ Radio RX → modem.radio_rx(data) → frames for ALL sessions → fan-out
 [[C6L]]
 type = RNodeInterface
 enabled = yes
-port = tcp://192.168.1.233:4990
+port = tcp://192.168.1.233   # NO :port — RNS hardcodes 7633
 frequency = 867500000
 bandwidth = 125000
 txpower = 14
@@ -75,7 +75,7 @@ codingrate = 5
 - Verify: KISS acceptance test still 10/10 over USB
 
 ### Phase 2: TCP listener (no bridging yet)
-- TcpListener on 4990, non-blocking, up to 2 sessions
+- TcpListener on 7633, non-blocking, up to 2 sessions
 - Each session: dedicated reader thread, KISS parser, channel to modem
 - Verify: host detect burst passes over WiFi (7-frame test from old firmware)
 
@@ -83,7 +83,7 @@ codingrate = 5
 - Fix `to_others` routing: TCP data forwards to USB, USB data forwards to TCP
 - Fix `radio_rx` fan-out: frames go to ALL sessions (USB + TCP)
 - Radio ops still execute on the modem thread
-- Verify: rnprobe 8/8 over tcp://C6L_IP:4990 against the Heltec
+- Verify: rnprobe 8/8 over tcp://C6L_IP against the Heltec
 
 ### Phase 4: Dual-link + reliability
 - USB + TCP simultaneously
@@ -101,7 +101,7 @@ codingrate = 5
 | TCP reader stalls during radio TX (up to 1.5s at SF12) | Dedicated session threads with bounded channels |
 | RF coexistence: 2.4GHz WiFi TX near 868MHz LoRa RX | Test with WiFi associated; expect a few dB RSSI degradation |
 | Env-var rebuild: cargo won't rebuild on C6L_WIFI_* change | touch src/main.rs + verify strings in binary |
-| RNodeInterface TCP URI parses port from hostname, hardcodes 7633 upstream | Our port is 4990; test with our rnsd first, file upstream fix later |
+| ~~RNodeInterface TCP URI parses port from hostname~~ CONFIRMED on bench: RNS 1.5.4 takes the whole post-`tcp://` string as hostname and hardcodes TARGET_PORT=7633 — `tcp://ip:4990` -> gaierror | Bridge listens on 7633; rnsd URI carries no port |
 
 ## Not a risk (both reviewers confirmed)
 - Incoming TCP SYNs: lwIP handles them correctly (old bug was esp-radio/smoltcp)
@@ -129,5 +129,5 @@ conflict; single modem thread + dedicated TCP session threads is correct.
 to_others must route to ALL other sessions (current code wrongly dumps
 them onto USB tx_buf); radio_rx returns per-session frames that must be
 zipped, not concatenated; bring WiFi up BEFORE the modem so the IP prints
-before any FEND corrupts the console; use tcp://C6L_IP:4990 URI in rnsd
+before any FEND corrupts the console; use tcp://C6L_IP URI in rnsd
 config, NOT TCPClientInterface.

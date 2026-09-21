@@ -1,7 +1,11 @@
 //! c6l-modem-idf v2: RNode-compatible KISS modem for the M5Stack Unit C6L.
 //!
-//! One std thread owns everything (single-radio, half-duplex):
-//!   USB-Serial-JTAG <-> rnode-modem-core (KISS protocol) <-> SX1262
+//! Thread layout (BRIDGE_PLAN): the modem thread below owns the single
+//! half-duplex radio chain — USB-Serial-JTAG + TCP:7633 sessions
+//! <-> rnode-modem-core (KISS protocol) <-> SX1262. WiFi bring-up
+//! (src/wifi.rs), the TCP listener + sessions (src/tcp_bridge.rs) and
+//! the watchdog run on their own threads; host links reach the modem
+//! through the session bus (src/bus.rs).
 //!
 //! Radio driver conventions verified on hardware (see TECHNICAL_NOTES.md):
 //! - byte-by-byte SPI with CS (GPIO23) held LOW for the whole command
@@ -14,10 +18,9 @@
 use esp_idf_hal::gpio::PinDriver;
 use esp_idf_hal::peripherals::Peripherals;
 use esp_idf_hal::spi::{config::Config, config::DriverConfig, SpiDeviceDriver, SpiSingleDeviceDriver};
-use esp_println::println;
 
 use rnode_modem_core::frame::FEND;
-use rnode_modem_core::modem::Modem;
+use rnode_modem_core::modem::{Fed, Modem};
 use rnode_modem_core::protocol::{Protocol, RadioOp};
 use rnode_modem_core::radio::RadioParams;
 use rnode_modem_core::MCU_ESP32_C6;
@@ -27,16 +30,47 @@ mod console;
 mod tcp_bridge;
 mod wifi;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static SAW_KISS: AtomicBool = AtomicBool::new(false);
-
+use crate::bus::{Bus, InMsg, USB_SESSION};
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+
 static LOOP_COUNT: AtomicU32 = AtomicU32::new(0);
 
 fn main() {
-    println!("c6l-modem v2.0 (KISS/RNode)");
-    // Watchdog thread: detects modem thread hangs
+    crate::clog!("c6l-modem v2.0 (KISS/RNode)");
+    // Install the USB-Serial-JTAG driver BEFORE the blocking WiFi wait:
+    // its ISR drains the host->device RX FIFO into the ring buffer while
+    // wifi::start() blocks below. Without this, host writes during the
+    // WiFi window stall (FIFO unclaimed -> CDC-ACM backpressure) — seen
+    // on the bench as the USB acceptance test blocking in write() until
+    // killed. Bytes buffered here are consumed once the modem loop
+    // starts polling.
+    let mut usb_cfg = esp_idf_sys::usb_serial_jtag_driver_config_t {
+        rx_buffer_size: 2048,
+        tx_buffer_size: 2048,
+    };
+    let usb_r = unsafe { esp_idf_sys::usb_serial_jtag_driver_install(&mut usb_cfg) };
+    if usb_r != 0 {
+        crate::clog!("usb driver install failed: {}", usb_r);
+    } else {
+        crate::clog!("usb driver ok");
+    }
+    // WiFi BEFORE the modem thread (plan Phase 1): the DHCP address
+    // must reach the console before any FEND traffic can silence it.
+    // wifi::start() uses raw esp-idf-sys init and consumes no HAL
+    // peripherals, so Peripherals::take() safely stays in modem_run
+    // (the plan's split risk only applies to esp-idf-svc paths).
+    // It BLOCKS until the address prints or a ~15s timeout elapses —
+    // which is why the watchdog must not be armed yet: LOOP_COUNT
+    // stays at 0 during the wait and a stalled count means "reboot".
+    wifi::start();
+    // Session bus + TCP listener: binding races DHCP on purpose —
+    // clients just can't connect until the netif is up.
+    let (bus, in_rx) = Bus::new();
+    tcp_bridge::start(bus.clone());
+    // Watchdog thread: detects modem thread hangs (spawned only once
+    // the modem thread is about to start ticking LOOP_COUNT).
     std::thread::Builder::new()
         .stack_size(16384)
         .spawn(|| {
@@ -47,7 +81,7 @@ fn main() {
                 let cur = LOOP_COUNT.load(AtomicOrdering::Relaxed);
                 beats += 1;
                 if cur == last && beats > 3 {
-                    println!("[WDT] MODEM THREAD HUNG at loop {} ({}s) — rebooting", cur, beats * 2);
+                    crate::clog!("[WDT] MODEM THREAD HUNG at loop {} ({}s) — rebooting", cur, beats * 2);
                     unsafe { esp_idf_sys::esp_restart() };
                 }
                 last = cur;
@@ -56,9 +90,9 @@ fn main() {
         .unwrap();
     let handle = std::thread::Builder::new()
         .stack_size(65536)
-        .spawn(|| {
-            if let Err(e) = modem_run() {
-                println!("modem error: {:?} — rebooting", e);
+        .spawn(move || {
+            if let Err(e) = modem_run(bus, in_rx) {
+                crate::clog!("modem error: {:?} — rebooting", e);
                 unsafe { esp_idf_sys::esp_restart() };
             }
         })
@@ -109,10 +143,18 @@ fn usb_write_direct(bytes: &[u8]) {
     }
 }
 
+/// RNode wire-format split flag (header low bit); header high nibble
+/// is the chunk sequence. Payloads > 254 bytes go out as two packets
+/// sharing one sequence, matching stock RNode_Firmware.
+const FLAG_SPLIT: u8 = 0x01;
+const CHUNK: usize = 254; // max payload per LoRa packet
+
 struct Radio {
     cs: PinDriver<'static, esp_idf_hal::gpio::InputOutput>,
     spi: SpiSingleDeviceDriver<'static>,
     last_params: RadioParams,
+    pending_split: Vec<u8>,
+    pending_seq: u8,
 }
 
 impl Radio {
@@ -253,16 +295,42 @@ impl Radio {
         let rx_offset = rbs[3];
         let mut got = false;
         if len > 0 && len < 256 {
-            let read_len = len.min(240);
-            let mut pkt = [0u8; 4 + 240];
+            // Read the FULL packet — a split chunk is 255 bytes on the
+            // wire; the earlier min(240) cap silently dropped the tail
+            // of every max-size chunk.
+            let mut pkt = [0u8; 4 + 255];
             pkt[0] = 0x1E; // ReadBuffer
             pkt[1] = rx_offset; // read from the packet's ACTUAL offset
-            self.xfer(&mut pkt[..4 + read_len])?;
-            let data = &pkt[3..3 + read_len];
-            // RNode wire format: first byte is the header (seq<<4|flags)
-            let payload = if data.len() > 1 { &data[1..] } else { &[][..] };
-            out.extend_from_slice(payload);
-            got = !payload.is_empty();
+            self.xfer(&mut pkt[..4 + len])?;
+            let data = &pkt[3..3 + len];
+            // RNode wire format: first byte is the header (seq<<4|flags).
+            // Split frames arrive as two packets sharing the seq nibble:
+            // buffer the first, emit the reassembled payload on the
+            // second. A non-split packet (or a new seq) discards a
+            // pending chunk — stock RNode_Firmware semantics.
+            if data.len() > 1 {
+                let header = data[0];
+                let payload = &data[1..];
+                if header & FLAG_SPLIT != 0 {
+                    let seq = header >> 4;
+                    if self.pending_seq == seq && !self.pending_split.is_empty() {
+                        self.pending_split.extend_from_slice(payload);
+                        out.extend_from_slice(&self.pending_split);
+                        self.pending_split.clear();
+                        self.pending_seq = 0xFF;
+                        got = true;
+                    } else {
+                        self.pending_split.clear();
+                        self.pending_split.extend_from_slice(payload);
+                        self.pending_seq = seq;
+                    }
+                } else {
+                    self.pending_split.clear();
+                    self.pending_seq = 0xFF;
+                    out.extend_from_slice(payload);
+                    got = true;
+                }
+            }
         }
         // Post-RX: absolute minimum — clear RxDone and re-enter RX.
         // CRITICAL: do NOT call SetBufferBaseAddress here! The modem is
@@ -277,11 +345,32 @@ impl Radio {
         Ok(got)
     }
 
+    /// LoRa airtime in ms for an on-wire packet of `len` bytes at the
+    /// current params (explicit header, CRC on, preamble 18 symbols).
+    /// Semtech formula; used to size the TxDone wait — see transmit().
+    fn airtime_ms(&self, len: usize) -> u32 {
+        let p = &self.last_params;
+        let sf = p.sf.clamp(5, 12) as i64;
+        let bw = p.bandwidth.max(1) as i64;
+        let cr = (p.cr.clamp(5, 8) - 4) as i64;
+        let ts_us = ((1i64 << sf) * 1_000_000) / bw; // symbol period
+        let de: i64 = if ts_us >= 16_000 { 1 } else { 0 }; // LDRO
+        let pl = len as i64;
+        let num = 8 * pl - 4 * sf + 28 + 16; // IH=0, CRC on
+        let denom = 4 * (sf - 2 * de);
+        let n_payload = 8 + ((num.max(0) + denom - 1) / denom) * (cr + 4);
+        (((18 + 4 + n_payload) * ts_us) / 1000) as u32
+    }
+
     /// Transmit with RNode wire format (header + payload), honoring
     /// split packets for payloads > 254 bytes.
     fn transmit(&mut self, payload: &[u8]) -> anyhow::Result<()> {
-        const FLAG_SPLIT: u8 = 0x01;
-        const CHUNK: usize = 254; // max payload per LoRa packet
+        // Stock receivers only reassemble TWO chunks; a host payload
+        // beyond 2*CHUNK can't be represented on the wire — drop the
+        // whole frame rather than air a truncated prefix.
+        if payload.len() > 2 * CHUNK {
+            return Ok(());
+        }
 
         let mut seq: u8 = 0;
         let chunks: Vec<&[u8]> = if payload.len() <= CHUNK {
@@ -315,14 +404,28 @@ impl Radio {
             self.xfer(&mut [0x8F, 0x00, 0x00, 0x00, 0x00])?;
             // SetTx(0x000000) single-shot (RNode endPacket)
             self.xfer(&mut [0x83, 0x00, 0x00, 0x00, 0x00])?;
-            // wait for TxDone (airtime up to ~1.3s at SF12)
+            // Wait for TxDone against a REAL deadline — airtime + 50%
+            // margin. CRITICAL for splits: the next chunk's SetStandby
+            // aborts any in-flight TX, so expiring early corrupts the
+            // chunk on the air. The old fixed 150×vTaskDelay(1) loop
+            // averaged ~0.75 s (vTaskDelay(1) at 100 Hz is 0–10 ms) vs
+            // ~1.29 s needed for a 255 B packet at SF9/BW125.
+            let budget_us = (self.airtime_ms(total) * 3 / 2 + 200) as i64 * 1000;
+            let t0 = unsafe { esp_idf_sys::esp_timer_get_time() };
             let mut done = false;
-            for _ in 0..150 {
+            loop {
+                // Slow-SF airtime can exceed the 8s software watchdog
+                // (SF12/255B ≈ 4s per chunk) — keep LOOP_COUNT ticking
+                // so a legitimately long TX isn't read as a hang.
+                LOOP_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
                 let mut ti = [0x12u8, 0x00, 0x00, 0x00];
                 self.xfer(&mut ti)?;
                 let tflags = ((ti[2] as u16) << 8) | ti[3] as u16;
                 if tflags & 0x0001 != 0 {
                     done = true;
+                    break;
+                }
+                if unsafe { esp_idf_sys::esp_timer_get_time() } - t0 > budget_us {
                     break;
                 }
                 // NOTE: 0x0004 is PreambleDetected (latches under
@@ -351,7 +454,7 @@ impl Radio {
 }
 
 
-fn modem_run() -> anyhow::Result<()> {
+fn modem_run(bus: Arc<Bus>, in_rx: Receiver<InMsg>) -> anyhow::Result<()> {
     let peripherals = Peripherals::take()?;
     let pins = peripherals.pins;
     let mut cs = PinDriver::input_output(pins.gpio23, esp_idf_hal::gpio::Pull::Floating)?;
@@ -362,7 +465,7 @@ fn modem_run() -> anyhow::Result<()> {
     // RX entirely (hardware-verified) — so we deliberately do NOT touch it.
     // The driver relies on command settle delays instead of BUSY polling.
 
-    let mut spi = SpiDeviceDriver::new_single(
+    let spi = SpiDeviceDriver::new_single(
         peripherals.spi2,
         pins.gpio20,
         pins.gpio21,
@@ -383,26 +486,33 @@ fn modem_run() -> anyhow::Result<()> {
     params.txpower = 14;
     params.radio_on = true;
 
-    let mut radio = Radio { cs, spi, last_params: params.clone() };
-    radio.init(&params)?;
-    println!("radio up");
-
-    // Install the USB-Serial-JTAG driver (the console output path does NOT
-    // install it; read_bytes/write_bytes need the driver's buffers/ISR).
-    let mut usb_cfg = esp_idf_sys::usb_serial_jtag_driver_config_t {
-        rx_buffer_size: 2048,
-        tx_buffer_size: 2048,
+    let mut radio = Radio {
+        cs,
+        spi,
+        last_params: params.clone(),
+        pending_split: Vec::new(),
+        pending_seq: 0xFF,
     };
-    let usb_r = unsafe { esp_idf_sys::usb_serial_jtag_driver_install(&mut usb_cfg) };
-    if usb_r != 0 {
-        println!("usb driver install failed: {}", usb_r);
-        return Err(anyhow::anyhow!("usb_serial_jtag_driver_install: {}", usb_r));
-    }
-    println!("usb driver ok");
+    radio.init(&params)?;
+    crate::clog!("radio up");
+    // Let the JTAG TX FIFO drain before the loop's first driver call —
+    // this line is empirically eaten otherwise (cosmetic; the modem is
+    // confirmed up when the first KISS reply goes out anyway).
+    unsafe { esp_idf_sys::vTaskDelay(5) }; // ~50 ms
+
+    // The USB-Serial-JTAG driver was already installed in main() BEFORE
+    // the blocking WiFi wait (its ISR must drain host->device RX while
+    // the modem isn't polling yet — see the install site for why).
+    // read_bytes/write_bytes below use that driver's buffers/ISR.
 
     let mut config_dirty = false;
     let mut modem = Modem::new(Protocol::new(MCU_ESP32_C6));
     let usb = modem.add_session();
+    // First modem session is the built-in USB link; the bus reserves
+    // id 1 for it and hands TCP sessions ids >= 2 (bus::USB_SESSION).
+    // A real assert: route_fed keys USB output on USB_SESSION, so a
+    // broken id convention must not slip into a release build.
+    assert_eq!(usb, USB_SESSION);
     let mut tx_buf: Vec<u8> = Vec::new();
     let mut rx_payload: Vec<u8> = Vec::new();
 
@@ -420,30 +530,27 @@ fn modem_run() -> anyhow::Result<()> {
             )
         };
         if n > 0 {
-            let data: &[u8] = &usb_in[..n as usize];
-            if !SAW_KISS.load(Ordering::Relaxed) && data.contains(&FEND) {
-                SAW_KISS.store(true, Ordering::Relaxed);
-            }
-            let fed = modem.feed(usb, data);
-            for frame in fed.to_sender.iter() {
-                tx_buf.extend_from_slice(frame);
-            }
-            // to_others = fan-out to OTHER host links (WiFi-TCP sessions).
-            // With a single USB session there are no others — sending it
-            // back would echo the host's own data (not half-duplex!).
-            if modem.session_ids().len() > 1 {
-                for frame in fed.to_others.iter() {
-                    tx_buf.extend_from_slice(frame);
+            feed_session(
+                &mut modem, &mut radio, &bus, &mut params, &mut config_dirty,
+                usb, &usb_in[..n as usize], &mut tx_buf,
+            )?;
+        }
+
+        // ---- drain TCP-session input (non-blocking) ----
+        // Capped at 32 msgs/tick so a TCP byte flood can't starve the
+        // radio poll — leftovers simply wait one 10ms tick.
+        for _ in 0..32 {
+            match in_rx.try_recv() {
+                Ok(InMsg::Data(id, bytes)) => {
+                    feed_session(
+                        &mut modem, &mut radio, &bus, &mut params, &mut config_dirty,
+                        id, &bytes, &mut tx_buf,
+                    )?;
                 }
-            }
-            // Flush replies NOW: RNS validates config echoes within 250ms
-            // of sending them; radio re-inits take longer than that.
-            if !tx_buf.is_empty() {
-                usb_write_direct(&tx_buf);
-                tx_buf.clear();
-            }
-            for op in fed.ops {
-                apply_op(&mut radio, &mut modem, &mut params, &mut config_dirty, op)?;
+                Ok(InMsg::Leave(id)) => {
+                    modem.remove_session(id); // drop the dead link's parser
+                }
+                Err(_) => break, // drained (or the accept side is gone)
             }
         }
 
@@ -464,8 +571,18 @@ fn modem_run() -> anyhow::Result<()> {
             let (rssi, snr) = radio.packet_status().unwrap_or((0, 0));
             modem.protocol.stats.rssi = rssi;
             modem.protocol.stats.snr = snr as f32;
-            for frame in modem.radio_rx(&rx_payload) {
-                tx_buf.extend_from_slice(&frame);
+            // radio_rx returns ONE frame PER internal session, in
+            // session_ids() order — zip them to their links (NOT a
+            // concatenated stream: every session gets its own frame,
+            // e.g. its own detect/echo replies).
+            let frames = modem.radio_rx(&rx_payload);
+            let sids = modem.session_ids();
+            for (sid, frame) in sids.iter().zip(frames) {
+                if *sid == USB_SESSION {
+                    tx_buf.extend_from_slice(&frame);
+                } else {
+                    bus.send_out(*sid, &frame);
+                }
             }
         }
 
@@ -476,6 +593,60 @@ fn modem_run() -> anyhow::Result<()> {
         }
 
         unsafe { esp_idf_sys::vTaskDelay(1); } // 10ms cadence, feeds the watchdog
+    }
+}
+
+/// Feed one host link's bytes and service the result: route frames,
+/// flush USB replies BEFORE radio work (RNS validates config echoes
+/// within 250ms of sending them; radio re-inits take longer than that),
+/// then run the radio ops (this thread owns the radio).
+fn feed_session(
+    modem: &mut Modem,
+    radio: &mut Radio,
+    bus: &Bus,
+    params: &mut RadioParams,
+    config_dirty: &mut bool,
+    id: u64,
+    bytes: &[u8],
+    tx_buf: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    if bytes.contains(&FEND) {
+        console::mark_kiss(); // any link's first FEND silences clog!
+    }
+    let fed = modem.feed(id, bytes);
+    route_fed(bus, id, &fed, tx_buf);
+    if !tx_buf.is_empty() {
+        usb_write_direct(tx_buf);
+        tx_buf.clear();
+    }
+    for op in fed.ops {
+        apply_op(radio, modem, params, config_dirty, op)?;
+    }
+    Ok(())
+}
+
+/// Route a `Fed` result onto the host links (plan Phase 3):
+/// - to_sender: straight back to the sender's own link — USB via
+///   tx_buf, TCP via the bus (send_out == false: session already
+///   gone, drop the frame).
+/// - to_others: every OTHER link. USB is an "other" for TCP senders
+///   (mirrored onto tx_buf); a USB sender gets NO tx_buf copy
+///   (half-duplex: echoing the host's own data back at it is wrong) —
+///   only the bus fan-out runs, and since USB_SESSION is never
+///   bus-registered it cannot be fanned back into either.
+fn route_fed(bus: &Bus, id: u64, fed: &Fed, tx_buf: &mut Vec<u8>) {
+    for frame in fed.to_sender.iter() {
+        if id == USB_SESSION {
+            tx_buf.extend_from_slice(frame);
+        } else {
+            bus.send_out(id, frame);
+        }
+    }
+    for frame in fed.to_others.iter() {
+        if id != USB_SESSION {
+            tx_buf.extend_from_slice(frame);
+        }
+        bus.fan_out(id, frame);
     }
 }
 
