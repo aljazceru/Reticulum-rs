@@ -175,10 +175,9 @@ fn wifi_run(ssid: &str, password: Option<&str>) -> anyhow::Result<()> {
     //    bindings' `Default` is bindgen ZERO-INIT — osi_funcs=NULL,
     //    zeroed wpa_crypto_funcs, buffer counts 0, magic=0 — which
     //    esp_wifi_init rejects (or crashes on), so the full literal is
-    //    required. ONE deliberate deviation: ampdu_rx_enable=0 where
-    //    the sdkconfig ships 1 — the BRIDGE_PLAN heap mitigation (no
-    //    AMPDU RX aggregation on the 512 KB C6; rx_ba_win stays unused
-    //    while it is 0).
+    //    field-by-field instead. All values mirror this build's sdkconfig;
+    //    NO deliberate deviations (the plan's ampdu_rx_enable=0 heap
+    //    mitigation was tried and REJECTED — see the field below).
     let init_cfg = wifi_init_config_t {
         osi_funcs: core::ptr::addr_of_mut!(esp_idf_sys::g_wifi_osi_funcs), // pointer, not access
         wpa_crypto_funcs: unsafe { esp_idf_sys::g_wifi_default_wpa_crypto_funcs },
@@ -191,12 +190,18 @@ fn wifi_run(ssid: &str, password: Option<&str>) -> anyhow::Result<()> {
         rx_mgmt_buf_num: 5,        // CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF
         cache_tx_buf_num: 0,       // no SPIRAM on this build
         csi_enable: 0,             // CONFIG_ESP_WIFI_CSI_ENABLED unset
-        ampdu_rx_enable: 0,        // plan heap mitigation (sdkconfig ships 1)
+        ampdu_rx_enable: 1,        // CONFIG_ESP_WIFI_AMPDU_RX_ENABLED. The
+                                   // plan's heap mitigation (0) also worked
+                                   // on the bench, but sdkconfig parity is
+                                   // what's verified on HEAD (cost ~5 KB).
         ampdu_tx_enable: 1,        // CONFIG_ESP_WIFI_AMPDU_TX_ENABLED
         amsdu_tx_enable: 0,        // CONFIG_ESP_WIFI_AMSDU_TX_ENABLED unset
         nvs_enable: 1,             // CONFIG_ESP_WIFI_NVS_ENABLED
         nano_enable: 0,            // CONFIG_NEWLIB_NANO_FORMAT unset
-        rx_ba_win: 0,              // unused while ampdu_rx_enable == 0
+        rx_ba_win: 6,              // CONFIG_ESP_WIFI_RX_BA_WIN. MUST be > 0
+                                   // when ampdu_rx is on — the driver rejects
+                                   // the init outright ("rx ba window 0
+                                   // error" and WiFi stays down).
         wifi_task_core_id: 0,      // CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_1 unset
         beacon_max_len: 752,       // CONFIG_ESP_WIFI_SOFTAP_BEACON_MAX_LEN
         mgmt_sbuf_num: 32,         // CONFIG_ESP_WIFI_MGMT_SBUF_NUM
@@ -316,13 +321,18 @@ fn wifi_run(ssid: &str, password: Option<&str>) -> anyhow::Result<()> {
                 let d = DISCONNECTS.load(Ordering::Relaxed);
                 if d != handled_disc {
                     handled_disc = d;
-                    connect_issued = false;
                     let reason = DISC_REASON.load(Ordering::Relaxed);
-                    crate::clog!(
-                        "wifi: disconnected (reason {}), retry in {}ms",
-                        reason,
-                        backoff_ms
-                    );
+                    // esp-println eats clog! lines during the wifi log
+                    // flood (TIMED_OUT latch) — this diagnostic must
+                    // survive, so write it through the direct FIFO path
+                    // (still gated: never after KISS started).
+                    if crate::console::may_log() {
+                        let msg = format!(
+                            "wifi: disconnected (reason {}), retry in {}ms\r\n",
+                            reason, backoff_ms
+                        );
+                        crate::usb_write_direct(msg.as_bytes());
+                    }
                 }
                 if !connect_issued {
                     // bounded-backoff wait, then reconnect (double to

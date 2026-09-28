@@ -60,6 +60,9 @@ SX1262 — no USB cable.
   `tcp://<that-ip>` with NO port — RNS hardcodes target port 7633 and
   treats a `:port` suffix as part of the hostname.
 - Max 2 concurrent TCP sessions; USB KISS keeps working in parallel.
+- Dual-link gate (USB + two TCP clients + 3rd-client reject + fan-out
+  both ways + radio fan-out to all links):
+  `python3 tests/dual_link_acceptance.py <c6l_ip>`
 - rnsd: `cp c6l-tcp-rnsd.config ~/demo/node-b/config` — RNodeInterface
   with a `tcp://` port URI (NOT TCPClientInterface; see BRIDGE_PLAN).
 - Acceptance over WiFi (same 10-check flow as the USB test, RNode still

@@ -494,11 +494,12 @@ fn modem_run(bus: Arc<Bus>, in_rx: Receiver<InMsg>) -> anyhow::Result<()> {
         pending_seq: 0xFF,
     };
     radio.init(&params)?;
-    crate::clog!("radio up");
-    // Let the JTAG TX FIFO drain before the loop's first driver call —
-    // this line is empirically eaten otherwise (cosmetic; the modem is
-    // confirmed up when the first KISS reply goes out anyway).
-    unsafe { esp_idf_sys::vTaskDelay(5) }; // ~50 ms
+    usb_write_direct(b"radio up\r\n");
+    // esp-println's jtag printer latches TIMED_OUT and silently drops any
+    // write that lands while the FIFO is full (e.g. right after the boot/
+    // wifi log burst) — as a clog! this line never reached the wire. The
+    // direct-FIFO writer above (the proven KISS TX path) retries per byte
+    // and flushes, so the boot signal survives.
 
     // The USB-Serial-JTAG driver was already installed in main() BEFORE
     // the blocking WiFi wait (its ISR must drain host->device RX while

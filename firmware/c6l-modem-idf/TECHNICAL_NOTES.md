@@ -399,3 +399,59 @@ Test-suite bugs found while adding coverage:
 - New checks 5+6 in tcp_kiss_acceptance.py: 300 B byte-exact
   round-trip through split/reassembly in both directions.
   Result: **12/12 PASS**.
+
+---
+
+## 2026-09-28: HEAD rebuilt, re-flashed, all gates re-verified
+
+The bench flash turned out to be `v0.1.0-271-ga46954b-dirty` (built from a
+dirty tree before d8bffd4 committed it). Rebuilt HEAD clean, recovered the
+build-time credentials, re-flashed, and re-ran every gate.
+
+### Findings
+1. **esp-println eats console lines by design** — its USB-JTAG printer
+   latches `TIMED_OUT` after one full-FIFO timeout and silently DROPS every
+   later write that arrives while the FIFO is full again (esp-println 0.13
+   `serial_jtag_printer`). This is the true root cause of the "radio up
+   never reaches the wire" cosmetic AND of the missing `wifi: disconnected
+   (reason N)` lines during the boot/wifi ESP_LOGx flood. Fixes:
+   `radio up` now goes through `usb_write_direct` (the proven KISS TX
+   path, retries per byte), and the disconnect-reason diagnostic does the
+   same, gated on `console::may_log()`.
+2. **rx_ba_win must be > 0 when ampdu_rx_enable=1** — the driver rejects
+   the whole `esp_wifi_init` ("E wifi:rx ba window 0 error") and WiFi
+   never comes up. wifi.rs now mirrors sdkconfig exactly
+   (ampdu_rx_enable=1, rx_ba_win=6); the plan's 0/0 heap mitigation also
+   worked on the bench but saved only ~5 KB of the ~300 KB free — not
+   worth a deviation from the C defaults.
+3. **Credentials recovery** — the PSK is not stored anywhere on the host.
+   Recovered it from the old flash dump: `esptool read_flash 0x10000`,
+   then disassemble the app image, find the `lui/addi + c.li 0xe` pair
+   in `wifi::start` that materializes the SSID (&str ptr+len) — the
+   adjacent pair is the password (ptr, len). NOTE: naive `strings`
+   extraction was WRONG (grabbed 2 junk bytes before the real literal);
+   always take the code-referenced (ptr, len). Password NOT recorded here.
+4. **The env-var rebuild trap is real and bit this session**: changing
+   only `C6L_WIFI_*` does not rebuild (option_env! is not tracked);
+   `touch src/main.rs` before `cargo +esp build`, and verify with
+   `strings` on the ELF. A stale-credential flash looks exactly like a
+   WiFi regression (reason 15 = 4WAY_HANDSHAKE_TIMEOUT loop).
+5. `state: run -> init (fc0)` in the net80211 log = the supplicant's
+   4-way handshake timing out (event reason 15) — i.e. wrong PSK, not an
+   RF/driver problem.
+
+### Verification on the HEAD image (2026-09-28, WiFi at 192.168.1.233)
+- Boot console: `wifi: sta up`, `wifi: got ip 192.168.1.233`, `radio up`
+  all present (radio up FIXED).
+- `tests/tcp_kiss_acceptance.py` — **12/12 PASS** (one transient 8/12
+  run right after re-flash: bench RF interference, clean on rerun).
+- `tests/kiss_modem_acceptance.py` (USB, WiFi active) — **10/10 PASS**.
+- `tests/dual_link_acceptance.py` — NEW permanent Phase-4 gate —
+  **13/13 PASS**: detect on USB + 2 TCP sessions, 3rd client politely
+  rejected, byte-exact fan-out both directions + cross-TCP, and one RNode
+  pong fanned out to all three links.
+- Still PENDING (unchanged): full AP-flap reconnect test needs physical
+  AP control; the bounded-backoff reconnect logic itself is exercised on
+  every boot (observed 1→2→4 s backoff in earlier logs) and the reason-15
+  loop during the wrong-PSK incident confirmed reconnect + reason logging
+  work continuously for minutes without wedging.
