@@ -9,7 +9,7 @@
 //! * [`rnprobe`] — round-trip probes (`Utilities/rnprobe.py`)
 //! * [`rnx`] — remote command execution (`Utilities/rnx.py`)
 //! * [`rnsh`] — remote shell sessions (`Utilities/rnsh/`)
-//! * [`rnodeconf`] — RNode diagnostics/config validation
+//! * [`rnodeconf`] — RNode probe, radio validation, and host configuration frames
 //! * [`rnir`] / [`rnpkg`] — reference stub utilities
 //! * [`rncp`] — file transfer over resources (`Utilities/rncp.py`)
 //!

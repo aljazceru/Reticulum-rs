@@ -27,6 +27,9 @@ tokio-util = "0.7.15"
 libc = "0.2"
 toml = "0.9.11"
 
+[dev-dependencies]
+rnode-modem-core = { path = "../rnode-modem-core" }
+
 [features]
 # Gate for the Python interop tests, mirroring the root crate's flag.
 python-tests = []

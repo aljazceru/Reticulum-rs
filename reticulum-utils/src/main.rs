@@ -208,6 +208,72 @@ struct NodeconfArgs {
     /// LoRa coding rate
     #[arg(short, long)]
     codingrate: Option<u8>,
+    /// Flash with an external rnodeconf or esptool, if that program is installed
+    #[arg(long)]
+    flash: bool,
+    /// Firmware image for esptool (requires --flash-offset)
+    #[arg(long)]
+    firmware: Option<PathBuf>,
+    /// Flash offset for esptool, decimal or 0x-hex
+    #[arg(long)]
+    flash_offset: Option<String>,
+    /// Baud rate passed to the external flasher
+    #[arg(long, default_value_t = 921600)]
+    baud_flash: u32,
+    /// Switch the device to TNC mode
+    #[arg(long)]
+    tnc: bool,
+    /// Switch the device to normal host-controlled mode
+    #[arg(long)]
+    normal: bool,
+    /// Display intensity, 0-255
+    #[arg(long)]
+    display: Option<u16>,
+    /// Display blanking timeout in seconds, 0 to disable
+    #[arg(long)]
+    display_timeout: Option<u16>,
+    /// Display rotation, 0 through 3
+    #[arg(long)]
+    rotation: Option<u8>,
+    /// Start display reconditioning
+    #[arg(long)]
+    recondition_display: bool,
+    /// Display address as a hex byte
+    #[arg(long)]
+    display_addr: Option<String>,
+    /// WiFi mode: off, ap, or station
+    #[arg(long)]
+    wifi: Option<String>,
+    /// WiFi channel, 1-14
+    #[arg(long)]
+    channel: Option<u8>,
+    /// WiFi SSID (NONE to delete)
+    #[arg(long)]
+    ssid: Option<String>,
+    /// WiFi PSK (NONE to delete)
+    #[arg(long)]
+    psk: Option<String>,
+    /// Static WiFi address (NONE for DHCP)
+    #[arg(long)]
+    ip: Option<String>,
+    /// Static WiFi netmask (NONE for DHCP)
+    #[arg(long)]
+    nm: Option<String>,
+    /// Turn device bluetooth on
+    #[arg(long)]
+    bluetooth_on: bool,
+    /// Turn device bluetooth off
+    #[arg(long)]
+    bluetooth_off: bool,
+    /// Put the device into bluetooth pairing mode
+    #[arg(long)]
+    bluetooth_pair: bool,
+    /// Read EEPROM and print the decoded image
+    #[arg(long)]
+    eeprom_dump: bool,
+    /// Unlock and wipe EEPROM
+    #[arg(long)]
+    eeprom_wipe: bool,
 }
 
 #[derive(Args)]
@@ -873,8 +939,53 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
 }
 
 #[cfg(feature = "iface-rnode")]
+fn optional_text(value: &str) -> Option<&str> {
+    if value.eq_ignore_ascii_case("none") {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(feature = "iface-rnode")]
 async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
+    use reticulum_utils::rnodeconf::{
+        bluetooth_host_frames, display_address_sequence, display_blanking_frame,
+        display_intensity_frame, display_recondition_frame, display_rotation_frame, enter_tnc_mode,
+        flash_command, normal_mode_frame, parse_eeprom, read_eeprom, render_eeprom, render_info,
+        transact, wifi_channel_frame, wifi_ip_frame, wifi_mode_code, wifi_mode_frame,
+        wifi_nm_frame, wifi_psk_frame, wifi_ssid_frame, wipe_eeprom, BT_CTRL_OFF, BT_CTRL_ON,
+        BT_CTRL_PAIR,
+    };
+
     init_logging(1);
+
+    if args.flash {
+        let port = args.port.as_deref().ok_or("flash needs a serial --port")?;
+        let offset = match args.flash_offset.as_deref() {
+            Some(text) => {
+                let text = text.trim();
+                let parsed = if let Some(hex) =
+                    text.strip_prefix("0x").or_else(|| text.strip_prefix("0X"))
+                {
+                    u32::from_str_radix(hex, 16)
+                } else {
+                    text.parse()
+                };
+                Some(parsed.map_err(|_| format!("invalid --flash-offset {text}"))?)
+            }
+            None => None,
+        };
+        let cmd = flash_command(port, args.baud_flash, args.firmware.as_deref(), offset)?;
+        let status = std::process::Command::new(&cmd.program)
+            .args(&cmd.args)
+            .status()
+            .map_err(|err| format!("failed to run {}: {err}", cmd.program.display()))?;
+        if !status.success() {
+            return Err(format!("{} exited with {status}", cmd.program.display()));
+        }
+        return Ok(());
+    }
 
     let target = if let Some(tcp) = args.tcp.as_deref() {
         reticulum_utils::rnodeconf::DeviceTarget::Tcp {
@@ -904,19 +1015,144 @@ async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
             st_alock: None,
             lt_alock: None,
         };
-
-        match reticulum_utils::rnodeconf::validate_config(&target, &config).await {
+        return match reticulum_utils::rnodeconf::validate_config(&target, &config).await {
             Ok(_) => {
                 println!("Radio configuration validated");
                 Ok(())
             }
             Err(err) => Err(format!("validation failed: {err:?}")),
-        }
-    } else {
-        let info = reticulum_utils::rnodeconf::device_info(&target)
-            .await
-            .map_err(|e| format!("device probe failed: {e:?}"))?;
-        print!("{}", reticulum_utils::rnodeconf::render_info(&info));
-        Ok(())
+        };
     }
+
+    if args.eeprom_wipe {
+        wipe_eeprom(&target)
+            .await
+            .map_err(|err| format!("EEPROM wipe failed: {err:?}"))?;
+        println!("EEPROM wipe sent");
+        return Ok(());
+    }
+
+    let mut frames = Vec::new();
+    if let Some(level) = args.display {
+        frames.extend(display_intensity_frame(level.min(255) as u8));
+    }
+    if let Some(timeout) = args.display_timeout {
+        frames.extend(display_blanking_frame(timeout.min(255) as u8));
+    }
+    if let Some(rotation) = args.rotation {
+        if rotation > 3 {
+            return Err("display rotation must be 0 through 3".into());
+        }
+        frames.extend(display_rotation_frame(rotation));
+    }
+    if args.recondition_display {
+        frames.extend(display_recondition_frame());
+    }
+    if let Some(addr) = args.display_addr.as_deref() {
+        let text = addr
+            .trim()
+            .trim_start_matches("0x")
+            .trim_start_matches("0X");
+        let byte =
+            u8::from_str_radix(text, 16).map_err(|_| format!("invalid display address {addr}"))?;
+        frames.extend(display_address_sequence(byte));
+    }
+    if args.bluetooth_on {
+        frames.extend(bluetooth_host_frames(BT_CTRL_ON));
+    }
+    if args.bluetooth_off {
+        frames.extend(bluetooth_host_frames(BT_CTRL_OFF));
+    }
+    if args.bluetooth_pair {
+        frames.extend(bluetooth_host_frames(BT_CTRL_PAIR));
+    }
+    if let Some(channel) = args.channel {
+        frames.extend(
+            wifi_channel_frame(channel)
+                .map_err(|_| "WiFi channel must be 1 through 14".to_string())?,
+        );
+    }
+    if let Some(ssid) = args.ssid.as_deref() {
+        frames.extend(
+            wifi_ssid_frame(optional_text(ssid)).map_err(|_| "invalid WiFi SSID".to_string())?,
+        );
+    }
+    if let Some(psk) = args.psk.as_deref() {
+        frames.extend(
+            wifi_psk_frame(optional_text(psk)).map_err(|_| "invalid WiFi PSK".to_string())?,
+        );
+    }
+    if let Some(ip) = args.ip.as_deref() {
+        frames.extend(
+            wifi_ip_frame(optional_text(ip)).map_err(|_| "invalid WiFi IP address".to_string())?,
+        );
+    }
+    if let Some(mask) = args.nm.as_deref() {
+        frames.extend(
+            wifi_nm_frame(optional_text(mask)).map_err(|_| "invalid WiFi netmask".to_string())?,
+        );
+    }
+    if let Some(mode) = args.wifi.as_deref() {
+        frames.extend(wifi_mode_frame(wifi_mode_code(mode)));
+    }
+
+    let mut acted = false;
+    if !frames.is_empty() {
+        transact(&target, &frames)
+            .await
+            .map_err(|err| format!("configuration failed: {err:?}"))?;
+        println!("configuration frames sent");
+        acted = true;
+    }
+
+    if args.eeprom_dump {
+        match read_eeprom(&target)
+            .await
+            .map_err(|err| format!("EEPROM read failed: {err:?}"))?
+        {
+            Some(image) => match parse_eeprom(&image) {
+                Some(map) => print!("{}", render_eeprom(&map)),
+                None => println!("EEPROM image ({} bytes) could not be parsed", image.len()),
+            },
+            None => println!("no EEPROM image in reply"),
+        }
+        acted = true;
+    }
+
+    if args.normal {
+        transact(&target, &normal_mode_frame())
+            .await
+            .map_err(|err| format!("normal mode failed: {err:?}"))?;
+        println!("Device set to normal (host-controlled) operating mode");
+        return Ok(());
+    }
+
+    if args.tnc {
+        let config = reticulum::iface::rnode::RnodeRadioConfig {
+            frequency: args.frequency.ok_or("--frequency is required")?,
+            bandwidth: args.bandwidth.ok_or("--bandwidth is required")?,
+            txpower: args.txpower.ok_or("--txpower is required")?,
+            spreadingfactor: args
+                .spreadingfactor
+                .ok_or("--spreadingfactor is required")?,
+            codingrate: args.codingrate.ok_or("--codingrate is required")?,
+            st_alock: None,
+            lt_alock: None,
+        };
+        enter_tnc_mode(&target, &config)
+            .await
+            .map_err(|err| format!("TNC mode failed: {err:?}"))?;
+        println!("Device set to TNC operating mode");
+        return Ok(());
+    }
+
+    if acted {
+        return Ok(());
+    }
+
+    let info = reticulum_utils::rnodeconf::device_info(&target)
+        .await
+        .map_err(|e| format!("device probe failed: {e:?}"))?;
+    print!("{}", render_info(&info));
+    Ok(())
 }

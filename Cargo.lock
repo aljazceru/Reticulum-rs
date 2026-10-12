@@ -1649,6 +1649,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "rmpv",
+ "rnode-modem-core",
  "serde",
  "serde_json",
  "tokio",
