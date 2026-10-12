@@ -98,7 +98,7 @@ pub struct PathRequests {
     controlled_destination: PlainInputDestination,
     /// Outstanding (discovery) path requests sent on behalf of an unknown
     /// destination (Python `Transport.discovery_path_requests`).
-    discovery: BTreeMap<AddressHash, (Instant, Vec<AddressHash>)>,
+    discovery: BTreeMap<AddressHash, PendingDiscovery>,
     /// Path requests issued locally, with the time they were last sent
     /// (Python `Transport.path_requests` accounting, used to exempt
     /// announces for requested destinations from ingress limiting).
@@ -106,6 +106,30 @@ pub struct PathRequests {
     /// Minimum interval between automated path requests for the same
     /// destination (Python `Transport.PATH_REQUEST_MI`).
     min_request_interval: Duration,
+}
+
+/// One in-flight discovery path request
+/// (Python `discovery_path_requests[destination_hash]`).
+struct PendingDiscovery {
+    deadline: Instant,
+    /// Wait that produced `deadline`. A later caller may lengthen it when
+    /// `medium_path_timeout` is larger, but not restart it: restarting
+    /// would let a stream of requestors keep the entry alive.
+    wait: Duration,
+    ifaces: Vec<AddressHash>,
+}
+
+/// Python `max(Transport.PATH_REQUEST_TIMEOUT, Transport.medium_path_timeout())`.
+fn discovery_wait(medium_path_timeout: Duration) -> Duration {
+    PATH_REQUEST_TIMEOUT.max(medium_path_timeout)
+}
+
+fn lengthen_discovery_wait(entry: &mut PendingDiscovery, medium_path_timeout: Duration) {
+    let wait = discovery_wait(medium_path_timeout);
+    if wait > entry.wait {
+        entry.deadline += wait - entry.wait;
+        entry.wait = wait;
+    }
 }
 
 impl PathRequests {
@@ -202,44 +226,81 @@ impl PathRequests {
     /// waiting (Python `Transport.discovery_path_requests`).
     pub fn discovery_pending(&self, destination: &AddressHash) -> bool {
         match self.discovery.get(destination) {
-            Some((timeout, _)) => Instant::now() < *timeout,
+            Some(entry) => Instant::now() < entry.deadline,
             None => false,
         }
     }
 
-    /// Register a waiting discovery path request for `destination`
-    /// (Python inserts `{"destination_hash", "timeout",
-    /// "requesting_interfaces": [...]}`). A second request for the same
-    /// destination while one is in flight is BATCHED: its interface is
-    /// appended so the eventual path response reaches every requestor
-    /// (Python 1.5.0 in-flight path request batching).
+    /// Register a waiting discovery path request for `destination`.
+    ///
+    /// The wait is [`PATH_REQUEST_TIMEOUT`] (15s). Pass a medium timeout
+    /// through [`Self::register_discovery_with_timeout`] when the caller
+    /// has one. A second request for the same destination while one is in
+    /// flight is batched: its interface is appended, and
+    /// [`Self::clear_discovery`] returns every requestor so each is
+    /// answered when the discovery completes.
     pub fn register_discovery(
         &mut self,
         destination: &AddressHash,
         requesting_iface: Option<AddressHash>,
     ) {
-        let Some(iface) = requesting_iface else {
-            return;
-        };
-        match self.discovery.get_mut(destination) {
-            Some((timeout, ifaces)) if Instant::now() < *timeout => {
-                if !ifaces.contains(&iface) {
-                    ifaces.push(iface);
-                }
-            }
-            _ => {
-                self.discovery.insert(
-                    *destination,
-                    (Instant::now() + PATH_REQUEST_TIMEOUT, vec![iface]),
-                );
-            }
-        }
+        self.register_discovery_with_timeout(destination, requesting_iface, PATH_REQUEST_TIMEOUT);
     }
 
-    /// A matching announce arrived for a waiting discovery request
-    /// (Python removes the entry in `Transport.inbound`).
+    /// [`Self::register_discovery`] with Python's discovery wait:
+    /// `max(PATH_REQUEST_TIMEOUT, medium_path_timeout)`.
+    ///
+    /// `medium_path_timeout` is `Transport.medium_path_timeout()` (zero
+    /// when the bitrate is unknown). A value that is already the max is
+    /// accepted. Returns `true` when this call started the discovery, so
+    /// the caller should forward the path request. Returns `false` when
+    /// the requestor was retained on a discovery that is already pending
+    /// (do not search again) or when no requesting interface was given.
+    ///
+    /// Batching does not restart the deadline. A supplied wait longer
+    /// than the one already stored lengthens it by the difference, which
+    /// is how a caller that only learns the medium timeout on a later
+    /// request still covers a slow link. A shorter wait does not shrink
+    /// an in-flight discovery.
+    pub fn register_discovery_with_timeout(
+        &mut self,
+        destination: &AddressHash,
+        requesting_iface: Option<AddressHash>,
+        medium_path_timeout: Duration,
+    ) -> bool {
+        let Some(iface) = requesting_iface else {
+            return false;
+        };
+        let wait = discovery_wait(medium_path_timeout);
+
+        if let Some(entry) = self.discovery.get_mut(destination) {
+            if Instant::now() < entry.deadline {
+                if !entry.ifaces.contains(&iface) {
+                    entry.ifaces.push(iface);
+                }
+                lengthen_discovery_wait(entry, medium_path_timeout);
+                return false;
+            }
+        }
+
+        self.discovery.insert(
+            *destination,
+            PendingDiscovery {
+                deadline: Instant::now() + wait,
+                wait,
+                ifaces: vec![iface],
+            },
+        );
+        true
+    }
+
+    /// A matching announce arrived. Removes the discovery entry and
+    /// returns every requesting interface that must be answered, including
+    /// requestors batched while the discovery was pending (Python pops
+    /// `discovery_path_requests` and retransmits a path response to each
+    /// `requesting_interfaces` entry).
     pub fn clear_discovery(&mut self, destination: &AddressHash) -> Option<Vec<AddressHash>> {
-        self.discovery.remove(destination).map(|(_, ifaces)| ifaces)
+        self.discovery.remove(destination).map(|entry| entry.ifaces)
     }
 
     /// Whether an automated path request for `destination` may be sent now,
@@ -300,13 +361,178 @@ mod tests {
 
         testee.register_discovery(&dest, Some(iface_a));
         assert!(testee.discovery_pending(&dest));
+        let deadline = testee.discovery.get(&dest).unwrap().deadline;
 
-        // A second in-flight request batches onto the existing entry
-        // (Python 1.5.0 in-flight path request batching).
+        // A second in-flight request batches onto the existing entry.
+        // The default signature does not move the 15s deadline.
         testee.register_discovery(&dest, Some(iface_b));
+        assert_eq!(testee.discovery.get(&dest).unwrap().deadline, deadline);
         let batched = testee.clear_discovery(&dest).expect("batched entry");
-        assert!(batched.contains(&iface_a));
-        assert!(batched.contains(&iface_b));
+        assert_eq!(batched, vec![iface_a, iface_b]);
         assert!(!testee.discovery_pending(&dest));
+    }
+
+    #[test]
+    fn two_requestors_retained_and_answered() {
+        let mut testee = PathRequests::new("", None);
+        let dest = AddressHash::new_from_rand(OsRng);
+        let iface_a = AddressHash::new_from_rand(OsRng);
+        let iface_b = AddressHash::new_from_rand(OsRng);
+
+        assert!(testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_a),
+            Duration::from_secs(40),
+        ));
+        assert_eq!(testee.discovery.get(&dest).unwrap().ifaces, vec![iface_a]);
+
+        // Second requestor while discovery is already pending. Same
+        // interface again must not be answered twice.
+        assert!(!testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_b),
+            Duration::from_secs(40),
+        ));
+        assert!(!testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_a),
+            Duration::from_secs(40),
+        ));
+        assert!(testee.discovery_pending(&dest));
+        assert_eq!(
+            testee.discovery.get(&dest).unwrap().ifaces,
+            vec![iface_a, iface_b]
+        );
+
+        let answered = testee
+            .clear_discovery(&dest)
+            .expect("both requestors answered");
+        assert_eq!(answered, vec![iface_a, iface_b]);
+        assert!(testee.clear_discovery(&dest).is_none());
+        assert!(!testee.discovery_pending(&dest));
+    }
+
+    #[test]
+    fn discovery_wait_floors_at_path_request_timeout() {
+        assert_eq!(discovery_wait(Duration::ZERO), PATH_REQUEST_TIMEOUT);
+        assert_eq!(discovery_wait(Duration::from_secs(5)), PATH_REQUEST_TIMEOUT);
+        assert_eq!(
+            discovery_wait(Duration::from_millis(14_999)),
+            PATH_REQUEST_TIMEOUT
+        );
+        assert_eq!(discovery_wait(PATH_REQUEST_TIMEOUT), PATH_REQUEST_TIMEOUT);
+        let longer = Duration::from_secs(40);
+        assert_eq!(discovery_wait(longer), longer);
+        let just_over = PATH_REQUEST_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(discovery_wait(just_over), just_over);
+
+        let mut testee = PathRequests::new("", None);
+        let iface = AddressHash::new_from_rand(OsRng);
+
+        assert_deadline_wait(&mut testee, iface, None, PATH_REQUEST_TIMEOUT);
+        assert_deadline_wait(
+            &mut testee,
+            iface,
+            Some(Duration::ZERO),
+            PATH_REQUEST_TIMEOUT,
+        );
+        assert_deadline_wait(
+            &mut testee,
+            iface,
+            Some(Duration::from_secs(5)),
+            PATH_REQUEST_TIMEOUT,
+        );
+        assert_deadline_wait(&mut testee, iface, Some(longer), longer);
+        assert_deadline_wait(&mut testee, iface, Some(just_over), just_over);
+    }
+
+    #[test]
+    fn longer_medium_timeout_extends_pending_discovery() {
+        let mut testee = PathRequests::new("", None);
+        let dest = AddressHash::new_from_rand(OsRng);
+        let iface_a = AddressHash::new_from_rand(OsRng);
+        let iface_b = AddressHash::new_from_rand(OsRng);
+
+        // Creation sites that still call `register_discovery` store 15s.
+        // A later caller that supplies a slower medium lengthens that
+        // wait by the difference and keeps the elapsed time.
+        testee.register_discovery(&dest, Some(iface_a));
+        let created = testee.discovery.get(&dest).unwrap().deadline;
+        assert_eq!(
+            testee.discovery.get(&dest).unwrap().wait,
+            PATH_REQUEST_TIMEOUT
+        );
+
+        assert!(!testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_b),
+            Duration::from_secs(40),
+        ));
+        let before = {
+            let entry = testee.discovery.get(&dest).unwrap();
+            assert_eq!(entry.wait, Duration::from_secs(40));
+            assert_eq!(
+                entry.deadline.checked_duration_since(created).unwrap(),
+                Duration::from_secs(25)
+            );
+            assert_eq!(entry.ifaces, vec![iface_a, iface_b]);
+            entry.deadline
+        };
+
+        // A shorter medium timeout must not shrink the in-flight wait.
+        let iface_c = AddressHash::new_from_rand(OsRng);
+        assert!(!testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_c),
+            Duration::from_secs(5),
+        ));
+        let entry = testee.discovery.get(&dest).unwrap();
+        assert_eq!(entry.deadline, before);
+        assert_eq!(entry.wait, Duration::from_secs(40));
+        assert_eq!(entry.ifaces, vec![iface_a, iface_b, iface_c]);
+
+        // An expired discovery is a new wait, not an answer to the old
+        // requestors.
+        testee.discovery.get_mut(&dest).unwrap().deadline = Instant::now() - Duration::from_secs(1);
+        assert!(!testee.discovery_pending(&dest));
+        let iface_d = AddressHash::new_from_rand(OsRng);
+        assert!(testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_d),
+            Duration::from_secs(40),
+        ));
+        let answered = testee.clear_discovery(&dest).unwrap();
+        assert_eq!(answered, vec![iface_d]);
+    }
+
+    fn assert_deadline_wait(
+        testee: &mut PathRequests,
+        iface: AddressHash,
+        medium: Option<Duration>,
+        expected: Duration,
+    ) {
+        let dest = AddressHash::new_from_rand(OsRng);
+        let before = Instant::now();
+        let started = match medium {
+            Some(medium) => testee.register_discovery_with_timeout(&dest, Some(iface), medium),
+            None => {
+                testee.register_discovery(&dest, Some(iface));
+                true
+            }
+        };
+        let after = Instant::now();
+        assert!(started);
+        let entry = testee.discovery.get(&dest).unwrap();
+        assert_eq!(entry.wait, expected);
+        let span = entry.deadline.duration_since(before);
+        let elapsed = after.saturating_duration_since(before);
+        assert!(
+            span >= expected,
+            "deadline span {span:?} shorter than {expected:?}"
+        );
+        assert!(
+            span - expected <= elapsed,
+            "deadline span {span:?} exceeds {expected:?} by more than elapsed {elapsed:?}"
+        );
     }
 }
