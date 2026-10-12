@@ -251,7 +251,7 @@ impl AsyncWrite for BufferWriter {
 ///
 /// The channel's primary message type does not have to be
 /// `StreamDataMessage`; frames are sent through [`Channel::send`], which
-/// accepts any registered [`Message`].
+/// accepts any [`Message`].
 fn spawn_writer<M: Message>(stream_id: u16, channel: Channel<M>) -> BufferWriter {
     // The user writes into `client`; the pump reads what was written
     // from the other end (`peer`) and frames it onto the channel.
@@ -290,9 +290,8 @@ fn spawn_writer<M: Message>(stream_id: u16, channel: Channel<M>) -> BufferWriter
             };
             chunk.extend_from_slice(&tmp[..n]);
 
-            // Send the chunk in as many frames as needed, retrying while
-            // the channel window is full (LinkNotReady), waiting for each
-            // frame's delivery receipt before continuing (backpressure).
+            // Send the chunk in as many frames as needed. Backpressure is
+            // the channel window: retry while send returns LinkNotReady.
             let mut offset = 0usize;
             while offset < chunk.len() {
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
@@ -320,11 +319,6 @@ fn spawn_writer<M: Message>(stream_id: u16, channel: Channel<M>) -> BufferWriter
                             return;
                         }
                     }
-                }
-                if let Some(mut receipt_rx) = pending_receipt(&mut channel).await {
-                    let _ =
-                        tokio::time::timeout(std::time::Duration::from_secs(30), receipt_rx.recv())
-                            .await;
                 }
             }
         }
@@ -397,14 +391,6 @@ async fn write_frame<M: Message>(
     channel.send(&message).await?;
     log::debug!("buffer_stream: frame of {processed} bytes queued (compressed={compressed})");
     Ok(processed)
-}
-
-/// Get a delivery-receipt receiver from the channel if one is available
-/// for the most recent message (backpressure for stream pumps).
-async fn pending_receipt<M: Message>(
-    channel: &mut Channel<M>,
-) -> Option<tokio::sync::broadcast::Receiver<bool>> {
-    channel.last_receipt().await
 }
 
 /// A bidirectional buffer stream pair
