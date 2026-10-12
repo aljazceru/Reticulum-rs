@@ -311,12 +311,17 @@ struct CpArgs {
     verbose: u8,
 }
 
-fn init_logging(verbosity: u8) {
-    let level = match verbosity {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
-        _ => "trace",
+fn init_logging(verbosity: i32) {
+    // Negative verbosity is quieter than the default `"warn"` filter.
+    let level = if verbosity < 0 {
+        "error"
+    } else {
+        match verbosity {
+            0 => "warn",
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        }
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 }
@@ -402,7 +407,7 @@ fn exit_code(result: Result<(), String>) -> ExitCode {
 }
 
 async fn run_path(args: PathArgs) -> Result<(), String> {
-    init_logging(args.verbose);
+    init_logging(args.verbose as i32);
     if !args.table && args.destination.is_none() {
         return Err(
             "No destination specified. Use -t/--table to list paths or pass a destination hash."
@@ -468,7 +473,7 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
 }
 
 async fn run_status(args: StatusArgs) -> Result<(), String> {
-    init_logging(args.verbose);
+    init_logging(args.verbose as i32);
     let config_dir = reticulum_utils::common::resolve_config_dir(args.config.as_deref());
     let transport = reticulum_utils::common::build_tool_transport(
         reticulum_utils::common::ToolTransportOptions {
@@ -493,7 +498,7 @@ async fn run_status(args: StatusArgs) -> Result<(), String> {
 }
 
 async fn run_cp(args: CpArgs) -> Result<(), String> {
-    init_logging(args.verbose.saturating_sub(args.quiet));
+    init_logging(args.verbose as i32 - args.quiet as i32);
     let timeout = duration_arg(args.timeout, reticulum_utils::rncp::DEFAULT_TIMEOUT);
     let udp_loopback = args.udp_loopback.as_deref().and_then(parse_udp_loopback);
 
@@ -579,7 +584,7 @@ fn parse_udp_loopback(spec: &str) -> Option<(u16, u16)> {
 }
 
 async fn run_probe(args: ProbeArgs) -> Result<(), String> {
-    init_logging(args.verbose);
+    init_logging(args.verbose as i32);
 
     if args.loopback {
         let (destination, results) = reticulum_utils::rnprobe::run_loopback()
@@ -693,12 +698,14 @@ async fn run_x(args: XArgs) -> Result<(), String> {
         stderr_limit: args.stderr,
     };
 
+    let mut last_code = 0i32;
     if let Some(command) = args.command_flag.as_deref().or(args.command.as_deref()) {
-        run_remote_command(
+        last_code = run_remote_command(
             &destination,
             command,
             &options,
             args.mirror && !args.interactive,
+            args.interactive,
         )
         .await?;
     } else if !args.interactive {
@@ -709,7 +716,6 @@ async fn run_x(args: XArgs) -> Result<(), String> {
         let mut loop_options = options.clone();
         loop_options.stdin = None;
         let stdin = std::io::stdin();
-        let mut last_code = 0i32;
         loop {
             if args.mirror && last_code != 0 {
                 print!("{last_code}> ");
@@ -721,19 +727,22 @@ async fn run_x(args: XArgs) -> Result<(), String> {
             if stdin.read_line(&mut line).map_err(|err| err.to_string())? == 0 {
                 break;
             }
-            match reticulum_utils::rnx::interactive_step(&line) {
-                reticulum_utils::rnx::InteractiveStep::Stop => break,
-                reticulum_utils::rnx::InteractiveStep::Clear => print!("\x1b[c"),
-                reticulum_utils::rnx::InteractiveStep::Run(command) if command.is_empty() => {}
-                reticulum_utils::rnx::InteractiveStep::Run(command) => {
-                    match run_remote_command(&destination, &command, &loop_options, false).await {
-                        Ok(code) => last_code = code,
-                        Err(err) => {
-                            eprintln!("{err}");
-                            last_code = 0;
-                        }
-                    }
-                }
+            let command = line.trim();
+            if command.is_empty() {
+                continue;
+            }
+            if command.eq_ignore_ascii_case("exit") || command.eq_ignore_ascii_case("quit") {
+                break;
+            }
+            if command.eq_ignore_ascii_case("clear") {
+                // RIS, same sequence as Python `print('\033c')`.
+                print!("\x1bc");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                continue;
+            }
+            match run_remote_command(&destination, command, &loop_options, false, true).await {
+                Ok(code) => last_code = code,
+                Err(err) => return Err(err),
             }
         }
     }
@@ -746,8 +755,23 @@ async fn run_remote_command(
     command: &str,
     options: &reticulum_utils::rnx::ExecOptions,
     mirror: bool,
+    interactive: bool,
 ) -> Result<i32, String> {
-    let result = reticulum_utils::rnx::execute(destination, command, options).await?;
+    let result = match reticulum_utils::rnx::execute(destination, command, options).await {
+        Ok(result) => result,
+        Err(err)
+            if interactive
+                && (err.contains("could not execute")
+                    || err.contains("did not execute")
+                    || err.contains("no result")
+                    || err.contains("no response")
+                    || err.contains("invalid response")) =>
+        {
+            eprintln!("{err}");
+            return Ok(0);
+        }
+        Err(err) => return Err(err),
+    };
     print!("{}", String::from_utf8_lossy(&result.stdout));
     if !result.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&result.stderr));
@@ -765,7 +789,18 @@ async fn run_remote_command(
         }
     }
     if !result.executed {
-        return Err("remote did not execute the command".to_string());
+        let message = "Remote could not execute command";
+        eprintln!("{message}");
+        if interactive {
+            return Ok(0);
+        }
+        std::process::exit(248);
+    }
+    if !result.has_retval {
+        if mirror {
+            std::process::exit(240);
+        }
+        return Ok(0);
     }
     let code = reticulum_utils::rnx::remote_exit_code(&result);
     if mirror && code != 0 {

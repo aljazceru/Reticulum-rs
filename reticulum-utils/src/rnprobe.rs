@@ -1,9 +1,14 @@
 //! `rnprobe` — probe a destination by measuring round-trip times
 //! (Python `RNS/Utilities/rnprobe.py`).
 //!
-//! The destination hash is the probe target. An optional full name
-//! (`app.aspects`, usually `rnstransport.probe`) must hash to that
-//! destination for the recalled identity.
+//! This port treats the destination name as optional. When a name is
+//! given, the probe errors if the recalled identity does not hash to
+//! the given destination under that name.
+//!
+//! Python requires the name and sends the probe to the destination
+//! built from it. It does not compare that destination hash to the
+//! argument. `rnstransport.probe` is the transport probe destination,
+//! not a default `rnprobe` argument.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -31,8 +36,8 @@ pub struct ProbeOptions {
     /// Delay before each probe after the first (`--wait`).
     pub wait: Duration,
     /// Full destination name in dotted notation (`app.aspects`).
-    /// When set, the recalled identity must hash to `destination` under
-    /// this name.
+    /// When set, this port errors if the recalled identity does not hash
+    /// to `destination` under this name.
     pub full_name: Option<String>,
 }
 

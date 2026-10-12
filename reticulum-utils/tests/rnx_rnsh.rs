@@ -231,7 +231,7 @@ async fn read_pty_text(
 
 #[tokio::test]
 async fn rnx_propagates_nonzero_remote_status_from_exit_message() {
-    let request = reticulum_utils::rnx::encode_request("exit 7", 5, Some(64), Some(64), None);
+    let request = reticulum_utils::rnx::encode_request("exit 7", 5.0, Some(64), Some(64), None);
     let response = reticulum_utils::rnx::execute_request(&request).await;
     let decoded = reticulum_utils::rnx::decode_exec_response(&response).expect("exit message");
     assert!(decoded.executed, "command must have run");
@@ -239,7 +239,7 @@ async fn rnx_propagates_nonzero_remote_status_from_exit_message() {
 
     let capped = reticulum_utils::rnx::encode_request(
         "printf stdout-data; printf stderr-data >&2",
-        5,
+        5.0,
         Some(6),
         Some(3),
         None,
@@ -261,7 +261,7 @@ async fn rnx_propagates_nonzero_remote_status_from_exit_message() {
     let stdin = reticulum_utils::rnx::stdin_payload(None, Some(&stdin_file))
         .expect("stdin file")
         .expect("bytes");
-    let echoed = reticulum_utils::rnx::encode_request("cat", 5, Some(4), Some(0), Some(&stdin));
+    let echoed = reticulum_utils::rnx::encode_request("cat", 5.0, Some(4), Some(0), Some(&stdin));
     let echoed = reticulum_utils::rnx::decode_exec_response(
         &reticulum_utils::rnx::execute_request(&echoed).await,
     )
@@ -269,17 +269,4 @@ async fn rnx_propagates_nonzero_remote_status_from_exit_message() {
     assert_eq!(echoed.stdout, b"hell");
     assert_eq!(echoed.stdout_len, b"hello-stdin".len() as u64);
     assert!(echoed.stderr.is_empty());
-
-    assert!(matches!(
-        reticulum_utils::rnx::interactive_step(" exit "),
-        reticulum_utils::rnx::InteractiveStep::Stop
-    ));
-    assert!(matches!(
-        reticulum_utils::rnx::interactive_step("quit"),
-        reticulum_utils::rnx::InteractiveStep::Stop
-    ));
-    assert!(matches!(
-        reticulum_utils::rnx::interactive_step("clear"),
-        reticulum_utils::rnx::InteractiveStep::Clear
-    ));
 }

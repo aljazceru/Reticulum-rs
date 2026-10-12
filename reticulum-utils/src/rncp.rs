@@ -787,11 +787,11 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
         &options.destination,
         &identity,
         options.timeout,
-        options.silent || options.quiet,
+        options.silent,
     )
     .await?;
 
-    if !options.silent && !options.quiet {
+    if !options.silent {
         println!("Advertising file resource");
     }
     // Subscribe BEFORE starting the transfer: the broadcast channel has
@@ -872,11 +872,11 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
         &options.destination,
         &identity,
         options.timeout,
-        options.silent || options.quiet,
+        options.silent,
     )
     .await?;
 
-    if !options.silent && !options.quiet {
+    if !options.silent {
         println!("Requesting file from remote");
     }
     // Subscribe BEFORE the request: the server starts the file resource
