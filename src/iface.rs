@@ -397,9 +397,8 @@ pub trait Interface {
 
     /// Whether this type applies announce ingress limiting.
     ///
-    /// Python overrides `should_ingress_limit` to return false for KISS,
-    /// AX.25 KISS and serial, so those links forward announce bursts
-    /// instead of holding them. Other types use the generic limiter.
+    /// KISS (including AX.25) and serial return false here, so those
+    /// links forward announce bursts instead of holding them.
     fn should_ingress_limit() -> bool {
         true
     }
@@ -512,9 +511,10 @@ impl InterfaceManager {
         }
     }
 
-    /// KISS, AX.25 and serial override `should_ingress_limit` to false.
-    /// Applied when the channel is registered so transport (which only
-    /// sees [`IfaceControlState`]) holds no announces for these types.
+    /// KISS (including AX.25) and serial return false from
+    /// `should_ingress_limit`. Applied when the channel is registered so
+    /// transport (which only sees [`IfaceControlState`]) holds no
+    /// announces for these types.
     fn apply_type_ingress_policy<T: Interface>(&self, address: &AddressHash) {
         if !T::should_ingress_limit() {
             self.with_control(address, |control| {

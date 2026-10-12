@@ -15,10 +15,10 @@ use tokio_serial::SerialStream;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
-use crate::iface::RxMessage;
 use crate::iface::hdlc::Hdlc;
 use crate::iface::hdlc::HdlcDecoder;
 use crate::iface::kiss::SerialPortConfig;
+use crate::iface::RxMessage;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -273,8 +273,8 @@ impl Interface for SerialInterface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::iface::control::{hold_announce_burst, IfaceControlState};
     use crate::iface::InterfaceManager;
-    use crate::iface::control::{IfaceControlState, hold_announce_burst};
 
     #[test]
     fn constructor_without_beacon_stays_quiet() {

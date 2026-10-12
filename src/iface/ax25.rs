@@ -208,9 +208,9 @@ mod tests {
 
     #[test]
     fn announce_burst_is_not_held() {
-        use crate::iface::Interface;
-        use crate::iface::control::{IfaceControlState, hold_announce_burst};
+        use crate::iface::control::{hold_announce_burst, IfaceControlState};
         use crate::iface::kiss::KissInterface;
+        use crate::iface::Interface;
 
         // AX.25 KISS is a `KissInterface`; both modes share the override.
         assert!(!KissInterface::should_ingress_limit());

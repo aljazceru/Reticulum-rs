@@ -213,8 +213,8 @@ pub struct IfaceControlState {
     /// Ingress control enabled (Python `Interface.ingress_control`).
     pub ingress_control: bool,
     /// When false, `should_ingress_limit` stays false even if
-    /// `ingress_control` is on. Python hard-overrides that method for
-    /// KISS, AX.25 and serial; path-request limiting is unchanged.
+    /// `ingress_control` is on. KISS (including AX.25) and serial set
+    /// this false. Path-request limiting is unchanged.
     announce_ingress_limit: bool,
     /// Egress control for path requests (Python `Interface.egress_control`).
     pub egress_control: bool,
@@ -310,9 +310,8 @@ impl IfaceControlState {
 
     /// Enable or disable announce ingress limiting.
     ///
-    /// KISS, AX.25 and serial set this false at spawn. `ingress_control`
-    /// still gates path-request bursts, matching the Python override of
-    /// `should_ingress_limit` only.
+    /// KISS (including AX.25) and serial set this false at spawn.
+    /// `ingress_control` still gates path-request bursts.
     pub fn set_announce_ingress_limit(&mut self, enabled: bool) {
         self.announce_ingress_limit = enabled;
     }

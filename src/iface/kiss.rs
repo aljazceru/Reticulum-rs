@@ -29,8 +29,8 @@ use tokio_serial::SerialStream;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
-use crate::iface::RxMessage;
 use crate::iface::ax25;
+use crate::iface::RxMessage;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -644,6 +644,8 @@ impl KissInterface {
 
                     /// Escape, write, and `note_sent`. A failed `write_all`
                     /// drops the connection and leaves `first_tx` alone.
+                    /// The payload is not put back: Python drops the
+                    /// in-flight frame when `serial.write` fails.
                     async fn write_now<W>(
                         write: &mut W,
                         packed: &[u8],
@@ -691,92 +693,6 @@ impl KissInterface {
                         } else {
                             true
                         }
-                    }
-
-                    /// One `process_queue` step: write the oldest raw payload.
-                    async fn drain_one<W>(
-                        write: &mut W,
-                        flow_control: bool,
-                        tx_state: &Arc<std::sync::Mutex<TxState>>,
-                        stats: &Arc<super::InterfaceCounters>,
-                        id_beacon: &Arc<std::sync::Mutex<Option<IdBeacon>>>,
-                        stop: &tokio_util::sync::CancellationToken,
-                    ) -> bool
-                    where
-                        W: tokio::io::AsyncWrite + Unpin,
-                    {
-                        let packed = {
-                            let mut state = tx_state.lock().unwrap();
-                            if flow_control && !state.ready {
-                                return false;
-                            }
-                            state.queue.pop_front()
-                        };
-                        let Some(packed) = packed else {
-                            return false;
-                        };
-                        if !write_now(
-                            write,
-                            &packed,
-                            flow_control,
-                            tx_state,
-                            stats,
-                            id_beacon,
-                            stop,
-                        )
-                        .await
-                        {
-                            tx_state.lock().unwrap().queue.push_front(packed);
-                            return false;
-                        }
-                        true
-                    }
-
-                    async fn send_id_if_due<W>(
-                        write: &mut W,
-                        flow_control: bool,
-                        tx_state: &Arc<std::sync::Mutex<TxState>>,
-                        stats: &Arc<super::InterfaceCounters>,
-                        id_beacon: &Arc<std::sync::Mutex<Option<IdBeacon>>>,
-                        stop: &tokio_util::sync::CancellationToken,
-                    ) where
-                        W: tokio::io::AsyncWrite + Unpin,
-                    {
-                        let due = {
-                            let mut guard = id_beacon.lock().unwrap();
-                            let Some(beacon) = guard.as_mut() else {
-                                return;
-                            };
-                            beacon.take_if_due(StdInstant::now())
-                        };
-                        let Some(payload) = due else {
-                            return;
-                        };
-                        // `take_if_due` leaves `first_tx` set, so a later wake
-                        // sees the same ID. Do not queue a second copy while
-                        // the first is still waiting for READY.
-                        {
-                            let state = tx_state.lock().unwrap();
-                            if flow_control
-                                && !state.ready
-                                && state.queue.iter().any(|queued| queued == &payload)
-                            {
-                                return;
-                            }
-                        }
-                        if !enqueue_if_blocked(payload.clone(), flow_control, tx_state) {
-                            return;
-                        }
-                        let _ = write_now(
-                            write,
-                            &payload,
-                            flow_control,
-                            tx_state,
-                            stats,
-                            id_beacon,
-                            stop,
-                        )
-                        .await;
                     }
 
                     loop {
@@ -836,29 +752,68 @@ impl KissInterface {
                         // queued data frame first.
                         let message = match wake {
                             Wake::Beacon | Wake::Flow | Wake::Message(None) => {
-                                let _ = drain_one(
-                                    &mut write_half,
-                                    flow_control,
-                                    &tx_state,
-                                    &stats,
-                                    &id_beacon,
-                                    &stop,
-                                )
-                                .await;
-                                if stop.is_cancelled() {
-                                    break;
+                                let packed = {
+                                    let mut state = tx_state.lock().unwrap();
+                                    if flow_control && !state.ready {
+                                        None
+                                    } else {
+                                        state.queue.pop_front()
+                                    }
+                                };
+                                if let Some(packed) = packed {
+                                    // Drop the popped frame on failure. The
+                                    // queue outlives the port, and the next
+                                    // task writes new packets ahead of it.
+                                    let wrote = write_now(
+                                        &mut write_half,
+                                        &packed,
+                                        flow_control,
+                                        &tx_state,
+                                        &stats,
+                                        &id_beacon,
+                                        &stop,
+                                    )
+                                    .await;
+                                    if !wrote {
+                                        break;
+                                    }
                                 }
-                                send_id_if_due(
-                                    &mut write_half,
-                                    flow_control,
-                                    &tx_state,
-                                    &stats,
-                                    &id_beacon,
-                                    &stop,
-                                )
-                                .await;
-                                if stop.is_cancelled() {
-                                    break;
+
+                                let due = id_beacon
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .and_then(|beacon| beacon.take_if_due(StdInstant::now()));
+                                if let Some(payload) = due {
+                                    // `take_if_due` leaves `first_tx` set, so
+                                    // a later wake sees the same ID. Do not
+                                    // queue a second copy while the first is
+                                    // still waiting for READY.
+                                    let already_queued = {
+                                        let state = tx_state.lock().unwrap();
+                                        flow_control
+                                            && !state.ready
+                                            && state.queue.iter().any(|queued| queued == &payload)
+                                    };
+                                    if !already_queued
+                                        && enqueue_if_blocked(
+                                            payload.clone(),
+                                            flow_control,
+                                            &tx_state,
+                                        )
+                                        && !write_now(
+                                            &mut write_half,
+                                            &payload,
+                                            flow_control,
+                                            &tx_state,
+                                            &stats,
+                                            &id_beacon,
+                                            &stop,
+                                        )
+                                        .await
+                                    {
+                                        break;
+                                    }
                                 }
                                 continue;
                             }
@@ -941,9 +896,7 @@ mod tests {
         // Python: bytes([KISS.FEND])+bytes([0x00])+KISS.escape(data)+bytes([KISS.FEND])
         assert_eq!(
             encode_frame(&[0x7e, 0x7d, 0x01, 0xc0, 0xdb, 0xdc, 0xdd]),
-            vec![
-                0xc0, 0x00, 0x7e, 0x7d, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0xdc, 0xdd, 0xc0
-            ]
+            vec![0xc0, 0x00, 0x7e, 0x7d, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0xdc, 0xdd, 0xc0]
         );
 
         // empty data frame
@@ -1079,11 +1032,9 @@ mod tests {
         // when the frame is actually written (`process_outgoing`).
         let sent_at = t0 + Duration::from_secs(601);
         beacon.note_sent(&queue[0], sent_at);
-        assert!(
-            beacon
-                .take_if_due(sent_at + Duration::from_secs(600))
-                .is_none()
-        );
+        assert!(beacon
+            .take_if_due(sent_at + Duration::from_secs(600))
+            .is_none());
         let next = beacon
             .take_if_due(sent_at + Duration::from_secs(600) + Duration::from_millis(1))
             .expect("next id");
@@ -1097,29 +1048,23 @@ mod tests {
         exact.note_sent(b"reticulum-packet", t0);
         assert_eq!(exact.take_if_due(due_at).as_deref(), Some(id.as_slice()));
         exact.note_sent(&id, sent_at);
-        assert!(
-            exact
-                .take_if_due(sent_at + Duration::from_secs(10_000))
-                .is_none()
-        );
+        assert!(exact
+            .take_if_due(sent_at + Duration::from_secs(10_000))
+            .is_none());
         let armed_at = sent_at + Duration::from_secs(5);
         exact.note_sent(b"queued-payload", armed_at);
-        assert!(
-            exact
-                .take_if_due(armed_at + Duration::from_secs(600))
-                .is_none()
-        );
-        assert!(
-            exact
-                .take_if_due(armed_at + Duration::from_secs(600) + Duration::from_millis(1))
-                .is_some()
-        );
+        assert!(exact
+            .take_if_due(armed_at + Duration::from_secs(600))
+            .is_none());
+        assert!(exact
+            .take_if_due(armed_at + Duration::from_secs(600) + Duration::from_millis(1))
+            .is_some());
     }
 
     #[tokio::test]
     async fn announce_burst_is_not_held() {
+        use crate::iface::control::{hold_announce_burst, IfaceControlState};
         use crate::iface::InterfaceManager;
-        use crate::iface::control::{IfaceControlState, hold_announce_burst};
 
         let t0 = tokio::time::Instant::now();
         let mut generic = IfaceControlState::new(t0);
