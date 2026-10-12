@@ -46,8 +46,8 @@ pub const DEFAULT_IFAC_SIZE: usize = 16;
 
 /// Default IFAC size in bytes for the serial family when none is
 /// configured (Python `DEFAULT_IFAC_SIZE` on `SerialInterface`,
-/// `KISSInterface`, `AX25KISSInterface`, `RNodeInterface`, and
-/// `RNodeMultiInterface`).
+/// `KISSInterface`, `AX25KISSInterface`, `RNodeInterface`,
+/// `RNodeMultiInterface`, and `PipeInterface`).
 pub const SERIAL_FAMILY_IFAC_SIZE: usize = 8;
 
 /// HKDF-SHA256 with an empty context (Python `RNS.Cryptography.hkdf`
@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(IFAC_MIN_SIZE, 1);
         // Omitted `ifac_size` is 16 bytes on the base interface.
         assert_eq!(DEFAULT_IFAC_SIZE, 16);
-        // Serial, KISS, AX.25, RNode, and RNodeMulti omit to 8 bytes.
+        // Serial, KISS, AX.25, RNode, RNodeMulti, and Pipe omit to 8 bytes.
         assert_eq!(SERIAL_FAMILY_IFAC_SIZE, 8);
 
         let base = IfacKey::derive(Some("net"), None, DEFAULT_IFAC_SIZE).expect("valid IFAC");
