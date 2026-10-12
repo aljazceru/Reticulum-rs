@@ -144,23 +144,29 @@ impl TcpServer {
                             // worker may otherwise begin decoding a frame
                             // before the slot is populated.
                             let inherited = server_ifac.read().expect("ifac lock").clone();
+                            // Name the client with its peer before the worker
+                            // can learn a path. Every accepted client would
+                            // otherwise share the `TcpClient` type name.
                             // Server options were already validated. The
                             // accepted client only copies framing and
                             // fixed_mtu, so this cannot fail.
+                            let peer_endpoint = client.1.to_string();
                             let peer = TcpClient::from_parts(
-                                client.1.to_string(),
+                                peer_endpoint.clone(),
                                 Some(client.0),
                                 options.for_accepted_client(),
                             );
 
                             let _address = if let Some(key) = inherited {
                                 iface_manager.spawn_with_ifac(
+                                    &peer_endpoint,
                                     peer,
                                     TcpClient::spawn,
                                     key,
                                 )
                             } else {
-                                iface_manager.spawn(
+                                iface_manager.spawn_named(
+                                    &peer_endpoint,
                                     peer,
                                     TcpClient::spawn,
                                 )
@@ -179,6 +185,10 @@ impl TcpServer {
 impl Interface for TcpServer {
     fn mtu() -> usize {
         2048
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.addr
     }
 }
 

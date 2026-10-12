@@ -23,7 +23,7 @@ pub mod rnode;
 #[cfg(feature = "iface-serial")]
 pub mod serial;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
@@ -403,12 +403,21 @@ pub trait Interface {
     fn should_ingress_limit() -> bool {
         true
     }
+
+    /// Bind or peer endpoint included in the stable interface id.
+    /// Empty when this interface has neither.
+    fn endpoint(&self) -> &str {
+        ""
+    }
 }
 
 struct LocalInterface {
     address: AddressHash,
     name: String,
     kind: String,
+    /// Bind or peer endpoint. Separate from `name` so a later config-name
+    /// change does not drop the endpoint Python puts in `str(self)`.
+    endpoint: String,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
     stats: Arc<InterfaceCounters>,
@@ -508,6 +517,7 @@ impl InterfaceManager {
             address,
             name: name.to_string(),
             kind: kind.to_string(),
+            endpoint: String::new(),
             tx_send,
             stop: stop.clone(),
             stats: stats.clone(),
@@ -531,7 +541,16 @@ impl InterfaceManager {
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
         let kind = interface_kind_name::<T>();
+        let endpoint = inner.endpoint().to_string();
         let channel = self.new_channel_named(1, &kind, &kind);
+        let address = channel.address;
+        if let Some(iface) = self
+            .ifaces
+            .iter_mut()
+            .find(|iface| iface.address == address)
+        {
+            iface.endpoint = endpoint;
+        }
 
         let inner = Arc::new(Mutex::new(inner));
         let address = channel.address;
@@ -648,6 +667,7 @@ impl InterfaceManager {
     /// may begin polling immediately).
     pub fn spawn_with_ifac<T, F, R>(
         &mut self,
+        name: impl AsRef<str>,
         inner: T,
         worker: F,
         ifac: Arc<ifac::IfacKey>,
@@ -658,11 +678,22 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
     {
         let kind = interface_kind_name::<T>();
+        let endpoint = inner.endpoint().to_string();
         let channel = self.new_channel_named(1, &kind, &kind);
         *channel.ifac.write().expect("ifac lock") = Some(ifac);
 
         let address = channel.address;
         self.apply_type_ingress_policy::<T>(&address);
+        // Name and endpoint are recorded before the worker starts, so an
+        // accepted client cannot learn a path under the shared type name.
+        if let Some(iface) = self
+            .ifaces
+            .iter_mut()
+            .find(|iface| iface.address == address)
+        {
+            iface.name = name.as_ref().to_string();
+            iface.endpoint = endpoint;
+        }
 
         let context = InterfaceContext::<T> {
             inner: Arc::new(Mutex::new(inner)),
@@ -830,29 +861,55 @@ impl InterfaceManager {
         messages
     }
 
-    /// Runtime address to a stable identity (`kind` + name), so a restart
-    /// can resolve persisted paths onto the new `AddressHash`.
+    /// Runtime address to a stable identity (kind, config name, and bind
+    /// or peer endpoint), so a restart can resolve persisted paths onto
+    /// the new `AddressHash`.
     pub fn stable_iface_map(&self) -> HashMap<AddressHash, AddressHash> {
         let mut map = HashMap::new();
         for iface in &self.ifaces {
             if iface.stop.is_cancelled() {
                 continue;
             }
-            map.insert(iface.address, stable_interface_id(&iface.kind, &iface.name));
+            map.insert(iface.address, iface_stable_id(iface));
         }
         map
     }
 
     /// Stable interface identity to the current runtime address.
+    /// An id shared by more than one live interface is omitted so load
+    /// does not attach every saved path to whichever interface was last.
     pub fn stable_to_live(&self) -> HashMap<AddressHash, AddressHash> {
-        let mut map = HashMap::new();
+        self.classify_stable_ids().0
+    }
+
+    /// Stable ids that currently belong to more than one live interface.
+    pub fn ambiguous_stable_ids(&self) -> HashSet<AddressHash> {
+        self.classify_stable_ids().1
+    }
+
+    fn classify_stable_ids(&self) -> (HashMap<AddressHash, AddressHash>, HashSet<AddressHash>) {
+        let mut counts: HashMap<AddressHash, usize> = HashMap::new();
+        let mut first: HashMap<AddressHash, AddressHash> = HashMap::new();
         for iface in &self.ifaces {
             if iface.stop.is_cancelled() {
                 continue;
             }
-            map.insert(stable_interface_id(&iface.kind, &iface.name), iface.address);
+            let id = iface_stable_id(iface);
+            *counts.entry(id).or_insert(0) += 1;
+            first.entry(id).or_insert(iface.address);
         }
-        map
+        let mut unique = HashMap::new();
+        let mut ambiguous = HashSet::new();
+        for (id, count) in counts {
+            if count == 1 {
+                if let Some(address) = first.remove(&id) {
+                    unique.insert(id, address);
+                }
+            } else {
+                ambiguous.insert(id);
+            }
+        }
+        (unique, ambiguous)
     }
 
     /// Addresses of all live interfaces with their online status,
@@ -1167,12 +1224,25 @@ impl Drop for InterfaceManager {
 /// Stable identity of an interface across process restarts.
 /// The runtime `AddressHash` from `new_channel_named` is a fresh random
 /// seed and is not persisted.
-fn stable_interface_id(kind: &str, name: &str) -> AddressHash {
-    let mut label = String::with_capacity(kind.len() + 1 + name.len());
+///
+/// `name` is the config name when one was set. `endpoint` is the bind or
+/// peer address (Python `str(self)`), so unnamed interfaces of the same
+/// kind do not collapse onto one id. An empty endpoint keeps the previous
+/// kind-and-name label.
+fn stable_interface_id(kind: &str, name: &str, endpoint: &str) -> AddressHash {
+    let mut label = String::with_capacity(kind.len() + name.len() + endpoint.len() + 2);
     label.push_str(kind);
     label.push('\0');
     label.push_str(name);
+    if !endpoint.is_empty() {
+        label.push('\0');
+        label.push_str(endpoint);
+    }
     AddressHash::new_from_slice(label.as_bytes())
+}
+
+fn iface_stable_id(iface: &LocalInterface) -> AddressHash {
+    stable_interface_id(&iface.kind, &iface.name, &iface.endpoint)
 }
 
 /// Short type name of an interface, used as statistics `kind`.
@@ -1439,5 +1509,74 @@ mod tests {
         }
 
         assert_eq!(manager.iface_hw_mtu(&AddressHash::new_empty()), None);
+    }
+
+    #[tokio::test]
+    async fn stable_ids_follow_endpoint_and_skip_collisions() {
+        use super::tcp_client::TcpClient;
+        use super::udp::UdpInterface;
+
+        let mut manager = InterfaceManager::new(4);
+
+        let udp_a = manager.new_context(UdpInterface::new("127.0.0.1:1", None, false));
+        let udp_a_addr = udp_a.channel.address;
+        drop(udp_a);
+        let udp_b = manager.new_context(UdpInterface::new("127.0.0.1:2", None, false));
+        let udp_b_addr = udp_b.channel.address;
+        drop(udp_b);
+
+        let map = manager.stable_to_live();
+        assert_eq!(map.len(), 2, "unnamed UDP interfaces must not share an id");
+        assert!(map.values().any(|address| *address == udp_a_addr));
+        assert!(map.values().any(|address| *address == udp_b_addr));
+
+        drop(manager.new_context(UdpInterface::new("127.0.0.1:1", None, false)));
+        let map = manager.stable_to_live();
+        assert!(
+            !map.values().any(|address| *address == udp_a_addr),
+            "two live interfaces with one id must not own persisted paths"
+        );
+        assert!(map.values().any(|address| *address == udp_b_addr));
+        assert!(!manager.ambiguous_stable_ids().is_empty());
+
+        let named_a = manager.new_context(UdpInterface::new("127.0.0.1:9", None, false));
+        let named_a_addr = named_a.channel.address;
+        drop(named_a);
+        manager.set_iface_name(&named_a_addr, "west");
+        let named_b = manager.new_context(UdpInterface::new("127.0.0.1:9", None, false));
+        let named_b_addr = named_b.channel.address;
+        drop(named_b);
+        manager.set_iface_name(&named_b_addr, "east");
+        let map = manager.stable_to_live();
+        assert!(map.values().any(|address| *address == named_a_addr));
+        assert!(
+            map.values().any(|address| *address == named_b_addr),
+            "a unique config name plus the bind endpoint stays distinct"
+        );
+
+        let tcp_a = manager.new_context(TcpClient::new("10.0.0.1:80"));
+        let tcp_a_addr = tcp_a.channel.address;
+        drop(tcp_a);
+        let tcp_b = manager.new_context(TcpClient::new("10.0.0.2:80"));
+        let tcp_b_addr = tcp_b.channel.address;
+        drop(tcp_b);
+        let map = manager.stable_to_live();
+        assert!(map.values().any(|address| *address == tcp_a_addr));
+        assert!(map.values().any(|address| *address == tcp_b_addr));
+
+        let same_a = manager.new_context(TcpClient::new("10.1.0.1:80"));
+        let same_a_addr = same_a.channel.address;
+        drop(same_a);
+        manager.set_iface_name(&same_a_addr, "uplink");
+        let same_b = manager.new_context(TcpClient::new("10.1.0.1:80"));
+        let same_b_addr = same_b.channel.address;
+        drop(same_b);
+        manager.set_iface_name(&same_b_addr, "uplink");
+        let map = manager.stable_to_live();
+        assert!(
+            !map.values()
+                .any(|address| *address == same_a_addr || *address == same_b_addr),
+            "interfaces that still share an id are skipped"
+        );
     }
 }

@@ -23,6 +23,12 @@ use crate::packet::PropagationType;
 /// (Python `Transport.PATH_REQUEST_TIMEOUT`).
 pub const PATH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// How long an automated path-request timestamp is kept
+/// (Python `Transport.PATH_REQUEST_GATE_TIMEOUT`). Longer than the 20s
+/// minimum interval, so the gate still sees the timestamp after the 15s
+/// ingress exemption has lapsed.
+const PATH_REQUEST_GATE_TIMEOUT: Duration = Duration::from_secs(45);
+
 pub fn create_path_request_destination() -> PlainInputDestination {
     PlainInputDestination::new(
         EmptyIdentity {},
@@ -99,10 +105,15 @@ pub struct PathRequests {
     /// Outstanding (discovery) path requests sent on behalf of an unknown
     /// destination (Python `Transport.discovery_path_requests`).
     discovery: BTreeMap<AddressHash, PendingDiscovery>,
-    /// Path requests issued locally, with the time they were last sent
-    /// (Python `Transport.path_requests` accounting, used to exempt
-    /// announces for requested destinations from ingress limiting).
+    /// Path requests issued locally, with the time they were last sent.
+    /// Ingress exemption only: entries lapse at `PATH_REQUEST_TIMEOUT`
+    /// (15s). This is not the automated-request gate.
     pending: BTreeMap<AddressHash, Instant>,
+    /// Last automated path-request time (Python `Transport.path_requests`).
+    /// Independent of `pending`. `has_pending` must not remove these:
+    /// `request_allowed` still needs them until `PATH_REQUEST_MI` (20s),
+    /// and Python keeps the table until `PATH_REQUEST_GATE_TIMEOUT` (45s).
+    last_request: BTreeMap<AddressHash, Instant>,
     /// Minimum interval between automated path requests for the same
     /// destination (Python `Transport.PATH_REQUEST_MI`).
     min_request_interval: Duration,
@@ -141,6 +152,7 @@ impl PathRequests {
             controlled_destination: create_path_request_destination(),
             discovery: BTreeMap::new(),
             pending: BTreeMap::new(),
+            last_request: BTreeMap::new(),
             min_request_interval: Duration::from_secs(20),
         }
     }
@@ -177,7 +189,9 @@ impl PathRequests {
     }
 
     pub fn generate(&mut self, destination: &AddressHash, tag: Option<TagBytes>) -> Packet {
-        self.pending.insert(*destination, Instant::now());
+        let now = Instant::now();
+        self.pending.insert(*destination, now);
+        self.last_request.insert(*destination, now);
 
         let mut data = PacketDataBuffer::new_from_slice(destination.as_slice());
 
@@ -208,8 +222,10 @@ impl PathRequests {
     }
 
     /// Whether a locally issued path request for `destination` is still
-    /// outstanding (Python: `destination_hash in Transport.path_requests`).
-    /// Entries expire after `PATH_REQUEST_TIMEOUT`.
+    /// inside the 15s ingress exemption. Reporting false after
+    /// `PATH_REQUEST_TIMEOUT` removes only that exemption. It does not
+    /// pop `last_request`: announce handling calls this before the 20s
+    /// gate, and Python's membership test does not pop `path_requests`.
     pub fn has_pending(&mut self, destination: &AddressHash) -> bool {
         let now = Instant::now();
         match self.pending.get(destination) {
@@ -288,9 +304,14 @@ impl PathRequests {
 
     /// Whether an automated path request for `destination` may be sent now,
     /// honouring `PATH_REQUEST_MI` (Python automated path request gating).
+    /// Reads `last_request`, which `has_pending` does not remove. Entries
+    /// stay until `PATH_REQUEST_GATE_TIMEOUT` (45s).
     pub fn request_allowed(&mut self, destination: &AddressHash) -> bool {
-        match self.pending.get(destination) {
-            Some(at) => Instant::now() - *at >= self.min_request_interval,
+        let now = Instant::now();
+        self.last_request
+            .retain(|_, at| now - *at < PATH_REQUEST_GATE_TIMEOUT);
+        match self.last_request.get(destination) {
+            Some(at) => now - *at >= self.min_request_interval,
             None => true,
         }
     }
@@ -327,6 +348,38 @@ mod tests {
             Instant::now() - PATH_REQUEST_TIMEOUT - Duration::from_secs(1),
         );
         assert!(!testee.has_pending(&dest));
+    }
+
+    #[test]
+    fn ingress_expiry_leaves_the_request_gate() {
+        let mut testee = PathRequests::new("", None);
+        let dest = AddressHash::new_from_rand(OsRng);
+
+        testee.generate(&dest, None);
+        assert!(testee.has_pending(&dest));
+        assert!(!testee.request_allowed(&dest));
+
+        // An announce at 15s expires the ingress exemption and must not
+        // make the 20s gate allow another automated request.
+        testee.pending.insert(
+            dest,
+            Instant::now() - PATH_REQUEST_TIMEOUT - Duration::from_secs(1),
+        );
+        assert!(!testee.has_pending(&dest));
+        assert!(
+            !testee.request_allowed(&dest),
+            "the 20s gate must still see the request timestamp after 15s"
+        );
+
+        testee
+            .last_request
+            .insert(dest, Instant::now() - Duration::from_secs(19));
+        assert!(!testee.request_allowed(&dest));
+
+        testee
+            .last_request
+            .insert(dest, Instant::now() - Duration::from_secs(20));
+        assert!(testee.request_allowed(&dest));
     }
 
     #[test]

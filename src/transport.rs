@@ -373,6 +373,11 @@ pub(crate) struct TransportHandler {
     seen_local_clients: Vec<AddressHash>,
     persisted_loaded: bool,
     shutdown_persisted: bool,
+    /// Saved paths whose stable interface was not live yet.
+    /// `None` means the destination table has not been read.
+    unresolved_paths: Option<Vec<PersistedPath>>,
+    /// Hashlist and tunnel table have been read for this load attempt.
+    persisted_aux_loaded: bool,
 }
 
 #[derive(Clone)]
@@ -613,6 +618,8 @@ impl Transport {
             seen_local_clients: Vec::new(),
             persisted_loaded,
             shutdown_persisted: false,
+            unresolved_paths: None,
+            persisted_aux_loaded: false,
         }));
 
         {
@@ -2311,9 +2318,13 @@ impl Transport {
 
     /// Load persisted transport tables once interfaces are attached
     /// (Python loads them at startup, after interfaces exist).
+    /// Paths whose interface is not up yet stay pending and are tried
+    /// again when that interface is added.
     pub async fn load_persisted_state(&self) {
         let mut handler = self.handler.lock().await;
         handler.persisted_loaded = false;
+        handler.unresolved_paths = None;
+        handler.persisted_aux_loaded = false;
         load_persisted_state(&mut handler).await;
     }
 
@@ -5233,6 +5244,36 @@ fn write_path_table(
             rmpv::Value::Binary(entry.packet_hash.as_slice().to_vec()),
         ]));
     }
+    // Paths whose interface was not live at load time are not in the
+    // table yet. Writing the table without them would drop them for good.
+    if let Some(pending) = &handler.unresolved_paths {
+        for path in pending {
+            if handler.path_table.get(&path.destination).is_some() {
+                continue;
+            }
+            let blobs = path
+                .blobs
+                .iter()
+                .map(|blob| rmpv::Value::Binary(blob.to_vec()))
+                .collect();
+            entries.push(rmpv::Value::Array(vec![
+                rmpv::Value::Binary(path.destination.as_slice().to_vec()),
+                rmpv::Value::Binary(path.stable_iface.as_slice().to_vec()),
+                rmpv::Value::from(u64::from(path.hops)),
+                rmpv::Value::from(path.stored_unix),
+                rmpv::Value::from(u64::from(path.mode)),
+                match path.gravity {
+                    Some(gravity) => rmpv::Value::from(gravity),
+                    None => rmpv::Value::Nil,
+                },
+                rmpv::Value::Boolean(path.unresponsive),
+                rmpv::Value::Array(blobs),
+                rmpv::Value::Binary(path.announce.clone()),
+                rmpv::Value::Binary(path.received_from.as_slice().to_vec()),
+                rmpv::Value::Binary(path.packet_hash.as_slice().to_vec()),
+            ]));
+        }
+    }
     let mut buf = Vec::new();
     if rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(entries)).is_err() {
         return false;
@@ -5350,6 +5391,129 @@ async fn shutdown_persist(handler: &Arc<Mutex<TransportHandler>>) {
     }
 }
 
+/// One path-table row read from storage, not yet bound to a live interface.
+struct PersistedPath {
+    destination: AddressHash,
+    stable_iface: AddressHash,
+    hops: u8,
+    /// Unix time the path was learned. Zero means the field was missing.
+    stored_unix: u64,
+    mode: u8,
+    gravity: Option<i64>,
+    unresponsive: bool,
+    blobs: Vec<[u8; 10]>,
+    announce: Vec<u8>,
+    received_from: AddressHash,
+    packet_hash: Hash,
+}
+
+fn parse_persisted_paths(bytes: &[u8]) -> Vec<PersistedPath> {
+    let Ok(value) = rmpv::decode::read_value(&mut &bytes[..]) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let Some(fields) = entry.as_array() else {
+            continue;
+        };
+        if fields.len() < 11 {
+            continue;
+        }
+        let (Some(destination), Some(stable_iface)) =
+            (value_addr(&fields[0]), value_addr(&fields[1]))
+        else {
+            continue;
+        };
+        let Some(announce) = value_bin(&fields[8]) else {
+            continue;
+        };
+        let Some(received_from) = value_addr(&fields[9]) else {
+            continue;
+        };
+        let Some(packet_hash) = value_hash(&fields[10]) else {
+            continue;
+        };
+        let blobs = fields[7]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let bytes = value_bin(item)?;
+                        if bytes.len() != 10 {
+                            return None;
+                        }
+                        let mut blob = [0u8; 10];
+                        blob.copy_from_slice(bytes);
+                        Some(blob)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.push(PersistedPath {
+            destination,
+            stable_iface,
+            hops: fields[2].as_u64().unwrap_or(0) as u8,
+            stored_unix: fields[3].as_u64().unwrap_or(0),
+            mode: fields[4].as_u64().unwrap_or(1) as u8,
+            gravity: fields[5].as_i64(),
+            unresponsive: fields[6].as_bool().unwrap_or(false),
+            blobs,
+            announce: announce.to_vec(),
+            received_from,
+            packet_hash,
+        });
+    }
+    paths
+}
+
+async fn restore_persisted_path(
+    handler: &mut TransportHandler,
+    path: &PersistedPath,
+    iface: AddressHash,
+) {
+    let mut input = InputBuffer::new(&path.announce);
+    let Ok(packet) = Packet::deserialize(&mut input) else {
+        return;
+    };
+    if let Some(identity) = announced_identity_hash(&packet) {
+        if handler.blackholes.read().await.is_blackholed(&identity) {
+            return;
+        }
+    }
+    // The path-table hop count is already the in-memory view. Cache the
+    // announce bytes unchanged so a later save does not add another hop.
+    handler.packet_cache.lock().await.cache_announce(&packet);
+    let unix_now = crate::time::unix_time_as_secs();
+    let now_ns = path_table::monotonic_ns(crate::time::now());
+    let stored_unix = if path.stored_unix == 0 {
+        unix_now
+    } else {
+        path.stored_unix
+    };
+    let age_secs = unix_now.saturating_sub(stored_unix);
+    let age_ns = (age_secs as u128)
+        .saturating_mul(1_000_000_000)
+        .min(i64::MAX as u128) as i64;
+    handler.path_table.restore(
+        path.destination,
+        path_table::PathEntry {
+            received_from: path.received_from,
+            hops: path.hops,
+            iface,
+            timestamp: now_ns.saturating_sub(age_ns),
+            unresponsive: path.unresponsive,
+            packet_hash: path.packet_hash,
+            mode: InterfaceMode::from_u8(path.mode).unwrap_or(InterfaceMode::Full),
+            random_blobs: path.blobs.clone(),
+            gravity: path.gravity,
+        },
+    );
+}
+
 async fn load_persisted_state(handler: &mut TransportHandler) {
     if handler.persisted_loaded {
         return;
@@ -5358,172 +5522,127 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
         handler.persisted_loaded = true;
         return;
     };
-    let stable_to_live = {
+    let (stable_to_live, ambiguous) = {
         let manager = handler.iface_manager.lock().await;
         if manager.connected_to_shared_instance() {
             handler.persisted_loaded = true;
             return;
         }
-        manager.stable_to_live()
+        (manager.stable_to_live(), manager.ambiguous_stable_ids())
     };
-    if stable_to_live.is_empty() {
+    // No interface yet. An empty map must retry; do not commit.
+    if stable_to_live.is_empty() && ambiguous.is_empty() {
         return;
     }
     if !handler.config.retransmit {
         handler.persisted_loaded = true;
         return;
     }
-    if let Some(raw) = storage.read(PACKET_HASHLIST_FILE) {
-        let mut cache = handler.packet_cache.lock().await;
-        for chunk in raw.as_chunks::<32>().0 {
-            cache.remember_hash(Hash::new(*chunk));
+    if !handler.persisted_aux_loaded {
+        if let Some(raw) = storage.read(PACKET_HASHLIST_FILE) {
+            let mut cache = handler.packet_cache.lock().await;
+            for chunk in raw.as_chunks::<32>().0 {
+                cache.remember_hash(Hash::new(*chunk));
+            }
         }
     }
-    if let Some(bytes) = storage.read(DESTINATION_TABLE_FILE) {
-        if let Ok(value) = rmpv::decode::read_value(&mut bytes.as_slice()) {
-            if let Some(entries) = value.as_array() {
-                let unix_now = crate::time::unix_time_as_secs();
-                let now_ns = path_table::monotonic_ns(crate::time::now());
-                for entry in entries {
-                    let Some(fields) = entry.as_array() else {
-                        continue;
-                    };
-                    if fields.len() < 11 {
-                        continue;
-                    }
-                    let (Some(destination), Some(stable_iface)) =
-                        (value_addr(&fields[0]), value_addr(&fields[1]))
-                    else {
-                        continue;
-                    };
-                    let Some(iface) = stable_to_live.get(&stable_iface).copied() else {
-                        continue;
-                    };
-                    let Some(announce_bytes) = value_bin(&fields[8]) else {
-                        continue;
-                    };
-                    let mut input = InputBuffer::new(announce_bytes);
-                    let Ok(packet) = Packet::deserialize(&mut input) else {
-                        continue;
-                    };
-                    if let Some(identity) = announced_identity_hash(&packet) {
-                        if handler.blackholes.read().await.is_blackholed(&identity) {
+    if handler.unresolved_paths.is_none() {
+        let paths = match storage.read(DESTINATION_TABLE_FILE) {
+            Some(bytes) => parse_persisted_paths(&bytes),
+            None => Vec::new(),
+        };
+        handler.unresolved_paths = Some(paths);
+    }
+    let pending = handler.unresolved_paths.take().unwrap_or_default();
+    let mut waiting = Vec::new();
+    for path in pending {
+        if ambiguous.contains(&path.stable_iface) {
+            // Several live interfaces share this id. Skip the path rather
+            // than attaching it to whichever interface was registered last.
+            continue;
+        }
+        let Some(iface) = stable_to_live.get(&path.stable_iface).copied() else {
+            waiting.push(path);
+            continue;
+        };
+        restore_persisted_path(handler, &path, iface).await;
+    }
+    // Keep entries whose interface is not up yet and try them again when
+    // one is added. `persisted_loaded` stays false until every saved path
+    // has been restored or skipped, so the first interface cannot drop the
+    // rest. An empty interface map already returned above.
+    if waiting.is_empty() {
+        handler.unresolved_paths = None;
+        handler.persisted_loaded = true;
+    } else {
+        handler.unresolved_paths = Some(waiting);
+    }
+    if !handler.persisted_aux_loaded {
+        if let Some(bytes) = storage.read(TUNNELS_FILE) {
+            if let Ok(value) = rmpv::decode::read_value(&mut bytes.as_slice()) {
+                if let Some(tunnels) = value.as_array() {
+                    let now = crate::time::now();
+                    let now_instant = time::Instant::now();
+                    for tunnel in tunnels {
+                        let Some(fields) = tunnel.as_array() else {
+                            continue;
+                        };
+                        if fields.len() < 4 {
                             continue;
                         }
-                    }
-                    let Some(received_from) = value_addr(&fields[9]) else {
-                        continue;
-                    };
-                    let Some(packet_hash) = value_hash(&fields[10]) else {
-                        continue;
-                    };
-                    let blobs = fields[7]
-                        .as_array()
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| {
-                                    let bytes = value_bin(item)?;
-                                    if bytes.len() != 10 {
-                                        return None;
-                                    }
-                                    let mut blob = [0u8; 10];
-                                    blob.copy_from_slice(bytes);
-                                    Some(blob)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    // The path-table hop count is already the in-memory
-                    // view. Cache the announce bytes unchanged so a later
-                    // save does not add another hop.
-                    handler.packet_cache.lock().await.cache_announce(&packet);
-                    let stored_unix = fields[3].as_u64().unwrap_or(unix_now);
-                    let age_secs = unix_now.saturating_sub(stored_unix);
-                    let age_ns = (age_secs as u128)
-                        .saturating_mul(1_000_000_000)
-                        .min(i64::MAX as u128) as i64;
-                    handler.path_table.restore(
-                        destination,
-                        path_table::PathEntry {
-                            received_from,
-                            hops: fields[2].as_u64().unwrap_or(0) as u8,
-                            iface,
-                            timestamp: now_ns.saturating_sub(age_ns),
-                            unresponsive: fields[6].as_bool().unwrap_or(false),
-                            packet_hash,
-                            mode: InterfaceMode::from_u8(fields[4].as_u64().unwrap_or(1) as u8)
-                                .unwrap_or(InterfaceMode::Full),
-                            random_blobs: blobs,
-                            gravity: fields[5].as_i64(),
-                        },
-                    );
-                }
-            }
-        }
-    }
-    if let Some(bytes) = storage.read(TUNNELS_FILE) {
-        if let Ok(value) = rmpv::decode::read_value(&mut bytes.as_slice()) {
-            if let Some(tunnels) = value.as_array() {
-                let now = crate::time::now();
-                let now_instant = time::Instant::now();
-                for tunnel in tunnels {
-                    let Some(fields) = tunnel.as_array() else {
-                        continue;
-                    };
-                    if fields.len() < 4 {
-                        continue;
-                    }
-                    let Some(tunnel_id) = value_addr(&fields[0]) else {
-                        continue;
-                    };
-                    let remaining = fields[2].as_u64().unwrap_or(0);
-                    let mut paths = std::collections::BTreeMap::new();
-                    if let Some(items) = fields[3].as_array() {
-                        for item in items {
-                            let Some(path_fields) = item.as_array() else {
-                                continue;
-                            };
-                            if path_fields.len() < 5 {
-                                continue;
+                        let Some(tunnel_id) = value_addr(&fields[0]) else {
+                            continue;
+                        };
+                        let remaining = fields[2].as_u64().unwrap_or(0);
+                        let mut paths = std::collections::BTreeMap::new();
+                        if let Some(items) = fields[3].as_array() {
+                            for item in items {
+                                let Some(path_fields) = item.as_array() else {
+                                    continue;
+                                };
+                                if path_fields.len() < 5 {
+                                    continue;
+                                }
+                                let (Some(destination), Some(received_from), Some(packet_hash)) = (
+                                    value_addr(&path_fields[0]),
+                                    value_addr(&path_fields[1]),
+                                    value_hash(&path_fields[4]),
+                                ) else {
+                                    continue;
+                                };
+                                paths.insert(
+                                    destination,
+                                    TunnelPath {
+                                        received_from,
+                                        hops: path_fields[2].as_u64().unwrap_or(0) as u8,
+                                        expires: now
+                                            + Duration::from_secs(
+                                                path_fields[3].as_u64().unwrap_or(0),
+                                            ),
+                                        packet_hash,
+                                    },
+                                );
                             }
-                            let (Some(destination), Some(received_from), Some(packet_hash)) = (
-                                value_addr(&path_fields[0]),
-                                value_addr(&path_fields[1]),
-                                value_hash(&path_fields[4]),
-                            ) else {
-                                continue;
-                            };
-                            paths.insert(
-                                destination,
-                                TunnelPath {
-                                    received_from,
-                                    hops: path_fields[2].as_u64().unwrap_or(0) as u8,
-                                    expires: now
-                                        + Duration::from_secs(path_fields[3].as_u64().unwrap_or(0)),
-                                    packet_hash,
-                                },
-                            );
                         }
+                        if paths.is_empty() {
+                            continue;
+                        }
+                        // The stored interface is not bound until a live
+                        // synthesis packet arrives (Python stores `None`).
+                        handler.tunnels.insert(
+                            tunnel_id,
+                            tunnels::TunnelEntry {
+                                iface: None,
+                                paths,
+                                expires: now_instant + Duration::from_secs(remaining),
+                            },
+                        );
                     }
-                    if paths.is_empty() {
-                        continue;
-                    }
-                    // The stored interface is not bound until a live
-                    // synthesis packet arrives (Python stores `None`).
-                    handler.tunnels.insert(
-                        tunnel_id,
-                        tunnels::TunnelEntry {
-                            iface: None,
-                            paths,
-                            expires: now_instant + Duration::from_secs(remaining),
-                        },
-                    );
                 }
             }
         }
+        handler.persisted_aux_loaded = true;
     }
-    handler.persisted_loaded = true;
 }
 
 async fn manage_transport(

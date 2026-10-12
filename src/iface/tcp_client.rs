@@ -447,6 +447,10 @@ impl Interface for TcpClient {
     fn mtu() -> usize {
         2048
     }
+
+    fn endpoint(&self) -> &str {
+        &self.addr
+    }
 }
 
 /// `None` keeps today's untimed `TcpStream::connect`. A device bind, IPv6

@@ -603,6 +603,120 @@ async fn path_table_survives_interface_address_restart() {
     }
 }
 
+#[tokio::test]
+async fn path_table_restores_interfaces_added_at_different_times() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let hash1;
+    let hash2;
+    let hops1;
+    let hops2;
+    {
+        let a = TransportConfig::new("rust-stagger-a", &PrivateIdentity::new_from_rand(OsRng))
+            .set_retransmit(true)
+            .set_storage(storage.clone())
+            .build();
+        let b =
+            TransportConfig::new("rust-stagger-b", &PrivateIdentity::new_from_rand(OsRng)).build();
+        let c =
+            TransportConfig::new("rust-stagger-c", &PrivateIdentity::new_from_rand(OsRng)).build();
+        {
+            let manager = a.iface_manager();
+            let mut manager = manager.lock().await;
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47060", Some("127.0.0.1:47061"), true),
+                UdpInterface::spawn,
+            );
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47062", Some("127.0.0.1:47063"), true),
+                UdpInterface::spawn,
+            );
+        }
+        {
+            let manager = b.iface_manager();
+            let mut manager = manager.lock().await;
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47061", Some("127.0.0.1:47060"), true),
+                UdpInterface::spawn,
+            );
+        }
+        {
+            let manager = c.iface_manager();
+            let mut manager = manager.lock().await;
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47063", Some("127.0.0.1:47062"), true),
+                UdpInterface::spawn,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let destination1 = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("stagger", "one"),
+        );
+        hash1 = destination1.desc.address_hash;
+        b.send_announce(&Arc::new(tokio::sync::Mutex::new(destination1)), None)
+            .await;
+        let destination2 = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("stagger", "two"),
+        );
+        hash2 = destination2.desc.address_hash;
+        c.send_announce(&Arc::new(tokio::sync::Mutex::new(destination2)), None)
+            .await;
+        hops1 = wait_hops(&a, &hash1)
+            .await
+            .expect("path on the first interface");
+        hops2 = wait_hops(&a, &hash2)
+            .await
+            .expect("path on the second interface");
+        a.persist_data().await;
+        drop(c);
+        drop(b);
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    let a = TransportConfig::new("rust-stagger-a", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .set_storage(storage)
+        .build();
+    let iface1 = {
+        let manager = a.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47060", Some("127.0.0.1:47061"), true),
+            UdpInterface::spawn,
+        )
+    };
+    let restored = wait_hops(&a, &hash1).await;
+    assert!(
+        restored.is_some(),
+        "the first interface's path must reload before the second interface exists"
+    );
+    assert!(
+        !a.has_path(&hash2).await,
+        "a path for an interface that is not up yet must not be attached or dropped"
+    );
+    let iface2 = {
+        let manager = a.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47062", Some("127.0.0.1:47063"), true),
+            UdpInterface::spawn,
+        )
+    };
+    assert_eq!(
+        wait_hops(&a, &hash2).await,
+        Some(hops2),
+        "adding the second interface later must restore its path"
+    );
+    assert_eq!(a.hops_to(&hash1).await, Some(hops1));
+    let (_via, bound1) = a.next_hop(&hash1).await.expect("path 1");
+    let (_via, bound2) = a.next_hop(&hash2).await.expect("path 2");
+    assert_eq!(bound1, iface1);
+    assert_eq!(bound2, iface2);
+}
+
 fn announce_packet(hops: u8) -> Packet {
     let mut data = PacketDataBuffer::new();
     data.safe_write(&[1u8; 32]);

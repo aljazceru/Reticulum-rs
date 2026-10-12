@@ -219,6 +219,10 @@ impl Interface for UdpInterface {
         // and not the next-hop MTU.
         2048
     }
+
+    fn endpoint(&self) -> &str {
+        &self.bind_addr
+    }
 }
 
 #[cfg(test)]
