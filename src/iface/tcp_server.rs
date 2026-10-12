@@ -5,7 +5,7 @@ use tokio::net::TcpListener;
 
 use crate::error::RnsError;
 
-use super::tcp_client::{BindTarget, TcpClient, TcpOptions, resolve_bind_target};
+use super::tcp_client::{resolve_bind_target, BindTarget, TcpClient, TcpOptions};
 use super::{Interface, InterfaceContext, InterfaceManager};
 
 pub struct TcpServer {
@@ -47,10 +47,6 @@ impl TcpServer {
 
     pub fn options(&self) -> &TcpOptions {
         &self.options
-    }
-
-    pub fn hardware_mtu(&self) -> usize {
-        self.options.hardware_mtu()
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -148,17 +144,14 @@ impl TcpServer {
                             // worker may otherwise begin decoding a frame
                             // before the slot is populated.
                             let inherited = server_ifac.read().expect("ifac lock").clone();
-                            let peer = match TcpClient::new_from_stream_with_options(
+                            // Server options were already validated. The
+                            // accepted client only copies framing and
+                            // fixed_mtu, so this cannot fail.
+                            let peer = TcpClient::from_parts(
                                 client.1.to_string(),
-                                client.0,
+                                Some(client.0),
                                 options.for_accepted_client(),
-                            ) {
-                                Ok(peer) => peer,
-                                Err(err) => {
-                                    log::warn!("tcp_server: dropping client, invalid options: {err:?}");
-                                    continue;
-                                }
-                            };
+                            );
 
                             let _address = if let Some(key) = inherited {
                                 iface_manager.spawn_with_ifac(
@@ -206,8 +199,7 @@ mod tests {
         assert!(server.options().fixed_mtu.is_none());
         assert!(server.options().max_reconnect_tries.is_none());
         assert!(server.options().connect_timeout.is_none());
-        assert!(server.options().autoconfigure_mtu());
-        assert_eq!(server.hardware_mtu(), 262_144);
+        assert_eq!(server.options().hardware_mtu(), 262_144);
         assert_eq!(<TcpServer as Interface>::mtu(), 2048);
     }
 

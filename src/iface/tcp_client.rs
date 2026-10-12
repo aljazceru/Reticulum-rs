@@ -90,25 +90,9 @@ impl TcpOptions {
         Ok(())
     }
 
-    /// Hardware MTU for link MTU discovery. `fixed_mtu` wins; otherwise
-    /// [`HW_MTU`] (262144).
+    /// Hardware MTU for a fixed limit, otherwise [`HW_MTU`] (262144).
     pub fn hardware_mtu(&self) -> usize {
         self.fixed_mtu.unwrap_or(HW_MTU)
-    }
-
-    /// Python `AUTOCONFIGURE_MTU`, cleared when `fixed_mtu` is set.
-    pub fn autoconfigure_mtu(&self) -> bool {
-        self.fixed_mtu.is_none()
-    }
-
-    /// Python `FIXED_MTU`.
-    pub fn fixed_mtu_set(&self) -> bool {
-        self.fixed_mtu.is_some()
-    }
-
-    /// Effective timeout: the configured value, or Python's 5s default.
-    pub fn effective_connect_timeout(&self) -> u64 {
-        self.connect_timeout.unwrap_or(INITIAL_CONNECT_TIMEOUT)
     }
 
     /// Options copied onto a client accepted by a TCP server. Accepted
@@ -161,7 +145,7 @@ impl TcpClient {
         Ok(Self::from_parts(addr.into(), Some(stream), options))
     }
 
-    fn from_parts(addr: String, stream: Option<TcpStream>, options: TcpOptions) -> Self {
+    pub(crate) fn from_parts(addr: String, stream: Option<TcpStream>, options: TcpOptions) -> Self {
         Self {
             addr,
             stream,
@@ -171,14 +155,6 @@ impl TcpClient {
 
     pub fn options(&self) -> &TcpOptions {
         &self.options
-    }
-
-    pub fn hardware_mtu(&self) -> usize {
-        self.options.hardware_mtu()
-    }
-
-    pub fn autoconfigure_mtu(&self) -> bool {
-        self.options.autoconfigure_mtu()
     }
 
     pub async fn spawn(context: InterfaceContext<TcpClient>) {
@@ -194,6 +170,8 @@ impl TcpClient {
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
         let mut running = true;
+        // Per outage, matching `TCPClientInterface.reconnect` (`attempts = 0`
+        // each time that runs). The first dial stays immediate.
         let mut reconnect_attempts: u32 = 0;
         'outer: loop {
             if !running || context.cancel.is_cancelled() {
@@ -226,27 +204,12 @@ impl TcpClient {
             stats.set_online(false);
             if stream.is_err() {
                 log::info!("tcp_client: couldn't connect to <{}>", addr);
-                let retry_at =
-                    tokio::time::Instant::now() + Duration::from_secs(RECONNECT_WAIT_SECS);
-
-                loop {
-                    let mut tx_channel = tx_channel.lock().await;
-
-                    tokio::select! {
-                        biased;
-                        _ = context.cancel.cancelled() => {
-                            break 'outer;
-                        }
-                        Some(_) = tx_channel.recv() => {}
-                        _ = tokio::time::sleep_until(retry_at) => {
-                            break;
-                        }
-                    }
+                if !pause_before_reconnect(&context.cancel, &tx_channel).await {
+                    break 'outer;
                 }
-                // Python increments after RECONNECT_WAIT and stops once
-                // `attempts > max_reconnect_tries`. `None` never stops.
-                reconnect_attempts = reconnect_attempts.saturating_add(1);
-                if !reconnect_permitted(reconnect_attempts, options.max_reconnect_tries) {
+                // `initial_connect` failed, so this is `reconnect`: the
+                // wait already elapsed, and `attempts > max` skips the dial.
+                if !reconnect_after_wait(&mut reconnect_attempts, options.max_reconnect_tries) {
                     log::error!("tcp_client: max reconnection attempts reached for <{addr}>");
                     break 'outer;
                 }
@@ -260,6 +223,10 @@ impl TcpClient {
             let (read_stream, write_stream) = stream.into_split();
 
             stats.set_online(true);
+            // A live session starts a fresh outage budget. Leaving the old
+            // count in place would make `max_reconnect_tries` a process
+            // lifetime cap instead of Python's per-drop cap.
+            note_session_live(&mut reconnect_attempts);
             log::info!("tcp_client connected to <{}>", addr);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
@@ -457,6 +424,20 @@ impl TcpClient {
 
             stats.set_online(false);
             log::info!("tcp_client: disconnected from <{}>", addr);
+
+            // Accepted sockets set `running` false and must not dial.
+            // An initiator waits, then applies `attempts > max`, before
+            // the next `connect_once`. The startup dial above is not gated.
+            if !running || context.cancel.is_cancelled() {
+                break;
+            }
+            if !pause_before_reconnect(&context.cancel, &tx_channel).await {
+                break;
+            }
+            if !reconnect_after_wait(&mut reconnect_attempts, options.max_reconnect_tries) {
+                log::error!("tcp_client: max reconnection attempts reached for <{addr}>");
+                break 'outer;
+            }
         }
 
         iface_stop.cancel();
@@ -533,6 +514,38 @@ fn reconnect_permitted(attempts: u32, max_reconnect_tries: Option<u32>) -> bool 
     }
 }
 
+/// `reconnect` assigns `attempts = 0` for the outage that follows a live session.
+fn note_session_live(attempts: &mut u32) {
+    *attempts = 0;
+}
+
+/// After `RECONNECT_WAIT`, increment and report whether the next dial may run.
+fn reconnect_after_wait(attempts: &mut u32, max_reconnect_tries: Option<u32>) -> bool {
+    *attempts = attempts.saturating_add(1);
+    reconnect_permitted(*attempts, max_reconnect_tries)
+}
+
+/// Drain outbound packets until `RECONNECT_WAIT` elapses. `false` means stop.
+async fn pause_before_reconnect(
+    cancel: &CancellationToken,
+    tx_channel: &Arc<tokio::sync::Mutex<super::InterfaceTxReceiver>>,
+) -> bool {
+    let retry_at = tokio::time::Instant::now() + Duration::from_secs(RECONNECT_WAIT_SECS);
+    loop {
+        let mut tx_channel = tx_channel.lock().await;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return false;
+            }
+            Some(_) = tx_channel.recv() => {}
+            _ = tokio::time::sleep_until(retry_at) => {
+                return true;
+            }
+        }
+    }
+}
+
 pub(crate) async fn resolve_bind_target(addr: &str, options: &TcpOptions) -> Option<BindTarget> {
     if options.device.is_none() && !options.prefer_ipv6 {
         return Some(BindTarget::Literal(addr.to_string()));
@@ -555,7 +568,7 @@ fn split_port(addr: &str) -> Option<u16> {
     port.parse().ok()
 }
 
-pub(crate) fn select_resolved(addrs: &[SocketAddr], prefer_ipv6: bool) -> Option<SocketAddr> {
+fn select_resolved(addrs: &[SocketAddr], prefer_ipv6: bool) -> Option<SocketAddr> {
     if addrs.is_empty() {
         return None;
     }
@@ -569,12 +582,12 @@ pub(crate) fn select_resolved(addrs: &[SocketAddr], prefer_ipv6: bool) -> Option
     Some(addrs[0])
 }
 
-pub(crate) async fn resolve_preferred(addr: &str, prefer_ipv6: bool) -> Option<SocketAddr> {
+async fn resolve_preferred(addr: &str, prefer_ipv6: bool) -> Option<SocketAddr> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr).await.ok()?.collect();
     select_resolved(&addrs, prefer_ipv6)
 }
 
-pub(crate) fn device_socket_addr(name: &str, port: u16, prefer_ipv6: bool) -> Option<SocketAddr> {
+fn device_socket_addr(name: &str, port: u16, prefer_ipv6: bool) -> Option<SocketAddr> {
     #[cfg(target_os = "linux")]
     {
         linux_device_addr(name, port, prefer_ipv6)
@@ -612,6 +625,9 @@ fn ipv4_for_device(name: &str) -> Option<std::net::Ipv4Addr> {
     let mut buf = [0u8; 40];
     buf[..name.len()].copy_from_slice(name.as_bytes());
     // SIOCGIFADDR. Address bytes sit at offset 20 of `struct ifreq`.
+    // The request argument is `unsigned long` (`libc::c_ulong`); a `u64`
+    // is the wrong C ABI on ILP32. libc stays behind `iface-serial`, so
+    // this uses the same type from std.
     let rc = unsafe { ioctl(socket.as_raw_fd(), 0x8915, buf.as_mut_ptr()) };
     if rc < 0 {
         return None;
@@ -654,7 +670,7 @@ fn ipv6_for_device(name: &str) -> Option<(std::net::Ipv6Addr, u32, bool)> {
 
 #[cfg(target_os = "linux")]
 extern "C" {
-    fn ioctl(fd: i32, request: u64, argp: *mut u8) -> i32;
+    fn ioctl(fd: i32, request: std::os::raw::c_ulong, argp: *mut u8) -> i32;
 }
 
 async fn deliver_frame(
@@ -779,9 +795,7 @@ mod tests {
         assert!(client.options().fixed_mtu.is_none());
         assert_eq!(client.options().max_reconnect_tries, RECONNECT_MAX_TRIES);
         assert!(client.options().connect_timeout.is_none());
-        assert!(client.autoconfigure_mtu());
-        assert!(!client.options().fixed_mtu_set());
-        assert_eq!(client.hardware_mtu(), 262_144);
+        assert_eq!(client.options().hardware_mtu(), 262_144);
         assert_eq!(<TcpClient as Interface>::mtu(), 2048);
         // Plain connect: no timeout cap, so a slow handshake still behaves
         // the way `TcpClient::new` did before these knobs existed.
@@ -801,17 +815,45 @@ mod tests {
         let mut options = TcpOptions::default();
         options.fixed_mtu = Some(crate::packet::PROTOCOL_MTU);
         let client = TcpClient::with_options("127.0.0.1:1", options).unwrap();
-        assert_eq!(client.hardware_mtu(), crate::packet::PROTOCOL_MTU);
-        assert!(!client.autoconfigure_mtu());
-        assert!(client.options().fixed_mtu_set());
+        assert_eq!(
+            client.options().fixed_mtu,
+            Some(crate::packet::PROTOCOL_MTU)
+        );
+        assert_eq!(client.options().hardware_mtu(), crate::packet::PROTOCOL_MTU);
     }
 
     #[test]
     fn reconnect_limit_matches_python() {
+        // One fresh outage: the immediate dial is not counted. After the
+        // wait, `attempts > max` stops. `None` never stops.
         assert!(reconnect_permitted(1, None));
         assert!(reconnect_permitted(1, Some(1)));
         assert!(!reconnect_permitted(1, Some(0)));
         assert!(!reconnect_permitted(2, Some(1)));
+
+        let mut attempts = 0;
+        assert!(!reconnect_after_wait(&mut attempts, Some(0)));
+
+        let mut attempts = 0;
+        assert!(reconnect_after_wait(&mut attempts, Some(1)));
+        assert!(!reconnect_after_wait(&mut attempts, Some(1)));
+
+        // A later live session clears a spent cap. The next outage counts
+        // from zero after its own wait, before the next dial.
+        let mut attempts = 2;
+        note_session_live(&mut attempts);
+        assert_eq!(attempts, 0);
+        assert!(reconnect_after_wait(&mut attempts, Some(1)));
+        note_session_live(&mut attempts);
+        assert!(reconnect_after_wait(&mut attempts, Some(1)));
+
+        let mut attempts = 5;
+        note_session_live(&mut attempts);
+        assert!(!reconnect_after_wait(&mut attempts, Some(0)));
+
+        let mut attempts = 0;
+        assert!(reconnect_after_wait(&mut attempts, None));
+        assert!(reconnect_after_wait(&mut attempts, None));
     }
 
     #[test]
@@ -822,7 +864,6 @@ mod tests {
             connect_budget(&options),
             Some(Duration::from_secs(INITIAL_CONNECT_TIMEOUT))
         );
-        assert_eq!(options.effective_connect_timeout(), 5);
     }
 
     #[test]

@@ -14,37 +14,25 @@ use super::{Interface, InterfaceContext};
 // TODO: Configure via features
 const PACKET_TRACE: bool = true;
 
-/// Python `UDPInterface.HW_MTU`. Link MTU discovery clamps against this
-/// hardware MTU; the packet MDU ([`Interface::mtu`]) stays 2048.
+/// Python `UDPInterface.HW_MTU`. This is the hardware MTU, not the
+/// next-hop MTU (`next_hop_interface_hw_mtu` is `None` for UDP) and not
+/// the packet MDU ([`Interface::mtu`] is 2048).
 pub const HW_MTU: usize = 1064;
 
 pub struct UdpInterface {
     bind_addr: String,
     forward_addr: Option<String>,
-    broadcast: bool,
 }
 
 impl UdpInterface {
     pub fn new<T: Into<String>>(bind_addr: T, forward_addr: Option<T>, broadcast: bool) -> Self {
-        // Python sets SO_BROADCAST on every transmit socket and has no
-        // off switch. Callers (including the daemon) still pass `false`;
-        // that must not disable the option.
+        // Python sets SO_BROADCAST on every socket and has no off switch.
+        // Existing callers pass `false`; that argument must not disable it.
         let _ = broadcast;
         Self {
             bind_addr: bind_addr.into(),
             forward_addr: forward_addr.map(Into::into),
-            broadcast: true,
         }
-    }
-
-    /// Whether the socket is created with `SO_BROADCAST` (always, matching Python).
-    pub fn broadcast(&self) -> bool {
-        self.broadcast
-    }
-
-    /// Hardware MTU consulted by link MTU discovery (`UDPInterface.HW_MTU`).
-    pub fn hardware_mtu() -> usize {
-        HW_MTU
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -216,9 +204,7 @@ impl UdpInterface {
 
 /// Bind a UDP socket the way `UDPInterface` does. `SO_BROADCAST` is always
 /// set (`UDPInterface.process_outgoing`); there is no Python off switch.
-pub(crate) async fn bind_udp_socket(
-    addr: impl tokio::net::ToSocketAddrs,
-) -> std::io::Result<UdpSocket> {
+async fn bind_udp_socket(addr: impl tokio::net::ToSocketAddrs) -> std::io::Result<UdpSocket> {
     let socket = UdpSocket::bind(addr).await?;
     if let Err(err) = socket.set_broadcast(true) {
         log::error!("error setting broadcast: {err}");
@@ -228,7 +214,8 @@ pub(crate) async fn bind_udp_socket(
 
 impl Interface for UdpInterface {
     fn mtu() -> usize {
-        // Packet MDU. Do not replace this with [`HW_MTU`] (1064).
+        // Packet MDU. [`HW_MTU`] is the Python hardware MTU, not this value
+        // and not the next-hop MTU.
         2048
     }
 }
@@ -238,20 +225,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn udp_broadcast_defaults_on_and_hw_mtu_is_1064() {
-        let iface = UdpInterface::new("127.0.0.1:4242", None::<&str>, false);
-        assert!(iface.broadcast());
-        assert_eq!(UdpInterface::hardware_mtu(), 1064);
+    fn udp_hw_mtu_is_python_hardware_mtu_not_packet_mdu() {
+        // `false` is what existing callers pass. Spawn ignores it and
+        // always sets SO_BROADCAST in `bind_udp_socket`.
+        let _iface = UdpInterface::new("127.0.0.1:4242", None::<&str>, false);
         assert_eq!(HW_MTU, 1064);
         assert_eq!(<UdpInterface as Interface>::mtu(), 2048);
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn udp_socket_is_created_with_broadcast_enabled() {
+        // Same bind `spawn` uses.
         let socket = bind_udp_socket("127.0.0.1:0").await.unwrap();
         assert!(
             socket_broadcast_enabled(&socket),
-            "SO_BROADCAST must be set, including when callers pass broadcast=false"
+            "SO_BROADCAST must be set on the socket spawn binds"
         );
     }
 
@@ -271,14 +260,6 @@ mod tests {
             )
         };
         rc == 0 && value != 0
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn socket_broadcast_enabled(socket: &UdpSocket) -> bool {
-        // Non-Linux hosts still go through `set_broadcast(true)` in
-        // `bind_udp_socket`; there is no portable getter.
-        let _ = socket;
-        true
     }
 }
 

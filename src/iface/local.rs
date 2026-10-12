@@ -29,9 +29,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
-use crate::iface::RxMessage;
 use crate::iface::hdlc::Hdlc;
 use crate::iface::hdlc::HdlcDecoder;
+use crate::iface::RxMessage;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -45,13 +45,13 @@ pub const SHARED_INSTANCE_PORT: u16 = 37428;
 /// `LocalClientInterface.RECONNECT_WAIT` in seconds
 pub const RECONNECT_WAIT: Duration = Duration::from_secs(8);
 
-/// Bitrate of the local shared instance (`LocalClientInterface` /
-/// `LocalServerInterface` both use 1e9).
-pub const BITRATE_BPS: u64 = 1_000_000_000;
+/// Hardware MTU from `AUTOCONFIGURE_MTU` at 1e9 bps (`Interface.optimise_mtu`).
+pub const HW_MTU: usize = 524_288;
 
-/// `Interface.optimise_mtu` for `AUTOCONFIGURE_MTU` interfaces.
-/// `None` when the bitrate is below the lowest tier (Python sets `HW_MTU = None`).
-pub const fn optimise_mtu(bitrate_bps: u64) -> Option<usize> {
+/// `Interface.optimise_mtu` tiers. Test-only: the local interface always
+/// uses [`HW_MTU`], and a non-test copy would be dead.
+#[cfg(test)]
+const fn optimise_mtu(bitrate_bps: u64) -> Option<usize> {
     if bitrate_bps >= 1_000_000_000 {
         Some(524_288)
     } else if bitrate_bps >= 750_000_000 {
@@ -76,12 +76,6 @@ pub const fn optimise_mtu(bitrate_bps: u64) -> Option<usize> {
         None
     }
 }
-
-/// Hardware MTU after `AUTOCONFIGURE_MTU` at [`BITRATE_BPS`] (1e9 → 524288).
-pub const HW_MTU: usize = match optimise_mtu(BITRATE_BPS) {
-    Some(mtu) => mtu,
-    None => panic!("local bitrate must yield a hardware MTU"),
-};
 
 /// Python ignores frames of at most `Reticulum.HEADER_MINSIZE` bytes
 /// (2 + 1 + TRUNCATED_HASHLENGTH/8 = 19).
@@ -871,9 +865,8 @@ mod tests {
 
     #[test]
     fn autoconfigure_mtu_at_1e9_is_524288() {
-        assert_eq!(BITRATE_BPS, 1_000_000_000);
-        assert_eq!(optimise_mtu(BITRATE_BPS), Some(524_288));
         assert_eq!(HW_MTU, 524_288);
+        assert_eq!(optimise_mtu(1_000_000_000), Some(HW_MTU));
         assert_eq!(<LocalClient as Interface>::mtu(), 524_288);
         assert_eq!(<LocalServer as Interface>::mtu(), 524_288);
 
