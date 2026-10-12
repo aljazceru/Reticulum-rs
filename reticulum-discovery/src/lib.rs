@@ -138,14 +138,6 @@ fn is_invalid_ip_address(address: &str) -> bool {
     INVALID_IP_ADDRESSES.contains(&address)
 }
 
-/// Yggdrasil addresses (Python `is_ygg_ipv6`, network `200::/7`).
-fn is_ygg_ipv6(address: &str) -> bool {
-    match address.parse::<std::net::Ipv6Addr>() {
-        Ok(ip) => ip.octets()[0] & 0xfe == 0x02,
-        Err(_) => false,
-    }
-}
-
 /// Python `InterfaceAnnouncer.sanitize`: drop CR/LF and surrounding space.
 fn sanitize_text(value: &str) -> String {
     value.replace(['\n', '\r'], "").trim().to_string()
@@ -234,6 +226,13 @@ fn system_from_unix(unix: f64) -> SystemTime {
         return UNIX_EPOCH;
     }
     UNIX_EPOCH + Duration::from_secs_f64(unix)
+}
+
+fn unix_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 // Discovery information wire keys (Python `RNS/Discovery.py`). The
@@ -789,14 +788,6 @@ impl DiscoveredStatus {
             Self::Available
         }
     }
-
-    fn rank(self) -> u16 {
-        match self {
-            Self::Available => 1000,
-            Self::Unknown => 100,
-            Self::Stale => 0,
-        }
-    }
 }
 
 /// A tracked discovered interface (Python persisted `info` record).
@@ -808,17 +799,26 @@ pub struct DiscoveredInterface {
     /// Stamp value of the accepted announce.
     pub value: u64,
     pub hops: u8,
-    pub discovered: SystemTime,
-    pub last_heard: SystemTime,
+    pub discovered: tokio::time::Instant,
+    pub last_heard: tokio::time::Instant,
     pub heard_count: usize,
+    /// Unix `discovered` and `last_heard` stored in the discovery directory.
+    /// Age checks use these values, including after load.
+    recorded_unix: Option<(f64, f64)>,
 }
 
 impl DiscoveredInterface {
+    fn heard_age(&self) -> Duration {
+        if let Some((_, last_heard)) = self.recorded_unix {
+            return SystemTime::now()
+                .duration_since(system_from_unix(last_heard))
+                .unwrap_or_default();
+        }
+        self.last_heard.elapsed()
+    }
+
     pub fn status(&self) -> DiscoveredStatus {
-        let age = SystemTime::now()
-            .duration_since(self.last_heard)
-            .unwrap_or_default();
-        DiscoveredStatus::from_age(age)
+        DiscoveredStatus::from_age(self.heard_age())
     }
 
     /// Endpoint hash for duplicate detection (Python `endpoint_hash`):
@@ -855,6 +855,8 @@ fn discovery_dir(storage: &Path) -> PathBuf {
 
 fn write_stored(entry: &DiscoveredInterface) -> Vec<u8> {
     use rmp::encode as mp;
+    let now_unix = unix_now();
+    let (discovered_unix, last_heard_unix) = entry.recorded_unix.unwrap_or((now_unix, now_unix));
     let mut fields: Vec<(&str, WireValue)> = vec![
         ("type", WireValue::Str(entry.info.interface_type.clone())),
         (
@@ -887,26 +889,8 @@ fn write_stored(entry: &DiscoveredInterface) -> Vec<u8> {
         ("hops", WireValue::Uint(entry.hops as u64)),
         ("value", WireValue::Uint(entry.value)),
         ("heard_count", WireValue::Uint(entry.heard_count as u64)),
-        (
-            "discovered",
-            WireValue::Float(
-                entry
-                    .discovered
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64(),
-            ),
-        ),
-        (
-            "last_heard",
-            WireValue::Float(
-                entry
-                    .last_heard
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64(),
-            ),
-        ),
+        ("discovered", WireValue::Float(discovered_unix)),
+        ("last_heard", WireValue::Float(last_heard_unix)),
     ];
     if let Some(host) = &entry.info.reachable_on {
         fields.push(("reachable_on", WireValue::Str(host.clone())));
@@ -1033,7 +1017,17 @@ fn read_stored(bytes: &[u8]) -> Option<DiscoveredInterface> {
             _ => None,
         }
     };
-    let now = SystemTime::now();
+    let now_unix = unix_now();
+    let discovered_unix = float_opt("discovered").unwrap_or(now_unix);
+    let last_heard_unix = float_opt("last_heard").unwrap_or(discovered_unix);
+    let instant_at = |unix: f64| {
+        let age = SystemTime::now()
+            .duration_since(system_from_unix(unix))
+            .unwrap_or_default();
+        tokio::time::Instant::now()
+            .checked_sub(age)
+            .unwrap_or_else(tokio::time::Instant::now)
+    };
     let name = str_opt("name")
         .and_then(|name| sanitize_name(&name))
         .unwrap_or_else(|| format!("Discovered {interface_type}"));
@@ -1076,20 +1070,13 @@ fn read_stored(bytes: &[u8]) -> Option<DiscoveredInterface> {
             .and_then(|v| v.as_u64())
             .and_then(|v| u8::try_from(v).ok())
             .unwrap_or(u8::MAX),
-        discovered: fields
-            .get("discovered")
-            .and_then(|v| v.as_f64())
-            .map(system_from_unix)
-            .unwrap_or(now),
-        last_heard: fields
-            .get("last_heard")
-            .and_then(|v| v.as_f64())
-            .map(system_from_unix)
-            .unwrap_or(now),
+        discovered: instant_at(discovered_unix),
+        last_heard: instant_at(last_heard_unix),
         heard_count: fields
             .get("heard_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as usize,
+        recorded_unix: Some((discovered_unix, last_heard_unix)),
     })
 }
 
@@ -1492,13 +1479,18 @@ impl InterfaceDiscovery {
             {
                 Some(entry) => {
                     let discovered_at = entry.discovered;
+                    let discovered_unix = entry
+                        .recorded_unix
+                        .map(|(at, _)| at)
+                        .unwrap_or_else(unix_now);
                     let heard_count = entry.heard_count + 1;
                     entry.info = info;
                     entry.network_id = network_id;
                     entry.value = value;
                     entry.hops = hops;
                     entry.discovered = discovered_at;
-                    entry.last_heard = SystemTime::now();
+                    entry.last_heard = tokio::time::Instant::now();
+                    entry.recorded_unix = Some((discovered_unix, unix_now()));
                     entry.heard_count = heard_count;
                     entry.clone()
                 }
@@ -1507,14 +1499,17 @@ impl InterfaceDiscovery {
                         "discovery: discovered {} (stamp value {value})",
                         info.name.as_deref().unwrap_or(&info.interface_type)
                     );
+                    let now = tokio::time::Instant::now();
+                    let now_unix = unix_now();
                     let entry = DiscoveredInterface {
                         info,
                         network_id,
                         value,
                         hops,
-                        discovered: SystemTime::now(),
-                        last_heard: SystemTime::now(),
+                        discovered: now,
+                        last_heard: now,
                         heard_count: 0,
+                        recorded_unix: Some((now_unix, now_unix)),
                     };
                     table.push(entry.clone());
                     entry
@@ -1537,9 +1532,7 @@ impl InterfaceDiscovery {
         let blackholes = self.transport.blackholes();
         let blackholes = blackholes.read().await;
         table.retain(|entry| {
-            let age = SystemTime::now()
-                .duration_since(entry.last_heard)
-                .unwrap_or_default();
+            let age = entry.heard_age();
             let host_ok = match entry.info.reachable_on.as_deref() {
                 Some(host) => !host.is_empty() && (is_ip_address(host) || is_hostname(host)),
                 None => true,
@@ -1564,11 +1557,18 @@ impl InterfaceDiscovery {
             }
         }
         table.sort_by(|a, b| {
-            b.status()
-                .rank()
-                .cmp(&a.status().rank())
-                .then(b.value.cmp(&a.value))
-                .then(b.last_heard.cmp(&a.last_heard))
+            match b.status() {
+                DiscoveredStatus::Available => 1000u16,
+                DiscoveredStatus::Unknown => 100,
+                DiscoveredStatus::Stale => 0,
+            }
+            .cmp(&match a.status() {
+                DiscoveredStatus::Available => 1000,
+                DiscoveredStatus::Unknown => 100,
+                DiscoveredStatus::Stale => 0,
+            })
+            .then(b.value.cmp(&a.value))
+            .then(a.heard_age().cmp(&b.heard_age()))
         });
         table.clone()
     }
@@ -1576,7 +1576,8 @@ impl InterfaceDiscovery {
     /// Connect discovered interfaces allowed by the autoconnect policy.
     /// The default policy is backbone-only and refuses peers below
     /// version 1.5.2 or with an implementation name other than `RNS`.
-    /// Peers that are not transport nodes are skipped.
+    /// Transport peers that `list` has not removed are dialed, including
+    /// unknown and stale ones.
     pub async fn connect_discovered(&self) -> usize {
         if !*self.autoconnect.read().await {
             return 0;
@@ -1601,7 +1602,7 @@ impl InterfaceDiscovery {
             if endpoints.len() >= max {
                 break;
             }
-            if entry.status() != DiscoveredStatus::Available || !entry.info.transport {
+            if !entry.info.transport {
                 continue;
             }
             if !policy.allows(&entry.info) {
@@ -1622,17 +1623,34 @@ impl InterfaceDiscovery {
                 );
                 continue;
             }
-            let (Some(host), Some(port)) = (entry.info.reachable_on.clone(), entry.info.port)
-            else {
+            if entry.info.interface_type == "I2PInterface" {
+                log::debug!(
+                    "reticulum-rs discovery: auto-connecting discovered I2P interfaces is not implemented"
+                );
+                return connected_now;
+            }
+            let Some(host) = entry.info.reachable_on.clone() else {
                 continue;
             };
-            if is_invalid_ip_address(&host) || is_onion_address(&host) || is_ygg_ipv6(&host) {
+            let Some(port) = entry.info.port else {
+                continue;
+            };
+            let ipv6 = host.parse::<std::net::Ipv6Addr>().ok();
+            // Python `is_ygg_ipv6`: network 200::/7.
+            let ygg = ipv6
+                .as_ref()
+                .is_some_and(|ip| ip.octets()[0] & 0xfe == 0x02);
+            if is_invalid_ip_address(&host) || is_onion_address(&host) || ygg {
                 log::debug!("discovery: not auto-connecting to {host}");
                 continue;
             }
 
             let endpoint = entry.endpoint_hash();
-            let address = format!("{host}:{port}");
+            let address = if ipv6.is_some() {
+                format!("[{host}]:{port}")
+            } else {
+                format!("{host}:{port}")
+            };
             let exists = endpoints.contains(&endpoint) || {
                 let manager = self.transport.iface_manager();
                 let manager = manager.lock().await;
@@ -1645,6 +1663,12 @@ impl InterfaceDiscovery {
                 continue;
             }
 
+            if !matches!(
+                entry.info.interface_type.as_str(),
+                "BackboneInterface" | "TCPServerInterface"
+            ) {
+                continue;
+            }
             let interface_name =
                 sequential_name(entry.info.name.as_deref().unwrap_or(&address), &taken);
             taken.insert(interface_name.clone());
@@ -1655,17 +1679,18 @@ impl InterfaceDiscovery {
                 "BackboneInterface" => {
                     manager.spawn(BackboneClient::new(address.clone()), BackboneClient::spawn)
                 }
-                "TCPServerInterface" => {
-                    manager.spawn(TcpClient::new(address.clone()), TcpClient::spawn)
-                }
-                _ => continue,
+                _ => manager.spawn(TcpClient::new(address.clone()), TcpClient::spawn),
             };
             manager.set_iface_name(&ifac_address, &interface_name);
-            if let (Some(netname), Some(netkey)) = (
-                cleaned_ifac(&entry.info.ifac_netname),
-                cleaned_ifac(&entry.info.ifac_netkey),
-            ) {
-                let _ = manager.set_iface_ifac(&ifac_address, Some(&netname), Some(&netkey), 8);
+            let netname = cleaned_ifac(&entry.info.ifac_netname);
+            let netkey = cleaned_ifac(&entry.info.ifac_netkey);
+            if netname.is_some() || netkey.is_some() {
+                let _ = manager.set_iface_ifac(
+                    &ifac_address,
+                    netname.as_deref(),
+                    netkey.as_deref(),
+                    16,
+                );
             }
             drop(manager);
 
@@ -1836,10 +1861,18 @@ mod addr_tests {
         assert!(super::is_onion_address("abc123.onion"));
         assert!(super::is_invalid_ip_address("127.0.0.1"));
         assert!(!super::is_invalid_ip_address("10.0.0.1"));
-        assert!(super::is_ygg_ipv6("200::1"));
-        assert!(super::is_ygg_ipv6("201::1"));
-        assert!(!super::is_ygg_ipv6("2001::1"));
-        assert!(!super::is_ygg_ipv6("gw.example"));
+        assert!("200::1"
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.octets()[0] & 0xfe == 0x02));
+        assert!("201::1"
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.octets()[0] & 0xfe == 0x02));
+        assert!(!"2001::1"
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.octets()[0] & 0xfe == 0x02));
+        assert!(!"gw.example"
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.octets()[0] & 0xfe == 0x02));
     }
 }
 
@@ -2003,7 +2036,8 @@ mod tests {
         info.spreadingfactor = Some(8);
         info.codingrate = Some("5".to_string());
         info.ifac_netname = Some("None".to_string());
-        let now = SystemTime::now();
+        let now = tokio::time::Instant::now();
+        let heard = unix_now() - (4 * 24 * 60 * 60) as f64;
         let entry = DiscoveredInterface {
             info,
             network_id: Hash::new([0x22; 32]),
@@ -2012,6 +2046,7 @@ mod tests {
             discovered: now,
             last_heard: now,
             heard_count: 0,
+            recorded_unix: Some((heard, heard)),
         };
         persist_entry(&dir, &entry);
         let path = discovery_dir(&dir).join(discovery_file_id(&entry.info));
@@ -2023,6 +2058,8 @@ mod tests {
         assert_eq!(loaded[0].info.codingrate.as_deref(), Some("5"));
         assert_eq!(loaded[0].info.ifac_netname, None);
         assert_eq!(loaded[0].value, 4);
+        assert_eq!(loaded[0].status(), DiscoveredStatus::Stale);
+        assert!(loaded[0].heard_age() < THRESHOLD_REMOVE);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

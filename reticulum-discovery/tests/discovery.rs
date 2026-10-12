@@ -128,9 +128,9 @@ async fn discovery_announce_validate_and_autoconnect() {
     assert_eq!(table[0].info.transport_impl.as_deref(), Some("RNS"));
     assert_eq!(table[0].info.transport_vers.as_deref(), Some("1.5.5"));
 
-    // Python autoconnects only BackboneInterface peers unless a policy
-    // names another type. The wire identity is RNS 1.5.5, which passes
-    // the version gate.
+    // Python dials only BackboneInterface. This test widens the Rust
+    // AutoconnectPolicy to TCPServerInterface. The wire identity is
+    // RNS 1.5.5, which passes the version gate.
     assert_eq!(discovery.connect_discovered().await, 0);
     discovery
         .set_autoconnect_policy(AutoconnectPolicy {
