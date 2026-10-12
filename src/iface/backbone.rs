@@ -732,9 +732,6 @@ pub struct BackboneServer {
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     /// Fast-flapping suppression table shared with spawned peers.
     pub fast_flap: Arc<tokio::sync::Mutex<FastFlapTable>>,
-    /// Constructor bitrate (Python `BITRATE_GUESS`, or [`Self::with_bitrate`]).
-    /// Zero is published as [`BITRATE_GUESS`].
-    bitrate: u64,
 }
 
 impl BackboneServer {
@@ -747,14 +744,7 @@ impl BackboneServer {
             addr: addr.into(),
             iface_manager,
             fast_flap,
-            bitrate: BITRATE_GUESS,
         }
-    }
-
-    /// Override the bitrate `optimise_mtu` uses for this listener.
-    pub fn with_bitrate(mut self, bitrate: u64) -> Self {
-        self.bitrate = bitrate;
-        self
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -871,7 +861,7 @@ impl Interface for BackboneServer {
     }
 
     fn constructor_bitrate(&self) -> Option<u64> {
-        Some(bitrate_or_guess(self.bitrate))
+        Some(BITRATE_GUESS)
     }
 }
 
@@ -1035,7 +1025,6 @@ mod tests {
                     FAST_FLAP_EXPIRY,
                 ))),
             )
-            .with_bitrate(0)
             .constructor_bitrate(),
             Some(BITRATE_GUESS)
         );
