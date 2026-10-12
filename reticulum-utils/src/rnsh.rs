@@ -512,6 +512,7 @@ async fn start_session(
     tokio::spawn(async move {
         let mut session: Option<SessionProcess> = None;
         let mut version_exchanged = false;
+        let mut stdin_is_pipe = false;
 
         while let Ok(message) = receiver.recv().await {
             match message {
@@ -555,6 +556,7 @@ async fn start_session(
                     hpix,
                     vpix,
                 } if version_exchanged => {
+                    stdin_is_pipe = pipe_stdin;
                     let mut command = default_command.clone().unwrap_or_default();
                     match cmdline {
                         Some(remote) if !remote.is_empty() => {
@@ -785,7 +787,8 @@ async fn start_session(
                         }
                         if eof {
                             stdin.take();
-                            if session_leader {
+                            // A pipe must drain. Tear down only when stdin is the PTY.
+                            if !stdin_is_pipe && session_leader {
                                 let _ = halt_input.send(()).await;
                                 break;
                             }
@@ -2095,5 +2098,47 @@ mod tests {
             .expect("child still running")
             .expect("wait");
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn piped_stdin_pty_stdout_eof_lets_child_finish() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "trap 'printf signaled; exit 42' TERM HUP; sleep 0.4; printf 'ok:%s' \"$(cat)\""
+                .to_string(),
+        ];
+        let mut proc = spawn_session_process(&argv, true, false, true, Some("xterm"), None, None)
+            .expect("spawn");
+        let mut stdin = proc.take_stdin().expect("stdin pipe");
+        let mut stdout = proc.take_stdout().expect("pty stdout");
+        stdin.write_all(b"hello\n").await.expect("write");
+        drop(stdin);
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            if String::from_utf8_lossy(&got).contains("ok:hello") {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(200), stdout.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Err(_) => {}
+            }
+        }
+        let text = String::from_utf8_lossy(&got);
+        assert!(
+            text.contains("ok:hello"),
+            "child did not finish after stdin EOF: {text:?}"
+        );
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), proc.wait())
+            .await
+            .expect("child still running")
+            .expect("wait");
+        assert!(status.success(), "{status:?}");
     }
 }
