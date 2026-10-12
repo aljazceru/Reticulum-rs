@@ -193,13 +193,16 @@ pub async fn execute_request(data: &[u8]) -> Vec<u8> {
     };
 
     // [command, timeout, o_limit, e_limit, stdin]
-    // Absent or non-numeric timeouts fall back to 30s. A present number,
-    // including fractions and values outside 1..=3600, is used as-is.
+    // Absent or non-numeric timeouts fall back to 30s. A positive finite
+    // timeout is used as given, including fractions and values outside
+    // 1..=3600. Non-positive finite values, including +0 and -0, expire
+    // immediately. Only a non-finite positive such as +inf uses the long deadline.
     let timeout = match items.get(1).and_then(|value| value.as_f64()) {
         Some(secs) if secs.is_finite() && secs > 0.0 => {
             Duration::try_from_secs_f64(secs).unwrap_or(Duration::MAX)
         }
-        Some(secs) if !secs.is_nan() && secs.is_sign_positive() => Duration::MAX,
+        Some(secs) if secs.is_finite() => Duration::ZERO,
+        Some(secs) if secs.is_sign_positive() => Duration::MAX,
         Some(_) => Duration::ZERO,
         None => Duration::from_secs(30),
     };
@@ -703,6 +706,41 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(3),
             "stdin write ran past the deadline: {elapsed:?}"
+        );
+        assert!(decoded.executed);
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_expires_immediately() {
+        for timeout in [0.0, -0.0] {
+            let started = Instant::now();
+            let decoded = decode_exec_response(
+                &execute_request(&encode_request("sleep 30", timeout, Some(0), Some(0), None))
+                    .await,
+            )
+            .unwrap();
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "timeout {timeout} waited {elapsed:?} instead of expiring immediately"
+            );
+            assert!(decoded.executed);
+        }
+
+        use rmp::encode as mp;
+        let mut request = Vec::new();
+        mp::write_array_len(&mut request, 5).unwrap();
+        mp::write_bin(&mut request, b"sleep 30").unwrap();
+        mp::write_u64(&mut request, 0).unwrap();
+        mp::write_nil(&mut request).unwrap();
+        mp::write_nil(&mut request).unwrap();
+        mp::write_nil(&mut request).unwrap();
+        let started = Instant::now();
+        let decoded = decode_exec_response(&execute_request(&request).await).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "integer timeout 0 waited {elapsed:?} instead of expiring immediately"
         );
         assert!(decoded.executed);
     }
