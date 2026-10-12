@@ -5,12 +5,13 @@ use tokio::net::TcpListener;
 
 use crate::error::RnsError;
 
-use super::tcp_client::TcpClient;
+use super::tcp_client::{BindTarget, TcpClient, TcpOptions, resolve_bind_target};
 use super::{Interface, InterfaceContext, InterfaceManager};
 
 pub struct TcpServer {
     addr: String,
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+    options: TcpOptions,
 }
 
 impl TcpServer {
@@ -18,14 +19,43 @@ impl TcpServer {
         addr: T,
         iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     ) -> Self {
+        Self::from_parts(addr.into(), iface_manager, TcpOptions::default())
+    }
+
+    /// `new` plus Python TCP server knobs. `fixed_mtu` below `Reticulum.MTU`
+    /// is rejected; omitted options match [`TcpServer::new`].
+    pub fn with_options<T: Into<String>>(
+        addr: T,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+        options: TcpOptions,
+    ) -> Result<Self, RnsError> {
+        options.validate()?;
+        Ok(Self::from_parts(addr.into(), iface_manager, options))
+    }
+
+    fn from_parts(
+        addr: String,
+        iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
+        options: TcpOptions,
+    ) -> Self {
         Self {
-            addr: addr.into(),
+            addr,
             iface_manager,
+            options,
         }
+    }
+
+    pub fn options(&self) -> &TcpOptions {
+        &self.options
+    }
+
+    pub fn hardware_mtu(&self) -> usize {
+        self.options.hardware_mtu()
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let addr = { context.inner.lock().unwrap().addr.clone() };
+        let options = { context.inner.lock().unwrap().options.clone() };
         let stats = context.channel.stats.clone();
 
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
@@ -40,9 +70,19 @@ impl TcpServer {
                 break;
             }
 
-            let listener = TcpListener::bind(addr.clone())
-                .await
-                .map_err(|_| RnsError::ConnectionError);
+            let bind_target = match resolve_bind_target(&addr, &options).await {
+                Some(target) => target,
+                None => {
+                    log::warn!("tcp_server: couldn't resolve bind address for <{}>", addr);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+            let listener = match &bind_target {
+                BindTarget::Literal(name) => TcpListener::bind(name.clone()).await,
+                BindTarget::Resolved(socket_addr) => TcpListener::bind(*socket_addr).await,
+            }
+            .map_err(|_| RnsError::ConnectionError);
 
             if listener.is_err() {
                 log::warn!("tcp_server: couldn't bind to <{}>", addr);
@@ -108,7 +148,17 @@ impl TcpServer {
                             // worker may otherwise begin decoding a frame
                             // before the slot is populated.
                             let inherited = server_ifac.read().expect("ifac lock").clone();
-                            let peer = TcpClient::new_from_stream(client.1.to_string(), client.0);
+                            let peer = match TcpClient::new_from_stream_with_options(
+                                client.1.to_string(),
+                                client.0,
+                                options.for_accepted_client(),
+                            ) {
+                                Ok(peer) => peer,
+                                Err(err) => {
+                                    log::warn!("tcp_server: dropping client, invalid options: {err:?}");
+                                    continue;
+                                }
+                            };
 
                             let _address = if let Some(key) = inherited {
                                 iface_manager.spawn_with_ifac(
@@ -136,5 +186,36 @@ impl TcpServer {
 impl Interface for TcpServer {
     fn mtu() -> usize {
         2048
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_tcp_server_options_keep_current_behavior() {
+        let server = TcpServer::new(
+            "0.0.0.0:4242",
+            Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1))),
+        );
+        assert_eq!(server.options(), &TcpOptions::default());
+        assert!(!server.options().kiss_framing);
+        assert!(!server.options().prefer_ipv6);
+        assert!(server.options().device.is_none());
+        assert!(server.options().fixed_mtu.is_none());
+        assert!(server.options().max_reconnect_tries.is_none());
+        assert!(server.options().connect_timeout.is_none());
+        assert!(server.options().autoconfigure_mtu());
+        assert_eq!(server.hardware_mtu(), 262_144);
+        assert_eq!(<TcpServer as Interface>::mtu(), 2048);
+    }
+
+    #[test]
+    fn server_rejects_fixed_mtu_below_protocol_mtu() {
+        let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1)));
+        let mut options = TcpOptions::default();
+        options.fixed_mtu = Some(499);
+        assert!(TcpServer::with_options("0.0.0.0:1", manager, options).is_err());
     }
 }

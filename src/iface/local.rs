@@ -29,9 +29,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
+use crate::iface::RxMessage;
 use crate::iface::hdlc::Hdlc;
 use crate::iface::hdlc::HdlcDecoder;
-use crate::iface::RxMessage;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -45,8 +45,43 @@ pub const SHARED_INSTANCE_PORT: u16 = 37428;
 /// `LocalClientInterface.RECONNECT_WAIT` in seconds
 pub const RECONNECT_WAIT: Duration = Duration::from_secs(8);
 
-/// `LocalClientInterface.HW_MTU`
-const HW_MTU: usize = 262144;
+/// Bitrate of the local shared instance (`LocalClientInterface` /
+/// `LocalServerInterface` both use 1e9).
+pub const BITRATE_BPS: u64 = 1_000_000_000;
+
+/// `Interface.optimise_mtu` for `AUTOCONFIGURE_MTU` interfaces.
+/// `None` when the bitrate is below the lowest tier (Python sets `HW_MTU = None`).
+pub const fn optimise_mtu(bitrate_bps: u64) -> Option<usize> {
+    if bitrate_bps >= 1_000_000_000 {
+        Some(524_288)
+    } else if bitrate_bps >= 750_000_000 {
+        Some(262_144)
+    } else if bitrate_bps >= 400_000_000 {
+        Some(131_072)
+    } else if bitrate_bps >= 200_000_000 {
+        Some(65_536)
+    } else if bitrate_bps >= 100_000_000 {
+        Some(32_768)
+    } else if bitrate_bps >= 10_000_000 {
+        Some(16_384)
+    } else if bitrate_bps >= 5_000_000 {
+        Some(8_192)
+    } else if bitrate_bps >= 2_000_000 {
+        Some(4_096)
+    } else if bitrate_bps >= 1_000_000 {
+        Some(2_048)
+    } else if bitrate_bps >= 62_500 {
+        Some(1_024)
+    } else {
+        None
+    }
+}
+
+/// Hardware MTU after `AUTOCONFIGURE_MTU` at [`BITRATE_BPS`] (1e9 → 524288).
+pub const HW_MTU: usize = match optimise_mtu(BITRATE_BPS) {
+    Some(mtu) => mtu,
+    None => panic!("local bitrate must yield a hardware MTU"),
+};
 
 /// Python ignores frames of at most `Reticulum.HEADER_MINSIZE` bytes
 /// (2 + 1 + TRUNCATED_HASHLENGTH/8 = 19).
@@ -827,5 +862,30 @@ impl LocalClient {
 impl Interface for LocalClient {
     fn mtu() -> usize {
         HW_MTU
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autoconfigure_mtu_at_1e9_is_524288() {
+        assert_eq!(BITRATE_BPS, 1_000_000_000);
+        assert_eq!(optimise_mtu(BITRATE_BPS), Some(524_288));
+        assert_eq!(HW_MTU, 524_288);
+        assert_eq!(<LocalClient as Interface>::mtu(), 524_288);
+        assert_eq!(<LocalServer as Interface>::mtu(), 524_288);
+
+        assert_eq!(optimise_mtu(750_000_000), Some(262_144));
+        assert_eq!(optimise_mtu(400_000_000), Some(131_072));
+        assert_eq!(optimise_mtu(200_000_000), Some(65_536));
+        assert_eq!(optimise_mtu(100_000_000), Some(32_768));
+        assert_eq!(optimise_mtu(10_000_000), Some(16_384));
+        assert_eq!(optimise_mtu(5_000_000), Some(8_192));
+        assert_eq!(optimise_mtu(2_000_000), Some(4_096));
+        assert_eq!(optimise_mtu(1_000_000), Some(2_048));
+        assert_eq!(optimise_mtu(62_500), Some(1_024));
+        assert_eq!(optimise_mtu(62_499), None);
     }
 }

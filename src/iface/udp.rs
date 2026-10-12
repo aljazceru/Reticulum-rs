@@ -14,6 +14,10 @@ use super::{Interface, InterfaceContext};
 // TODO: Configure via features
 const PACKET_TRACE: bool = true;
 
+/// Python `UDPInterface.HW_MTU`. Link MTU discovery clamps against this
+/// hardware MTU; the packet MDU ([`Interface::mtu`]) stays 2048.
+pub const HW_MTU: usize = 1064;
+
 pub struct UdpInterface {
     bind_addr: String,
     forward_addr: Option<String>,
@@ -22,11 +26,25 @@ pub struct UdpInterface {
 
 impl UdpInterface {
     pub fn new<T: Into<String>>(bind_addr: T, forward_addr: Option<T>, broadcast: bool) -> Self {
+        // Python sets SO_BROADCAST on every transmit socket and has no
+        // off switch. Callers (including the daemon) still pass `false`;
+        // that must not disable the option.
+        let _ = broadcast;
         Self {
             bind_addr: bind_addr.into(),
             forward_addr: forward_addr.map(Into::into),
-            broadcast,
+            broadcast: true,
         }
+    }
+
+    /// Whether the socket is created with `SO_BROADCAST` (always, matching Python).
+    pub fn broadcast(&self) -> bool {
+        self.broadcast
+    }
+
+    /// Hardware MTU consulted by link MTU discovery (`UDPInterface.HW_MTU`).
+    pub fn hardware_mtu() -> usize {
+        HW_MTU
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -45,7 +63,7 @@ impl UdpInterface {
                 break;
             }
 
-            let socket = UdpSocket::bind(bind_addr.clone())
+            let socket = bind_udp_socket(bind_addr.clone())
                 .await
                 .map_err(|_| RnsError::ConnectionError);
 
@@ -62,11 +80,6 @@ impl UdpInterface {
             let socket = socket.unwrap();
             let read_socket = Arc::new(socket);
             let write_socket = read_socket.clone();
-            if context.inner.lock().unwrap().broadcast {
-                let _ = write_socket
-                    .set_broadcast(true)
-                    .map_err(|err| log::error!("error setting broadcast: {err}"));
-            }
 
             log::info!("udp_interface bound to <{}>", bind_addr);
             stats.set_online(true);
@@ -201,8 +214,81 @@ impl UdpInterface {
     }
 }
 
+/// Bind a UDP socket the way `UDPInterface` does. `SO_BROADCAST` is always
+/// set (`UDPInterface.process_outgoing`); there is no Python off switch.
+pub(crate) async fn bind_udp_socket(
+    addr: impl tokio::net::ToSocketAddrs,
+) -> std::io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(addr).await?;
+    if let Err(err) = socket.set_broadcast(true) {
+        log::error!("error setting broadcast: {err}");
+    }
+    Ok(socket)
+}
+
 impl Interface for UdpInterface {
     fn mtu() -> usize {
+        // Packet MDU. Do not replace this with [`HW_MTU`] (1064).
         2048
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_broadcast_defaults_on_and_hw_mtu_is_1064() {
+        let iface = UdpInterface::new("127.0.0.1:4242", None::<&str>, false);
+        assert!(iface.broadcast());
+        assert_eq!(UdpInterface::hardware_mtu(), 1064);
+        assert_eq!(HW_MTU, 1064);
+        assert_eq!(<UdpInterface as Interface>::mtu(), 2048);
+    }
+
+    #[tokio::test]
+    async fn udp_socket_is_created_with_broadcast_enabled() {
+        let socket = bind_udp_socket("127.0.0.1:0").await.unwrap();
+        assert!(
+            socket_broadcast_enabled(&socket),
+            "SO_BROADCAST must be set, including when callers pass broadcast=false"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn socket_broadcast_enabled(socket: &UdpSocket) -> bool {
+        use std::os::fd::AsRawFd;
+
+        let mut value: i32 = 0;
+        let mut len: u32 = std::mem::size_of::<i32>() as u32;
+        let rc = unsafe {
+            getsockopt(
+                socket.as_raw_fd(),
+                1, // SOL_SOCKET
+                6, // SO_BROADCAST
+                &mut value as *mut i32 as *mut std::ffi::c_void,
+                &mut len,
+            )
+        };
+        rc == 0 && value != 0
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn socket_broadcast_enabled(socket: &UdpSocket) -> bool {
+        // Non-Linux hosts still go through `set_broadcast(true)` in
+        // `bind_udp_socket`; there is no portable getter.
+        let _ = socket;
+        true
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+unsafe extern "C" {
+    fn getsockopt(
+        sockfd: i32,
+        level: i32,
+        optname: i32,
+        optval: *mut std::ffi::c_void,
+        optlen: *mut u32,
+    ) -> i32;
 }
