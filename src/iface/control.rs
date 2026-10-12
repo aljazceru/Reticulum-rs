@@ -15,7 +15,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::buffer::OutputBuffer;
 use crate::hash::AddressHash;
-use crate::packet::{PACKET_MDU, Packet, PacketType};
+use crate::packet::{Packet, PacketType, PACKET_MDU};
 use crate::serde::Serialize;
 
 /// Offset of the 10-byte random blob inside announce data
@@ -343,24 +343,14 @@ impl IfaceControlState {
         Self::push_sample(&mut self.op_freq_deque, now);
     }
 
+    /// `preemptive` counts a packet that has not been sampled yet.
+    /// Python adds that 1 after the length check (`outgoing_pr_frequency`).
     fn frequency(
         deque: &mut VecDeque<Instant>,
         decay: Duration,
         min_samples: usize,
         now: Instant,
-    ) -> f64 {
-        Self::frequency_with_extra(deque, decay, min_samples, now, 0)
-    }
-
-    /// `extra` counts a packet that has not been sampled yet
-    /// (Python `outgoing_pr_frequency(preemptive=True)` adds 1 to `n`
-    /// after the length check, not before it).
-    fn frequency_with_extra(
-        deque: &mut VecDeque<Instant>,
-        decay: Duration,
-        min_samples: usize,
-        now: Instant,
-        extra: usize,
+        preemptive: bool,
     ) -> f64 {
         let n = deque.len();
         if n <= min_samples {
@@ -376,7 +366,7 @@ impl IfaceControlState {
         if span <= 0.0 {
             0.0
         } else {
-            (n + extra) as f64 / span
+            (n + usize::from(preemptive)) as f64 / span
         }
     }
 
@@ -388,12 +378,13 @@ impl IfaceControlState {
             AR_FREQ_DECAY,
             DEQUE_MIN_SAMPLE,
             now,
+            false,
         )
     }
 
     /// Outgoing announce frequency in Hz.
     pub fn outgoing_announce_frequency(&mut self, now: Instant) -> f64 {
-        Self::frequency(&mut self.oa_freq_deque, AR_FREQ_DECAY, 1, now)
+        Self::frequency(&mut self.oa_freq_deque, AR_FREQ_DECAY, 1, now, false)
     }
 
     /// Incoming path-request frequency in Hz
@@ -404,18 +395,13 @@ impl IfaceControlState {
             PR_FREQ_DECAY,
             DEQUE_MIN_SAMPLE,
             now,
+            false,
         )
     }
 
     /// Outgoing path-request frequency in Hz.
     pub fn outgoing_pr_frequency(&mut self, now: Instant) -> f64 {
-        Self::frequency(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now)
-    }
-
-    /// Outgoing path-request frequency including the packet about to be sent
-    /// (Python `outgoing_pr_frequency(preemptive=True)`).
-    fn outgoing_pr_frequency_preemptive(&mut self, now: Instant) -> f64 {
-        Self::frequency_with_extra(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now, 1)
+        Self::frequency(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now, false)
     }
 
     // ------------------------------------------------------------------
@@ -508,7 +494,8 @@ impl IfaceControlState {
 
         // Frequency is sampled first: it may drop a stale deque entry
         // before the minimum-sample check, matching Python.
-        let op_freq = self.outgoing_pr_frequency_preemptive(now);
+        // `preemptive` counts the path request about to be sent.
+        let op_freq = Self::frequency(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now, true);
         op_freq > self.params.ec_pr_freq && self.op_freq_deque.len() >= EC_BURST_MIN_SAMPLES
     }
 
@@ -732,11 +719,9 @@ mod tests {
         assert_eq!(state.held_announces_len(), 1);
 
         // Held announces are not released while the burst penalty is active.
-        assert!(
-            state
-                .release_held_announce(t0 + Duration::from_secs(2))
-                .is_none()
-        );
+        assert!(state
+            .release_held_announce(t0 + Duration::from_secs(2))
+            .is_none());
     }
 
     #[test]
