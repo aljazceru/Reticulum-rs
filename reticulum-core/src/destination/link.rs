@@ -152,14 +152,21 @@ pub struct Link {
     remote_identity: Option<Identity>,
     derived_key: DerivedKey,
     status: LinkStatus,
+    /// Establishment clock. Inbound traffic must not move it: the
+    /// responder's RTT is `max(now - request_time, advertised)`, and an
+    /// early `touch` of the LRRTT packet would otherwise zero the sample.
     request_time: Duration,
+    /// Last packet that counts as inbound activity (Python `last_inbound`).
+    last_inbound: Duration,
+    /// Last packet sent on this link (Python `last_outbound`).
+    last_outbound: Duration,
     rtt: Duration,
     /// `false` until a link proof or an LRRTT packet supplies an RTT
     /// (Python `Link.rtt is None`).
     rtt_known: bool,
     keepalive: Duration,
-    stale_time: Duration,
-    /// Last initiator keepalive (0xFF). Not updated by inbound traffic.
+    /// Last initiator keepalive (0xFF) or responder reply (0xFE).
+    /// Not updated by other outbound traffic.
     last_keepalive: Duration,
     proves_messages: bool,
     /// Maximum transfer unit negotiated (or defaulted) for this link.
@@ -225,10 +232,11 @@ impl Link {
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
             request_time: now(),
+            last_inbound: now(),
+            last_outbound: now(),
             rtt: Duration::from_secs(0),
             rtt_known: false,
             keepalive: KEEPALIVE,
-            stale_time: STALE_TIME,
             last_keepalive: now(),
             proves_messages: false,
             mtu: crate::packet::PROTOCOL_MTU,
@@ -301,10 +309,11 @@ impl Link {
             derived_key: DerivedKey::new_empty(),
             status: LinkStatus::Pending,
             request_time: now(),
+            last_inbound: now(),
+            last_outbound: now(),
             rtt: Duration::from_secs(0),
             rtt_known: false,
             keepalive: KEEPALIVE,
-            stale_time: STALE_TIME,
             last_keepalive: now(),
             proves_messages: false,
             mtu,
@@ -341,6 +350,9 @@ impl Link {
 
         self.status = LinkStatus::Pending;
         self.id = LinkId::from(&packet);
+        // Retry pacing and the RTT sample share the establishment clock.
+        // `touch` only moves inbound silence.
+        self.request_time = now();
         self.touch();
 
         packet
@@ -350,7 +362,7 @@ impl Link {
     /// Outbound sends, including our own keepalive, must not call this:
     /// Python only moves `last_inbound` when a packet arrives.
     pub fn touch(&mut self) {
-        self.request_time = now();
+        self.last_inbound = now();
         if self.status == LinkStatus::Stale {
             self.status = LinkStatus::Active;
         }
@@ -785,8 +797,14 @@ impl Link {
         self.status = LinkStatus::Pending;
     }
 
+    /// Time since the last inbound packet. Pending establishment uses the
+    /// same clock because [`Link::request`] stamps both.
     pub fn elapsed(&self) -> Duration {
-        now() - self.request_time
+        now().saturating_sub(self.last_inbound)
+    }
+
+    fn since_request(&self) -> Duration {
+        now().saturating_sub(self.request_time)
     }
 
     pub fn status(&self) -> LinkStatus {
@@ -821,13 +839,13 @@ impl Link {
 
     /// Inbound silence before the link is marked stale (`2 * keepalive`).
     pub fn stale_time(&self) -> Duration {
-        self.stale_time
+        self.keepalive.saturating_mul(STALE_FACTOR)
     }
 
     /// Stale threshold, using `unknown_rtt` until an RTT has been measured.
     pub fn effective_stale(&self, unknown_rtt: Duration) -> Duration {
         if self.rtt_known {
-            self.stale_time
+            self.stale_time()
         } else {
             unknown_rtt
         }
@@ -847,40 +865,66 @@ impl Link {
         scaled.min(WATCHDOG_MAX_SLEEP)
     }
 
+    fn keepalive_interval(&self, unknown_rtt: Duration) -> Duration {
+        if self.rtt_known {
+            self.keepalive
+        } else {
+            unknown_rtt
+        }
+    }
+
     /// Whether the initiator should emit keepalive `0xFF`.
-    /// `unknown_rtt` is the interval used before RTT is known.
+    /// Python sends only when inbound or outbound has been idle for one
+    /// interval, and at most once per interval. `unknown_rtt` is that
+    /// interval before an RTT has been measured.
     pub fn keepalive_due(&self, unknown_rtt: Duration) -> bool {
         if self.status != LinkStatus::Active {
             return false;
         }
-        let interval = if self.rtt_known {
-            self.keepalive
-        } else {
-            unknown_rtt
-        };
-        now().saturating_sub(self.last_keepalive) >= interval
+        let interval = self.keepalive_interval(unknown_rtt);
+        let now = now();
+        let inbound_idle = now.saturating_sub(self.last_inbound) >= interval;
+        let outbound_idle = now.saturating_sub(self.last_outbound) >= interval;
+        let keepalive_idle = now.saturating_sub(self.last_keepalive) >= interval;
+        (inbound_idle || outbound_idle) && keepalive_idle
+    }
+
+    /// Whether the responder should answer `0xFF` with `0xFE`.
+    /// Python replies only when `now >= last_outbound + keepalive`.
+    pub fn keepalive_reply_due(&self, unknown_rtt: Duration) -> bool {
+        if !matches!(self.status, LinkStatus::Active | LinkStatus::Stale) {
+            return false;
+        }
+        let interval = self.keepalive_interval(unknown_rtt);
+        now().saturating_sub(self.last_outbound) >= interval
+    }
+
+    /// Record an outbound send. Keepalive packets also stamp `last_keepalive`
+    /// (Python `Link.had_outbound`). Does not move the inbound clock.
+    pub fn mark_outbound(&mut self, is_keepalive: bool) {
+        let now = now();
+        self.last_outbound = now;
+        if is_keepalive {
+            self.last_keepalive = now;
+        }
     }
 
     /// Record an outbound keepalive without touching the inbound clock.
     pub fn mark_keepalive_sent(&mut self) {
-        self.last_keepalive = now();
+        self.mark_outbound(true);
     }
 
     fn note_rtt(&mut self, rtt: Duration) {
         self.rtt = rtt;
         self.rtt_known = true;
-        self.recompute_keepalive();
+        let scaled = rtt.as_secs_f64() * (KEEPALIVE_MAX.as_secs_f64() / KEEPALIVE_MAX_RTT);
+        let secs = scaled.clamp(KEEPALIVE_MIN.as_secs_f64(), KEEPALIVE_MAX.as_secs_f64());
+        self.keepalive = Duration::from_secs_f64(secs);
     }
 
-    fn recompute_keepalive(&mut self) {
-        let secs = if self.rtt_known {
-            let scaled = self.rtt.as_secs_f64() * (KEEPALIVE_MAX.as_secs_f64() / KEEPALIVE_MAX_RTT);
-            scaled.clamp(KEEPALIVE_MIN.as_secs_f64(), KEEPALIVE_MAX.as_secs_f64())
-        } else {
-            KEEPALIVE.as_secs_f64()
-        };
-        self.keepalive = Duration::from_secs_f64(secs);
-        self.stale_time = Duration::from_secs_f64(secs * f64::from(STALE_FACTOR));
+    /// Python `Link.rtt_packet`: `rtt = max(time.time() - request_time, unpacked)`.
+    fn note_responder_rtt(&mut self, advertised: Duration) {
+        self.note_rtt(self.since_request().max(advertised));
     }
 
     fn handle_data_packet<E: LinkEventSink, P: LinkPayloadSink>(
@@ -997,6 +1041,12 @@ impl Link {
             }
             PacketContext::KeepAlive => {
                 if !packet.data.is_empty() && packet.data.as_slice()[0] == 0xFF {
+                    // Initiator's own or reflected 0xFF is not inbound traffic
+                    // and must not be echoed as 0xFE (Python `Link.__receive`).
+                    if out_link {
+                        log::trace!("link({}): ignoring initiator keepalive", self.id);
+                        return LinkHandleResult::None;
+                    }
                     self.touch();
                     log::trace!("link({}): keep-alive request", self.id);
                     return LinkHandleResult::KeepAlive;
@@ -1019,7 +1069,10 @@ impl Link {
                         // enormous RTT values; clamp to a sane range
                         // instead of panicking in Duration construction.
                         if rtt.is_finite() && (0.0..86_400.0).contains(&rtt) {
-                            self.note_rtt(Duration::from_secs_f64(rtt));
+                            // Measure before touch(). `request_time` is the
+                            // establishment clock, so an earlier inbound
+                            // refresh of this same packet does not zero it.
+                            self.note_responder_rtt(Duration::from_secs_f64(rtt));
                             self.touch();
                         } else {
                             log::debug!("link: ignoring invalid rtt packet ({rtt})");
@@ -1097,6 +1150,14 @@ impl Link {
         packet: &Packet,
     ) -> LinkHandleResult {
         if self.status == LinkStatus::Pending && packet.context == PacketContext::LinkRequestProof {
+            // Python `validate_proof` closes the link when the proof mode
+            // is not the enabled mode. Absent signalling stays AES-256-CBC.
+            let mode = mode_from_lp_packet(packet.data.as_slice());
+            if mode != LINK_MODE_AES256_CBC {
+                log::debug!("link({}): rejecting link proof mode {mode:#04x}", self.id);
+                self.close(event_tx);
+                return LinkHandleResult::None;
+            }
             if let Ok(identity) = validate_proof_packet(&self.destination, &self.id, packet) {
                 log::debug!("link({}): has been proved", self.id);
 
@@ -1104,8 +1165,8 @@ impl Link {
                 self.remote_identity = Some(self.destination.identity);
 
                 self.status = LinkStatus::Active;
-                // Measure before touch() restarts the inbound clock.
-                self.note_rtt(self.elapsed());
+                // Establishment clock, not inbound silence.
+                self.note_rtt(self.since_request());
                 self.last_keepalive = now();
                 self.touch();
 
@@ -1237,6 +1298,18 @@ fn reject_disabled_link_mode(packet: &Packet) -> Result<(), RnsError> {
     } else {
         log::debug!("link: rejecting link request mode {mode:#04x}");
         Err(RnsError::InvalidArgument)
+    }
+}
+
+/// Python `Link.mode_from_lp_packet`. Signalling starts after the
+/// signature and the ephemeral public key. Absent bytes default to
+/// AES-256-CBC.
+fn mode_from_lp_packet(data: &[u8]) -> u8 {
+    let offset = SIGNATURE_LENGTH + PUBLIC_KEY_LENGTH;
+    if data.len() > offset {
+        data[offset] >> 5
+    } else {
+        LINK_MODE_AES256_CBC
     }
 }
 
@@ -1460,5 +1533,169 @@ mod keepalive_tests {
             Link::new_from_request(&packet, local.sign_key().clone(), destination.desc),
             Err(RnsError::InvalidArgument)
         ));
+    }
+
+    #[derive(Clone)]
+    struct Nop;
+
+    impl LinkEventSink for Nop {
+        fn send(&self, _event: LinkEventData) {}
+    }
+
+    impl LinkPayloadSink for Nop {
+        fn send(&self, _payload: LinkPayload) {}
+    }
+
+    fn keepalive_packet(byte: u8) -> Packet {
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(&[byte]);
+        Packet {
+            header: Header {
+                destination_type: DestinationType::Link,
+                packet_type: PacketType::Data,
+                ..Default::default()
+            },
+            context: PacketContext::KeepAlive,
+            data,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn inbound_touch_leaves_establishment_clock() {
+        let mut link = fresh_link();
+        let stamped = now().saturating_sub(Duration::from_secs(4));
+        link.request_time = stamped;
+        link.touch();
+        assert_eq!(link.request_time, stamped);
+        assert!(link.last_inbound > stamped);
+    }
+
+    #[test]
+    fn responder_rtt_is_max_of_measured_and_advertised() {
+        let mut link = fresh_link();
+        // Establishment is the monotonic origin. `touch` must not collapse
+        // the sample onto the advertised RTT (the clock starts at process
+        // launch, so the measured side is small but strictly larger).
+        link.request_time = Duration::ZERO;
+        link.touch();
+        assert_eq!(link.request_time, Duration::ZERO);
+        let advertised = Duration::from_nanos(1);
+        link.note_responder_rtt(advertised);
+        assert!(*link.rtt() > advertised);
+
+        let mut link = fresh_link();
+        link.request_time = now();
+        link.note_responder_rtt(Duration::from_secs(2));
+        assert!(link.rtt().as_secs_f64() >= 2.0);
+        assert!(link.rtt().as_secs_f64() < 2.5);
+    }
+
+    #[test]
+    fn initiator_keepalive_does_not_refresh_silence() {
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Active);
+        link.last_inbound = Duration::ZERO;
+        let result = link.handle_data_packet(&Nop, None::<&Nop>, &keepalive_packet(0xFF), true);
+        assert!(matches!(result, LinkHandleResult::None));
+        assert_eq!(link.last_inbound, Duration::ZERO);
+    }
+
+    #[test]
+    fn responder_keepalive_refreshes_silence() {
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Active);
+        link.last_inbound = Duration::ZERO;
+        let result = link.handle_data_packet(&Nop, None::<&Nop>, &keepalive_packet(0xFF), false);
+        assert!(matches!(result, LinkHandleResult::KeepAlive));
+        assert!(link.last_inbound > Duration::ZERO);
+    }
+
+    #[test]
+    fn keepalive_response_refreshes_inbound() {
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Active);
+        link.last_inbound = Duration::ZERO;
+        let result = link.handle_data_packet(&Nop, None::<&Nop>, &keepalive_packet(0xFE), true);
+        assert!(matches!(result, LinkHandleResult::None));
+        assert!(link.last_inbound > Duration::ZERO);
+    }
+
+    #[test]
+    fn keepalive_waits_for_an_idle_direction() {
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Active);
+        // `Duration::MAX` saturates elapsed time to zero (fresh). `ZERO` is
+        // the monotonic origin, so a 1ns interval counts as idle without
+        // sleeping. The real interval is `KEEPALIVE` once a link is running.
+        let fresh = Duration::MAX;
+        let interval = Duration::from_nanos(1);
+        link.last_inbound = fresh;
+        link.last_outbound = fresh;
+        link.last_keepalive = Duration::ZERO;
+        assert!(!link.keepalive_due(interval));
+
+        link.last_inbound = Duration::ZERO;
+        assert!(link.keepalive_due(interval));
+
+        link.last_inbound = fresh;
+        link.last_outbound = Duration::ZERO;
+        assert!(link.keepalive_due(interval));
+
+        link.last_outbound = fresh;
+        link.last_keepalive = fresh;
+        link.last_inbound = Duration::ZERO;
+        assert!(!link.keepalive_due(interval));
+    }
+
+    #[test]
+    fn keepalive_reply_follows_outbound_idle() {
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Active);
+        let interval = Duration::from_nanos(1);
+        link.last_outbound = Duration::MAX;
+        assert!(!link.keepalive_reply_due(interval));
+        link.last_outbound = Duration::ZERO;
+        assert!(link.keepalive_reply_due(interval));
+        link.mark_outbound(true);
+        assert!(!link.keepalive_reply_due(KEEPALIVE));
+        assert!(link.last_keepalive > Duration::ZERO);
+    }
+
+    fn proof_with_mode(mode: Option<u8>) -> Packet {
+        let mut raw = vec![0u8; 96];
+        if let Some(mode) = mode {
+            raw.push(mode << 5);
+        }
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(&raw);
+        Packet {
+            header: Header {
+                packet_type: PacketType::Proof,
+                ..Default::default()
+            },
+            context: PacketContext::LinkRequestProof,
+            data,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn link_proof_rejects_mode_other_than_aes256_cbc() {
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Pending);
+        let result = link.handle_proof_packet(&Nop, &proof_with_mode(Some(0x02)));
+        assert!(matches!(result, LinkHandleResult::None));
+        assert_eq!(link.status(), LinkStatus::Closed);
+
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Pending);
+        let _ = link.handle_proof_packet(&Nop, &proof_with_mode(None));
+        assert_eq!(link.status(), LinkStatus::Pending);
+
+        let mut link = fresh_link();
+        link.set_status(LinkStatus::Pending);
+        let _ = link.handle_proof_packet(&Nop, &proof_with_mode(Some(0x01)));
+        assert_eq!(link.status(), LinkStatus::Pending);
     }
 }

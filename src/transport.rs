@@ -922,11 +922,11 @@ impl Transport {
     pub async fn send_to_all_out_links(&self, payload: &[u8]) {
         let handler = self.handler.lock().await;
         for link in handler.out_links.values() {
-            let link = link.lock().await;
+            let mut link = link.lock().await;
             if link.status() == LinkStatus::Active {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
-                    handler.send_packet(packet).await;
+                    handler.send_from_link(&mut link, packet).await;
                 }
             }
         }
@@ -936,14 +936,15 @@ impl Transport {
         let mut sent_packets = vec![];
         let handler = self.handler.lock().await;
         for link in handler.out_links.values() {
-            let link = link.lock().await;
+            let mut link = link.lock().await;
             if link.destination().address_hash == *destination
                 && link.status() == LinkStatus::Active
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
-                    handler.send_packet(packet).await;
-                    sent_packets.push(packet.hash());
+                    let hash = packet.hash();
+                    handler.send_from_link(&mut link, packet).await;
+                    sent_packets.push(hash);
                 }
             }
         }
@@ -963,14 +964,14 @@ impl Transport {
         let handler = self.handler.lock().await;
         let mut count = 0usize;
         for link in handler.in_links.values() {
-            let link = link.lock().await;
+            let mut link = link.lock().await;
 
             if link.destination().address_hash == *destination
                 && link.status() == LinkStatus::Active
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
-                    handler.send_packet(packet).await;
+                    handler.send_from_link(&mut link, packet).await;
                     count += 1;
                 }
             }
@@ -1386,7 +1387,7 @@ impl Transport {
         options: ResourceOptions,
     ) -> Result<crate::hash::Hash, RnsError> {
         let mut handler = self.handler.lock().await;
-        let link_guard = link.lock().await;
+        let mut link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
             return Err(RnsError::LinkNotReady);
         }
@@ -1411,7 +1412,7 @@ impl Transport {
         }
 
         for packet in tx.packets {
-            handler.send_packet(packet).await;
+            handler.send_from_link(&mut link_guard, packet).await;
         }
 
         handler
@@ -1470,7 +1471,7 @@ impl Transport {
         data: &[u8],
     ) -> Result<AddressHash, RnsError> {
         let mut handler = self.handler.lock().await;
-        let link_guard = link.lock().await;
+        let mut link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
             return Err(RnsError::LinkNotReady);
         }
@@ -1479,11 +1480,12 @@ impl Transport {
 
         let rid = if packed.len() <= link_guard.mdu() {
             let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
-            handler.send_packet(packet).await;
             // A packet-carried request is tracked by its packet hashable
             // part (Python `PacketReceipt.truncated_hash`), which is the
             // id a responder echoes back.
-            request_id_from_packet(&packet)
+            let rid = request_id_from_packet(&packet);
+            handler.send_from_link(&mut link_guard, packet).await;
+            rid
         } else {
             // A resource-carried request keeps the packed-payload id
             // (Python `Link.request` sets `request_id =
@@ -1500,7 +1502,7 @@ impl Transport {
             let mut tx = crate::resource::ResourceTx::default();
             resource.advertise(&link_guard, &mut tx)?;
             for p in tx.packets {
-                handler.send_packet(p).await;
+                handler.send_from_link(&mut link_guard, p).await;
             }
             handler
                 .resources
@@ -2143,6 +2145,48 @@ impl TransportHandler {
         self.send(message).await;
     }
 
+    /// Send a packet that originated on `link`. Stamps `last_outbound`
+    /// (and `last_keepalive` for keepalive context) before the bytes go
+    /// out. Callers that already hold the link lock must use this: `send`
+    /// only try-locks, and a held guard makes that miss.
+    async fn send_from_link(&self, link: &mut Link, packet: Packet) {
+        link.mark_outbound(packet.context == PacketContext::KeepAlive);
+        self.send_packet(packet).await;
+    }
+
+    /// Python `Packet.send` sets `last_outbound` when the destination is a
+    /// link. Link requests are addressed to a destination, so Python calls
+    /// `had_outbound` explicitly; the same stamp is applied here when the
+    /// link lock is free.
+    fn note_unlocked_link_outbound(&self, packet: &Packet) {
+        let is_keepalive = packet.context == PacketContext::KeepAlive;
+        if packet.header.destination_type == DestinationType::Link {
+            if let Some(link) = self.in_links.get(&packet.destination) {
+                if let Ok(mut link) = link.try_lock() {
+                    link.mark_outbound(is_keepalive);
+                }
+                return;
+            }
+            for link in self.out_links.values() {
+                let Ok(mut link) = link.try_lock() else {
+                    continue;
+                };
+                if link.id() == &packet.destination {
+                    link.mark_outbound(is_keepalive);
+                    return;
+                }
+            }
+            return;
+        }
+        if packet.header.packet_type == PacketType::LinkRequest {
+            if let Some(link) = self.out_links.get(&packet.destination) {
+                if let Ok(mut link) = link.try_lock() {
+                    link.mark_outbound(false);
+                }
+            }
+        }
+    }
+
     async fn send(&self, message: TxMessage) {
         // Early rejection of excessive hop counts
         // (Python `Transport._outbound`:
@@ -2155,6 +2199,7 @@ impl TransportHandler {
             );
             return;
         }
+        self.note_unlocked_link_outbound(&message.packet);
         self.packet_cache.lock().await.update(&message.packet);
         self.iface_manager.lock().await.send(message).await;
     }
@@ -2391,13 +2436,16 @@ async fn handle_proof<'a>(
         }
         let link = link.or_else(|| handler.in_links.get(&packet.destination).cloned());
         if let Some(link) = link {
-            let link_guard = link.lock().await;
+            let mut link_guard = link.lock().await;
+            // Resource proofs return before link data handling. Refresh
+            // inbound silence for an established link first.
+            note_established_inbound(&mut link_guard, packet, false);
             let mut tx = ResourceTx::default();
             handler
                 .resources
                 .handle_proof(&link_guard, packet.data.as_slice(), &mut tx);
-            for packet in tx.packets {
-                handler.send_packet(packet).await;
+            for reply in tx.packets {
+                handler.send_from_link(&mut link_guard, reply).await;
             }
             drop(link_guard);
             handler.resources.cleanup();
@@ -2446,7 +2494,7 @@ async fn handle_proof<'a>(
             rebalanced_path = Some((link.destination().address_hash, observed));
 
             let rtt_packet = link.create_rtt();
-            handler.send_packet(rtt_packet).await;
+            handler.send_from_link(&mut link, rtt_packet).await;
         }
     }
 
@@ -2629,7 +2677,7 @@ async fn handle_resource_packet<'a>(
 ) -> bool {
     use crate::packet::PacketContext as Ctx;
 
-    let link = link_arc.lock().await;
+    let mut link = link_arc.lock().await;
     let handled = match packet.context {
         Ctx::ResourceAdvertisement => {
             let mut buffer = [0u8; PACKET_MDU];
@@ -2639,7 +2687,7 @@ async fn handle_resource_packet<'a>(
                         .resources
                         .handle_advertisement(&link, packet, plaintext);
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     // an accepted request resource may need dispatch once done
                     true
@@ -2653,7 +2701,7 @@ async fn handle_resource_packet<'a>(
                 Ok(plaintext) => {
                     let tx = handler.resources.handle_request_data(&link, plaintext);
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     true
                 }
@@ -2666,7 +2714,7 @@ async fn handle_resource_packet<'a>(
                 Ok(plaintext) => {
                     let tx = handler.resources.handle_hashmap_update(&link, plaintext);
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     true
                 }
@@ -2676,13 +2724,13 @@ async fn handle_resource_packet<'a>(
         Ctx::Resource => {
             let (part_tx, completed) = handler.resources.handle_part(&link, packet);
             for p in part_tx.packets {
-                handler.send_packet(p).await;
+                handler.send_from_link(&mut link, p).await;
             }
             if completed {
                 let mut tx = crate::resource::ResourceTx::default();
                 if let Some((_hash, data)) = handler.resources.assemble_completed(&link, &mut tx) {
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     // Dispatch an inbound request resource to handlers
                     let request_data = data;
@@ -2705,7 +2753,7 @@ async fn handle_resource_packet<'a>(
                     }
                 } else {
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                 }
             }
@@ -2716,8 +2764,8 @@ async fn handle_resource_packet<'a>(
             handler
                 .resources
                 .handle_proof(&link, packet.data.as_slice(), &mut tx);
-            for packet in tx.packets {
-                handler.send_packet(packet).await;
+            for reply in tx.packets {
+                handler.send_from_link(&mut link, reply).await;
             }
             handler.resources.cleanup();
             true
@@ -2744,7 +2792,7 @@ async fn handle_resource_packet<'a>(
 /// Send a request response as a packet or resource
 /// (shared by the sync and async handler paths).
 async fn send_response<'a>(
-    link: &Link,
+    link: &mut Link,
     rid: &AddressHash,
     response: &[u8],
     handler: &mut MutexGuard<'a, TransportHandler>,
@@ -2752,7 +2800,7 @@ async fn send_response<'a>(
     let packed = pack_response(rid, response);
     if packed.len() <= link.mdu() {
         if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
-            handler.send_packet(packet).await;
+            handler.send_from_link(link, packet).await;
         }
     } else {
         let opts = ResourceOptions {
@@ -2763,7 +2811,7 @@ async fn send_response<'a>(
         match handler.resources.send_resource(link, packed, opts) {
             Ok(tx) => {
                 for p in tx.packets {
-                    handler.send_packet(p).await;
+                    handler.send_from_link(link, p).await;
                 }
             }
             Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
@@ -2780,7 +2828,7 @@ async fn handle_incoming_request<'a>(
     transport_handler: &Arc<Mutex<TransportHandler>>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
-    let link = link_arc.lock().await;
+    let mut link = link_arc.lock().await;
     let destination = link.destination().address_hash;
     let remote_identity = link.remote_identity();
 
@@ -2818,8 +2866,8 @@ async fn handle_incoming_request<'a>(
 
             if let Some(response) = response {
                 let mut handler = transport_handler.lock().await;
-                let link = link_arc.lock().await;
-                send_response(&link, &rid, &response, &mut handler).await;
+                let mut link = link_arc.lock().await;
+                send_response(&mut link, &rid, &response, &mut handler).await;
             }
         });
         return;
@@ -2846,7 +2894,7 @@ async fn handle_incoming_request<'a>(
     });
 
     if let Some(response) = response {
-        send_response(&link, &rid, &response, handler).await;
+        send_response(&mut link, &rid, &response, handler).await;
     }
 }
 
@@ -2973,6 +3021,21 @@ async fn handle_cache_request<'a>(
     }
 }
 
+/// Python `Link.__receive` sets `last_inbound` before dispatch, for every
+/// packet on an open link except an initiator's own `0xFF`.
+fn note_established_inbound(link: &mut Link, packet: &Packet, out_link: bool) {
+    if !matches!(link.status(), LinkStatus::Active | LinkStatus::Stale) {
+        return;
+    }
+    if out_link
+        && packet.context == PacketContext::KeepAlive
+        && packet.data.as_slice().first() == Some(&KEEP_ALIVE_REQUEST)
+    {
+        return;
+    }
+    link.touch();
+}
+
 async fn handle_data<'a>(
     packet: &Packet,
     ingress_iface: AddressHash,
@@ -3000,6 +3063,12 @@ async fn handle_data<'a>(
             // link-table routing must not also try to forward it
             // (Python delivers endpoint link data to the local link).
             local_out_link_handled = true;
+            // Refresh inbound silence before resource/request/cache
+            // handlers return. Pending links are left alone.
+            {
+                let mut established = link.lock().await;
+                note_established_inbound(&mut established, packet, false);
+            }
             if handle_resource_packet(packet, &link, transport_handler, &mut handler).await {
                 return;
             }
@@ -3024,7 +3093,7 @@ async fn handle_data<'a>(
                     .get_cached_announce(&request_hash);
                 if let Some(cached) = cached {
                     if let Ok(response) = link.data_packet(cached.data.as_slice()) {
-                        handler.send_packet(response).await;
+                        handler.send_from_link(&mut link, response).await;
                         return;
                     }
                 }
@@ -3046,8 +3115,12 @@ async fn handle_data<'a>(
 
             match result {
                 LinkHandleResult::KeepAlive => {
-                    let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
-                    handler.send_packet(packet).await;
+                    // Python answers 0xFF only when outbound has been idle
+                    // for a keepalive interval.
+                    if link.keepalive_reply_due(handler.config.timer_config.out_link_keep) {
+                        let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
+                        handler.send_from_link(&mut link, packet).await;
+                    }
                 }
                 LinkHandleResult::MessageReceived(proof) => {
                     let strategy = proof_strategy.unwrap_or_default();
@@ -3065,7 +3138,7 @@ async fn handle_data<'a>(
 
                     if should_prove {
                         if let Some(proof) = proof {
-                            handler.send_packet(proof).await;
+                            handler.send_from_link(&mut link, proof).await;
                         }
                     }
                 }
@@ -3085,6 +3158,10 @@ async fn handle_data<'a>(
             let link_id = *link.lock().await.id();
 
             if link_id == packet.destination {
+                {
+                    let mut established = link.lock().await;
+                    note_established_inbound(&mut established, packet, true);
+                }
                 if handle_resource_packet(packet, &link, transport_handler, &mut handler).await {
                     local_out_link_handled = true;
                     data_handled = true;
@@ -3108,7 +3185,7 @@ async fn handle_data<'a>(
                 );
 
                 if let LinkHandleResult::MessageReceived(Some(proof)) = result {
-                    handler.send_packet(proof).await;
+                    handler.send_from_link(&mut link, proof).await;
                 }
 
                 local_out_link_handled = true;
@@ -3938,9 +4015,8 @@ async fn handle_link_request_as_destination<'a>(
                     // follow the destination's proof strategy.
                     link.prove_messages(proof_strategy != ProofStrategy::None);
 
-                    handler
-                        .send_packet(link.prove(&handler.link_in_event_tx))
-                        .await;
+                    let proof = link.prove(&handler.link_in_event_tx);
+                    handler.send_from_link(&mut link, proof).await;
 
                     log::debug!(
                         "tp({}): save input link {} for destination {}",
@@ -4048,7 +4124,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     // Clean up input links. Inbound silence is per link: 720s until RTT
     // is known, then `2 * keepalive(rtt)`. Close follows `close_grace`
-    // (the watchdog cap of 5s), not a fixed 10s stale timer.
+    // (the watchdog cap of 5s).
     for link_entry in &handler.in_links {
         let mut link = link_entry.1.lock().await;
         let stale_after = link.effective_stale(timer_config.in_link_stale);
@@ -4069,7 +4145,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                             None
                         })
                 {
-                    handler.send_packet(packet).await
+                    handler.send_from_link(&mut link, packet).await
                 }
                 links_to_remove.push(*link_entry.0);
             }
@@ -4094,8 +4170,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         // order). The send does not count as inbound activity.
         if link.keepalive_due(timer_config.out_link_keep) {
             let packet = link.keep_alive_packet(KEEP_ALIVE_REQUEST);
-            link.mark_keepalive_sent();
-            handler.send_packet(packet).await;
+            handler.send_from_link(&mut link, packet).await;
         }
 
         let stale_after = link.effective_stale(timer_config.out_link_stale);
@@ -4122,7 +4197,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                                 None
                             })
                     {
-                        handler.send_packet(packet).await
+                        handler.send_from_link(&mut link, packet).await
                     }
                     links_to_remove.push(*link_entry.0);
                 }
@@ -4169,7 +4244,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     );
                     let rediscover = !handler.config.retransmit;
                     if let Some(packet) = link.teardown(&handler.link_out_event_tx).ok().flatten() {
-                        handler.send_packet(packet).await;
+                        handler.send_from_link(&mut link, packet).await;
                     }
                     expired_links.push((link_destination, rediscover));
                     links_to_remove.push(*link_entry.0);
@@ -4179,7 +4254,10 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         handler.config.name,
                         link.id()
                     );
-                    handler.send_packet(link.request()).await;
+                    // `request` resets the establishment clock. The packet
+                    // is not link-addressed, so stamp outbound here.
+                    let packet = link.request();
+                    handler.send_from_link(&mut link, packet).await;
                 }
             }
             LinkStatus::Closed => {
