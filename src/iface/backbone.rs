@@ -339,35 +339,13 @@ fn drain_write(
     ok
 }
 
-fn constructor_bitrate(rate: u64) -> u64 {
+/// `0` is the unset constructor rate and means [`BITRATE_GUESS`].
+fn bitrate_or_guess(rate: u64) -> u64 {
     if rate == 0 {
         BITRATE_GUESS
     } else {
         rate
     }
-}
-
-/// Store `rate` before `worker` is scheduled.
-///
-/// `InterfaceManager::spawn` schedules the worker while the caller still holds
-/// the manager mutex, so the constructor rate is written here instead.
-#[cfg(test)]
-fn spawn_with_bitrate<T, F, R>(
-    manager: &mut InterfaceManager,
-    inner: T,
-    rate: u64,
-    worker: F,
-) -> crate::hash::AddressHash
-where
-    T: Interface,
-    F: FnOnce(InterfaceContext<T>) -> R,
-    R: std::future::Future<Output = ()> + Send + 'static,
-{
-    let context = manager.new_context(inner);
-    let address = context.channel.address;
-    manager.set_iface_bitrate(&address, constructor_bitrate(rate));
-    tokio::spawn(worker(context));
-    address
 }
 
 /// Enable fast-flapping suppression by default
@@ -586,10 +564,10 @@ impl BackboneClient {
                 manager.set_iface_wants_tunnel(&iface_address, true);
                 let rate = manager
                     .with_control(&iface_address, |control| control.bitrate)
-                    .unwrap_or_else(|| constructor_bitrate(constructor_rate));
+                    .unwrap_or_else(|| bitrate_or_guess(constructor_rate));
                 hw_mtu_for_bitrate(rate)
             } else {
-                hw_mtu_for_bitrate(constructor_bitrate(constructor_rate))
+                hw_mtu_for_bitrate(bitrate_or_guess(constructor_rate))
             };
 
             let (read_half, write_half) = stream.into_split();
@@ -739,6 +717,10 @@ impl Interface for BackboneClient {
     fn mtu() -> usize {
         HW_MTU
     }
+
+    fn constructor_bitrate(&self) -> Option<u64> {
+        Some(bitrate_or_guess(self.bitrate))
+    }
 }
 
 /// The backbone server: accepts connections and spawns peers with
@@ -750,6 +732,9 @@ pub struct BackboneServer {
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     /// Fast-flapping suppression table shared with spawned peers.
     pub fast_flap: Arc<tokio::sync::Mutex<FastFlapTable>>,
+    /// Constructor bitrate (Python `BITRATE_GUESS`, or [`Self::with_bitrate`]).
+    /// Zero is published as [`BITRATE_GUESS`].
+    bitrate: u64,
 }
 
 impl BackboneServer {
@@ -762,7 +747,14 @@ impl BackboneServer {
             addr: addr.into(),
             iface_manager,
             fast_flap,
+            bitrate: BITRATE_GUESS,
         }
+    }
+
+    /// Override the bitrate `optimise_mtu` uses for this listener.
+    pub fn with_bitrate(mut self, bitrate: u64) -> Self {
+        self.bitrate = bitrate;
+        self
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -876,6 +868,10 @@ impl BackboneServer {
 impl Interface for BackboneServer {
     fn mtu() -> usize {
         HW_MTU
+    }
+
+    fn constructor_bitrate(&self) -> Option<u64> {
+        Some(bitrate_or_guess(self.bitrate))
     }
 }
 
@@ -1022,30 +1018,33 @@ mod tests {
     async fn constructor_bitrate_is_published_before_spawn_returns() {
         let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(16)));
 
-        // Store 62500 first. Nothing after that writes the guess back.
-        let configured = {
-            let mut guard = manager.lock().await;
-            let context =
-                guard.new_context(BackboneClient::new("127.0.0.1:1").with_manager(manager.clone()));
-            let address = context.channel.address;
-            guard.set_iface_bitrate(&address, GENERIC_INTERFACE_BITRATE);
-            tokio::spawn(BackboneClient::spawn(context));
-            address
-        };
-        let rate = {
-            let guard = manager.lock().await;
-            control_bitrate(&guard, &configured).unwrap()
-        };
-        assert_eq!(rate, 62_500);
-        assert_eq!(hw_mtu_for_bitrate(rate), 1_024);
+        assert_eq!(
+            BackboneClient::new("127.0.0.1:1")
+                .with_bitrate(0)
+                .constructor_bitrate(),
+            Some(BITRATE_GUESS)
+        );
+        assert_eq!(
+            BackboneServer::new(
+                "127.0.0.1:1",
+                manager.clone(),
+                Arc::new(tokio::sync::Mutex::new(FastFlapTable::new(
+                    false,
+                    FAST_FLAP_THRESHOLD,
+                    FAST_FLAP_GRACE,
+                    FAST_FLAP_EXPIRY,
+                ))),
+            )
+            .with_bitrate(0)
+            .constructor_bitrate(),
+            Some(BITRATE_GUESS)
+        );
 
-        // Untouched: constructor rate is stored before the worker is scheduled.
+        // Untouched: `spawn` stores the constructor rate before it returns.
         let untouched = {
             let mut guard = manager.lock().await;
-            spawn_with_bitrate(
-                &mut guard,
+            guard.spawn(
                 BackboneClient::new("127.0.0.1:1").with_manager(manager.clone()),
-                BITRATE_GUESS,
                 BackboneClient::spawn,
             )
         };
@@ -1057,14 +1056,30 @@ mod tests {
         assert_eq!(hw_mtu_for_bitrate(rate), 32_768);
         manager.lock().await.stop_iface(&untouched);
 
+        // Zero is the same guess, published by `spawn_named`.
+        let zero = {
+            let mut guard = manager.lock().await;
+            guard.spawn_named(
+                "zero",
+                BackboneClient::new("127.0.0.1:1")
+                    .with_manager(manager.clone())
+                    .with_bitrate(0),
+                BackboneClient::spawn,
+            )
+        };
+        assert_eq!(
+            control_bitrate(&*manager.lock().await, &zero),
+            Some(100_000_000)
+        );
+        assert_eq!(hw_mtu_for_bitrate(100_000_000), 32_768);
+        manager.lock().await.stop_iface(&zero);
+
         let custom = {
             let mut guard = manager.lock().await;
-            spawn_with_bitrate(
-                &mut guard,
+            guard.spawn(
                 BackboneClient::new("127.0.0.1:1")
                     .with_manager(manager.clone())
                     .with_bitrate(7_500_000),
-                7_500_000,
                 BackboneClient::spawn,
             )
         };
@@ -1074,20 +1089,21 @@ mod tests {
         );
         manager.lock().await.stop_iface(&custom);
 
-        // Constructor publish, then an explicit 62500. A later prime does not run.
+        // Spawn publishes the guess, then an explicit 62500. The polled
+        // worker must not write the guess back.
         let replaced = {
             let mut guard = manager.lock().await;
-            spawn_with_bitrate(
-                &mut guard,
+            guard.spawn(
                 BackboneClient::new("127.0.0.1:1").with_manager(manager.clone()),
-                BITRATE_GUESS,
                 BackboneClient::spawn,
             )
         };
         {
             let guard = manager.lock().await;
+            assert_eq!(control_bitrate(&guard, &replaced), Some(100_000_000));
             guard.set_iface_bitrate(&replaced, GENERIC_INTERFACE_BITRATE);
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let rate = {
             let guard = manager.lock().await;
             control_bitrate(&guard, &replaced).unwrap()
@@ -1107,8 +1123,8 @@ mod tests {
 
             let server = {
                 let mut guard = manager.lock().await;
-                let address = spawn_with_bitrate(
-                    &mut guard,
+                let address = guard.spawn_named(
+                    "backbone",
                     BackboneServer::new(
                         format!("127.0.0.1:{port}"),
                         manager.clone(),
@@ -1119,11 +1135,16 @@ mod tests {
                             FAST_FLAP_EXPIRY,
                         ))),
                     ),
-                    BITRATE_GUESS,
                     BackboneServer::spawn,
                 );
+                let published = control_bitrate(&guard, &address).unwrap();
+                assert_eq!(published, 100_000_000);
+                assert_eq!(hw_mtu_for_bitrate(published), 32_768);
                 if parent_rate != BITRATE_GUESS {
                     guard.set_iface_bitrate(&address, parent_rate);
+                    let configured = control_bitrate(&guard, &address).unwrap();
+                    assert_eq!(configured, 62_500);
+                    assert_eq!(hw_mtu_for_bitrate(configured), 1_024);
                 }
                 address
             };
@@ -1159,8 +1180,17 @@ mod tests {
             assert_eq!(child_rate, parent_rate);
             assert_eq!(
                 hw_mtu_for_bitrate(child_rate),
-                hw_mtu_for_bitrate(parent_rate)
+                if parent_rate == BITRATE_GUESS {
+                    32_768
+                } else {
+                    1_024
+                }
             );
+            let server_rate = {
+                let guard = manager.lock().await;
+                control_bitrate(&guard, &server).unwrap()
+            };
+            assert_eq!(server_rate, parent_rate);
             manager.lock().await.stop_iface(&server);
         }
     }

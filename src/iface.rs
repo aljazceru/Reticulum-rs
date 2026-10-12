@@ -385,6 +385,15 @@ impl InterfaceChannel {
 
 pub trait Interface {
     fn mtu() -> usize;
+
+    /// Bitrate to store on the control word when this interface is spawned.
+    ///
+    /// `None` leaves the generic default. The worker is not polled until
+    /// after [`InterfaceManager::spawn`] returns, so this is the only
+    /// chance to publish a constructor rate before that return.
+    fn constructor_bitrate(&self) -> Option<u64> {
+        None
+    }
 }
 
 struct LocalInterface {
@@ -858,6 +867,16 @@ impl InterfaceManager {
             .collect()
     }
 
+    /// Store a constructor bitrate after `new_context` has inserted the
+    /// generic default and before the worker is scheduled. An `async fn`
+    /// body does not run until the task is polled, which is after `spawn`
+    /// has returned.
+    fn publish_constructor_bitrate<T: Interface>(&self, context: &InterfaceContext<T>) {
+        if let Some(rate) = context.inner.lock().unwrap().constructor_bitrate() {
+            self.set_iface_bitrate(&context.channel.address, rate);
+        }
+    }
+
     pub fn spawn<T: Interface, F, R>(&mut self, inner: T, worker: F) -> AddressHash
     where
         F: FnOnce(InterfaceContext<T>) -> R,
@@ -866,6 +885,7 @@ impl InterfaceManager {
     {
         let context = self.new_context(inner);
         let address = *context.channel.address();
+        self.publish_constructor_bitrate(&context);
 
         task::spawn(worker(context));
 
@@ -887,6 +907,7 @@ impl InterfaceManager {
     {
         let context = self.new_context(inner);
         let address = *context.channel.address();
+        self.publish_constructor_bitrate(&context);
 
         self.set_iface_name(&address, name.as_ref());
 
