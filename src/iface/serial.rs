@@ -259,8 +259,55 @@ impl SerialInterface {
     }
 }
 
+/// Python `SerialInterface.should_ingress_limit`.
+pub fn should_ingress_limit() -> bool {
+    false
+}
+
 impl Interface for SerialInterface {
     fn mtu() -> usize {
         HW_MTU
+    }
+
+    fn should_ingress_limit() -> bool {
+        // Free function, not the trait method: same Python override.
+        crate::iface::serial::should_ingress_limit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::iface::control::{hold_announce_burst, IfaceControlState};
+    use crate::iface::InterfaceManager;
+
+    #[test]
+    fn constructor_without_beacon_stays_quiet() {
+        // Serial has no `id_interval` / `id_callsign` in Python. The
+        // constructor takes only the port and must keep working.
+        let iface = SerialInterface::new(SerialPortConfig::new("/dev/null", 9600));
+        assert!(iface.stream.is_none());
+        assert!(!should_ingress_limit());
+    }
+
+    #[tokio::test]
+    async fn announce_burst_is_not_held() {
+        let t0 = tokio::time::Instant::now();
+        let mut generic = IfaceControlState::new(t0);
+        assert!(
+            hold_announce_burst(&mut generic, t0) > 0,
+            "burst fixture must trip the generic limiter"
+        );
+
+        let (stream, _peer) = tokio_serial::SerialStream::pair().expect("pty pair");
+        let mut manager = InterfaceManager::new(4);
+        let address = manager.spawn(SerialInterface::from_stream(stream), SerialInterface::spawn);
+
+        let held = manager
+            .with_control(&address, |control| hold_announce_burst(control, t0))
+            .unwrap();
+        assert_eq!(held, 0);
+
+        manager.stop_iface(&address);
     }
 }

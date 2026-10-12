@@ -212,6 +212,10 @@ pub struct IfaceControlState {
     pub announce_cap: f64,
     /// Ingress control enabled (Python `Interface.ingress_control`).
     pub ingress_control: bool,
+    /// When false, `should_ingress_limit` stays false even if
+    /// `ingress_control` is on. Python hard-overrides that method for
+    /// KISS, AX.25 and serial; path-request limiting is unchanged.
+    announce_ingress_limit: bool,
     /// Egress control for path requests (Python `Interface.egress_control`).
     pub egress_control: bool,
     /// Always send recursive path requests out of this interface
@@ -272,6 +276,7 @@ impl IfaceControlState {
             bitrate: DEFAULT_BITRATE,
             announce_cap: ANNOUNCE_CAP,
             ingress_control: true,
+            announce_ingress_limit: true,
             egress_control: false,
             recursive_prs: false,
             announces_from_internal: true,
@@ -301,6 +306,15 @@ impl IfaceControlState {
     /// Override the configurable control parameters.
     pub fn set_params(&mut self, params: IfaceControlParams) {
         self.params = params;
+    }
+
+    /// Enable or disable announce ingress limiting.
+    ///
+    /// KISS, AX.25 and serial set this false at spawn. `ingress_control`
+    /// still gates path-request bursts, matching the Python override of
+    /// `should_ingress_limit` only.
+    pub fn set_announce_ingress_limit(&mut self, enabled: bool) {
+        self.announce_ingress_limit = enabled;
     }
 
     pub fn params(&self) -> &IfaceControlParams {
@@ -411,7 +425,7 @@ impl IfaceControlState {
 
     /// Whether announces should currently be ingress limited.
     pub fn should_ingress_limit(&mut self, now: Instant) -> bool {
-        if !self.ingress_control {
+        if !self.ingress_control || !self.announce_ingress_limit {
             return false;
         }
 
@@ -657,6 +671,25 @@ impl IfaceControlState {
     }
 }
 
+/// Feed a new-interface announce burst and hold the next announce when
+/// `should_ingress_limit` says so. Returns how many announces were held.
+///
+/// Ten samples over half a second, scored one second after the first, is
+/// above `ic_burst_freq_new` (3 Hz) for a generic interface.
+#[cfg(test)]
+pub(crate) fn hold_announce_burst(state: &mut IfaceControlState, t0: Instant) -> usize {
+    for i in 0..10 {
+        state.received_announce(t0 + Duration::from_millis(50 * i));
+    }
+    let now = t0 + Duration::from_secs(1);
+    if state.should_ingress_limit(now) {
+        let mut packet = Packet::default();
+        packet.header.hops = 1;
+        state.hold_announce(&packet, 128);
+    }
+    state.held_announces_len()
+}
+
 // ---------------------------------------------------------------------------
 // Tests: timing simulations of the Python control loops.
 // ---------------------------------------------------------------------------
@@ -722,6 +755,18 @@ mod tests {
         assert!(state
             .release_held_announce(t0 + Duration::from_secs(2))
             .is_none());
+    }
+
+    #[test]
+    fn disabled_announce_ingress_limit_does_not_hold_burst() {
+        let t0 = Instant::now();
+        let mut state = IfaceControlState::new(t0);
+        state.set_announce_ingress_limit(false);
+        assert_eq!(super::hold_announce_burst(&mut state, t0), 0);
+
+        // The same burst is held when the override is left at the default.
+        let mut generic = IfaceControlState::new(t0);
+        assert!(super::hold_announce_burst(&mut generic, t0) > 0);
     }
 
     #[test]

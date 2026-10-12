@@ -394,6 +394,15 @@ pub trait Interface {
     fn constructor_bitrate(&self) -> Option<u64> {
         None
     }
+
+    /// Whether this type applies announce ingress limiting.
+    ///
+    /// Python overrides `should_ingress_limit` to return false for KISS,
+    /// AX.25 KISS and serial, so those links forward announce bursts
+    /// instead of holding them. Other types use the generic limiter.
+    fn should_ingress_limit() -> bool {
+        true
+    }
 }
 
 struct LocalInterface {
@@ -493,11 +502,24 @@ impl InterfaceManager {
         let channel = self.new_channel_named(1, &kind, &kind);
 
         let inner = Arc::new(Mutex::new(inner));
+        let address = channel.address;
+        self.apply_type_ingress_policy::<T>(&address);
 
         InterfaceContext::<T> {
             inner: inner.clone(),
             channel,
             cancel: self.cancel.clone(),
+        }
+    }
+
+    /// KISS, AX.25 and serial override `should_ingress_limit` to false.
+    /// Applied when the channel is registered so transport (which only
+    /// sees [`IfaceControlState`]) holds no announces for these types.
+    fn apply_type_ingress_policy<T: Interface>(&self, address: &AddressHash) {
+        if !T::should_ingress_limit() {
+            self.with_control(address, |control| {
+                control.set_announce_ingress_limit(false);
+            });
         }
     }
 
@@ -606,13 +628,15 @@ impl InterfaceManager {
         let channel = self.new_channel_named(1, &kind, &kind);
         *channel.ifac.write().expect("ifac lock") = Some(ifac);
 
+        let address = channel.address;
+        self.apply_type_ingress_policy::<T>(&address);
+
         let context = InterfaceContext::<T> {
             inner: Arc::new(Mutex::new(inner)),
             channel,
             cancel: self.cancel.clone(),
         };
 
-        let address = context.channel.address;
         task::spawn(worker(context));
         address
     }

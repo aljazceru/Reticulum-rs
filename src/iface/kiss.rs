@@ -20,6 +20,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant as StdInstant;
 
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -28,8 +29,8 @@ use tokio_serial::SerialStream;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
-use crate::iface::ax25;
 use crate::iface::RxMessage;
+use crate::iface::ax25;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -287,13 +288,84 @@ pub enum KissMode {
     Ax25 { callsign: String, ssid: u8 },
 }
 
-/// KISS beacon configuration (`id_interval` / `id_callsign`): transmit the
-/// callsign padded to 15 bytes `id_interval` seconds after the last start of
-/// regular traffic (see the `first_tx` logic in `KISSInterface.readLoop`).
+/// KISS beacon configuration (`id_interval` / `id_callsign`).
+///
+/// Absent unless both were configured. Python stores an empty callsign
+/// when `id_callsign` is omitted and only transmits when `id_interval`
+/// is set; [`KissInterface::with_beacon`] is that armed state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KissBeacon {
     pub interval: u64,
     pub data: Vec<u8>,
+}
+
+/// Runtime ID beacon (`KISSInterface.readLoop` / `process_outgoing`).
+///
+/// `first_tx` is armed by the first non-ID payload. Once `id_interval`
+/// seconds have elapsed, the callsign padded out to 15 bytes is returned
+/// for the transmit queue. Python compares the written bytes with the
+/// unpadded callsign, so a shorter ID restarts the window.
+struct IdBeacon {
+    interval: Duration,
+    callsign: Vec<u8>,
+    first_tx: Option<StdInstant>,
+}
+
+impl IdBeacon {
+    fn new(interval_secs: u64, callsign: impl Into<Vec<u8>>) -> Self {
+        Self {
+            interval: Duration::from_secs(interval_secs),
+            callsign: callsign.into(),
+            first_tx: None,
+        }
+    }
+
+    fn from_config(config: &KissBeacon) -> Self {
+        Self::new(config.interval, config.data.clone())
+    }
+
+    /// Delay until the ID may be queued. `None` until a real payload has
+    /// been sent. The extra millisecond matches Python's strict `>`.
+    fn time_until_due(&self, now: StdInstant) -> Option<Duration> {
+        let started = self.first_tx?;
+        let due = started + self.interval + Duration::from_millis(1);
+        Some(due.saturating_duration_since(now))
+    }
+
+    /// The padded ID payload when the interval has elapsed.
+    ///
+    /// Clears `first_tx` the way `readLoop` does before `process_outgoing`.
+    /// The caller must [`IdBeacon::note_sent`] only if the frame is written,
+    /// not if flow control merely queues it.
+    fn take_if_due(&mut self, now: StdInstant) -> Option<Vec<u8>> {
+        let started = self.first_tx?;
+        if now > started + self.interval {
+            self.first_tx = None;
+            Some(pad_id_frame(&self.callsign))
+        } else {
+            None
+        }
+    }
+
+    /// `process_outgoing` bookkeeping. An exact (unpadded) callsign clears
+    /// the window; any other payload arms it if it is not already armed.
+    fn note_sent(&mut self, data: &[u8], now: StdInstant) {
+        if data == self.callsign.as_slice() {
+            self.first_tx = None;
+        } else if self.first_tx.is_none() {
+            self.first_tx = Some(now);
+        }
+    }
+}
+
+/// Python pads the ID with `0x00` until it is 15 bytes. Longer callsigns
+/// are sent as-is.
+fn pad_id_frame(callsign: &[u8]) -> Vec<u8> {
+    let mut frame = callsign.to_vec();
+    if frame.len() < 15 {
+        frame.resize(15, 0x00);
+    }
+    frame
 }
 
 /// Shared transmit state: flow-control readiness and the packet queue
@@ -350,6 +422,10 @@ impl KissInterface {
     }
 
     /// Enable the identification beacon (`id_interval` / `id_callsign`).
+    ///
+    /// Plain KISS only. AX.25 identifies with the header callsign and does
+    /// not transmit this frame (`AX25KISSInterface.py` has no ID beacon).
+    /// Omit the call to leave the beacon unset.
     pub fn with_beacon(mut self, interval_secs: u64, data: impl Into<Vec<u8>>) -> Self {
         self.beacon = Some(KissBeacon {
             interval: interval_secs,
@@ -547,8 +623,12 @@ impl KissInterface {
                 let mut write_half = write_half;
 
                 tokio::spawn(async move {
-                    // `first_tx` opens the beacon window (Python readLoop)
-                    let mut first_tx: Option<tokio::time::Instant> = None;
+                    // AX.25 identifies in the UI header. Only plain KISS
+                    // sends the `id_callsign` beacon.
+                    let mut id_beacon = match (&mode, beacon) {
+                        (KissMode::Kiss, Some(config)) => Some(IdBeacon::from_config(&config)),
+                        _ => None,
+                    };
 
                     let encode = |data: &[u8]| match &mode {
                         KissMode::Kiss => encode_frame(data),
@@ -594,16 +674,58 @@ impl KissInterface {
                     loop {
                         let mut tx_channel = tx_channel.lock().await;
 
-                        let message = tokio::select! {
+                        let beacon_wait = async {
+                            match id_beacon
+                                .as_ref()
+                                .and_then(|beacon| beacon.time_until_due(StdInstant::now()))
+                            {
+                                Some(delay) => tokio::time::sleep(delay).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        };
+
+                        enum Wake {
+                            Flow,
+                            Message(Option<crate::iface::TxMessage>),
+                            Beacon,
+                        }
+
+                        let wake = tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = stop.cancelled() => break,
                             // flow control released: send one queued packet
-                            _ = ready_notify.notified() => None,
-                            message = tx_channel.recv() => Some(message),
+                            _ = ready_notify.notified() => Wake::Flow,
+                            message = tx_channel.recv() => Wake::Message(message),
+                            _ = beacon_wait => Wake::Beacon,
                         };
 
-                        let data = match message {
-                            Some(Some(message)) => {
+                        if matches!(wake, Wake::Beacon) {
+                            if let Some(beacon) = id_beacon.as_mut() {
+                                if let Some(payload) = beacon.take_if_due(StdInstant::now()) {
+                                    let transmitted = transmit(
+                                        &mut write_half,
+                                        encode(&payload),
+                                        payload.len(),
+                                        flow_control,
+                                        &tx_state,
+                                        &stats,
+                                    )
+                                    .await;
+                                    // note_sent only after a real write. A
+                                    // flow-control queue holds framed bytes,
+                                    // and Python restarts `first_tx` only
+                                    // once the ID hits the port.
+                                    if transmitted {
+                                        log::debug!("kiss: transmitted beacon data");
+                                        beacon.note_sent(&payload, StdInstant::now());
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+
+                        let data = match wake {
+                            Wake::Message(Some(message)) => {
                                 let packet = message.packet;
                                 let mut buffer = [0u8; 2048];
                                 let mut output = OutputBuffer::new(&mut buffer[..]);
@@ -616,7 +738,7 @@ impl KissInterface {
                                     ifac.as_deref(),
                                 ))
                             }
-                            None | Some(None) => {
+                            Wake::Flow | Wake::Message(None) => {
                                 // process_queue: exactly one queued packet
                                 let queued = tx_state.lock().unwrap().queue.pop_front();
                                 if let Some(frame) = queued {
@@ -632,37 +754,8 @@ impl KissInterface {
                                 }
                                 None
                             }
+                            Wake::Beacon => None,
                         };
-
-                        // identification beacon window
-                        if let Some(beacon) = &beacon {
-                            if let Some(started) = first_tx {
-                                if tokio::time::Instant::now()
-                                    > started + Duration::from_secs(beacon.interval)
-                                {
-                                    // Pad to minimum length
-                                    let mut frame = beacon.data.clone();
-                                    while frame.len() < 15 {
-                                        frame.push(0x00);
-                                    }
-
-                                    let transmitted = transmit(
-                                        &mut write_half,
-                                        encode(&frame),
-                                        frame.len(),
-                                        flow_control,
-                                        &tx_state,
-                                        &stats,
-                                    )
-                                    .await;
-
-                                    if transmitted {
-                                        log::debug!("kiss: transmitted beacon data");
-                                        first_tx = None;
-                                    }
-                                }
-                            }
-                        }
 
                         let Some(data) = data else { continue };
 
@@ -677,10 +770,8 @@ impl KissInterface {
                         .await;
 
                         if transmitted {
-                            if let Some(beacon) = &beacon {
-                                if data != beacon.data && first_tx.is_none() {
-                                    first_tx = Some(tokio::time::Instant::now());
-                                }
+                            if let Some(beacon) = id_beacon.as_mut() {
+                                beacon.note_sent(&data, StdInstant::now());
                             }
                         }
                     }
@@ -709,6 +800,12 @@ impl Interface for KissInterface {
     fn mtu() -> usize {
         HW_MTU
     }
+
+    fn should_ingress_limit() -> bool {
+        // Plain KISS and AX.25 KISS share this type. Both Python classes
+        // return false; the AX.25 override is `ax25::should_ingress_limit`.
+        ax25::should_ingress_limit()
+    }
 }
 
 #[cfg(test)]
@@ -730,7 +827,9 @@ mod tests {
         // Python: bytes([KISS.FEND])+bytes([0x00])+KISS.escape(data)+bytes([KISS.FEND])
         assert_eq!(
             encode_frame(&[0x7e, 0x7d, 0x01, 0xc0, 0xdb, 0xdc, 0xdd]),
-            vec![0xc0, 0x00, 0x7e, 0x7d, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0xdc, 0xdd, 0xc0]
+            vec![
+                0xc0, 0x00, 0x7e, 0x7d, 0x01, 0xdb, 0xdc, 0xdb, 0xdd, 0xdc, 0xdd, 0xc0
+            ]
         );
 
         // empty data frame
@@ -798,5 +897,127 @@ mod tests {
         // regular data frame on port 0
         let data = encode_frame(&[0xaa, 0xbb]);
         assert_eq!(decoder.feed(&data), vec![KissEvent::Data(vec![0xaa, 0xbb])]);
+    }
+
+    #[test]
+    fn constructor_without_beacon_stays_quiet() {
+        let iface = KissInterface::new(
+            SerialPortConfig::new("/dev/null", 9600),
+            CsmaParams::default(),
+            false,
+        );
+        assert!(iface.beacon.is_none());
+
+        let ax25 = KissInterface::new_ax25(
+            "N0CALL",
+            1,
+            SerialPortConfig::new("/dev/null", 9600),
+            CsmaParams::default(),
+            false,
+        )
+        .unwrap();
+        assert!(ax25.beacon.is_none());
+
+        // Optional beacon does not change the constructor shape.
+        let armed = iface.with_beacon(600, b"MYCALL-0".as_slice());
+        assert_eq!(armed.beacon.unwrap().interval, 600);
+    }
+
+    #[test]
+    fn configured_interval_queues_id_frame() {
+        let mut beacon = IdBeacon::new(600, b"MYCALL-0".as_slice());
+        let t0 = StdInstant::now();
+        let mut queue = VecDeque::new();
+
+        // No transmission yet: Python IDs only after a real payload.
+        if let Some(frame) = beacon.take_if_due(t0 + Duration::from_secs(10_000)) {
+            queue.push_back(frame);
+        }
+        assert!(queue.is_empty());
+
+        beacon.note_sent(b"reticulum-packet", t0);
+        // Strict greater-than, same as `time.time() > first_tx + beacon_i`.
+        if let Some(frame) = beacon.take_if_due(t0 + Duration::from_secs(600)) {
+            queue.push_back(frame);
+        }
+        assert!(queue.is_empty());
+
+        if let Some(frame) =
+            beacon.take_if_due(t0 + Duration::from_secs(600) + Duration::from_millis(1))
+        {
+            queue.push_back(frame);
+        }
+        assert_eq!(queue.len(), 1);
+
+        let mut expected = b"MYCALL-0".to_vec();
+        expected.resize(15, 0x00);
+        assert_eq!(queue[0], expected);
+
+        let wire = encode_frame(&queue[0]);
+        assert_eq!(&wire[..2], &[FEND, CMD_DATA]);
+        assert_eq!(*wire.last().unwrap(), FEND);
+        assert!(wire.windows(expected.len()).any(|chunk| chunk == expected));
+
+        // Padded ID does not equal the raw callsign, so the window restarts
+        // when the frame is actually written (`process_outgoing`).
+        let sent_at = t0 + Duration::from_secs(601);
+        beacon.note_sent(&queue[0], sent_at);
+        assert!(
+            beacon
+                .take_if_due(sent_at + Duration::from_secs(600))
+                .is_none()
+        );
+        let next = beacon
+            .take_if_due(sent_at + Duration::from_secs(600) + Duration::from_millis(1))
+            .expect("next id");
+        queue.push_back(next);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn announce_burst_is_not_held() {
+        use crate::iface::InterfaceManager;
+        use crate::iface::control::{IfaceControlState, hold_announce_burst};
+
+        let t0 = tokio::time::Instant::now();
+        let mut generic = IfaceControlState::new(t0);
+        assert!(
+            hold_announce_burst(&mut generic, t0) > 0,
+            "burst fixture must trip the generic limiter"
+        );
+
+        let (kiss_stream, _kiss_peer) = tokio_serial::SerialStream::pair().expect("pty pair");
+        let (ax_stream, _ax_peer) = tokio_serial::SerialStream::pair().expect("pty pair");
+        let mut manager = InterfaceManager::new(4);
+
+        let kiss = manager.spawn(
+            KissInterface::from_stream(KissMode::Kiss, CsmaParams::default(), false, kiss_stream),
+            KissInterface::spawn,
+        );
+        let ax25 = manager.spawn(
+            KissInterface::from_stream(
+                KissMode::Ax25 {
+                    callsign: "N0CALL".to_string(),
+                    ssid: 0,
+                },
+                CsmaParams::default(),
+                false,
+                ax_stream,
+            )
+            .with_beacon(600, b"N0CALL".as_slice()),
+            KissInterface::spawn,
+        );
+
+        let kiss_held = manager
+            .with_control(&kiss, |control| hold_announce_burst(control, t0))
+            .unwrap();
+        let ax_held = manager
+            .with_control(&ax25, |control| hold_announce_burst(control, t0))
+            .unwrap();
+        assert_eq!(kiss_held, 0);
+        assert_eq!(ax_held, 0);
+
+        manager.stop_iface(&kiss);
+        manager.stop_iface(&ax25);
     }
 }
