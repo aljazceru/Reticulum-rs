@@ -577,7 +577,40 @@ async fn start_session(
                     }
 
                     if command.is_empty() {
-                        command = vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".into())];
+                        // Python `listener.listen` uses `pwd.getpwuid(os.getuid()).pw_shell`.
+                        let mut shell = String::new();
+                        let mut buf_len = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+                        if buf_len < 1024 {
+                            buf_len = 16 * 1024;
+                        }
+                        let mut buf = vec![0u8; buf_len as usize];
+                        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+                        let mut result: *mut libc::passwd = std::ptr::null_mut();
+                        let rc = unsafe {
+                            libc::getpwuid_r(
+                                libc::getuid(),
+                                &mut pwd,
+                                buf.as_mut_ptr().cast(),
+                                buf.len(),
+                                &mut result,
+                            )
+                        };
+                        if rc == 0 && !result.is_null() && !pwd.pw_shell.is_null() {
+                            if let Ok(text) =
+                                unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }.to_str()
+                            {
+                                shell = text.to_string();
+                            }
+                        } else if rc != 0 {
+                            log::error!(
+                                "Error looking up shell: {}",
+                                std::io::Error::from_raw_os_error(rc)
+                            );
+                        }
+                        if shell.is_empty() {
+                            shell = "/bin/sh".to_string();
+                        }
+                        command = vec![shell];
                     }
 
                     match spawn_session_process(
@@ -612,11 +645,14 @@ async fn start_session(
 
         let stdout = session.take_stdout();
         let stderr = session.take_stderr();
-        let mut stdin = session.take_stdin();
+        let stdin = session.take_stdin();
         let winsize = session.winsize_fd.clone();
+        let child_pid = session.child.id();
+        // Set only when `prepare_child_tty` ran `setsid`, so this pid is the process group.
+        let session_leader = session.winsize_fd.is_some();
 
         let channel_out = channel.clone();
-        let stdout_task = tokio::spawn(async move {
+        let mut stdout_task = tokio::spawn(async move {
             let mut stdout = stdout;
             if let Some(stdout) = stdout.as_mut() {
                 let mut buffer = vec![0u8; stream_chunk_size(&channel_out.link).await];
@@ -631,7 +667,7 @@ async fn start_session(
                             )
                             .await
                             {
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -646,10 +682,11 @@ async fn start_session(
                 },
             )
             .await;
+            true
         });
 
         let channel_err = channel.clone();
-        let stderr_task = tokio::spawn(async move {
+        let mut stderr_task = tokio::spawn(async move {
             let mut stderr = stderr;
             if let Some(stderr) = stderr.as_mut() {
                 let mut buffer = vec![0u8; stream_chunk_size(&channel_err.link).await];
@@ -664,9 +701,55 @@ async fn start_session(
                             )
                             .await
                             {
-                                return;
+                                return false;
                             }
                         }
+                    }
+                }
+            }
+            true
+        });
+
+        let stdout_abort = stdout_task.abort_handle();
+        let stderr_abort = stderr_task.abort_handle();
+        let (halt_tx, mut halt_rx) = tokio::sync::mpsc::channel::<()>(4);
+
+        // The channel broadcast stays open across link close. This task is the
+        // one that sees `LinkEvent::Closed` and is not blocked on a PTY write.
+        let halt_link = halt_tx.clone();
+        let watch_transport = transport.clone();
+        let link_watch = tokio::spawn(async move {
+            let mut events = watch_transport.in_link_events();
+            loop {
+                match events.recv().await {
+                    Ok(event)
+                        if event.id == link_id
+                            && matches!(
+                                event.event,
+                                reticulum::destination::link::LinkEvent::Closed
+                            ) =>
+                    {
+                        let _ = halt_link.send(()).await;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("rnsh link events lagged; dropped {skipped} messages");
+                        let closed = match watch_transport.find_in_link(&link_id).await {
+                            Some(link) => {
+                                link.lock().await.status()
+                                    == reticulum::destination::link::LinkStatus::Closed
+                            }
+                            None => true,
+                        };
+                        if closed {
+                            let _ = halt_link.send(()).await;
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = halt_link.send(()).await;
+                        break;
                     }
                 }
             }
@@ -674,40 +757,120 @@ async fn start_session(
 
         // Same receiver that accepted ExecuteCommand, so a WindowSize or
         // stdin frame that follows it is not dropped.
-        tokio::spawn(async move {
-            while let Ok(message) = receiver.recv().await {
-                match message {
-                    RnshMessage::WindowSize {
+        let halt_input = halt_tx;
+        let input_task = tokio::spawn(async move {
+            let mut stdin = stdin;
+            loop {
+                match receiver.recv().await {
+                    Ok(RnshMessage::WindowSize {
                         rows,
                         cols,
                         hpix,
                         vpix,
-                    } => {
+                    }) => {
                         if let Some(fd) = &winsize {
                             let _ = apply_winsize(fd, rows, cols, hpix, vpix);
                         }
                     }
-                    RnshMessage::StreamData {
+                    Ok(RnshMessage::StreamData {
                         stream_id: STREAM_ID_STDIN,
                         data,
                         eof,
-                    } => {
+                    }) => {
                         if let Some(writer) = stdin.as_mut() {
                             if !data.is_empty() && writer.write_all(&data).await.is_err() {
+                                let _ = halt_input.send(()).await;
                                 break;
                             }
                         }
                         if eof {
                             stdin.take();
+                            if session_leader {
+                                let _ = halt_input.send(()).await;
+                                break;
+                            }
                         }
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        log::warn!("rnsh session input lagged; dropped {skipped} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        let _ = halt_input.send(()).await;
+                        break;
+                    }
                 }
             }
         });
 
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+        let mut stdout_done = false;
+        let mut stderr_done = false;
+        let mut teardown = false;
+        loop {
+            if stdout_done && stderr_done {
+                break;
+            }
+            tokio::select! {
+                _ = halt_rx.recv() => {
+                    teardown = true;
+                    break;
+                }
+                joined = &mut stdout_task, if !stdout_done => {
+                    stdout_done = true;
+                    match joined {
+                        Ok(true) if stderr_done => break,
+                        Ok(true) => {}
+                        _ => {
+                            teardown = true;
+                            break;
+                        }
+                    }
+                }
+                joined = &mut stderr_task, if !stderr_done => {
+                    stderr_done = true;
+                    match joined {
+                        Ok(true) if stdout_done => break,
+                        Ok(true) => {}
+                        _ => {
+                            teardown = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if teardown {
+            if let Some(pid) = child_pid {
+                let pid = pid as libc::pid_t;
+                if pid > 0 {
+                    // Negative pid is the process group from `prepare_child_tty`.
+                    // A pipe child never called `setsid`, so only its pid is signalled.
+                    let target = if session_leader { -pid } else { pid };
+                    unsafe {
+                        libc::kill(target, libc::SIGTERM);
+                        libc::kill(target, libc::SIGHUP);
+                        libc::kill(target, libc::SIGKILL);
+                    }
+                }
+            }
+            if !stdout_done {
+                stdout_abort.abort();
+            }
+            if !stderr_done {
+                stderr_abort.abort();
+            }
+        }
+        input_task.abort();
+        link_watch.abort();
+        if !stdout_done {
+            let _ = stdout_task.await;
+        }
+        if !stderr_done {
+            let _ = stderr_task.await;
+        }
+        let _ = input_task.await;
+        let _ = link_watch.await;
 
         let status = session.wait().await;
         let return_code = status.ok().and_then(|s| s.code());
@@ -717,7 +880,8 @@ async fn start_session(
 
 /// Child process for one listener session.
 ///
-/// A PTY is opened unless stdin, stdout, and stderr are all pipes.
+/// A PTY is opened when stdout or stderr is not a pipe. When both are
+/// pipes, a non-pipe stdin is `/dev/null`.
 pub struct SessionProcess {
     child: tokio::process::Child,
     stdin: Option<SessionWriter>,
@@ -778,10 +942,6 @@ impl SessionProcess {
     pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
-
-    pub fn start_kill(&mut self) -> std::io::Result<()> {
-        self.child.start_kill()
-    }
 }
 
 /// Spawn `argv`. `initial` is applied to the PTY before exec when one is opened.
@@ -801,7 +961,7 @@ pub fn spawn_session_process(
         ));
     }
 
-    let use_pty = !(pipe_stdin && pipe_stdout && pipe_stderr);
+    let use_pty = !pipe_stdout || !pipe_stderr;
     let mut master = None;
     let mut slave = None;
     if use_pty {
@@ -1372,7 +1532,8 @@ fn is_tty(fd: i32) -> bool {
 
 /// Interactive client session.
 ///
-/// `command` `None` or `""` asks the listener for its default shell.
+/// `command` `None` or `""` sends no command line, and the listener runs
+/// the shell it already chose. This does not ask the listener for `pw_shell`.
 /// [`run_command`] remains the non-interactive `--command` path.
 pub async fn run_interactive(
     destination: &AddressHash,
@@ -1380,7 +1541,7 @@ pub async fn run_interactive(
     options: &ServeOptions,
 ) -> Result<i32, String> {
     let connected = connect_client(destination, options).await?;
-    let _transport = connected.transport;
+    let transport = connected.transport;
     let channel = connected.channel;
     let mut receiver = connected.receiver;
 
@@ -1468,7 +1629,11 @@ pub async fn run_interactive(
                         return Err(msg.unwrap_or_else(|| "remote error".into()));
                     }
                     Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        return Err(format!(
+                            "rnsh session lagged; dropped {skipped} messages"
+                        ));
+                    }
                     Err(_) => break 255,
                 }
             }
@@ -1493,6 +1658,8 @@ pub async fn run_interactive(
                         let data = if filter_keys {
                             let (data, quit) = keys.push(&chunk);
                             if quit {
+                                let link_id = *channel.link.lock().await.id();
+                                let _ = transport.link_close(link_id).await;
                                 break 0;
                             }
                             data
@@ -1631,18 +1798,22 @@ impl InteractiveKeys {
         const FLUSH: &[u8] = &[
             0x01, 0x03, 0x04, 0x05, 0x0c, 0x11, 0x13, 0x15, 0x19, b'\t', 0x1a, 0x1b,
         ];
-        let mut data = Vec::new();
-        let mut line_flush = false;
+        let mut out = Vec::new();
         let mut quit = false;
         for &byte in input {
-            if byte == b'\r' {
-                self.pre_esc = true;
-                line_flush = true;
-                data.push(byte);
-            } else if self.line_mode && FLUSH.contains(&byte) {
-                self.pre_esc = false;
-                line_flush = true;
-                data.push(byte);
+            if byte == b'\r' || (self.line_mode && FLUSH.contains(&byte)) {
+                self.pre_esc = byte == b'\r';
+                if self.line_mode {
+                    self.line_buffer.push(byte);
+                    out.extend(std::mem::take(&mut self.line_buffer));
+                    if self.blind > 0 {
+                        let erase = b"\x08 \x08".repeat(self.blind);
+                        let _ = write_fd(1, &erase);
+                        self.blind = 0;
+                    }
+                } else {
+                    out.push(byte);
+                }
             } else if self.line_mode && (byte == 0x08 || byte == 0x7f) {
                 self.pre_esc = false;
                 if !self.line_buffer.is_empty() {
@@ -1672,38 +1843,42 @@ impl InteractiveKeys {
                         }
                     }
                     other => {
-                        if other != b'~' {
-                            data.push(b'~');
+                        let mut produced = [0u8; 2];
+                        let count = if other == b'~' {
+                            produced[0] = other;
+                            1
+                        } else {
+                            produced[0] = b'~';
+                            produced[1] = other;
+                            2
+                        };
+                        for produced_byte in produced.into_iter().take(count) {
+                            if self.line_mode {
+                                self.line_buffer.push(produced_byte);
+                                let _ = write_fd(1, &[produced_byte]);
+                                self.blind += 1;
+                            } else {
+                                out.push(produced_byte);
+                            }
                         }
-                        data.push(other);
                     }
                 }
             } else {
                 self.pre_esc = false;
-                data.push(byte);
+                if self.line_mode {
+                    self.line_buffer.push(byte);
+                    let _ = write_fd(1, &[byte]);
+                    self.blind += 1;
+                } else {
+                    out.push(byte);
+                }
             }
         }
 
         if quit {
-            return (Vec::new(), true);
-        }
-        if !self.line_mode {
-            return (data, false);
-        }
-        if line_flush {
-            self.line_buffer.extend_from_slice(&data);
-            let out = std::mem::take(&mut self.line_buffer);
-            if self.blind > 0 {
-                let erase = b"\x08 \x08".repeat(self.blind);
-                let _ = write_fd(1, &erase);
-                self.blind = 0;
-            }
-            (out, false)
+            (Vec::new(), true)
         } else {
-            let _ = write_fd(1, &data);
-            self.line_buffer.extend_from_slice(&data);
-            self.blind += data.len();
-            (Vec::new(), false)
+            (out, false)
         }
     }
 }
@@ -1874,5 +2049,51 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains(&parse_allowed_identity_line(&hash).unwrap()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn line_mode_applies_erase_inside_the_chunk() {
+        let mut keys = InteractiveKeys::new();
+        keys.line_mode = true;
+        let (data, quit) = keys.push(b"a\x7f");
+        assert!(!quit);
+        assert!(data.is_empty());
+        assert!(keys.line_buffer.is_empty());
+
+        let (data, quit) = keys.push(b"ab\x08c\x7f\r");
+        assert!(!quit);
+        assert_eq!(data, b"a\r");
+        assert!(keys.line_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn piped_stdout_and_stderr_leave_stdin_at_eof() {
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "if [ -t 0 ]; then printf tty; else printf notty; fi; cat".to_string(),
+        ];
+        let mut proc =
+            spawn_session_process(&argv, false, true, true, None, None, None).expect("spawn");
+        let mut stdout = proc.take_stdout().expect("stdout");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got != b"notty" && tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), stdout.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                Ok(Err(err)) => panic!("{err}"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(got, b"notty");
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), proc.wait())
+            .await
+            .expect("child still running")
+            .expect("wait");
+        assert!(status.success());
     }
 }

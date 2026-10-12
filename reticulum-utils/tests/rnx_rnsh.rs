@@ -122,7 +122,7 @@ async fn rnsh_session_command_roundtrip() {
     listener.abort();
 }
 
-/// Local PTY only: the child sees a tty, and a window-size message changes it.
+/// Local PTY only: the child sees a tty, and the test applies `TIOCSWINSZ` on the local PTY.
 #[tokio::test]
 async fn rnsh_pty_resize_without_network() {
     let script = r#"
@@ -179,22 +179,7 @@ sys.exit(1)
     } else {
         (48, 123, 640, 480)
     };
-    let message = reticulum_utils::rnsh::RnshMessage::WindowSize {
-        rows: Some(rows),
-        cols: Some(cols),
-        hpix: Some(hpix),
-        vpix: Some(vpix),
-    };
-    let reticulum_utils::rnsh::RnshMessage::WindowSize {
-        rows,
-        cols,
-        hpix,
-        vpix,
-    } = message
-    else {
-        unreachable!();
-    };
-    proc.set_window_size(rows, cols, hpix, vpix)
+    proc.set_window_size(Some(rows), Some(cols), Some(hpix), Some(vpix))
         .expect("TIOCSWINSZ");
 
     let rest = read_pty_text(&mut stdout, 1).await;
@@ -203,13 +188,10 @@ sys.exit(1)
         .filter(|line| !line.is_empty())
         .find_map(parse_winsz)
         .unwrap_or_else(|| panic!("resize did not change winsize, output {rest:?}"));
-    assert_eq!(
-        updated,
-        (rows.unwrap(), cols.unwrap(), hpix.unwrap(), vpix.unwrap())
-    );
+    assert_eq!(updated, (rows, cols, hpix, vpix));
 
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), proc.wait()).await;
-    let _ = proc.start_kill();
+    drop(stdout);
+    drop(proc);
 }
 
 fn parse_winsz(line: &str) -> Option<(u32, u32, u32, u32)> {
