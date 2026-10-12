@@ -16,10 +16,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::iface::hdlc::{Hdlc, HdlcDecoder};
@@ -27,22 +28,16 @@ use crate::iface::{Interface, InterfaceContext, InterfaceManager, RxMessage};
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
-/// Python `BackboneInterface.HW_MTU` before `optimise_mtu` replaces it.
-const HW_MTU_INITIAL: usize = 1_048_576;
-
 /// Nominal bitrate guess (Python `BackboneInterface.BITRATE_GUESS`).
 pub const BITRATE_GUESS: u64 = 100_000_000;
 
-/// `Interface.bitrate` default. Backbone control state starts there until
-/// a configured rate or [`BITRATE_GUESS`] replaces it, so a still-default
-/// reading must not drive `optimise_mtu`.
+/// `Interface.bitrate` default (Python `Interface.__init__`).
 const GENERIC_INTERFACE_BITRATE: u64 = 62_500;
 
 /// Hardware MTU selected by Python `Interface.optimise_mtu`.
 ///
-/// Backbone sets `AUTOCONFIGURE_MTU`, so the class `HW_MTU` (1048576) does
-/// not stay in force: the bitrate tier replaces it. The decoder and
-/// [`HW_MTU`] both use this function so they cannot diverge.
+/// Below 62_500 Python clears `HW_MTU`. The decoder keeps the last finite
+/// tier (1024) rather than the 1048576 class ceiling.
 pub const fn hw_mtu_for_bitrate(bitrate: u64) -> usize {
     if bitrate >= 1_000_000_000 {
         524_288
@@ -65,9 +60,7 @@ pub const fn hw_mtu_for_bitrate(bitrate: u64) -> usize {
     } else if bitrate >= 62_500 {
         1_024
     } else {
-        // Below the lowest tier Python clears `HW_MTU`. Keep the class
-        // ceiling so the decoder still has a finite limit.
-        HW_MTU_INITIAL
+        1_024
     }
 }
 
@@ -87,91 +80,7 @@ pub const DP_EC_RELEASE_ETA: f64 = 5.0;
 pub const DP_EC_DEAD_TIME: Duration = Duration::from_secs(12);
 pub const DP_EC_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Dataplane ingress watermarks (Python `DP_IC_*`). The queue length they
-/// scale is `Transport.INBOUND_DA_QUEUE_LENGTH` (1024) unless configured.
-pub const DP_IC_HIGH_WM_PCT: usize = 90;
-pub const DP_IC_MID_WM_PCT: usize = 68;
-pub const DP_IC_LOW_WM_PCT: usize = 10;
-pub const DP_IC_INTERVAL: Duration = Duration::from_millis(250);
-pub const DP_IC_RCVBUF: usize = 32_768;
-pub const DP_IC_IF_HEADROOM: usize = 32;
-pub const DP_IC_PENALTY: f64 = 1.5;
-pub const DEFAULT_DATA_QUEUE_LEN: usize = 1024;
-
-/// `(high, mid, low)` packet marks (Python startup scaling of `DP_IC_*_WM`).
-pub fn dp_ic_watermarks(data_queue_len: usize) -> (usize, usize, usize) {
-    let high = ((DP_IC_HIGH_WM_PCT * data_queue_len) / 100).max(4);
-    let mid = ((DP_IC_MID_WM_PCT * data_queue_len) / 100).max(2);
-    let low = (DP_IC_LOW_WM_PCT * data_queue_len) / 100;
-    (high, mid, low)
-}
-
-fn ingress_hold(span: Duration, bytes: u64, interfaces: usize) -> Duration {
-    let span_s = span.as_secs_f64().max(0.001);
-    let avail = bytes as f64 / span_s;
-    let alloc = 1.0 / ((interfaces.max(DP_IC_IF_HEADROOM) as f64) * DP_IC_PENALTY);
-    let hold_s = (avail / (avail * alloc).max(1.0)) * span_s;
-    Duration::from_secs_f64(hold_s.max(0.0))
-}
-
-/// Per-peer ingress gate (Python `__dp_ic_job` for one producer).
-#[derive(Debug)]
-pub struct IngressControl {
-    gated: bool,
-    hold_until: Option<Instant>,
-    packets: u64,
-    bytes: u64,
-    snapshot: Instant,
-}
-
-impl IngressControl {
-    pub fn new(now: Instant) -> Self {
-        Self {
-            gated: false,
-            hold_until: None,
-            packets: 0,
-            bytes: 0,
-            snapshot: now,
-        }
-    }
-
-    pub fn gated(&self) -> bool {
-        self.gated
-    }
-
-    pub fn note(&mut self, bytes: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(bytes as u64);
-    }
-
-    /// Update the gate from the inbound data-queue depth.
-    /// `true` when further socket reads should pause.
-    pub fn evaluate(&mut self, q_depth: usize, now: Instant, data_queue_len: usize) -> bool {
-        let (_high, mid, low) = dp_ic_watermarks(data_queue_len);
-        if q_depth > mid && self.packets > 0 {
-            let hold = ingress_hold(now.saturating_duration_since(self.snapshot), self.bytes, 1);
-            self.gated = true;
-            self.hold_until = Some(now + hold);
-        } else if q_depth < low {
-            let held = self.hold_until.is_some_and(|until| now < until);
-            if !held {
-                self.gated = false;
-                self.hold_until = None;
-            }
-        }
-        self.snapshot = now;
-        self.packets = 0;
-        self.bytes = 0;
-        self.gated
-    }
-}
-
 /// Coalesced egress buffer (Python `TransmitBuffer`).
-///
-/// Small frames share one chunk up to [`COALESCE_TARGET`]. The chunk is
-/// published on [`Self::flush`] / [`Self::drain_to`], not on every append:
-/// this task both produces and drains, so flushing each idle append would
-/// split a burst into one socket write per frame.
 #[derive(Debug, Default)]
 pub struct TransmitBuffer {
     cur: Vec<u8>,
@@ -199,17 +108,10 @@ impl TransmitBuffer {
         self.tx_sent
     }
 
-    fn tail_len(&self) -> usize {
-        self.cur.len()
-    }
-
-    /// Queue one HDLC frame. `false` when `limit` (the TX high-water mark)
-    /// would be exceeded — the caller drops the frame.
-    pub fn append(&mut self, frame: &[u8], limit: Option<usize>) -> bool {
-        if let Some(limit) = limit {
-            if self.buffered() + frame.len() > limit {
-                return false;
-            }
+    /// Queue one HDLC frame. `false` when [`TX_HWM`] would be exceeded.
+    pub fn append(&mut self, frame: &[u8]) -> bool {
+        if self.buffered() + frame.len() > TX_HWM {
+            return false;
         }
 
         if frame.len() >= COALESCE_TARGET {
@@ -221,6 +123,10 @@ impl TransmitBuffer {
                 self.flush_tail();
             }
             self.cur.extend_from_slice(frame);
+            // Python flushes immediately only while the chunk queue is idle.
+            if self.chunks.is_empty() {
+                self.flush_tail();
+            }
         }
         self.tx_total += frame.len() as u64;
         true
@@ -356,57 +262,55 @@ impl EgressControl {
 }
 
 fn accept_outbound(stalled: bool, buffer: &mut TransmitBuffer, frame: &[u8]) -> bool {
-    if stalled {
-        return false;
-    }
-    buffer.append(frame, Some(TX_HWM))
+    !stalled && buffer.append(frame)
 }
 
 fn encode_hdlc_frame(
     packet: &Packet,
     ifac: Option<&crate::iface::ifac::IfacKey>,
-) -> Option<(Vec<u8>, usize)> {
+) -> Option<Vec<u8>> {
     let mut raw = [0u8; 4096];
     let mut output = OutputBuffer::new(&mut raw);
     if packet.serialize(&mut output).is_err() {
         return None;
     }
     let wire = crate::iface::ifac::encode(output.as_slice(), ifac);
-    let payload_len = wire.len();
-    Some((Hdlc::encode_frame_vec(&wire), payload_len))
+    Some(Hdlc::encode_frame_vec(&wire))
 }
 
-enum Enqueue {
-    Queued,
-    Skip,
-    Drop,
-}
-
+/// `true` when the frame was dropped (stalled or over [`TX_HWM`]).
 fn enqueue_frame(
     packet: &Packet,
     ifac: &crate::iface::IfacSlot,
-    stats: &crate::iface::InterfaceCounters,
     stalled: bool,
     buffer: &mut TransmitBuffer,
-) -> Enqueue {
+) -> bool {
     let ifac = ifac.read().expect("ifac lock").clone();
-    let Some((frame, payload_len)) = encode_hdlc_frame(packet, ifac.as_deref()) else {
-        return Enqueue::Skip;
+    let Some(frame) = encode_hdlc_frame(packet, ifac.as_deref()) else {
+        return false;
     };
-    if !accept_outbound(stalled, buffer, &frame) {
-        log::debug!(
-            "backbone: egress control dropping outbound frame of {} bytes",
-            frame.len()
-        );
-        return Enqueue::Drop;
+    if accept_outbound(stalled, buffer, &frame) {
+        return false;
     }
-    stats.count_tx(payload_len);
-    Enqueue::Queued
+    log::debug!(
+        "backbone: egress control dropping outbound frame of {} bytes",
+        frame.len()
+    );
+    true
 }
 
-fn drain_write(stream: &tokio::net::tcp::OwnedWriteHalf, buffer: &mut TransmitBuffer) -> bool {
+fn drain_write(
+    stream: &tokio::net::tcp::OwnedWriteHalf,
+    buffer: &mut TransmitBuffer,
+    stats: &crate::iface::InterfaceCounters,
+) -> bool {
     buffer.drain_to(|chunk| match stream.try_write(chunk) {
-        Ok(n) => Ok(n),
+        Ok(n) => {
+            if n > 0 {
+                stats.count_tx(n);
+            }
+            Ok(n)
+        }
         Err(err) if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted => {
             Err(DrainError::Blocked)
         }
@@ -414,17 +318,49 @@ fn drain_write(stream: &tokio::net::tcp::OwnedWriteHalf, buffer: &mut TransmitBu
     })
 }
 
-fn resolve_bitrate(configured: u64, control: Option<u64>) -> u64 {
-    match control {
-        Some(rate) if rate != GENERIC_INTERFACE_BITRATE => rate,
-        _ => {
-            if configured == 0 {
-                BITRATE_GUESS
-            } else {
-                configured
-            }
-        }
+fn constructor_bitrate(rate: u64) -> u64 {
+    if rate == 0 {
+        BITRATE_GUESS
+    } else {
+        rate
     }
+}
+
+/// Publish the constructor bitrate while `spawn_named` still holds the
+/// manager, so `configure_iface` can overwrite it (including with 62500).
+async fn prime_constructor_bitrate(
+    manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
+    address: &crate::hash::AddressHash,
+    constructor: u64,
+) {
+    let constructor = constructor_bitrate(constructor);
+    if manager.try_lock().is_ok() {
+        return;
+    }
+    let manager = manager.lock().await;
+    let current = manager.with_control(address, |control| control.bitrate);
+    if matches!(current, None | Some(GENERIC_INTERFACE_BITRATE)) {
+        manager.set_iface_bitrate(address, constructor);
+    }
+}
+
+/// Sample the bitrate once `configure_iface` has had the manager lock.
+/// An explicit 62500 is the low tier and is stored as itself.
+async fn commit_installed_bitrate(
+    manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
+    address: &crate::hash::AddressHash,
+    constructor: u64,
+) -> u64 {
+    let constructor = constructor_bitrate(constructor);
+    drop(manager.lock().await);
+    tokio::task::yield_now().await;
+
+    let manager = manager.lock().await;
+    let rate = manager
+        .with_control(address, |control| control.bitrate)
+        .unwrap_or(constructor);
+    manager.set_iface_bitrate(address, rate);
+    rate
 }
 
 /// Enable fast-flapping suppression by default
@@ -538,9 +474,7 @@ pub struct BackboneClient {
     pub iface_manager: Option<Arc<tokio::sync::Mutex<InterfaceManager>>>,
     /// Shared fast-flap table of the parent server, if spawned.
     pub fast_flap: Option<Arc<tokio::sync::Mutex<FastFlapTable>>>,
-    /// Bitrate used for `optimise_mtu` when interface control still has
-    /// the generic default (Python `BITRATE_GUESS`, or the parent server's
-    /// configured rate for a spawned peer).
+    /// Constructor bitrate (Python `BITRATE_GUESS`, or [`Self::with_bitrate`]).
     bitrate: u64,
 }
 
@@ -599,6 +533,14 @@ impl BackboneClient {
         let (rx_channel, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
+        let constructor_rate = inner.lock().unwrap().bitrate;
+        let manager_of = inner.lock().unwrap().iface_manager.clone();
+        if inner.lock().unwrap().addr.is_some() {
+            if let Some(manager) = manager_of.clone() {
+                prime_constructor_bitrate(&manager, &iface_address, constructor_rate).await;
+            }
+        }
+
         loop {
             if context.cancel.is_cancelled() {
                 stats.set_online(false);
@@ -637,24 +579,17 @@ impl BackboneClient {
             // Tunnel synthesis once the link is up
             // (Python `initial_connect`: `self.wants_tunnel = True`).
             let manager_of = inner.lock().unwrap().iface_manager.clone();
-            if let Some(manager) = manager_of {
+            if let Some(manager) = manager_of.clone() {
                 let manager = manager.lock().await;
                 manager.set_iface_wants_tunnel(&iface_address, true);
             }
 
-            let hw_mtu = {
-                // Drop the client lock before awaiting the manager.
-                let (configured, manager_of) = {
-                    let client = inner.lock().unwrap();
-                    (client.bitrate, client.iface_manager.clone())
-                };
-                let control = if let Some(manager) = manager_of {
-                    let manager = manager.lock().await;
-                    manager.with_control(&iface_address, |control| control.bitrate)
-                } else {
-                    None
-                };
-                hw_mtu_for_bitrate(resolve_bitrate(configured, control))
+            let hw_mtu = if let Some(manager) = manager_of {
+                let rate =
+                    commit_installed_bitrate(&manager, &iface_address, constructor_rate).await;
+                hw_mtu_for_bitrate(rate)
+            } else {
+                hw_mtu_for_bitrate(constructor_bitrate(constructor_rate))
             };
 
             let (read_half, write_half) = stream.into_split();
@@ -670,29 +605,16 @@ impl BackboneClient {
                 let mut stream = read_half;
 
                 tokio::spawn(async move {
-                    // Same limit `optimise_mtu` stored on the peer. Python's
-                    // class 1048576 is only the pre-optimise assignment.
                     let mut decoder = HdlcDecoder::new(hw_mtu);
-                    let mut buffer = vec![0u8; hw_mtu.max(DP_IC_RCVBUF)];
+                    let mut buffer = vec![0u8; hw_mtu];
                     let mut frames: Vec<Vec<u8>> = Vec::new();
-                    let mut ingress = IngressControl::new(Instant::now());
-                    let mut ic_tick = tokio::time::interval(DP_IC_INTERVAL);
-                    ic_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
                     loop {
-                        let gated = ingress.gated();
                         let closed = tokio::select! {
                             _ = cancel.cancelled() => true,
                             _ = stop.cancelled() => true,
                             _ = link_cancel.cancelled() => true,
-                            _ = ic_tick.tick() => {
-                                let depth = rx_channel
-                                    .max_capacity()
-                                    .saturating_sub(rx_channel.capacity());
-                                ingress.evaluate(depth, Instant::now(), DEFAULT_DATA_QUEUE_LEN);
-                                false
-                            }
-                            result = stream.read(&mut buffer), if !gated => match result {
+                            result = stream.read(&mut buffer) => match result {
                                 Ok(0) | Err(_) => true,
                                 Ok(n) => {
                                     decoder.feed(&buffer[..n], |frame| {
@@ -713,7 +635,6 @@ impl BackboneClient {
                                             }
                                         };
                                         if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&plain)) {
-                                            ingress.note(plain.len());
                                             stats.count_rx(plain.len());
                                             let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
                                         }
@@ -742,8 +663,11 @@ impl BackboneClient {
 
                 tokio::spawn(async move {
                     let mut coalesce = TransmitBuffer::new();
-                    let mut egress = EgressControl::new(Instant::now());
-                    let mut ec_tick = tokio::time::interval(DP_EC_INTERVAL);
+                    let armed = Instant::now();
+                    let mut egress = EgressControl::new(armed);
+                    // Python sleeps `DP_EC_INTERVAL` before the first evaluation.
+                    let mut ec_tick =
+                        tokio::time::interval_at(armed + DP_EC_INTERVAL, DP_EC_INTERVAL);
                     ec_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     let mut tx_channel = tx_channel.lock().await;
 
@@ -754,49 +678,24 @@ impl BackboneClient {
                             _ = stop.cancelled() => break,
                             _ = link_cancel.cancelled() => break,
                             _ = ec_tick.tick() => {
-                                // No drain progress for DP_EC_DEAD_TIME drops the peer.
                                 if egress.evaluate(&coalesce, Instant::now()) {
                                     log::warn!("backbone: egress stalled, tearing down peer");
                                     break;
                                 }
                             }
                             ready = stream.writable(), if sendable => {
-                                if ready.is_err() || !drain_write(&stream, &mut coalesce) {
+                                if ready.is_err() || !drain_write(&stream, &mut coalesce, &stats) {
                                     break;
                                 }
                             }
                             message = tx_channel.recv() => {
                                 let Some(message) = message else { break };
-                                let stalled = egress.tx_stalled;
-                                match enqueue_frame(&message.packet, &channel_ifac, &stats, stalled, &mut coalesce) {
-                                    Enqueue::Drop => {}
-                                    Enqueue::Skip | Enqueue::Queued => {
-                                        // Stop once append publishes a chunk
-                                        // (the coalesce window filled) so the
-                                        // socket write is not held behind the
-                                        // rest of the queue.
-                                        let published = coalesce.sendable();
-                                        while coalesce.tail_len() < COALESCE_TARGET
-                                            && coalesce.buffered() < TX_HWM
-                                            && coalesce.sendable() == published
-                                        {
-                                            match tx_channel.try_recv() {
-                                                Ok(more) => {
-                                                    if matches!(
-                                                        enqueue_frame(&more.packet, &channel_ifac, &stats, stalled, &mut coalesce),
-                                                        Enqueue::Drop
-                                                    ) {
-                                                        break;
-                                                    }
-                                                }
-                                                Err(_) => break,
-                                            }
-                                        }
-                                    }
-                                }
-                                // One publish for the burst, so the frames
-                                // share a socket write up to COALESCE_TARGET.
-                                coalesce.flush();
+                                let _dropped = enqueue_frame(
+                                    &message.packet,
+                                    &channel_ifac,
+                                    egress.tx_stalled,
+                                    &mut coalesce,
+                                );
                             }
                         }
                     }
@@ -872,6 +771,8 @@ impl BackboneServer {
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let fast_flap = { context.inner.lock().unwrap().fast_flap.clone() };
+
+        prime_constructor_bitrate(&iface_manager, &server_address, BITRATE_GUESS).await;
 
         loop {
             if context.cancel.is_cancelled() {
@@ -950,13 +851,10 @@ impl BackboneServer {
                 let inherited = context.channel.ifac.read().expect("ifac lock").clone();
 
                 let mut manager = iface_manager.lock().await;
-                // Spawned peers inherit the listener bitrate (Python
-                // `spawned_interface.bitrate = self.bitrate` then
-                // `optimise_mtu`). The generic 62500 default is not a
-                // backbone rate.
+                // Python `spawned_interface.bitrate = self.bitrate`.
+                // 62500 is the low tier when that is the listener rate.
                 let parent_bitrate = manager
                     .with_control(&server_address, |c| c.bitrate)
-                    .filter(|rate| *rate != GENERIC_INTERFACE_BITRATE)
                     .unwrap_or(BITRATE_GUESS);
                 let address = manager.spawn(
                     BackboneClient::new_from_stream(socket, remote_ip)
@@ -964,6 +862,7 @@ impl BackboneServer {
                         .with_bitrate(parent_bitrate),
                     BackboneClient::spawn,
                 );
+                manager.set_iface_bitrate(&address, parent_bitrate);
 
                 if inherited.is_some() {
                     manager.with_iface_ifac(&address, |slot| {
@@ -985,29 +884,66 @@ impl Interface for BackboneServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::ErrorKind;
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    #[test]
-    fn two_small_writes_within_coalesce_window_leave_as_one_write() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::iface::{InterfaceCounters, InterfaceManager, TxMessage, TxMessageType};
+    use crate::packet::Packet;
+
+    #[tokio::test]
+    async fn two_small_frames_coalesce_while_the_consumer_is_behind() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
         let mut buffer = TransmitBuffer::new();
-        assert!(buffer.append(b"aaaa", Some(TX_HWM)));
-        assert!(buffer.append(b"bbbb", Some(TX_HWM)));
+
+        assert!(buffer.append(&[0xAB; 32]));
+        let queued = buffer.sendable();
+        assert!(queued > 0);
+
+        tx.send(b"aaaa".to_vec()).await.unwrap();
+        let second = tokio::spawn({
+            let tx = tx.clone();
+            async move {
+                tx.send(b"bbbb".to_vec()).await.unwrap();
+            }
+        });
+
+        let first = rx.recv().await.unwrap();
+        assert!(buffer.append(&first));
+        assert_eq!(buffer.sendable(), queued);
+
+        let second_frame = rx.recv().await.unwrap();
+        second.await.unwrap();
+        assert!(buffer.append(&second_frame));
+        assert_eq!(buffer.sendable(), queued);
 
         let mut writes = Vec::new();
         assert!(buffer.drain_to(|chunk| {
             writes.push(chunk.to_vec());
             Ok(chunk.len())
         }));
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1], b"aaaabbbb");
+    }
 
-        assert_eq!(writes.len(), 1, "frames inside 65536 leave as one write");
-        assert_eq!(writes[0], b"aaaabbbb");
+    #[test]
+    fn lone_idle_frame_is_published_immediately() {
+        let mut buffer = TransmitBuffer::new();
+        assert!(buffer.append(b"only"));
+        assert_eq!(buffer.sendable(), 4);
     }
 
     #[test]
     fn coalesce_window_splits_above_target() {
         let mut buffer = TransmitBuffer::new();
-        assert!(buffer.append(&vec![1u8; COALESCE_TARGET - 4], Some(TX_HWM)));
-        assert!(buffer.append(&vec![2u8; 8], Some(TX_HWM)));
+        assert!(buffer.append(&[9u8; 16]));
+        assert!(buffer.append(&vec![1u8; COALESCE_TARGET - 4]));
+        assert!(buffer.append(&vec![2u8; 8]));
 
         let mut writes = Vec::new();
         assert!(buffer.drain_to(|chunk| {
@@ -1015,13 +951,13 @@ mod tests {
             assert!(chunk.len() <= COALESCE_TARGET);
             Ok(chunk.len())
         }));
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes, vec![16, COALESCE_TARGET - 4, 8]);
     }
 
     #[test]
     fn tx_high_water_mark_rejects_another_frame() {
         let mut buffer = TransmitBuffer::new();
-        assert!(buffer.append(&vec![0u8; TX_HWM], Some(TX_HWM)));
+        assert!(buffer.append(&vec![0u8; TX_HWM]));
         assert!(!accept_outbound(false, &mut buffer, &[1]));
         assert_eq!(TX_HWM, DP_EC_HIGH_WM);
     }
@@ -1032,7 +968,6 @@ mod tests {
         let mut buffer = TransmitBuffer::new();
         let mut egress = EgressControl::new(t0);
         assert!(accept_outbound(false, &mut buffer, b"stuck-frame"));
-        buffer.flush();
         assert!(buffer.sendable() > 0);
 
         assert!(
@@ -1050,8 +985,7 @@ mod tests {
         let t0 = Instant::now();
         let mut buffer = TransmitBuffer::new();
         let mut egress = EgressControl::new(t0);
-        assert!(buffer.append(&vec![0u8; DP_EC_MID_WM + 1], Some(TX_HWM)));
-        buffer.flush();
+        assert!(buffer.append(&vec![0u8; DP_EC_MID_WM + 1]));
 
         for tick in 0..DP_EC_STALL_TICKS {
             assert!(!egress.evaluate(&buffer, t0 + DP_EC_INTERVAL * tick));
@@ -1067,7 +1001,6 @@ mod tests {
         assert_eq!(hw_mtu_for_bitrate(BITRATE_GUESS), HW_MTU);
         assert_eq!(BackboneClient::mtu(), HW_MTU);
         assert_eq!(BackboneServer::mtu(), HW_MTU);
-        assert_ne!(HW_MTU, HW_MTU_INITIAL);
         assert_eq!(hw_mtu_for_bitrate(1_000_000_000), 524_288);
         assert_eq!(hw_mtu_for_bitrate(750_000_000), 262_144);
         assert_eq!(hw_mtu_for_bitrate(400_000_000), 131_072);
@@ -1077,30 +1010,112 @@ mod tests {
         assert_eq!(hw_mtu_for_bitrate(2_000_000), 4_096);
         assert_eq!(hw_mtu_for_bitrate(1_000_000), 2_048);
         assert_eq!(hw_mtu_for_bitrate(62_500), 1_024);
-        assert_eq!(hw_mtu_for_bitrate(1_000), HW_MTU_INITIAL);
-        assert_eq!(
-            hw_mtu_for_bitrate(resolve_bitrate(
-                BITRATE_GUESS,
-                Some(GENERIC_INTERFACE_BITRATE)
-            )),
-            HW_MTU
-        );
-        assert_eq!(
-            hw_mtu_for_bitrate(resolve_bitrate(BITRATE_GUESS, Some(1_000_000_000))),
-            524_288
-        );
+        assert_eq!(hw_mtu_for_bitrate(1_000), 1_024);
+        assert_ne!(hw_mtu_for_bitrate(62_500), HW_MTU);
     }
 
-    #[test]
-    fn ingress_watermarks_match_python_and_release() {
-        assert_eq!(dp_ic_watermarks(DEFAULT_DATA_QUEUE_LEN), (921, 696, 102));
-        let t0 = Instant::now();
-        let mut ingress = IngressControl::new(t0);
-        let (_high, mid, _low) = dp_ic_watermarks(DEFAULT_DATA_QUEUE_LEN);
-        ingress.note(1500);
-        assert!(ingress.evaluate(mid + 1, t0, DEFAULT_DATA_QUEUE_LEN));
-        assert!(ingress.gated());
-        assert!(!ingress.evaluate(0, t0 + Duration::from_secs(60), DEFAULT_DATA_QUEUE_LEN));
-        assert!(!ingress.gated());
+    #[tokio::test]
+    async fn explicit_62500_is_not_rewritten_to_bitrate_guess() {
+        let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(16)));
+        let address = {
+            let mut guard = manager.lock().await;
+            let channel = guard.new_channel(1);
+            *channel.address()
+        };
+
+        let rate = commit_installed_bitrate(&manager, &address, BITRATE_GUESS).await;
+        assert_eq!(rate, GENERIC_INTERFACE_BITRATE);
+        assert_eq!(hw_mtu_for_bitrate(rate), 1_024);
+
+        {
+            let guard = manager.lock().await;
+            guard.set_iface_bitrate(&address, BITRATE_GUESS);
+        }
+        {
+            let guard = manager.lock().await;
+            guard.set_iface_bitrate(&address, GENERIC_INTERFACE_BITRATE);
+        }
+        let rate = commit_installed_bitrate(&manager, &address, BITRATE_GUESS).await;
+        assert_eq!(rate, 62_500);
+        assert_eq!(hw_mtu_for_bitrate(rate), 1_024);
+        let stored = manager.lock().await.with_control(&address, |c| c.bitrate);
+        assert_eq!(stored, Some(62_500));
+    }
+
+    #[tokio::test]
+    async fn tx_bytes_count_bytes_written_not_bytes_queued() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connector = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (_server, _) = listener.accept().await.unwrap();
+        let client = connector.await.unwrap();
+        let (_read, write) = client.into_split();
+
+        let stats = InterfaceCounters::default();
+        let mut buffer = TransmitBuffer::new();
+        assert!(buffer.append(b"abcdef"));
+        assert_eq!(stats.tx_bytes(), 0);
+        assert!(drain_write(&write, &mut buffer, &stats));
+        assert_eq!(stats.tx_bytes(), 6);
+    }
+
+    #[tokio::test]
+    async fn stuck_try_write_drops_the_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connector = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (mut server, _) = listener.accept().await.unwrap();
+        let client = connector.await.unwrap();
+
+        loop {
+            match client.try_write(&[0x5A; 8192]) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => panic!("fill send buffer: {err}"),
+            }
+        }
+
+        let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(16)));
+        let address = {
+            let mut guard = manager.lock().await;
+            guard.spawn(
+                BackboneClient::new_from_stream(client, "stuck".into())
+                    .with_manager(manager.clone()),
+                BackboneClient::spawn,
+            )
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        manager
+            .lock()
+            .await
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(address),
+                packet: Packet::default(),
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::pause();
+        for _ in 0..14 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        tokio::time::resume();
+
+        let mut buf = [0u8; 8192];
+        let mut saw_eof = false;
+        for _ in 0..10_000 {
+            match tokio::time::timeout(Duration::from_secs(2), server.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    saw_eof = true;
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => panic!("peer read: {err}"),
+                Err(_) => break,
+            }
+        }
+        assert!(saw_eof, "stuck try_write must drop the stream");
     }
 }
