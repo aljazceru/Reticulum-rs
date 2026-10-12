@@ -138,7 +138,18 @@ pub(crate) struct RegisteredHandler {
 
 impl RegisteredHandler {
     pub fn allows(&self, remote: &Option<crate::identity::Identity>) -> bool {
-        request_allowed(self.config.allow, &self.config.allowed_list, remote)
+        match self.config.allow {
+            RequestAllow::None => false,
+            RequestAllow::All => true,
+            // Unidentified peers are not in the list (Python requires
+            // `self.__remote_identity.hash`).
+            RequestAllow::List => remote.as_ref().is_some_and(|identity| {
+                self.config
+                    .allowed_list
+                    .iter()
+                    .any(|hash| hash == &identity.address_hash)
+            }),
+        }
     }
 
     pub fn call(&self, ctx: RequestContext) -> Option<RequestResponse> {
@@ -148,24 +159,6 @@ impl RegisteredHandler {
 
 fn path_hash_of(path: &str) -> AddressHash {
     AddressHash::new_from_slice(path.as_bytes())
-}
-
-fn request_allowed(
-    allow: RequestAllow,
-    allowed_list: &[AddressHash],
-    remote: &Option<crate::identity::Identity>,
-) -> bool {
-    match allow {
-        RequestAllow::None => false,
-        RequestAllow::All => true,
-        // Unidentified peers are not in the list (Python requires
-        // `self.__remote_identity.hash`).
-        RequestAllow::List => remote.as_ref().is_some_and(|identity| {
-            allowed_list
-                .iter()
-                .any(|hash| hash == &identity.address_hash)
-        }),
-    }
 }
 
 #[derive(Debug)]
