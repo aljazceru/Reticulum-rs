@@ -205,19 +205,8 @@ where
     public_destination_b64(status_dest)
 }
 
-/// One I2P-base64 token (`A-Za-z0-9-~=`). `=` is checked again by the decoder.
-fn is_i2p_b64_token(key: &str) -> bool {
-    !key.is_empty()
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'~' | b'='))
-}
-
 /// A key file is usable only when it decodes to a full SAM private key.
 fn validate_private_key(key: &str) -> Result<(), RnsError> {
-    if !is_i2p_b64_token(key) {
-        return Err(RnsError::Storage);
-    }
     let bytes = i2p_b64_decode(key).ok_or(RnsError::Storage)?;
     if bytes.len() < MIN_SAM_PRIVATE_KEY {
         return Err(RnsError::Storage);
