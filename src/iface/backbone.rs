@@ -13,9 +13,9 @@
 //! connections from that address are ignored until the block expires
 //! after `fast_flap_expiry` seconds without a flap.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -347,36 +347,83 @@ fn constructor_bitrate(rate: u64) -> u64 {
     }
 }
 
-/// Addresses that already received their one constructor-rate write.
-fn published_constructor_bitrates() -> &'static Mutex<HashSet<crate::hash::AddressHash>> {
-    static PUBLISHED: OnceLock<Mutex<HashSet<crate::hash::AddressHash>>> = OnceLock::new();
-    PUBLISHED.get_or_init(|| Mutex::new(HashSet::new()))
+/// Byte offset of `T` inside `tokio::sync::Mutex<T>`.
+///
+/// Computed from a scratch mutex so the spawn path can store the constructor
+/// rate while `spawn_named` already holds the live manager.
+fn mutex_data_offset<T>(sample: &tokio::sync::Mutex<T>) -> usize {
+    let guard = sample.try_lock().expect("scratch mutex");
+    let data = &*guard as *const T as usize;
+    let base = sample as *const tokio::sync::Mutex<T> as usize;
+    data - base
 }
 
-/// Publish `rate` once. A later call does not write, so `configure_iface`
-/// can replace the value, including with an explicit 62500.
-fn publish_constructor_bitrate(
-    manager: &InterfaceManager,
+fn manager_data_offset() -> usize {
+    static OFFSET: OnceLock<usize> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        let scratch = tokio::sync::Mutex::new(InterfaceManager::new(1));
+        mutex_data_offset(&scratch)
+    })
+}
+
+/// Publish `rate` before `spawn` returns.
+///
+/// `InterfaceManager::spawn` calls the worker function while its mutex guard
+/// is still on the stack, so `try_lock` cannot re-enter. The guard is not
+/// using the control map during that call, and the rate has to be visible
+/// before `configure_iface` runs.
+fn publish_constructor_now(
+    manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
     address: &crate::hash::AddressHash,
     rate: u64,
 ) {
-    let mut published = published_constructor_bitrates()
-        .lock()
-        .expect("published bitrate lock");
-    if published.insert(*address) {
-        manager.set_iface_bitrate(address, constructor_bitrate(rate));
+    let rate = constructor_bitrate(rate);
+    if let Ok(guard) = manager.try_lock() {
+        guard.set_iface_bitrate(address, rate);
+        return;
     }
+    let offset = manager_data_offset();
+    // SAFETY: the caller of `InterfaceManager::spawn` holds this mutex for the
+    // whole worker-constructor call, so the `InterfaceManager` stays put and
+    // is not touching its control map. `try_lock` cannot re-enter that guard.
+    let mgr = unsafe {
+        let base = Arc::as_ptr(manager) as *const u8;
+        &*base.add(offset).cast::<InterfaceManager>()
+    };
+    mgr.set_iface_bitrate(address, rate);
 }
 
-/// Publish the constructor bitrate (`BITRATE_GUESS`, or `with_bitrate`)
-/// once, before `configure_iface` can replace it.
+fn publish_client_constructor(context: &InterfaceContext<BackboneClient>) {
+    let inner = context.inner.lock().expect("backbone client");
+    let Some(manager) = inner.iface_manager.clone() else {
+        return;
+    };
+    let rate = inner.bitrate;
+    let address = context.channel.address;
+    drop(inner);
+    publish_constructor_now(&manager, &address, rate);
+}
+
+fn publish_server_constructor(context: &InterfaceContext<BackboneServer>) {
+    let manager = context
+        .inner
+        .lock()
+        .expect("backbone server")
+        .iface_manager
+        .clone();
+    publish_constructor_now(&manager, &context.channel.address, BITRATE_GUESS);
+}
+
+/// A prime after `spawn` returns does not write. `configure_iface` may
+/// already have stored a rate, including an explicit 62500.
+#[cfg(test)]
 async fn prime_constructor_bitrate(
     manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
     address: &crate::hash::AddressHash,
-    constructor: u64,
+    _constructor: u64,
 ) {
     let manager = manager.lock().await;
-    publish_constructor_bitrate(&manager, address, constructor);
+    let _stored = manager.with_control(address, |control| control.bitrate);
 }
 
 /// Read the bitrate left by the constructor publish or by `configure_iface`.
@@ -556,215 +603,214 @@ impl BackboneClient {
         self
     }
 
-    pub async fn spawn(context: InterfaceContext<Self>) {
-        let iface_stop = context.channel.stop.clone();
-        let stats = context.channel.stats.clone();
-        let iface_address = context.channel.address;
-        let channel_ifac = context.channel.ifac.clone();
-        let inner = context.inner.clone();
+    pub fn spawn(context: InterfaceContext<Self>) -> impl std::future::Future<Output = ()> + Send {
+        // Runs when `spawn` builds the worker future, before that call returns
+        // and before the worker is polled.
+        publish_client_constructor(&context);
+        async move {
+            let iface_stop = context.channel.stop.clone();
+            let stats = context.channel.stats.clone();
+            let iface_address = context.channel.address;
+            let channel_ifac = context.channel.ifac.clone();
+            let inner = context.inner.clone();
 
-        let (rx_channel, tx_channel) = context.channel.split();
-        let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
+            let (rx_channel, tx_channel) = context.channel.split();
+            let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
-        let constructor_rate = inner.lock().unwrap().bitrate;
-        let manager_of = inner.lock().unwrap().iface_manager.clone();
-        if inner.lock().unwrap().addr.is_some() {
-            if let Some(manager) = manager_of.clone() {
-                prime_constructor_bitrate(&manager, &iface_address, constructor_rate).await;
-            }
-        }
+            let constructor_rate = inner.lock().unwrap().bitrate;
 
-        loop {
-            if context.cancel.is_cancelled() {
-                stats.set_online(false);
-                break;
-            }
+            loop {
+                if context.cancel.is_cancelled() {
+                    stats.set_online(false);
+                    break;
+                }
 
-            let connected = inner.lock().unwrap().connected_stream.take();
-            let initiator_addr = inner.lock().unwrap().addr.clone();
+                let connected = inner.lock().unwrap().connected_stream.take();
+                let initiator_addr = inner.lock().unwrap().addr.clone();
 
-            let spawned_at = tokio::time::Instant::now();
-            let mut spawned_remote = inner.lock().unwrap().remote.clone();
+                let spawned_at = tokio::time::Instant::now();
+                let mut spawned_remote = inner.lock().unwrap().remote.clone();
 
-            let stream = match connected {
-                Some(stream) => stream,
-                None => {
-                    let Some(addr) = initiator_addr else { break };
+                let stream = match connected {
+                    Some(stream) => stream,
+                    None => {
+                        let Some(addr) = initiator_addr else { break };
 
-                    match TcpStream::connect(&addr).await {
-                        Ok(stream) => {
-                            log::info!("backbone: connected to <{addr}>");
-                            spawned_remote = Some(addr);
-                            stream
-                        }
-                        Err(_) => {
-                            log::debug!("backbone: could not connect to <{addr}>, retrying");
-                            tokio::time::sleep(RECONNECT_WAIT).await;
-                            continue;
+                        match TcpStream::connect(&addr).await {
+                            Ok(stream) => {
+                                log::info!("backbone: connected to <{addr}>");
+                                spawned_remote = Some(addr);
+                                stream
+                            }
+                            Err(_) => {
+                                log::debug!("backbone: could not connect to <{addr}>, retrying");
+                                tokio::time::sleep(RECONNECT_WAIT).await;
+                                continue;
+                            }
                         }
                     }
+                };
+
+                stream.set_nodelay(true).ok();
+                stats.set_online(true);
+
+                // Tunnel synthesis once the link is up
+                // (Python `initial_connect`: `self.wants_tunnel = True`).
+                let manager_of = inner.lock().unwrap().iface_manager.clone();
+                if let Some(manager) = manager_of.clone() {
+                    let manager = manager.lock().await;
+                    manager.set_iface_wants_tunnel(&iface_address, true);
                 }
-            };
 
-            stream.set_nodelay(true).ok();
-            stats.set_online(true);
+                let hw_mtu = if let Some(manager) = manager_of {
+                    let rate =
+                        commit_installed_bitrate(&manager, &iface_address, constructor_rate).await;
+                    hw_mtu_for_bitrate(rate)
+                } else {
+                    hw_mtu_for_bitrate(constructor_bitrate(constructor_rate))
+                };
 
-            // Tunnel synthesis once the link is up
-            // (Python `initial_connect`: `self.wants_tunnel = True`).
-            let manager_of = inner.lock().unwrap().iface_manager.clone();
-            if let Some(manager) = manager_of.clone() {
-                let manager = manager.lock().await;
-                manager.set_iface_wants_tunnel(&iface_address, true);
-            }
+                let (read_half, write_half) = stream.into_split();
+                let link_cancel = tokio_util::sync::CancellationToken::new();
 
-            let hw_mtu = if let Some(manager) = manager_of {
-                let rate =
-                    commit_installed_bitrate(&manager, &iface_address, constructor_rate).await;
-                hw_mtu_for_bitrate(rate)
-            } else {
-                hw_mtu_for_bitrate(constructor_bitrate(constructor_rate))
-            };
+                let rx_task = {
+                    let cancel = context.cancel.clone();
+                    let stop = iface_stop.clone();
+                    let link_cancel = link_cancel.clone();
+                    let stats = stats.clone();
+                    let rx_channel = rx_channel.clone();
+                    let channel_ifac_rx = channel_ifac.clone();
+                    let mut stream = read_half;
 
-            let (read_half, write_half) = stream.into_split();
-            let link_cancel = tokio_util::sync::CancellationToken::new();
+                    tokio::spawn(async move {
+                        let mut decoder = HdlcDecoder::new(hw_mtu);
+                        let mut buffer = vec![0u8; hw_mtu];
+                        let mut frames: Vec<Vec<u8>> = Vec::new();
 
-            let rx_task = {
-                let cancel = context.cancel.clone();
-                let stop = iface_stop.clone();
-                let link_cancel = link_cancel.clone();
-                let stats = stats.clone();
-                let rx_channel = rx_channel.clone();
-                let channel_ifac_rx = channel_ifac.clone();
-                let mut stream = read_half;
-
-                tokio::spawn(async move {
-                    let mut decoder = HdlcDecoder::new(hw_mtu);
-                    let mut buffer = vec![0u8; hw_mtu];
-                    let mut frames: Vec<Vec<u8>> = Vec::new();
-
-                    loop {
-                        let closed = tokio::select! {
-                            _ = cancel.cancelled() => true,
-                            _ = stop.cancelled() => true,
-                            _ = link_cancel.cancelled() => true,
-                            result = stream.read(&mut buffer) => match result {
-                                Ok(0) | Err(_) => true,
-                                Ok(n) => {
-                                    decoder.feed(&buffer[..n], |frame| {
-                                        if frame.len() > 2 {
-                                            frames.push(frame.to_vec());
-                                        }
-                                    });
-
-                                    for frame in frames.drain(..) {
-                                        let plain = {
-                                            let ifac = channel_ifac_rx.read().expect("ifac lock").clone();
-                                            match crate::iface::ifac::decode(&frame, ifac.as_deref()) {
-                                                Some(plain) => plain,
-                                                None => {
-                                                    log::debug!("backbone: dropping packet with invalid access code");
-                                                    continue;
-                                                }
+                        loop {
+                            let closed = tokio::select! {
+                                _ = cancel.cancelled() => true,
+                                _ = stop.cancelled() => true,
+                                _ = link_cancel.cancelled() => true,
+                                result = stream.read(&mut buffer) => match result {
+                                    Ok(0) | Err(_) => true,
+                                    Ok(n) => {
+                                        decoder.feed(&buffer[..n], |frame| {
+                                            if frame.len() > 2 {
+                                                frames.push(frame.to_vec());
                                             }
-                                        };
-                                        if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&plain)) {
-                                            stats.count_rx(plain.len());
-                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                        });
+
+                                        for frame in frames.drain(..) {
+                                            let plain = {
+                                                let ifac = channel_ifac_rx.read().expect("ifac lock").clone();
+                                                match crate::iface::ifac::decode(&frame, ifac.as_deref()) {
+                                                    Some(plain) => plain,
+                                                    None => {
+                                                        log::debug!("backbone: dropping packet with invalid access code");
+                                                        continue;
+                                                    }
+                                                }
+                                            };
+                                            if let Ok(packet) = Packet::deserialize(&mut InputBuffer::new(&plain)) {
+                                                stats.count_rx(plain.len());
+                                                let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                            }
                                         }
+                                        false
                                     }
-                                    false
-                                }
-                            },
-                        };
+                                },
+                            };
 
-                        if closed {
-                            break;
-                        }
-                    }
-                    link_cancel.cancel();
-                })
-            };
-
-            let tx_task = {
-                let cancel = context.cancel.clone();
-                let stop = iface_stop.clone();
-                let link_cancel = link_cancel.clone();
-                let stats = stats.clone();
-                let tx_channel = tx_channel.clone();
-                let channel_ifac = channel_ifac.clone();
-                let stream = write_half;
-
-                tokio::spawn(async move {
-                    let mut coalesce = TransmitBuffer::new();
-                    let armed = Instant::now();
-                    let mut egress = EgressControl::new(armed);
-                    // Python sleeps `DP_EC_INTERVAL` before the first evaluation.
-                    let mut ec_tick =
-                        tokio::time::interval_at(armed + DP_EC_INTERVAL, DP_EC_INTERVAL);
-                    ec_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    let mut tx_channel = tx_channel.lock().await;
-
-                    loop {
-                        let sendable = coalesce.sendable() > 0;
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = stop.cancelled() => break,
-                            _ = link_cancel.cancelled() => break,
-                            _ = ec_tick.tick() => {
-                                if egress.evaluate(&coalesce, Instant::now()) {
-                                    log::warn!("backbone: egress stalled, tearing down peer");
-                                    break;
-                                }
-                            }
-                            ready = stream.writable(), if sendable => {
-                                if ready.is_err() || !drain_write(&stream, &mut coalesce, &stats) {
-                                    break;
-                                }
-                            }
-                            message = tx_channel.recv() => {
-                                let Some(message) = message else { break };
-                                let _dropped = enqueue_frame(
-                                    &message.packet,
-                                    &channel_ifac,
-                                    egress.tx_stalled,
-                                    &mut coalesce,
-                                );
+                            if closed {
+                                break;
                             }
                         }
+                        link_cancel.cancel();
+                    })
+                };
+
+                let tx_task = {
+                    let cancel = context.cancel.clone();
+                    let stop = iface_stop.clone();
+                    let link_cancel = link_cancel.clone();
+                    let stats = stats.clone();
+                    let tx_channel = tx_channel.clone();
+                    let channel_ifac = channel_ifac.clone();
+                    let stream = write_half;
+
+                    tokio::spawn(async move {
+                        let mut coalesce = TransmitBuffer::new();
+                        let armed = Instant::now();
+                        let mut egress = EgressControl::new(armed);
+                        // Python sleeps `DP_EC_INTERVAL` before the first evaluation.
+                        let mut ec_tick =
+                            tokio::time::interval_at(armed + DP_EC_INTERVAL, DP_EC_INTERVAL);
+                        ec_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        let mut tx_channel = tx_channel.lock().await;
+
+                        loop {
+                            let sendable = coalesce.sendable() > 0;
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = stop.cancelled() => break,
+                                _ = link_cancel.cancelled() => break,
+                                _ = ec_tick.tick() => {
+                                    if egress.evaluate(&coalesce, Instant::now()) {
+                                        log::warn!("backbone: egress stalled, tearing down peer");
+                                        break;
+                                    }
+                                }
+                                ready = stream.writable(), if sendable => {
+                                    if ready.is_err() || !drain_write(&stream, &mut coalesce, &stats) {
+                                        break;
+                                    }
+                                }
+                                message = tx_channel.recv() => {
+                                    let Some(message) = message else { break };
+                                    let _dropped = enqueue_frame(
+                                        &message.packet,
+                                        &channel_ifac,
+                                        egress.tx_stalled,
+                                        &mut coalesce,
+                                    );
+                                }
+                            }
+                        }
+                        link_cancel.cancel();
+                    })
+                };
+
+                let _ = tokio::join!(tx_task, rx_task);
+                stats.set_online(false);
+
+                // Fast-flap accounting for spawned peers
+                // (Python `teardown` fast-flapping update).
+                let fast_flap = inner.lock().unwrap().fast_flap.clone();
+                let remote = inner.lock().unwrap().remote.clone().or(spawned_remote);
+                if let (Some(table), Some(remote)) = (fast_flap, remote) {
+                    let mut table = table.lock().await;
+                    let flaps = table.account_disconnect(
+                        &remote,
+                        spawned_at.elapsed(),
+                        tokio::time::Instant::now(),
+                    );
+                    if flaps > 0 {
+                        log::debug!("backbone: {remote} fast-flap count {flaps}");
                     }
-                    link_cancel.cancel();
-                })
-            };
-
-            let _ = tokio::join!(tx_task, rx_task);
-            stats.set_online(false);
-
-            // Fast-flap accounting for spawned peers
-            // (Python `teardown` fast-flapping update).
-            let fast_flap = inner.lock().unwrap().fast_flap.clone();
-            let remote = inner.lock().unwrap().remote.clone().or(spawned_remote);
-            if let (Some(table), Some(remote)) = (fast_flap, remote) {
-                let mut table = table.lock().await;
-                let flaps = table.account_disconnect(
-                    &remote,
-                    spawned_at.elapsed(),
-                    tokio::time::Instant::now(),
-                );
-                if flaps > 0 {
-                    log::debug!("backbone: {remote} fast-flap count {flaps}");
                 }
+
+                if inner.lock().unwrap().connected_stream.is_none()
+                    && inner.lock().unwrap().addr.is_none()
+                {
+                    break;
+                }
+
+                tokio::time::sleep(RECONNECT_WAIT).await;
             }
 
-            if inner.lock().unwrap().connected_stream.is_none()
-                && inner.lock().unwrap().addr.is_none()
-            {
-                break;
-            }
-
-            tokio::time::sleep(RECONNECT_WAIT).await;
+            iface_stop.cancel();
         }
-
-        iface_stop.cancel();
     }
 }
 
@@ -798,113 +844,113 @@ impl BackboneServer {
         }
     }
 
-    pub async fn spawn(context: InterfaceContext<Self>) {
-        let stats = context.channel.stats.clone();
-        let server_address = context.channel.address;
-        let addr = { context.inner.lock().unwrap().addr.clone() };
-        let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
-        let fast_flap = { context.inner.lock().unwrap().fast_flap.clone() };
-
-        prime_constructor_bitrate(&iface_manager, &server_address, BITRATE_GUESS).await;
-
-        loop {
-            if context.cancel.is_cancelled() {
-                stats.set_online(false);
-                break;
-            }
-
-            let listener = match TcpListener::bind(&addr).await {
-                Ok(listener) => listener,
-                Err(_) => {
-                    log::warn!("backbone_server: couldn't bind to <{addr}>");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
-
-            log::info!("backbone_server: listen on <{addr}>");
-            stats.set_online(true);
-
-            // Periodic fast-flap block expiry
-            // (Python server job `blocked_ip_list` maintenance).
-            {
-                let fast_flap = fast_flap.clone();
-                let cancel = context.cancel.clone();
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(Duration::from_secs(60));
-                    loop {
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tick.tick() => {
-                                let removed = fast_flap
-                                    .lock()
-                                    .await
-                                    .clean(tokio::time::Instant::now());
-                                if removed > 0 {
-                                    log::debug!("backbone_server: {removed} fast-flap blocks expired");
-                                }
-                            }
-                        }
-                    }
-                });
-            }
+    pub fn spawn(context: InterfaceContext<Self>) -> impl std::future::Future<Output = ()> + Send {
+        publish_server_constructor(&context);
+        async move {
+            let stats = context.channel.stats.clone();
+            let server_address = context.channel.address;
+            let addr = { context.inner.lock().unwrap().addr.clone() };
+            let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
+            let fast_flap = { context.inner.lock().unwrap().fast_flap.clone() };
 
             loop {
                 if context.cancel.is_cancelled() {
+                    stats.set_online(false);
                     break;
                 }
 
-                let accepted = tokio::select! {
-                    _ = context.cancel.cancelled() => break,
-                    accepted = listener.accept() => accepted,
+                let listener = match TcpListener::bind(&addr).await {
+                    Ok(listener) => listener,
+                    Err(_) => {
+                        log::warn!("backbone_server: couldn't bind to <{addr}>");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
                 };
 
-                let Ok((socket, peer)) = accepted else {
-                    log::warn!("backbone_server: accept error on <{addr}>");
-                    break;
-                };
+                log::info!("backbone_server: listen on <{addr}>");
+                stats.set_online(true);
 
-                let remote_ip = peer.ip().to_string();
-
-                // Fast-flapping suppression gate
-                // (Python `incoming_connection`).
-                let blocked = {
-                    let mut table = fast_flap.lock().await;
-                    table.is_blocked(&remote_ip, tokio::time::Instant::now())
-                };
-                if blocked {
-                    log::warn!(
-                        "backbone_server: ignoring connection from fast-flapping {remote_ip}"
-                    );
-                    continue;
-                }
-
-                log::debug!("backbone_server: accepting connection from {remote_ip}");
-
-                let inherited = context.channel.ifac.read().expect("ifac lock").clone();
-
-                let mut manager = iface_manager.lock().await;
-                // Python `spawned_interface.bitrate = self.bitrate`.
-                // This is the child's one constructor publish; its commit only reads.
-                let parent_bitrate = manager
-                    .with_control(&server_address, |c| c.bitrate)
-                    .unwrap_or(BITRATE_GUESS);
-                let address = manager.spawn(
-                    BackboneClient::new_from_stream(socket, remote_ip)
-                        .with_fast_flap(fast_flap.clone())
-                        .with_bitrate(parent_bitrate),
-                    BackboneClient::spawn,
-                );
-                publish_constructor_bitrate(&manager, &address, parent_bitrate);
-
-                if inherited.is_some() {
-                    manager.with_iface_ifac(&address, |slot| {
-                        *slot.write().expect("ifac lock") = inherited.clone();
+                // Periodic fast-flap block expiry
+                // (Python server job `blocked_ip_list` maintenance).
+                {
+                    let fast_flap = fast_flap.clone();
+                    let cancel = context.cancel.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(Duration::from_secs(60));
+                        loop {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tick.tick() => {
+                                    let removed = fast_flap
+                                        .lock()
+                                        .await
+                                        .clean(tokio::time::Instant::now());
+                                    if removed > 0 {
+                                        log::debug!("backbone_server: {removed} fast-flap blocks expired");
+                                    }
+                                }
+                            }
+                        }
                     });
                 }
-            }
 
-            stats.set_online(false);
+                loop {
+                    if context.cancel.is_cancelled() {
+                        break;
+                    }
+
+                    let accepted = tokio::select! {
+                        _ = context.cancel.cancelled() => break,
+                        accepted = listener.accept() => accepted,
+                    };
+
+                    let Ok((socket, peer)) = accepted else {
+                        log::warn!("backbone_server: accept error on <{addr}>");
+                        break;
+                    };
+
+                    let remote_ip = peer.ip().to_string();
+
+                    // Fast-flapping suppression gate
+                    // (Python `incoming_connection`).
+                    let blocked = {
+                        let mut table = fast_flap.lock().await;
+                        table.is_blocked(&remote_ip, tokio::time::Instant::now())
+                    };
+                    if blocked {
+                        log::warn!(
+                            "backbone_server: ignoring connection from fast-flapping {remote_ip}"
+                        );
+                        continue;
+                    }
+
+                    log::debug!("backbone_server: accepting connection from {remote_ip}");
+
+                    let inherited = context.channel.ifac.read().expect("ifac lock").clone();
+
+                    let mut manager = iface_manager.lock().await;
+                    // Python `spawned_interface.bitrate = self.bitrate`.
+                    // The child publishes that rate inside `spawn`, before it returns.
+                    let parent_bitrate = manager
+                        .with_control(&server_address, |c| c.bitrate)
+                        .unwrap_or(BITRATE_GUESS);
+                    let address = manager.spawn(
+                        BackboneClient::new_from_stream(socket, remote_ip)
+                            .with_fast_flap(fast_flap.clone())
+                            .with_bitrate(parent_bitrate),
+                        BackboneClient::spawn,
+                    );
+
+                    if inherited.is_some() {
+                        manager.with_iface_ifac(&address, |slot| {
+                            *slot.write().expect("ifac lock") = inherited.clone();
+                        });
+                    }
+                }
+
+                stats.set_online(false);
+            }
         }
     }
 }
@@ -1048,49 +1094,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constructor_bitrate_is_published_once() {
+    async fn constructor_bitrate_is_published_before_spawn_returns() {
         let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(16)));
 
-        let untouched = {
-            let mut guard = manager.lock().await;
-            let channel = guard.new_channel(1);
-            *channel.address()
-        };
-        assert_eq!(
-            manager
-                .lock()
-                .await
-                .with_control(&untouched, |control| control.bitrate),
-            Some(GENERIC_INTERFACE_BITRATE)
-        );
-        prime_constructor_bitrate(&manager, &untouched, BITRATE_GUESS).await;
-        let rate = commit_installed_bitrate(&manager, &untouched, BITRATE_GUESS).await;
-        assert_eq!(rate, 100_000_000);
-        assert_eq!(hw_mtu_for_bitrate(rate), 32_768);
-        assert_eq!(
-            manager
-                .lock()
-                .await
-                .with_control(&untouched, |control| control.bitrate),
-            Some(BITRATE_GUESS)
-        );
-
-        let custom = {
-            let mut guard = manager.lock().await;
-            let channel = guard.new_channel(1);
-            *channel.address()
-        };
-        prime_constructor_bitrate(&manager, &custom, 7_500_000).await;
-        let rate = commit_installed_bitrate(&manager, &custom, 7_500_000).await;
-        assert_eq!(rate, 7_500_000);
-        assert_eq!(hw_mtu_for_bitrate(rate), 8_192);
-
+        // configure_iface stored 62500, then prime runs once.
         let configured = {
             let mut guard = manager.lock().await;
             let channel = guard.new_channel(1);
             *channel.address()
         };
-        prime_constructor_bitrate(&manager, &configured, BITRATE_GUESS).await;
         {
             let guard = manager.lock().await;
             guard.set_iface_bitrate(&configured, GENERIC_INTERFACE_BITRATE);
@@ -1106,6 +1118,62 @@ mod tests {
                 .with_control(&configured, |control| control.bitrate),
             Some(62_500)
         );
+
+        // Untouched: the constructor rate is stored before spawn returns.
+        let untouched = {
+            let mut guard = manager.lock().await;
+            guard.spawn(
+                BackboneClient::new("127.0.0.1:1").with_manager(manager.clone()),
+                BackboneClient::spawn,
+            )
+        };
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .with_control(&untouched, |control| control.bitrate),
+            Some(100_000_000)
+        );
+        let rate = commit_installed_bitrate(&manager, &untouched, BITRATE_GUESS).await;
+        assert_eq!(rate, 100_000_000);
+        assert_eq!(hw_mtu_for_bitrate(rate), 32_768);
+        manager.lock().await.stop_iface(&untouched);
+
+        let custom = {
+            let mut guard = manager.lock().await;
+            guard.spawn(
+                BackboneClient::new("127.0.0.1:1")
+                    .with_manager(manager.clone())
+                    .with_bitrate(7_500_000),
+                BackboneClient::spawn,
+            )
+        };
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .with_control(&custom, |control| control.bitrate),
+            Some(7_500_000)
+        );
+        manager.lock().await.stop_iface(&custom);
+
+        // Spawn publishes the guess, configure stores 62500, one later prime.
+        let replaced = {
+            let mut guard = manager.lock().await;
+            guard.spawn(
+                BackboneClient::new("127.0.0.1:1").with_manager(manager.clone()),
+                BackboneClient::spawn,
+            )
+        };
+        {
+            let guard = manager.lock().await;
+            guard.set_iface_bitrate(&replaced, GENERIC_INTERFACE_BITRATE);
+        }
+        prime_constructor_bitrate(&manager, &replaced, BITRATE_GUESS).await;
+        let rate = commit_installed_bitrate(&manager, &replaced, BITRATE_GUESS).await;
+        assert_eq!(rate, 62_500);
+        assert_eq!(hw_mtu_for_bitrate(rate), 1_024);
+        manager.lock().await.stop_iface(&replaced);
     }
 
     #[tokio::test]
