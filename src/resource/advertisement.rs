@@ -89,6 +89,18 @@ impl ResourceAdvertisement {
         self.flags & FLAG_HAS_METADATA != 0
     }
 
+    /// Python `ResourceAdvertisement.read_size`: uncompressed data size (`d`),
+    /// which is what `max_response_size` is compared against.
+    pub fn read_size(&self) -> usize {
+        self.data_size
+    }
+
+    /// Python `ResourceAdvertisement.read_transfer_size`: encrypted stream
+    /// length (`t`).
+    pub fn read_transfer_size(&self) -> usize {
+        self.transfer_size
+    }
+
     /// Pack the advertisement into the msgpack map layout used by Python
     /// `ResourceAdvertisement.pack` (keys: `t d n h r o i l q f m`).
     pub fn pack(&self) -> Vec<u8> {

@@ -1,6 +1,8 @@
 //! Outbound (sender) side of a resource transfer.
 
 use alloc::vec::Vec;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use rand_core::OsRng;
 use sha2::Digest;
@@ -12,10 +14,118 @@ use crate::packet::{Packet, PacketContext, PacketType};
 
 use super::advertisement::{ResourceAdvertisement, COLLISION_GUARD_SIZE, HASHMAP_MAX_LEN};
 use super::{
-    map_hash, maybe_compress, unix_time, ResourceStatus, ResourceTx, MAPHASH_LEN, MAX_ADV_RETRIES,
-    MAX_EFFICIENT_SIZE, MAX_RETRIES, RANDOM_HASH_SIZE, RESPONSE_MAX_GRACE_TIME, SDU,
-    SENDER_GRACE_TIME, WINDOW_MAX,
+    map_hash, maybe_compress, should_auto_compress, unix_time, ResourceStatus, ResourceTx,
+    MAPHASH_LEN, MAX_ADV_RETRIES, MAX_EFFICIENT_SIZE, MAX_RETRIES, RANDOM_HASH_SIZE,
+    RESPONSE_MAX_GRACE_TIME, SDU, SENDER_GRACE_TIME, WINDOW_MAX,
 };
+
+/// Object-safe read/seek so a file or any other stream can back a transfer
+/// without `Read`/`Seek` object-safety details leaking into the enum.
+// Sync: an outbound resource lives in the transport handler, which is
+// shared across packet tasks (`&TransportHandler: Send` needs `Sync`).
+trait StreamRead: Send + Sync {
+    fn read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn seek_to(&mut self, pos: SeekFrom) -> std::io::Result<u64>;
+}
+
+impl<T: Read + Seek + Send + Sync> StreamRead for T {
+    fn read_chunk(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Read::read(self, buf)
+    }
+
+    fn seek_to(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        Seek::seek(self, pos)
+    }
+}
+
+/// Where segment bytes come from. A file-backed transfer keeps the handle
+/// and reads one segment at a time so the rest of the file stays on disk
+/// until the receiver has the previous segment (Python `input_file`).
+enum PayloadSource {
+    /// Metadata prefix followed by the original bytes.
+    Memory(Vec<u8>),
+    Stream {
+        reader: Box<dyn StreamRead>,
+        metadata: Vec<u8>,
+        /// Reader length, not including the metadata prefix.
+        len: u64,
+        /// Set only for streams we spooled ourselves; removed on drop.
+        spool_path: Option<PathBuf>,
+    },
+}
+
+impl Drop for PayloadSource {
+    fn drop(&mut self) {
+        if let PayloadSource::Stream {
+            spool_path: Some(path),
+            ..
+        } = self
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl PayloadSource {
+    fn read_range(&mut self, range: core::ops::Range<usize>) -> Result<Vec<u8>, RnsError> {
+        if range.start > range.end {
+            return Err(RnsError::ResourceMsg("resource segment out of range"));
+        }
+        match self {
+            Self::Memory(buf) => {
+                if range.end > buf.len() {
+                    return Err(RnsError::ResourceMsg("resource segment out of range"));
+                }
+                Ok(buf[range].to_vec())
+            }
+            Self::Stream {
+                reader,
+                metadata,
+                len,
+                ..
+            } => {
+                let mut out = Vec::with_capacity(range.end - range.start);
+                let meta_len = metadata.len();
+                if range.start < meta_len {
+                    let end = range.end.min(meta_len);
+                    out.extend_from_slice(&metadata[range.start..end]);
+                }
+                if range.end > meta_len {
+                    let file_start = range.start.saturating_sub(meta_len) as u64;
+                    let file_end = (range.end - meta_len) as u64;
+                    if file_start > *len || file_end > *len {
+                        return Err(RnsError::ResourceMsg("resource segment out of range"));
+                    }
+                    reader
+                        .seek_to(SeekFrom::Start(file_start))
+                        .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;
+                    let mut remaining = (file_end - file_start) as usize;
+                    let mut buf = [0u8; 16 * 1024];
+                    while remaining > 0 {
+                        let want = remaining.min(buf.len());
+                        let n = reader
+                            .read_chunk(&mut buf[..want])
+                            .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;
+                        if n == 0 {
+                            return Err(RnsError::ResourceMsg("resource stream ended early"));
+                        }
+                        out.extend_from_slice(&buf[..n]);
+                        remaining -= n;
+                    }
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+struct SpoolGuard(PathBuf);
+
+impl Drop for SpoolGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 pub use super::ResourceOptions;
 
@@ -42,6 +152,10 @@ pub struct OutgoingResource {
     pub request_id: Option<AddressHash>,
     pub is_response: bool,
     pub auto_compress: bool,
+    pub auto_compress_limit: Option<usize>,
+    /// Original input length excluding metadata. Python compares this, not
+    /// the segment length, against the auto-compress limit.
+    pub input_len: usize,
     pub sdu: usize,
 
     /// Pre-built part packets with per-part map hashes.
@@ -64,57 +178,185 @@ pub struct OutgoingResource {
     pub timeout_factor: f64,
     pub sender_grace_time: f64,
 
-    /// Full original stream (metadata + data) kept for segmentation.
-    pub original_stream: Option<Vec<u8>>,
+    /// Remaining unread source. Moved into the next segment when that
+    /// segment is prepared, so only one segment's plaintext is resident.
+    source: Option<PayloadSource>,
     /// Prepared next segment (already compressed/split), advertised when
     /// the current segment completes.
     pub next_segment: Option<Box<OutgoingResource>>,
     pub advertise_next: bool,
 }
 
+/// 3-byte length prefix + caller-supplied msgpack metadata, matching
+/// Python `struct.pack(">I", metadata_size)[1:] + umsgpack.packb(metadata)`.
+fn metadata_prefix(opts: &ResourceOptions) -> Result<(Vec<u8>, bool, usize), RnsError> {
+    let Some(packed) = opts.metadata.as_ref() else {
+        return Ok((Vec::new(), false, 0));
+    };
+    if packed.len() > super::METADATA_MAX_SIZE {
+        return Err(RnsError::ResourceMsg("resource metadata size exceeded"));
+    }
+    let len = packed.len() as u32;
+    let mut blob = Vec::with_capacity(3 + packed.len());
+    blob.extend_from_slice(&len.to_be_bytes()[1..]);
+    blob.extend_from_slice(packed);
+    let size = blob.len();
+    Ok((blob, true, size))
+}
+
+fn spool_path() -> PathBuf {
+    let rand = Hash::new_from_rand(OsRng);
+    let mut name = format!("reticulum-resource-{}", std::process::id());
+    for byte in &rand.as_slice()[..8] {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    std::env::temp_dir().join(name)
+}
+
 impl OutgoingResource {
     /// Create an outbound resource for `data` (metadata prepended when
     /// given), splitting, compressing, encrypting and hashing exactly like
     /// Python `RNS.Resource.__init__`.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(data: Vec<u8>, link: &Link, opts: ResourceOptions) -> Result<Self, RnsError> {
-        let mut metadata_blob = Vec::new();
-        let mut has_metadata = false;
-        let mut metadata_size = 0usize;
-
-        if let Some(metadata) = &opts.metadata {
-            let packed = metadata; // callers pass pre-packed msgpack bytes
-            if packed.len() > super::METADATA_MAX_SIZE {
-                return Err(RnsError::ResourceMsg("resource metadata size exceeded"));
-            }
-            // 3-byte big-endian size prefix + payload
-            let len = packed.len() as u32;
-            metadata_blob.extend_from_slice(&len.to_be_bytes()[1..]);
-            metadata_blob.extend_from_slice(packed);
-            metadata_size = metadata_blob.len();
-            has_metadata = true;
-        }
-
-        // Build the full stream: metadata + data
+        let (metadata_blob, has_metadata, metadata_size) = metadata_prefix(&opts)?;
+        let input_len = data.len();
         let mut stream = Vec::with_capacity(metadata_size + data.len());
         stream.extend_from_slice(&metadata_blob);
         stream.extend_from_slice(&data);
         let total_size = stream.len();
+        Self::open_source(
+            PayloadSource::Memory(stream),
+            input_len,
+            total_size,
+            link,
+            opts,
+            has_metadata,
+            metadata_size,
+        )
+    }
 
+    /// Advertise a file without reading past the first segment. Later
+    /// segments are read when the previous one is proven, matching Python's
+    /// `input_file` seek/read.
+    pub fn from_path(path: &Path, link: &Link, opts: ResourceOptions) -> Result<Self, RnsError> {
+        let file = std::fs::File::open(path)
+            .map_err(|_| RnsError::ResourceMsg("could not open resource file"))?;
+        Self::from_reader(file, link, opts)
+    }
+
+    /// Advertise a seekable stream. Length comes from seeking to the end,
+    /// which does not read the body; only the first segment is read before
+    /// the resource is advertised.
+    pub fn from_reader<R: Read + Seek + Send + Sync + 'static>(
+        reader: R,
+        link: &Link,
+        opts: ResourceOptions,
+    ) -> Result<Self, RnsError> {
+        Self::from_seekable(Box::new(reader), None, link, opts)
+    }
+
+    /// Spool a non-seekable stream to a temporary file (Python proxies a
+    /// size-less `BufferedReader` through `TemporaryFile`) and advertise
+    /// from that file. The spool is removed when the transfer is dropped.
+    /// The whole stream is consumed, but only in small chunks — it is not
+    /// held as one buffer, and only the first segment is loaded afterwards.
+    pub fn from_read<R: Read>(
+        mut reader: R,
+        link: &Link,
+        opts: ResourceOptions,
+    ) -> Result<Self, RnsError> {
+        let path = spool_path();
+        let guard = SpoolGuard(path.clone());
+        {
+            // `File::create` is write-only. Reopen for reading once the
+            // spool is on disk so the transfer can seek and read segments.
+            let mut file = std::fs::File::create(&path)
+                .map_err(|_| RnsError::ResourceMsg("could not spool resource stream"))?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader
+                    .read(&mut buf)
+                    .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;
+                if n == 0 {
+                    break;
+                }
+                file.write_all(&buf[..n])
+                    .map_err(|_| RnsError::ResourceMsg("could not spool resource stream"))?;
+            }
+        }
+        let file = std::fs::File::open(&path)
+            .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;
+        // The source owns the path from here and deletes it on drop.
+        std::mem::forget(guard);
+        match Self::from_seekable(Box::new(file), Some(path.clone()), link, opts) {
+            Ok(resource) => Ok(resource),
+            Err(err) => {
+                // `from_seekable` only unlinks once the source exists. A
+                // failure before that (metadata rejected, seek failed)
+                // would otherwise leave the spool behind.
+                let _ = std::fs::remove_file(&path);
+                Err(err)
+            }
+        }
+    }
+
+    fn from_seekable(
+        mut reader: Box<dyn StreamRead>,
+        spool_path: Option<PathBuf>,
+        link: &Link,
+        opts: ResourceOptions,
+    ) -> Result<Self, RnsError> {
+        let (metadata_blob, has_metadata, metadata_size) = metadata_prefix(&opts)?;
+        let end = reader
+            .seek_to(SeekFrom::End(0))
+            .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;
+        reader
+            .seek_to(SeekFrom::Start(0))
+            .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;
+        let input_len = usize::try_from(end)
+            .map_err(|_| RnsError::ResourceMsg("resource stream is too large"))?;
+        let total_size = metadata_size + input_len;
+        Self::open_source(
+            PayloadSource::Stream {
+                reader,
+                metadata: metadata_blob,
+                len: end,
+                spool_path,
+            },
+            input_len,
+            total_size,
+            link,
+            opts,
+            has_metadata,
+            metadata_size,
+        )
+    }
+
+    fn open_source(
+        mut source: PayloadSource,
+        input_len: usize,
+        total_size: usize,
+        link: &Link,
+        opts: ResourceOptions,
+        has_metadata: bool,
+        metadata_size: usize,
+    ) -> Result<Self, RnsError> {
         let total_segments = if total_size <= MAX_EFFICIENT_SIZE {
             1
         } else {
             (total_size - 1) / MAX_EFFICIENT_SIZE + 1
         };
-        let segment_index = 1;
-        let segment_range = Self::segment_range(total_size, metadata_size, segment_index);
-
-        Self::new_segment(
-            stream,
-            segment_range,
+        let range = Self::segment_range(total_size, metadata_size, 1);
+        // Only this segment is pulled into memory. The rest stays in
+        // `source` until the receiver proves the segment.
+        let segment_data = source.read_range(range)?;
+        Self::from_segment_bytes(
+            segment_data,
+            source,
+            input_len,
             total_size,
             total_segments,
-            segment_index,
+            1,
             None,
             link,
             opts,
@@ -123,12 +365,12 @@ impl OutgoingResource {
         )
     }
 
-    /// Build one segment of a (possibly multi-segment) resource. `stream`
-    /// is the complete original data; `range` selects this segment's bytes.
+    /// Build one segment. `segment_data` is only this segment's plaintext.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new_segment(
-        stream: Vec<u8>,
-        range: core::ops::Range<usize>,
+    fn from_segment_bytes(
+        segment_data: Vec<u8>,
+        source: PayloadSource,
+        input_len: usize,
         total_size: usize,
         total_segments: usize,
         segment_index: usize,
@@ -138,14 +380,14 @@ impl OutgoingResource {
         has_metadata: bool,
         metadata_size: usize,
     ) -> Result<Self, RnsError> {
-        let segment_data = stream[range.clone()].to_vec();
         let split = total_segments > 1;
 
-        // Compress (only beneficial compression is used)
+        // Python gates on the original input size, then keeps the
+        // compressed form only when it is actually smaller.
         let (prepared, compressed) = maybe_compress(
             &segment_data,
-            opts.auto_compress,
-            super::AUTO_COMPRESS_MAX_SIZE,
+            should_auto_compress(&opts, input_len),
+            usize::MAX,
         );
 
         // Random hash prefix + payload
@@ -273,6 +515,8 @@ impl OutgoingResource {
             request_id: opts.request_id,
             is_response: opts.is_response,
             auto_compress: opts.auto_compress,
+            auto_compress_limit: opts.auto_compress_limit,
+            input_len,
             sdu,
             parts,
             part_hashes,
@@ -290,7 +534,7 @@ impl OutgoingResource {
             timeout,
             timeout_factor: super::TRAFFIC_TIMEOUT_FACTOR,
             sender_grace_time: SENDER_GRACE_TIME,
-            original_stream: Some(stream),
+            source: Some(source),
             next_segment: None,
             advertise_next: false,
         })
@@ -491,36 +735,40 @@ impl OutgoingResource {
     /// (Python `__prepare_next_segment`). Returns `None` for the last
     /// segment or non-split resources.
     pub(super) fn prepare_next_segment(
-        &self,
+        &mut self,
         link: &Link,
     ) -> Result<Option<Box<OutgoingResource>>, RnsError> {
         if !self.split || self.segment_index >= self.total_segments {
             return Ok(None);
         }
 
-        let Some(ref stream) = self.original_stream else {
+        let Some(mut source) = self.source.take() else {
             return Ok(None);
         };
 
         let next_segment = self.segment_index + 1;
-        let range = Self::segment_range(stream.len(), self.metadata_size, next_segment);
+        let range = Self::segment_range(self.total_size, self.metadata_size, next_segment);
 
-        if range.start >= stream.len() {
+        if range.start >= self.total_size {
+            self.source = Some(source);
             return Ok(None);
         }
 
+        let segment_data = source.read_range(range)?;
         let next_opts = ResourceOptions {
             auto_compress: self.auto_compress,
+            auto_compress_limit: self.auto_compress_limit,
             timeout: Some(self.timeout),
             request_id: self.request_id,
             is_response: self.is_response,
             metadata: None,
         };
 
-        Ok(Some(Box::new(Self::new_segment(
-            stream.clone(),
-            range,
-            stream.len(),
+        Ok(Some(Box::new(Self::from_segment_bytes(
+            segment_data,
+            source,
+            self.input_len,
+            self.total_size,
             self.total_segments,
             next_segment,
             Some(self.original_hash),

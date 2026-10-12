@@ -32,8 +32,9 @@ use crate::packet::{
 use crate::resource::{
     self,
     manager::{
-        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
-        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
+        pack_request, pack_response, packet_response_size, request_id as make_request_id,
+        PendingRequest, RequestContext as RequestCtx, RequestEvent, RequestEventData,
+        RequestHandlerConfig, RequestOptions, RequestResponse, ResourceManager, ResourceStrategy,
     },
     ResourceEvent, ResourceOptions, ResourceTx,
 };
@@ -1332,6 +1333,26 @@ impl Transport {
             .register_request_handler(*destination, path, Arc::new(handler));
     }
 
+    /// Register a request handler with Python's `allow`, `allowed_list` and
+    /// `auto_compress` arguments. The handler may return a msgpack element
+    /// or a file. [`Transport::register_request_handler`] stays allow-all
+    /// and element-only so existing callers keep working.
+    pub async fn register_request_handler_with_config<F>(
+        &self,
+        destination: &AddressHash,
+        path: &str,
+        config: RequestHandlerConfig,
+        handler: F,
+    ) where
+        F: Fn(RequestCtx) -> Option<RequestResponse> + Send + Sync + 'static,
+    {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .register_request_handler_with_config(*destination, path, config, Arc::new(handler));
+    }
+
     /// Register an async request handler for a path on one of our inbound
     /// destinations. Async handlers keep the transport responsive for
     /// long-running work (e.g. remote command execution).
@@ -1392,37 +1413,70 @@ impl Transport {
             return Err(RnsError::LinkNotReady);
         }
 
-        // reserve a slot and build the resource under the link lock
-        let mut resource =
+        let resource =
             crate::resource::outbound::OutgoingResource::new(data, &link_guard, options)?;
+        enqueue_resource(&mut handler, &mut link_guard, resource).await
+    }
 
-        let mut tx = crate::resource::ResourceTx::default();
-        let active = handler
-            .resources
-            .out
-            .get(link_guard.id())
-            .map(|list| list.iter().any(|r| !r.status.is_concluded()))
-            .unwrap_or(false);
-
-        let hash = resource.hash;
-        if active {
-            resource.status = crate::resource::ResourceStatus::Queued;
-        } else {
-            resource.advertise(&link_guard, &mut tx)?;
+    /// Send a file as a resource. Only the first segment is read before
+    /// the advertisement; later segments are read as the transfer advances.
+    pub async fn send_resource_from_path(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &std::path::Path,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError> {
+        let mut handler = self.handler.lock().await;
+        let mut link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
         }
+        let resource =
+            crate::resource::outbound::OutgoingResource::from_path(path, &link_guard, options)?;
+        enqueue_resource(&mut handler, &mut link_guard, resource).await
+    }
 
-        for packet in tx.packets {
-            handler.send_from_link(&mut link_guard, packet).await;
+    /// Send a seekable stream as a resource. Seeking to discover the length
+    /// does not read the body, and only the first segment is read before
+    /// the advertisement.
+    pub async fn send_resource_from_reader<R>(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        reader: R,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError>
+    where
+        R: std::io::Read + std::io::Seek + Send + Sync + 'static,
+    {
+        let mut handler = self.handler.lock().await;
+        let mut link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
         }
+        let resource =
+            crate::resource::outbound::OutgoingResource::from_reader(reader, &link_guard, options)?;
+        enqueue_resource(&mut handler, &mut link_guard, resource).await
+    }
 
-        handler
-            .resources
-            .out
-            .entry(*link_guard.id())
-            .or_default()
-            .push(resource);
-
-        Ok(hash)
+    /// Spool a non-seekable stream to a temporary file and send that, so
+    /// the bytes are not held as a single buffer.
+    pub async fn send_resource_from_read<R>(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        reader: R,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let mut handler = self.handler.lock().await;
+        let mut link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
+        }
+        let resource =
+            crate::resource::outbound::OutgoingResource::from_read(reader, &link_guard, options)?;
+        enqueue_resource(&mut handler, &mut link_guard, resource).await
     }
 
     /// Cancel an outbound resource transfer on a link (Python
@@ -1470,6 +1524,21 @@ impl Transport {
         path: &str,
         data: &[u8],
     ) -> Result<AddressHash, RnsError> {
+        self.request_with_options(link, path, data, RequestOptions::default())
+            .await
+    }
+
+    /// [`Transport::request`] plus Python's per-request `timeout` and
+    /// `max_response_size`. A timeout is armed when the request is
+    /// delivered (immediately for a packet, after the request resource is
+    /// proven otherwise) and fails the request on the resource watchdog.
+    pub async fn request_with_options(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &str,
+        data: &[u8],
+        options: RequestOptions,
+    ) -> Result<AddressHash, RnsError> {
         let mut handler = self.handler.lock().await;
         let mut link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
@@ -1477,46 +1546,46 @@ impl Transport {
         }
 
         let packed = pack_request(path, data);
+        let now = crate::resource::unix_time();
 
-        let rid = if packed.len() <= link_guard.mdu() {
+        let (rid, awaiting_response, deadline) = if packed.len() <= link_guard.mdu() {
             let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
             // A packet-carried request is tracked by its packet hashable
             // part (Python `PacketReceipt.truncated_hash`), which is the
-            // id a responder echoes back.
+            // id a responder echoes back. The response timer starts now.
+            // Stamp outbound while this guard is held; `send` only try-locks.
             let rid = request_id_from_packet(&packet);
             handler.send_from_link(&mut link_guard, packet).await;
-            rid
+            let deadline = options.timeout.map(|timeout| now + timeout);
+            (rid, true, deadline)
         } else {
             // A resource-carried request keeps the packed-payload id
             // (Python `Link.request` sets `request_id =
-            // truncated_hash(packed_request)`).
+            // truncated_hash(packed_request)`). The response timer starts
+            // when that resource is proven.
             let rid = make_request_id(&packed);
             let opts = ResourceOptions {
                 request_id: Some(rid),
                 is_response: false,
+                timeout: options.timeout,
                 ..Default::default()
             };
-            // Build + advertise directly (single outstanding request is fine)
-            let mut resource =
+            let resource =
                 crate::resource::outbound::OutgoingResource::new(packed, &link_guard, opts)?;
-            let mut tx = crate::resource::ResourceTx::default();
-            resource.advertise(&link_guard, &mut tx)?;
-            for p in tx.packets {
-                handler.send_from_link(&mut link_guard, p).await;
-            }
-            handler
-                .resources
-                .out
-                .entry(*link_guard.id())
-                .or_default()
-                .push(resource);
-            rid
+            enqueue_resource(&mut handler, &mut link_guard, resource).await?;
+            (rid, false, None)
         };
 
-        handler
-            .resources
-            .pending_requests
-            .insert(rid, *link_guard.id());
+        handler.resources.track_request(
+            rid,
+            PendingRequest {
+                link_id: *link_guard.id(),
+                deadline,
+                timeout: options.timeout,
+                max_response_size: options.max_response_size,
+                awaiting_response,
+            },
+        );
         Ok(rid)
     }
 
@@ -2789,33 +2858,82 @@ async fn handle_resource_packet<'a>(
     handled
 }
 
+/// Queue `resource` behind any transfer already running on the link, or
+/// advertise it immediately. Callers already hold the handler and link locks.
+async fn enqueue_resource(
+    handler: &mut TransportHandler,
+    link: &mut Link,
+    mut resource: crate::resource::OutgoingResource,
+) -> Result<Hash, RnsError> {
+    let active = handler
+        .resources
+        .out
+        .get(link.id())
+        .is_some_and(|list| list.iter().any(|r| !r.status.is_concluded()));
+    let mut tx = ResourceTx::default();
+    if active {
+        resource.status = crate::resource::ResourceStatus::Queued;
+    } else {
+        resource.advertise(link, &mut tx)?;
+    }
+    let hash = resource.hash;
+    handler
+        .resources
+        .out
+        .entry(*link.id())
+        .or_default()
+        .push(resource);
+    for packet in tx.packets {
+        handler.send_from_link(link, packet).await;
+    }
+    Ok(hash)
+}
+
 /// Send a request response as a packet or resource
 /// (shared by the sync and async handler paths).
+///
+/// A msgpack element is wrapped as `[request_id, element]`. A file is
+/// Python's `(BufferedReader, metadata)` return: the bytes go out as a
+/// resource with no msgpack wrapper, using the handler's auto_compress.
 async fn send_response<'a>(
     link: &mut Link,
     rid: &AddressHash,
-    response: &[u8],
+    response: &RequestResponse,
+    auto_compress: bool,
+    auto_compress_limit: Option<usize>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
-    let packed = pack_response(rid, response);
-    if packed.len() <= link.mdu() {
-        if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
-            handler.send_from_link(link, packet).await;
-        }
-    } else {
-        let opts = ResourceOptions {
-            request_id: Some(*rid),
-            is_response: true,
-            ..Default::default()
-        };
-        match handler.resources.send_resource(link, packed, opts) {
-            Ok(tx) => {
-                for p in tx.packets {
-                    handler.send_from_link(link, p).await;
+    let opts = ResourceOptions {
+        request_id: Some(*rid),
+        is_response: true,
+        auto_compress,
+        auto_compress_limit,
+        ..Default::default()
+    };
+    let resource = match response {
+        RequestResponse::Element(element) => {
+            let packed = pack_response(rid, element);
+            if packed.len() <= link.mdu() {
+                if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
+                    handler.send_from_link(link, packet).await;
                 }
+                return;
             }
-            Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
+            crate::resource::OutgoingResource::new(packed, link, opts)
         }
+        RequestResponse::File { path, metadata } => {
+            let mut opts = opts;
+            opts.metadata = metadata.clone();
+            crate::resource::OutgoingResource::from_path(path, link, opts)
+        }
+    };
+    match resource {
+        Ok(resource) => {
+            if let Err(err) = enqueue_resource(handler, link, resource).await {
+                log::debug!("tp: could not send response resource: {err:?}");
+            }
+        }
+        Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
     }
 }
 
@@ -2838,12 +2956,21 @@ async fn handle_incoming_request<'a>(
     // locks deadlocked any handler that re-entered transport APIs
     // (send_packet/request/send_resource) and stalled all packet
     // processing for slow handlers.
-    if let Some(async_fn) = handler
+    if let Some(registered) = handler
         .resources
         .async_request_handler(&destination, &path_hash)
     {
+        // Python skips the generator entirely when the peer is outside
+        // the handler's allow policy. An unidentified link has no hash
+        // to match against ALLOW_LIST.
+        if !registered.allows(&remote_identity) {
+            log::debug!("tp: async request from peer not allowed");
+            return;
+        }
+        let auto_compress = registered.auto_compress;
+        let auto_compress_limit = registered.auto_compress_limit;
+        let async_fn = registered.invoke();
         let link_id = *link.id();
-        let _mdu = link.mdu();
         drop(link);
 
         // Async handlers run on the runtime WITHOUT the transport lock:
@@ -2867,24 +2994,32 @@ async fn handle_incoming_request<'a>(
             if let Some(response) = response {
                 let mut handler = transport_handler.lock().await;
                 let mut link = link_arc.lock().await;
-                send_response(&mut link, &rid, &response, &mut handler).await;
+                send_response(
+                    &mut link,
+                    &rid,
+                    &RequestResponse::Element(response),
+                    auto_compress,
+                    auto_compress_limit,
+                    &mut handler,
+                )
+                .await;
             }
         });
         return;
     }
 
-    let handler_fn = handler
-        .resources
-        .request_handlers
-        .get(&destination)
-        .and_then(|handlers| handlers.get(&path_hash).cloned());
-
-    let Some(handler_fn) = handler_fn else {
+    let Some(registered) = handler.resources.request_handler(&destination, &path_hash) else {
         log::trace!("tp: no handler for request path {path_hash}");
         return;
     };
+    if !registered.allows(&remote_identity) {
+        log::debug!("tp: request from peer not allowed");
+        return;
+    }
+    let auto_compress = registered.auto_compress;
+    let auto_compress_limit = registered.auto_compress_limit;
 
-    let response = handler_fn(RequestCtx {
+    let response = registered.call(RequestCtx {
         path_hash,
         data: request_data,
         request_id: rid,
@@ -2894,7 +3029,15 @@ async fn handle_incoming_request<'a>(
     });
 
     if let Some(response) = response {
-        send_response(&mut link, &rid, &response, handler).await;
+        send_response(
+            &mut link,
+            &rid,
+            &response,
+            auto_compress,
+            auto_compress_limit,
+            handler,
+        )
+        .await;
     }
 }
 
@@ -2956,6 +3099,18 @@ async fn handle_request_or_response_packet<'a>(
             let Some((rid, response)) = crate::resource::manager::unpack_response(plaintext) else {
                 return false;
             };
+            // Python `handle_response` only accepts a response while the
+            // request receipt is still pending. A late packet after a
+            // timeout (the receipt was already removed) is ignored.
+            if !handler.resources.pending_requests.contains_key(&rid) {
+                return true;
+            }
+            // `len(umsgpack.packb(response_data)) - 2`.
+            let size = packet_response_size(plaintext).unwrap_or(response.len());
+            if !handler.resources.response_size_allowed(&rid, size) {
+                handler.resources.fail_request(rid);
+                return true;
+            }
             // Retain the completed response so an `await_request_response`
             // call that has not subscribed yet still observes it.
             handler
