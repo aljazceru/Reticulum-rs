@@ -231,32 +231,16 @@ impl PathRequests {
         }
     }
 
-    /// Register a waiting discovery path request for `destination`.
-    ///
-    /// The wait is [`PATH_REQUEST_TIMEOUT`] (15s). Pass a medium timeout
-    /// through [`Self::register_discovery_with_timeout`] when the caller
-    /// has one. A second request for the same destination while one is in
-    /// flight is batched: its interface is appended, and
-    /// [`Self::clear_discovery`] returns every requestor so each is
-    /// answered when the discovery completes.
-    #[allow(dead_code)] // 15s entry point; medium timeouts use `register_discovery_with_timeout`.
-    pub fn register_discovery(
-        &mut self,
-        destination: &AddressHash,
-        requesting_iface: Option<AddressHash>,
-    ) {
-        self.register_discovery_with_timeout(destination, requesting_iface, PATH_REQUEST_TIMEOUT);
-    }
-
-    /// [`Self::register_discovery`] with Python's discovery wait:
-    /// `max(PATH_REQUEST_TIMEOUT, medium_path_timeout)`.
+    /// Register a waiting discovery path request for `destination`
+    /// (Python `max(PATH_REQUEST_TIMEOUT, medium_path_timeout)`).
     ///
     /// `medium_path_timeout` is `Transport.medium_path_timeout()` (zero
-    /// when the bitrate is unknown). A value that is already the max is
-    /// accepted. Returns `true` when this call started the discovery, so
-    /// the caller should forward the path request. Returns `false` when
-    /// the requestor was retained on a discovery that is already pending
-    /// (do not search again) or when no requesting interface was given.
+    /// when the bitrate is unknown). Pass [`PATH_REQUEST_TIMEOUT`] for the
+    /// 15s floor. A value that is already the max is accepted. Returns
+    /// `true` when this call started the discovery, so the caller should
+    /// forward the path request. Returns `false` when the requestor was
+    /// retained on a discovery that is already pending (do not search
+    /// again) or when no requesting interface was given.
     ///
     /// Batching does not restart the deadline. Elapsed time still counts:
     /// a longer supplied wait extends it by the difference, and a shorter
@@ -355,16 +339,20 @@ mod tests {
         assert!(!testee.discovery_pending(&dest));
         // A request without a requesting interface registers nothing
         // (Python entries always carry their requesting interface).
-        testee.register_discovery(&dest, None);
+        assert!(!testee.register_discovery_with_timeout(&dest, None, PATH_REQUEST_TIMEOUT));
         assert!(!testee.discovery_pending(&dest));
 
-        testee.register_discovery(&dest, Some(iface_a));
+        assert!(testee.register_discovery_with_timeout(&dest, Some(iface_a), PATH_REQUEST_TIMEOUT));
         assert!(testee.discovery_pending(&dest));
         let deadline = testee.discovery.get(&dest).unwrap().deadline;
 
         // A second in-flight request batches onto the existing entry.
-        // The default signature does not move the 15s deadline.
-        testee.register_discovery(&dest, Some(iface_b));
+        // The same 15s wait does not move the deadline.
+        assert!(!testee.register_discovery_with_timeout(
+            &dest,
+            Some(iface_b),
+            PATH_REQUEST_TIMEOUT
+        ));
         assert_eq!(testee.discovery.get(&dest).unwrap().deadline, deadline);
         let batched = testee.clear_discovery(&dest).expect("batched entry");
         assert_eq!(batched, vec![iface_a, iface_b]);
@@ -454,7 +442,7 @@ mod tests {
 
         // Elapsed time still counts: 40s on a pending 15s discovery
         // extends the deadline by 25s. A shorter wait does not shrink it.
-        testee.register_discovery(&dest, Some(iface_a));
+        assert!(testee.register_discovery_with_timeout(&dest, Some(iface_a), PATH_REQUEST_TIMEOUT));
         let created = testee.discovery.get(&dest).unwrap().deadline;
         assert_eq!(
             testee.discovery.get(&dest).unwrap().wait,
@@ -514,8 +502,7 @@ mod tests {
         let started = match medium {
             Some(medium) => testee.register_discovery_with_timeout(&dest, Some(iface), medium),
             None => {
-                testee.register_discovery(&dest, Some(iface));
-                true
+                testee.register_discovery_with_timeout(&dest, Some(iface), PATH_REQUEST_TIMEOUT)
             }
         };
         let after = Instant::now();

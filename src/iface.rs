@@ -430,9 +430,9 @@ pub struct InterfaceManager {
     /// Per-interface transport control state (Python `Interface` ingress /
     /// egress control attributes).
     controls: Mutex<HashMap<AddressHash, IfaceControlState>>,
-    /// Sampled local-client hop rewrite (Python `Transport.local_hops_delta`).
-    /// Zero disables it.
-    local_hops_delta: AtomicU8,
+    /// Sampled hops-0 rewrite onto the wider network
+    /// (Python `Transport.local_hops_delta`). Zero disables it.
+    pub(crate) local_hops_delta: AtomicU8,
     /// Transport identity inserted when an announce header is upgraded.
     transport_identity: Mutex<Option<AddressHash>>,
 }
@@ -830,6 +830,31 @@ impl InterfaceManager {
         messages
     }
 
+    /// Runtime address to a stable identity (`kind` + name), so a restart
+    /// can resolve persisted paths onto the new `AddressHash`.
+    pub fn stable_iface_map(&self) -> HashMap<AddressHash, AddressHash> {
+        let mut map = HashMap::new();
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() {
+                continue;
+            }
+            map.insert(iface.address, stable_interface_id(&iface.kind, &iface.name));
+        }
+        map
+    }
+
+    /// Stable interface identity to the current runtime address.
+    pub fn stable_to_live(&self) -> HashMap<AddressHash, AddressHash> {
+        let mut map = HashMap::new();
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() {
+                continue;
+            }
+            map.insert(stable_interface_id(&iface.kind, &iface.name), iface.address);
+        }
+        map
+    }
+
     /// Addresses of all live interfaces with their online status,
     /// for fan-out decisions (path request forwarding).
     pub fn live_iface_addresses(&self) -> Vec<(AddressHash, bool)> {
@@ -1065,14 +1090,24 @@ impl InterfaceManager {
                 }
 
                 let mut outbound = message;
+                let local_client = self.is_local_client_iface(&iface.address);
                 if rewrite_hops
-                    && should_apply_hops_delta(
-                        &outbound.packet,
-                        &iface.kind,
-                        self.is_local_client_iface(&iface.address),
-                    )
+                    && outbound.packet.header.hops == 0
+                    && outbound.packet.header.destination_type != DestinationType::Plain
+                    && outbound.packet.header.destination_type != DestinationType::Group
+                    && !local_client
+                    && iface.kind != "LocalServer"
                 {
-                    mangle_hops(&mut outbound.packet, hops_delta, transport_id);
+                    let upgrade = outbound.packet.header.packet_type == PacketType::Announce
+                        && outbound.packet.header.header_type == HeaderType::Type1;
+                    outbound.packet.header.hops = hops_delta;
+                    if upgrade {
+                        if let Some(transport_id) = transport_id {
+                            outbound.packet.header.header_type = HeaderType::Type2;
+                            outbound.packet.header.propagation_type = PropagationType::Transport;
+                            outbound.packet.transport = Some(transport_id);
+                        }
+                    }
                 }
 
                 let _ = iface.tx_send.send(outbound).await;
@@ -1129,28 +1164,15 @@ impl Drop for InterfaceManager {
     }
 }
 
-/// Python `Transport.should_apply_delta` for one egress interface.
-fn should_apply_hops_delta(packet: &Packet, kind: &str, local_client: bool) -> bool {
-    packet.header.hops == 0
-        && packet.header.destination_type != DestinationType::Plain
-        && packet.header.destination_type != DestinationType::Group
-        && !local_client
-        && kind != "LocalServer"
-}
-
-/// Python `Transport.mangle_hops`. Header-1 announces become header-2
-/// and carry the transport identity.
-fn mangle_hops(packet: &mut Packet, hops: u8, transport_id: Option<AddressHash>) {
-    let upgrade = packet.header.packet_type == PacketType::Announce
-        && packet.header.header_type == HeaderType::Type1;
-    packet.header.hops = hops;
-    if upgrade {
-        if let Some(transport_id) = transport_id {
-            packet.header.header_type = HeaderType::Type2;
-            packet.header.propagation_type = PropagationType::Transport;
-            packet.transport = Some(transport_id);
-        }
-    }
+/// Stable identity of an interface across process restarts.
+/// The runtime `AddressHash` from `new_channel_named` is a fresh random
+/// seed and is not persisted.
+fn stable_interface_id(kind: &str, name: &str) -> AddressHash {
+    let mut label = String::with_capacity(kind.len() + 1 + name.len());
+    label.push_str(kind);
+    label.push('\0');
+    label.push_str(name);
+    AddressHash::new_from_slice(label.as_bytes())
 }
 
 /// Short type name of an interface, used as statistics `kind`.

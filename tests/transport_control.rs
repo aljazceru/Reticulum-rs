@@ -514,6 +514,95 @@ async fn path_table_reloads_on_the_same_interfaces() {
     assert_eq!(a.hops_to(&hash).await, Some(hops));
 }
 
+fn stored_announce_hops(bytes: &[u8]) -> Option<u8> {
+    let value = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
+    let entries = value.as_array()?;
+    let fields = entries.first()?.as_array()?;
+    let announce = fields.get(8)?.as_slice()?;
+    announce.get(1).copied()
+}
+
+#[tokio::test]
+async fn path_table_survives_interface_address_restart() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    {
+        let a = TransportConfig::new("rust-restart-a", &PrivateIdentity::new_from_rand(OsRng))
+            .set_retransmit(true)
+            .set_storage(storage.clone())
+            .build();
+        let b = TransportConfig::new("rust-restart-b", &PrivateIdentity::new_from_rand(OsRng))
+            .set_retransmit(true)
+            .build();
+        {
+            let manager = a.iface_manager();
+            let mut manager = manager.lock().await;
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47030", Some("127.0.0.1:47031"), true),
+                UdpInterface::spawn,
+            );
+        }
+        {
+            let manager = b.iface_manager();
+            let mut manager = manager.lock().await;
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47031", Some("127.0.0.1:47030"), true),
+                UdpInterface::spawn,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let destination = SingleInputDestination::new(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("restart", "path"),
+        );
+        let hash = destination.desc.address_hash;
+        b.send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), None)
+            .await;
+        let hops = wait_hops(&a, &hash).await.expect("path learned");
+        a.persist_data().await;
+        let saved = storage
+            .read(DESTINATION_TABLE_FILE)
+            .expect("destination table written");
+        let wire_hops = stored_announce_hops(&saved).expect("cached announce hops");
+        drop(b);
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let a = TransportConfig::new("rust-restart-a", &PrivateIdentity::new_from_rand(OsRng))
+            .set_retransmit(true)
+            .set_storage(storage.clone())
+            .build();
+        {
+            let manager = a.iface_manager();
+            let mut manager = manager.lock().await;
+            manager.spawn(
+                UdpInterface::new("127.0.0.1:47030", Some("127.0.0.1:47031"), true),
+                UdpInterface::spawn,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        a.load_persisted_state().await;
+        assert!(
+            a.has_path(&hash).await,
+            "a restart must keep the path when the interface kind and name match"
+        );
+        assert_eq!(a.hops_to(&hash).await, Some(hops));
+
+        a.persist_data().await;
+        let again = storage
+            .read(DESTINATION_TABLE_FILE)
+            .expect("destination table rewritten");
+        assert_eq!(
+            stored_announce_hops(&again),
+            Some(wire_hops),
+            "saving a reloaded path must not add a hop to the cached announce"
+        );
+        assert!(a.drop_path(&hash).await);
+        a.load_persisted_state().await;
+        assert_eq!(a.hops_to(&hash).await, Some(hops));
+    }
+}
+
 fn announce_packet(hops: u8) -> Packet {
     let mut data = PacketDataBuffer::new();
     data.safe_write(&[1u8; 32]);

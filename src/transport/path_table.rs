@@ -28,11 +28,13 @@ pub struct PathEntry {
     pub received_from: AddressHash,
     pub hops: u8,
     pub iface: AddressHash,
-    /// When this path was learned (unstable time base; only differences
-    /// matter).
-    pub timestamp: core::time::Duration,
-    /// Paths marked unresponsive are skipped for new link attempts until a
-    /// fresh announce arrives (Python `mark_path_unresponsive`).
+    /// Monotonic nanoseconds since process start when the path was learned.
+    /// Negative when a restored path is older than this process. Zero is the
+    /// boot instant, not an expiry sentinel.
+    pub timestamp: i64,
+    /// Set by `mark_path_unresponsive`. The path stays visible to `get` and
+    /// `hops_to` and is still routed. An equal-hop announce may replace it
+    /// (Python `path_is_unresponsive` only affects path selection).
     pub unresponsive: bool,
     /// Hash of the announce packet that created this path, for analytics.
     pub packet_hash: crate::hash::Hash,
@@ -74,6 +76,20 @@ fn path_lifetime(mode: InterfaceMode) -> core::time::Duration {
         InterfaceMode::AccessPoint => AP_PATH_TIME,
         InterfaceMode::Roaming => ROAMING_PATH_TIME,
         _ => PATHFINDER_E,
+    }
+}
+
+pub(super) fn monotonic_ns(now: core::time::Duration) -> i64 {
+    now.as_nanos().min(i64::MAX as u128) as i64
+}
+
+/// Age of a path learned at `timestamp_ns` (see [`PathEntry::timestamp`]).
+pub(super) fn path_age(now: core::time::Duration, timestamp_ns: i64) -> core::time::Duration {
+    let delta = monotonic_ns(now).saturating_sub(timestamp_ns);
+    if delta <= 0 {
+        core::time::Duration::ZERO
+    } else {
+        core::time::Duration::from_nanos(delta as u64)
     }
 }
 
@@ -126,12 +142,12 @@ impl PathTable {
         let now = (self.now)();
         let before = self.map.len();
         self.map
-            .retain(|_, entry| now.saturating_sub(entry.timestamp) < path_lifetime(entry.mode));
+            .retain(|_, entry| path_age(now, entry.timestamp) < path_lifetime(entry.mode));
         before - self.map.len()
     }
 
-    /// Mark a path unresponsive so link attempts prefer alternatives
-    /// (Python `Transport.mark_path_unresponsive`).
+    /// Mark a path unresponsive (Python `Transport.mark_path_unresponsive`).
+    /// The entry stays routable. An equal-hop announce may replace it.
     pub fn mark_path_unresponsive(&mut self, destination: &AddressHash) -> bool {
         match self.map.get_mut(destination) {
             Some(entry) => {
@@ -190,24 +206,24 @@ impl PathTable {
     }
 
     pub fn get(&self, destination: &AddressHash) -> Option<&PathEntry> {
-        self.map
-            .get(destination)
-            .filter(|entry| !entry.unresponsive)
+        self.map.get(destination)
     }
 
     #[allow(dead_code)]
     pub fn get_mut(&mut self, destination: &AddressHash) -> Option<&mut PathEntry> {
-        self.map
-            .get_mut(destination)
-            .filter(|entry| !entry.unresponsive)
+        self.map.get_mut(destination)
     }
 
-    /// Mark a path for immediate expiry (Python `Transport.expire_path`
-    /// zeroes `IDX_PT_TIMESTAMP`).
+    /// Make a path due for removal on the next [`Self::expire_paths`]
+    /// (Python `Transport.expire_path` zeroes the unix timestamp so the
+    /// next cull sees it as long expired). Does not use timestamp zero:
+    /// that value is the boot instant.
     pub fn expire_path(&mut self, destination: &AddressHash) -> bool {
         match self.map.get_mut(destination) {
             Some(entry) => {
-                entry.timestamp = core::time::Duration::ZERO;
+                let now_ns = monotonic_ns((self.now)());
+                let life_ns = path_lifetime(entry.mode).as_nanos().min(i64::MAX as u128) as i64;
+                entry.timestamp = now_ns.saturating_sub(life_ns).saturating_sub(1);
                 true
             }
             None => false,
@@ -237,7 +253,7 @@ impl PathTable {
                 received_from,
                 hops,
                 iface,
-                timestamp: (self.now)(),
+                timestamp: monotonic_ns((self.now)()),
                 unresponsive: false,
                 packet_hash,
                 mode: InterfaceMode::Full,
@@ -250,20 +266,7 @@ impl PathTable {
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {
         self.map
             .get(destination)
-            .filter(|entry| !entry.unresponsive)
             .map(|entry| (entry.received_from, entry.iface))
-    }
-
-    #[allow(dead_code)] // full-mode entry point; known interfaces use `handle_announce_with_mode`.
-    pub fn handle_announce(
-        &mut self,
-        announce: &Packet,
-        transport_id: Option<AddressHash>,
-        iface: AddressHash,
-    ) {
-        // This default records full mode and unset gravity. Callers that
-        // know the interface should pass them to `handle_announce_with_mode`.
-        self.handle_announce_with_mode(announce, transport_id, iface, InterfaceMode::Full, None);
     }
 
     /// Record an announce heard on an interface of `mode` with optional
@@ -303,7 +306,7 @@ impl PathTable {
             received_from,
             hops,
             iface,
-            timestamp: (self.now)(),
+            timestamp: monotonic_ns((self.now)()),
             unresponsive: false,
             packet_hash: announce.hash(),
             mode,
@@ -365,7 +368,7 @@ impl PathTable {
     ) -> (Packet, Option<AddressHash>) {
         let lookup = lookup.unwrap_or(original_packet.destination);
 
-        let entry = match self.map.get(&lookup).filter(|entry| !entry.unresponsive) {
+        let entry = match self.map.get(&lookup) {
             Some(entry) => entry,
             None => return (*original_packet, None),
         };
@@ -383,7 +386,7 @@ impl PathTable {
         // Routed traffic refreshes the path timestamp (Python updates
         // `IDX_PT_TIMESTAMP` after forwarding).
         if let Some(entry) = self.map.get_mut(&lookup) {
-            entry.timestamp = (self.now)();
+            entry.timestamp = monotonic_ns((self.now)());
         }
 
         (
@@ -441,7 +444,7 @@ impl PathTable {
     ) -> (Packet, Option<AddressHash>) {
         let lookup = original_packet.destination;
 
-        let entry = match self.map.get(&lookup).filter(|entry| !entry.unresponsive) {
+        let entry = match self.map.get(&lookup) {
             Some(entry) => entry,
             None => return (*original_packet, None),
         };
@@ -455,7 +458,7 @@ impl PathTable {
         let next_hop = entry.received_from;
 
         if let Some(entry) = self.map.get_mut(&lookup) {
-            entry.timestamp = (self.now)();
+            entry.timestamp = monotonic_ns((self.now)());
         }
 
         if direct {
@@ -496,11 +499,7 @@ impl PathTable {
             return (*original_packet, None);
         }
 
-        let entry = match self
-            .map
-            .get(&original_packet.destination)
-            .filter(|entry| !entry.unresponsive)
-        {
+        let entry = match self.map.get(&original_packet.destination) {
             Some(entry) => entry,
             None => return (*original_packet, None),
         };
@@ -582,30 +581,48 @@ mod tests {
     }
 
     #[test]
-    fn unresponsive_paths_are_retained_but_never_routed() {
+    fn unresponsive_paths_stay_visible_until_an_equal_hop_announce() {
         let destination = address(1);
         let first_iface = address(2);
         let recovered_iface = address(3);
         let mut table = PathTable::new(false);
-        table.handle_announce(&announce(destination, 0, 1), None, first_iface);
+        table.handle_announce_with_mode(
+            &announce(destination, 0, 1),
+            None,
+            first_iface,
+            InterfaceMode::Full,
+            None,
+        );
         assert!(table.get(&destination).is_some());
 
         assert!(table.mark_path_unresponsive(&destination));
         assert!(table.contains(&destination));
-        assert!(table.get(&destination).is_none());
-        assert!(table.next_hop_full(&destination).is_none());
+        assert_eq!(table.get(&destination).unwrap().hops, 1);
+        assert_eq!(
+            table.next_hop_full(&destination),
+            Some((destination, first_iface))
+        );
         assert_eq!(table.iter().count(), 1, "diagnostics retain the entry");
 
         let packet = Packet {
             destination,
             ..Default::default()
         };
-        assert!(table.handle_packet(&packet).1.is_none());
-        assert!(table.handle_inbound_packet(&packet, None).1.is_none());
+        assert_eq!(table.handle_packet(&packet).1, Some(first_iface));
+        assert_eq!(
+            table.handle_inbound_packet(&packet, None).1,
+            Some(first_iface)
+        );
 
-        // A fresh equal-hop announce revives the route even without eager
-        // rerouting.
-        table.handle_announce(&announce(destination, 0, 2), None, recovered_iface);
+        // A fresh equal-hop announce replaces the unresponsive path even
+        // without eager rerouting.
+        table.handle_announce_with_mode(
+            &announce(destination, 0, 2),
+            None,
+            recovered_iface,
+            InterfaceMode::Full,
+            None,
+        );
         assert!(!table.path_is_unresponsive(&destination));
         assert_eq!(table.get(&destination).unwrap().iface, recovered_iface);
 
@@ -811,6 +828,54 @@ mod tests {
             5,
         );
         assert_eq!(table.get(&destination).unwrap().iface, high_iface);
+    }
+
+    #[test]
+    fn expire_path_is_due_on_the_next_cull_even_at_boot() {
+        let destination = address(11);
+        let iface = address(12);
+        let mut table = PathTable::new(false);
+        table.now = clock;
+        set_clock(0);
+        learn(
+            &mut table,
+            destination,
+            iface,
+            InterfaceMode::Full,
+            None,
+            1,
+            1,
+        );
+        assert_eq!(table.get(&destination).unwrap().timestamp, 0);
+        assert!(table.expire_path(&destination));
+        assert_ne!(table.get(&destination).unwrap().timestamp, 0);
+        assert_eq!(table.expire_paths(), 1);
+        assert!(!table.contains(&destination));
+    }
+
+    #[test]
+    fn restored_age_is_not_a_fresh_lifetime_when_uptime_is_short() {
+        let destination = address(13);
+        let iface = address(14);
+        let mut table = PathTable::new(false);
+        table.now = clock;
+        set_clock(10);
+        learn(
+            &mut table,
+            destination,
+            iface,
+            InterfaceMode::Full,
+            None,
+            1,
+            1,
+        );
+        let learned = table.get(&destination).unwrap().timestamp;
+        // One second of lifetime left, but the process has only been up 10s.
+        let almost_expired = learned - (PATHFINDER_E.as_nanos() as i64) + 1_000_000_000;
+        table.get_mut(&destination).unwrap().timestamp = almost_expired;
+        assert_eq!(table.expire_paths(), 0);
+        set_clock(12);
+        assert_eq!(table.expire_paths(), 1);
     }
 
     #[test]

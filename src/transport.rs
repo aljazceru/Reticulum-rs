@@ -178,8 +178,8 @@ pub struct TransportConfig {
     /// matching Python `use_implicit_proof`.
     use_implicit_proof: bool,
 
-    /// Rewrite hops on local-client egress to a value in `2..=7`
-    /// (Python `local_hops_delta`, default off).
+    /// Rewrite hops-0 packets onto the wider network
+    /// (Python `local_hops_delta`, default off). The sampled value is in `2..=7`.
     local_hops_delta: bool,
 
     timer_config: TimerConfig,
@@ -3439,19 +3439,20 @@ async fn handle_data<'a>(
 
             let channel_tx = handler.channel_table.get(link.id());
 
-            // Proof strategy of the destination owning this link gates
-            // message proofs (Python `Link.receive`: PROVE_NONE never
-            // proves, PROVE_ALL always proves, PROVE_APP only proves
-            // application data packets).
+            // Python `Link.receive` calls `proof_requested` only for
+            // context NONE. CHANNEL is proved with no callback. Every
+            // other link context ignores the callback. PROVE_ALL still
+            // proves NONE without asking the callback.
             let proof_strategy = handler
                 .single_in_destinations
                 .get(&link.destination().address_hash)
                 .and_then(|destination| destination.try_lock().ok())
                 .map(|destination| {
-                    (
-                        destination.proof_strategy(),
-                        destination.should_prove(packet),
-                    )
+                    let strategy = destination.proof_strategy();
+                    let app_prove = packet.context == PacketContext::None
+                        && strategy == ProofStrategy::App
+                        && destination.should_prove(packet);
+                    (strategy, app_prove)
                 });
 
             let result = link.handle_packet(&handler.link_in_event_tx, channel_tx, packet, false);
@@ -3468,13 +3469,14 @@ async fn handle_data<'a>(
                 LinkHandleResult::MessageReceived(proof) => {
                     let (strategy, app_prove) =
                         proof_strategy.unwrap_or((ProofStrategy::None, false));
-                    // Python `Link.receive`: CHANNEL-context packets are
-                    // proved unconditionally (channel reliability).
-                    // PROVE_APP otherwise follows `Destination::should_prove`.
-                    let should_prove = match strategy {
-                        ProofStrategy::None => packet.context == PacketContext::Channel,
-                        ProofStrategy::App => packet.context == PacketContext::Channel || app_prove,
-                        ProofStrategy::All => true,
+                    let should_prove = match packet.context {
+                        PacketContext::Channel => true,
+                        PacketContext::None => match strategy {
+                            ProofStrategy::None => false,
+                            ProofStrategy::App => app_prove,
+                            ProofStrategy::All => true,
+                        },
+                        _ => false,
                     };
 
                     if should_prove {
@@ -4320,7 +4322,8 @@ async fn handle_tunnel_synthesize<'a>(
             let should_restore = match handler.path_table.get(&destination) {
                 None => true,
                 Some(entry) => {
-                    let expired = now.saturating_sub(entry.timestamp) >= path_table::PATHFINDER_E;
+                    let expired =
+                        path_table::path_age(now, entry.timestamp) >= path_table::PATHFINDER_E;
                     expired || path.hops <= entry.hops
                 }
             };
@@ -4424,6 +4427,12 @@ async fn handle_link_request_as_intermediate<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
+    let next_hop_bitrate = handler
+        .iface_manager
+        .lock()
+        .await
+        .with_control(&next_hop_iface, |control| control.bitrate)
+        .unwrap_or(0);
     handler.link_table.add(
         packet,
         packet.destination,
@@ -4431,6 +4440,7 @@ async fn handle_link_request_as_intermediate<'a>(
         next_hop,
         next_hop_iface,
         remaining_hops,
+        next_hop_bitrate,
     );
 
     send_to_next_hop(packet, &mut handler, None, None).await;
@@ -4540,7 +4550,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     links_to_remove.clear();
 
-    let mut expired_links: Vec<(AddressHash, bool)> = Vec::new();
+    let mut expired_links: Vec<AddressHash> = Vec::new();
 
     for link_entry in &handler.out_links {
         let mut link = link_entry.1.lock().await;
@@ -4583,8 +4593,11 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                 }
             }
             LinkStatus::Pending if link.elapsed() > timer_config.out_link_repeat => {
-                // Establishment timeout: first-hop airtime plus the extra
-                // link-proof airtime of the next hop, plus per-hop timeout.
+                // Python `Link.__init__` waits `get_first_hop_timeout`
+                // (one MTU of airtime plus 6s) plus
+                // `ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, hops)`.
+                // That first-hop timeout already includes one MTU; this
+                // deadline does not add a second one.
                 let link_destination = link.destination().address_hash;
                 let hops = handler
                     .path_table
@@ -4604,9 +4617,8 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         .unwrap_or(0),
                     None => 0,
                 };
-                let establishment_timeout = first_hop_timeout(bitrate)
-                    + extra_link_proof_timeout(bitrate)
-                    + TIMEOUT_PER_HOP * u32::from(hops.max(1));
+                let establishment_timeout =
+                    first_hop_timeout(bitrate) + TIMEOUT_PER_HOP * u32::from(hops.max(1));
 
                 if link.elapsed() > establishment_timeout {
                     log::warn!(
@@ -4614,11 +4626,10 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         handler.config.name,
                         link.id()
                     );
-                    let rediscover = !handler.config.retransmit;
                     if let Some(packet) = link.teardown(&handler.link_out_event_tx).ok().flatten() {
                         handler.send_from_link(&mut link, packet).await;
                     }
-                    expired_links.push((link_destination, rediscover));
+                    expired_links.push(link_destination);
                     links_to_remove.push(*link_entry.0);
                 } else {
                     log::warn!(
@@ -4644,33 +4655,31 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         handler.out_links.remove(addr);
     }
 
-    for (destination, rediscover) in expired_links {
-        let hops = handler
-            .path_table
-            .get(&destination)
-            .map(|entry| entry.hops)
-            .unwrap_or(1);
-        let mode = match handler
-            .path_table
-            .get(&destination)
-            .map(|entry| entry.iface)
+    // Python closes a pending link that never activated and, when this
+    // instance is not a transport, expires the path and rediscovers it.
+    // The request is sent only when `PATH_REQUEST_MI` allows it and this
+    // instance is not attached to a shared instance. The path is not
+    // marked unresponsive here.
+    for destination in expired_links {
+        let shared = handler
+            .iface_manager
+            .lock()
+            .await
+            .connected_to_shared_instance();
+        if handler.config.retransmit
+            || shared
+            || !handler.path_requests.request_allowed(&destination)
         {
-            Some(iface) => handler.iface_manager.lock().await.iface_mode(&iface),
-            None => InterfaceMode::Full,
-        };
-        if hops == 1 && handler.config.retransmit && mode != InterfaceMode::Boundary {
-            handler.path_table.mark_path_unresponsive(&destination);
+            continue;
         }
-        if rediscover {
-            handler.path_table.expire_path(&destination);
-            let packet = handler.path_requests.generate(&destination, None);
-            handler
-                .send(TxMessage {
-                    tx_type: TxMessageType::Broadcast(None),
-                    packet,
-                })
-                .await;
-        }
+        handler.path_table.expire_path(&destination);
+        let packet = handler.path_requests.generate(&destination, None);
+        handler
+            .send(TxMessage {
+                tx_type: TxMessageType::Broadcast(None),
+                packet,
+            })
+            .await;
     }
 }
 
@@ -4792,10 +4801,6 @@ impl InboundQueues {
         (heights.iter().sum(), heights, self.dropped)
     }
 
-    /// Enqueue `incoming` and drain everything queued so far, in class
-    /// order. Path-request classification needs the fixed destination,
-    /// which this helper does not have; the transport loop classifies
-    /// with [`Self::classify`] before `put`.
     pub fn enqueue_and_drain(&mut self, incoming: RxMessage) -> Vec<RxMessage> {
         let class = Self::classify(&incoming.packet, &AddressHash::new([0; 16]), false);
         self.put(class, incoming);
@@ -4892,17 +4897,9 @@ fn first_hop_timeout(bitrate: u64) -> Duration {
     Duration::from_secs_f64(crate::packet::PROTOCOL_MTU as f64 * (8.0 / bitrate as f64) + 6.0)
 }
 
-/// Python `Transport.extra_link_proof_timeout`.
-fn extra_link_proof_timeout(bitrate: u64) -> Duration {
-    if bitrate == 0 {
-        return Duration::ZERO;
-    }
-    Duration::from_secs_f64((1.0 / bitrate as f64) * 8.0 * crate::packet::PROTOCOL_MTU as f64)
-}
-
 async fn medium_discovery_timeout(handler: &TransportHandler) -> Duration {
     const MINIMUM_BITRATE: f64 = 5.0;
-    let medium = match handler
+    match handler
         .iface_manager
         .lock()
         .await
@@ -4913,8 +4910,7 @@ async fn medium_discovery_timeout(handler: &TransportHandler) -> Duration {
             Duration::from_secs_f64(2.0 * (mtu * 8.0 / (bitrate as f64).max(MINIMUM_BITRATE)) + 6.0)
         }
         _ => Duration::ZERO,
-    };
-    PATH_REQUEST_TIMEOUT.max(medium)
+    }
 }
 
 async fn ingress_limited_path_request(handler: &TransportHandler, message: &RxMessage) -> bool {
@@ -4948,8 +4944,11 @@ fn receipt_info(receipt: &PacketReceipt) -> PacketReceiptInfo {
     }
 }
 
+/// How long a concluded receipt stays readable by `receipt()`.
+/// Link checks run every second; callers poll for a few seconds.
+const RECEIPT_CONCLUDED_GRACE: Duration = Duration::from_secs(5);
+
 fn check_receipts(receipts: &mut HashMap<AddressHash, PacketReceipt>) {
-    cull_receipts(receipts);
     let now = time::Instant::now();
     for receipt in receipts.values_mut() {
         if receipt.status != ReceiptStatus::Sent {
@@ -4968,33 +4967,36 @@ fn check_receipts(receipts: &mut HashMap<AddressHash, PacketReceipt>) {
             receipt.concluded_at = Some(now);
         }
     }
+    cull_receipts(receipts);
 }
 
-/// Drop oldest concluded receipts past `MAX_RECEIPTS`. If every receipt
-/// is still in flight, mark the oldest culled and keep it observable.
+/// Drop concluded receipts after [`RECEIPT_CONCLUDED_GRACE`]. While the
+/// map is over [`MAX_RECEIPTS`], drop the oldest in-flight receipts until
+/// it fits. `SENT` receipts under the cap stay until their timeout.
 fn cull_receipts(receipts: &mut HashMap<AddressHash, PacketReceipt>) {
+    let now = time::Instant::now();
+    receipts.retain(|_, receipt| match receipt.status {
+        ReceiptStatus::Sent => true,
+        _ => match receipt.concluded_at {
+            Some(at) => now.saturating_duration_since(at) < RECEIPT_CONCLUDED_GRACE,
+            None => false,
+        },
+    });
     while receipts.len() > MAX_RECEIPTS {
-        let oldest_concluded = receipts
+        let oldest_inflight = receipts
             .iter()
-            .filter(|(_, receipt)| receipt.status != ReceiptStatus::Sent)
+            .filter(|(_, receipt)| receipt.status == ReceiptStatus::Sent)
             .min_by_key(|(_, receipt)| receipt.sent_at)
             .map(|(key, _)| *key);
-        if let Some(key) = oldest_concluded {
-            receipts.remove(&key);
-            continue;
-        }
-        if let Some(key) = receipts
-            .iter()
-            .min_by_key(|(_, receipt)| receipt.sent_at)
-            .map(|(key, _)| *key)
-        {
-            if let Some(receipt) = receipts.get_mut(&key) {
-                receipt.timeout = None;
-                receipt.status = ReceiptStatus::Culled;
-                receipt.concluded_at = Some(time::Instant::now());
-            }
-        }
-        break;
+        let Some(key) = oldest_inflight.or_else(|| {
+            receipts
+                .iter()
+                .min_by_key(|(_, receipt)| receipt.concluded_at.unwrap_or(receipt.sent_at))
+                .map(|(key, _)| *key)
+        }) else {
+            break;
+        };
+        receipts.remove(&key);
     }
 }
 
@@ -5015,11 +5017,14 @@ async fn relay_reverse_proof(
     else {
         return;
     };
-    let (from_local, proof_for_local) = {
+    let (from_local, proof_for_local, hops_delta) = {
         let manager = handler.iface_manager.lock().await;
         (
             manager.is_local_client_iface(&ingress),
             manager.is_local_client_iface(&received),
+            manager
+                .local_hops_delta
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     };
     if !(handler.config.retransmit || from_local || proof_for_local) {
@@ -5028,7 +5033,14 @@ async fn relay_reverse_proof(
     handler.reverse_table.remove(&packet.destination);
     if ingress == outbound {
         let mut outbound_packet = *packet;
-        outbound_packet.header.hops = packet.header.hops.saturating_add(1);
+        // Python writes `local_hops_delta` when the proof came from a
+        // local client toward the wider network. `send` only rewrites
+        // hops 0, so the sampled value has to be applied here.
+        outbound_packet.header.hops = if from_local && !proof_for_local && hops_delta != 0 {
+            hops_delta
+        } else {
+            packet.header.hops.saturating_add(1)
+        };
         handler
             .send(TxMessage {
                 tx_type: TxMessageType::Direct(received),
@@ -5170,36 +5182,42 @@ fn write_hashlist(storage: &dyn Storage, hashes: &[Hash]) -> bool {
     for hash in hashes {
         raw.extend_from_slice(hash.as_slice());
     }
-    storage.write(PACKET_HASHLIST_FILE, &raw).is_ok()
+    match storage.write(PACKET_HASHLIST_FILE, &raw) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("failed to write {PACKET_HASHLIST_FILE}: {err:?}");
+            false
+        }
+    }
 }
 
 fn write_path_table(
     handler: &TransportHandler,
     cache: &PacketCache,
     storage: &dyn Storage,
+    iface_ids: &HashMap<AddressHash, AddressHash>,
 ) -> bool {
     let now = crate::time::now();
+    let unix_now = crate::time::unix_time_as_secs();
     let mut entries = Vec::new();
     for (destination, entry) in handler.path_table.iter() {
-        let age = now.saturating_sub(entry.timestamp).as_secs();
+        let Some(iface) = iface_ids.get(&entry.iface).copied() else {
+            continue;
+        };
+        let age = path_table::path_age(now, entry.timestamp).as_secs();
+        let learned_unix = unix_now.saturating_sub(age);
         let announce = cache
             .get_cached_announce(&entry.packet_hash)
             .and_then(|packet| serialize_packet(&packet));
-        let blobs = entry
-            .random_blobs
+        let blobs = entry.random_blobs[entry.random_blobs.len().saturating_sub(32)..]
             .iter()
-            .rev()
-            .take(32)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
             .map(|blob| rmpv::Value::Binary(blob.to_vec()))
             .collect();
         entries.push(rmpv::Value::Array(vec![
             rmpv::Value::Binary(destination.as_slice().to_vec()),
-            rmpv::Value::Binary(entry.iface.as_slice().to_vec()),
+            rmpv::Value::Binary(iface.as_slice().to_vec()),
             rmpv::Value::from(u64::from(entry.hops)),
-            rmpv::Value::from(age),
+            rmpv::Value::from(learned_unix),
             rmpv::Value::from(entry.mode as u64),
             match entry.gravity {
                 Some(gravity) => rmpv::Value::from(gravity),
@@ -5219,10 +5237,20 @@ fn write_path_table(
     if rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(entries)).is_err() {
         return false;
     }
-    storage.write(DESTINATION_TABLE_FILE, &buf).is_ok()
+    match storage.write(DESTINATION_TABLE_FILE, &buf) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("failed to write {DESTINATION_TABLE_FILE}: {err:?}");
+            false
+        }
+    }
 }
 
-fn write_tunnel_table(handler: &TransportHandler, storage: &dyn Storage) -> bool {
+fn write_tunnel_table(
+    handler: &TransportHandler,
+    storage: &dyn Storage,
+    iface_ids: &HashMap<AddressHash, AddressHash>,
+) -> bool {
     let now_instant = time::Instant::now();
     let now = crate::time::now();
     let mut tunnels = Vec::new();
@@ -5241,9 +5269,10 @@ fn write_tunnel_table(handler: &TransportHandler, storage: &dyn Storage) -> bool
                 rmpv::Value::Binary(path.packet_hash.as_slice().to_vec()),
             ]));
         }
+        let stable_iface = entry.iface.and_then(|iface| iface_ids.get(&iface).copied());
         tunnels.push(rmpv::Value::Array(vec![
             rmpv::Value::Binary(tunnel_id.as_slice().to_vec()),
-            match entry.iface {
+            match stable_iface {
                 Some(iface) => rmpv::Value::Binary(iface.as_slice().to_vec()),
                 None => rmpv::Value::Nil,
             },
@@ -5255,30 +5284,35 @@ fn write_tunnel_table(handler: &TransportHandler, storage: &dyn Storage) -> bool
     if rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(tunnels)).is_err() {
         return false;
     }
-    storage.write(TUNNELS_FILE, &buf).is_ok()
+    match storage.write(TUNNELS_FILE, &buf) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("failed to write {TUNNELS_FILE}: {err:?}");
+            false
+        }
+    }
 }
 
 async fn persist_handler(handler: &mut TransportHandler) -> bool {
     let Some(storage) = handler.storage.clone() else {
         return true;
     };
-    if handler
-        .iface_manager
-        .lock()
-        .await
-        .connected_to_shared_instance()
-    {
-        return true;
-    }
+    let iface_ids = {
+        let manager = handler.iface_manager.lock().await;
+        if manager.connected_to_shared_instance() {
+            return true;
+        }
+        manager.stable_iface_map()
+    };
     let cache = handler.packet_cache.lock().await;
     let hash_ok = if handler.config.retransmit {
         write_hashlist(&*storage, &cache.hashes())
     } else {
         true
     };
-    let path_ok = write_path_table(handler, &cache, &*storage);
+    let path_ok = write_path_table(handler, &cache, &*storage, &iface_ids);
     drop(cache);
-    hash_ok && path_ok && write_tunnel_table(handler, &*storage)
+    hash_ok && path_ok && write_tunnel_table(handler, &*storage, &iface_ids)
 }
 
 fn try_persist_handler(handler: &mut TransportHandler) -> bool {
@@ -5291,6 +5325,7 @@ fn try_persist_handler(handler: &mut TransportHandler) -> bool {
     if manager.connected_to_shared_instance() {
         return true;
     }
+    let iface_ids = manager.stable_iface_map();
     drop(manager);
     let Ok(cache) = handler.packet_cache.try_lock() else {
         return false;
@@ -5300,9 +5335,9 @@ fn try_persist_handler(handler: &mut TransportHandler) -> bool {
     } else {
         true
     };
-    let path_ok = write_path_table(handler, &cache, &*storage);
+    let path_ok = write_path_table(handler, &cache, &*storage, &iface_ids);
     drop(cache);
-    hash_ok && path_ok && write_tunnel_table(handler, &*storage)
+    hash_ok && path_ok && write_tunnel_table(handler, &*storage, &iface_ids)
 }
 
 async fn shutdown_persist(handler: &Arc<Mutex<TransportHandler>>) {
@@ -5323,19 +5358,15 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
         handler.persisted_loaded = true;
         return;
     };
-    let live = {
+    let stable_to_live = {
         let manager = handler.iface_manager.lock().await;
         if manager.connected_to_shared_instance() {
             handler.persisted_loaded = true;
             return;
         }
-        manager
-            .live_iface_addresses()
-            .into_iter()
-            .map(|(address, _)| address)
-            .collect::<Vec<_>>()
+        manager.stable_to_live()
     };
-    if live.is_empty() {
+    if stable_to_live.is_empty() {
         return;
     }
     if !handler.config.retransmit {
@@ -5351,7 +5382,8 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
     if let Some(bytes) = storage.read(DESTINATION_TABLE_FILE) {
         if let Ok(value) = rmpv::decode::read_value(&mut bytes.as_slice()) {
             if let Some(entries) = value.as_array() {
-                let now = crate::time::now();
+                let unix_now = crate::time::unix_time_as_secs();
+                let now_ns = path_table::monotonic_ns(crate::time::now());
                 for entry in entries {
                     let Some(fields) = entry.as_array() else {
                         continue;
@@ -5359,19 +5391,19 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
                     if fields.len() < 11 {
                         continue;
                     }
-                    let (Some(destination), Some(iface)) =
+                    let (Some(destination), Some(stable_iface)) =
                         (value_addr(&fields[0]), value_addr(&fields[1]))
                     else {
                         continue;
                     };
-                    if !live.contains(&iface) {
+                    let Some(iface) = stable_to_live.get(&stable_iface).copied() else {
                         continue;
-                    }
+                    };
                     let Some(announce_bytes) = value_bin(&fields[8]) else {
                         continue;
                     };
                     let mut input = InputBuffer::new(announce_bytes);
-                    let Ok(mut packet) = Packet::deserialize(&mut input) else {
+                    let Ok(packet) = Packet::deserialize(&mut input) else {
                         continue;
                     };
                     if let Some(identity) = announced_identity_hash(&packet) {
@@ -5402,17 +5434,22 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    packet.header.hops = packet.header.hops.saturating_add(1);
+                    // The path-table hop count is already the in-memory
+                    // view. Cache the announce bytes unchanged so a later
+                    // save does not add another hop.
                     handler.packet_cache.lock().await.cache_announce(&packet);
+                    let stored_unix = fields[3].as_u64().unwrap_or(unix_now);
+                    let age_secs = unix_now.saturating_sub(stored_unix);
+                    let age_ns = (age_secs as u128)
+                        .saturating_mul(1_000_000_000)
+                        .min(i64::MAX as u128) as i64;
                     handler.path_table.restore(
                         destination,
                         path_table::PathEntry {
                             received_from,
                             hops: fields[2].as_u64().unwrap_or(0) as u8,
                             iface,
-                            timestamp: now.saturating_sub(Duration::from_secs(
-                                fields[3].as_u64().unwrap_or(0),
-                            )),
+                            timestamp: now_ns.saturating_sub(age_ns),
                             unresponsive: fields[6].as_bool().unwrap_or(false),
                             packet_hash,
                             mode: InterfaceMode::from_u8(fields[4].as_u64().unwrap_or(1) as u8)
@@ -5440,7 +5477,6 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
                     let Some(tunnel_id) = value_addr(&fields[0]) else {
                         continue;
                     };
-                    let iface = value_addr(&fields[1]).filter(|iface| live.contains(iface));
                     let remaining = fields[2].as_u64().unwrap_or(0);
                     let mut paths = std::collections::BTreeMap::new();
                     if let Some(items) = fields[3].as_array() {
@@ -5470,21 +5506,19 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
                             );
                         }
                     }
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    // The stored interface is not bound until a live
+                    // synthesis packet arrives (Python stores `None`).
                     handler.tunnels.insert(
                         tunnel_id,
                         tunnels::TunnelEntry {
-                            iface,
+                            iface: None,
                             paths,
                             expires: now_instant + Duration::from_secs(remaining),
                         },
                     );
-                    if let Some(iface) = iface {
-                        handler
-                            .iface_manager
-                            .lock()
-                            .await
-                            .set_iface_tunnel(&iface, Some(tunnel_id));
-                    }
                 }
             }
         }
@@ -5881,34 +5915,36 @@ async fn manage_transport(
                         let stale_links = handler.link_table.remove_stale();
                         let retransmit = handler.config.retransmit;
                         for entry in stale_links {
-                            let hops = handler
-                                .path_table
-                                .get(&entry.original_destination)
-                                .map(|path| path.hops);
-                            let one_hop = entry.taken_hops == 1 || hops == Some(1);
-                            let mode = handler
-                                .iface_manager
-                                .lock()
-                                .await
-                                .iface_mode(&entry.receiving_iface);
-                            if one_hop && retransmit && mode != InterfaceMode::Boundary {
-                                handler
-                                    .path_table
-                                    .mark_path_unresponsive(&entry.original_destination);
-                            } else if !retransmit {
-                                handler.path_table.expire_path(&entry.original_destination);
+                            let destination = entry.original_destination;
+                            let has_path = handler.path_table.contains(&destination);
+                            let hops = handler.path_table.get(&destination).map(|path| path.hops);
+                            let allowed = handler.path_requests.request_allowed(&destination);
+                            let mut rediscover = false;
+                            let mut exclude: Option<AddressHash> = None;
+                            if !has_path {
+                                rediscover = true;
+                            } else if allowed && entry.taken_hops == 0 {
+                                rediscover = true;
+                            } else if allowed && (hops == Some(1) || entry.taken_hops == 1) {
+                                rediscover = true;
+                                exclude = Some(entry.receiving_iface);
+                                let mode = handler
+                                    .iface_manager
+                                    .lock()
+                                    .await
+                                    .iface_mode(&entry.receiving_iface);
+                                if retransmit && mode != InterfaceMode::Boundary {
+                                    handler.path_table.mark_path_unresponsive(&destination);
+                                }
                             }
-                            if (one_hop || hops.is_none() || entry.taken_hops == 0)
-                                && !handler
-                                    .path_requests
-                                    .has_pending(&entry.original_destination)
-                            {
-                                let packet = handler
-                                    .path_requests
-                                    .generate(&entry.original_destination, None);
+                            if rediscover {
+                                if !retransmit {
+                                    handler.path_table.expire_path(&destination);
+                                }
+                                let packet = handler.path_requests.generate(&destination, None);
                                 handler
                                     .send(TxMessage {
-                                        tx_type: TxMessageType::Broadcast(None),
+                                        tx_type: TxMessageType::Broadcast(exclude),
                                         packet,
                                     })
                                     .await;
@@ -6547,7 +6583,7 @@ impl Transport {
                 via: entry.received_from,
                 iface: entry.iface,
                 unresponsive: entry.unresponsive,
-                age_secs: now.saturating_sub(entry.timestamp).as_secs(),
+                age_secs: path_table::path_age(now, entry.timestamp).as_secs(),
                 announce_hash: entry.packet_hash,
             })
             .collect()
@@ -6722,7 +6758,8 @@ impl Transport {
                         via: entry.received_from,
                         iface: entry.iface,
                         unresponsive: entry.unresponsive,
-                        age_secs: crate::time::now().saturating_sub(entry.timestamp).as_secs(),
+                        age_secs: path_table::path_age(crate::time::now(), entry.timestamp)
+                            .as_secs(),
                         announce_hash: entry.packet_hash,
                     })
                     .collect();

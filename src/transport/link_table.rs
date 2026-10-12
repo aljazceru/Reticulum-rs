@@ -113,6 +113,7 @@ impl LinkTable {
         next_hop: AddressHash,
         next_hop_iface: AddressHash,
         remaining_hops: u8,
+        next_hop_bitrate: u64,
     ) {
         let link_id = LinkId::from(link_request);
 
@@ -120,10 +121,18 @@ impl LinkTable {
         // link request, so a retried LR after a route or interface
         // change refreshes the forwarding state.
         let now = Instant::now();
-        // Python: `extra_link_proof_timeout(ingress)` (an MTU-sized
-        // transmission on slow interfaces; zero for typical IP links)
-        // plus `ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, remaining_hops)`.
-        let proof_timeout = now + ESTABLISHMENT_TIMEOUT_PER_HOP * remaining_hops.max(1) as u32;
+        // `extra_link_proof_timeout` of the next-hop interface: one MTU
+        // of airtime, or zero when that bitrate is unknown, plus
+        // `ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, remaining_hops)`.
+        let airtime = if next_hop_bitrate == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64(
+                (1.0 / next_hop_bitrate as f64) * 8.0 * crate::packet::PROTOCOL_MTU as f64,
+            )
+        };
+        let proof_timeout =
+            now + airtime + ESTABLISHMENT_TIMEOUT_PER_HOP * remaining_hops.max(1) as u32;
 
         let entry = LinkEntry {
             next_hop,
