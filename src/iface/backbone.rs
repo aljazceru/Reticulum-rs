@@ -452,8 +452,12 @@ pub struct BackboneClient {
     pub addr: Option<String>,
     /// Already-accepted stream (spawned mode).
     pub connected_stream: Option<TcpStream>,
-    /// Remote address label for fast-flap accounting (spawned mode).
+    /// Remote IP for fast-flap accounting (spawned mode). The port is
+    /// not part of this key.
     pub remote: Option<String>,
+    /// Full peer socket address (`ip:port`) for the stable interface id.
+    /// Empty for an initiator that has not recorded one.
+    peer_endpoint: String,
     /// Interface manager of the owning transport (tunnel synthesis
     /// signalling; the server also uses it to spawn peers).
     pub iface_manager: Option<Arc<tokio::sync::Mutex<InterfaceManager>>>,
@@ -471,6 +475,7 @@ impl BackboneClient {
             addr: Some(addr.into()),
             connected_stream: None,
             remote: None,
+            peer_endpoint: String::new(),
             iface_manager: None,
             fast_flap: None,
             bitrate: BITRATE_GUESS,
@@ -479,11 +484,20 @@ impl BackboneClient {
 
     /// Create a spawned peer for an accepted stream
     /// (Python `incoming_connection`).
+    ///
+    /// `remote` is the peer socket address. Fast-flap accounting keeps
+    /// only the IP. `endpoint()` returns the full `ip:port` so concurrent
+    /// peers do not share a stable id.
     pub fn new_from_stream(stream: TcpStream, remote: String) -> Self {
+        let flap_ip = remote
+            .parse::<std::net::SocketAddr>()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_else(|_| remote.clone());
         Self {
             addr: None,
             connected_stream: Some(stream),
-            remote: Some(remote),
+            remote: Some(flap_ip),
+            peer_endpoint: remote,
             iface_manager: None,
             fast_flap: None,
             bitrate: BITRATE_GUESS,
@@ -725,6 +739,10 @@ impl Interface for BackboneClient {
     fn constructor_bitrate(&self) -> Option<u64> {
         Some(bitrate_or_guess(self.bitrate))
     }
+
+    fn endpoint(&self) -> &str {
+        &self.peer_endpoint
+    }
 }
 
 /// The backbone server: accepts connections and spawns peers with
@@ -830,17 +848,22 @@ impl BackboneServer {
                     continue;
                 }
 
-                log::debug!("backbone_server: accepting connection from {remote_ip}");
+                let peer_endpoint = peer.to_string();
+                log::debug!("backbone_server: accepting connection from {peer_endpoint}");
 
                 let inherited = context.channel.ifac.read().expect("ifac lock").clone();
 
+                // Register under ip:port before the worker can learn a
+                // path and before this lock is released. Fast-flap above
+                // stays keyed by IP only.
                 let mut manager = iface_manager.lock().await;
                 // Python `spawned_interface.bitrate = self.bitrate`.
                 let parent_bitrate = manager
                     .with_control(&server_address, |c| c.bitrate)
                     .unwrap_or(BITRATE_GUESS);
-                let address = manager.spawn(
-                    BackboneClient::new_from_stream(socket, remote_ip)
+                let address = manager.spawn_named(
+                    &peer_endpoint,
+                    BackboneClient::new_from_stream(socket, peer_endpoint.clone())
                         .with_fast_flap(fast_flap.clone())
                         .with_bitrate(parent_bitrate),
                     BackboneClient::spawn,
@@ -1281,5 +1304,48 @@ mod tests {
             }
         }
         assert!(saw_eof, "stuck try_write must drop the stream");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn accepted_peers_differ_by_port_and_flap_by_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        let _client_a = TcpStream::connect(local).await.unwrap();
+        let (sock_a, peer_a) = listener.accept().await.unwrap();
+        let _client_b = TcpStream::connect(local).await.unwrap();
+        let (sock_b, peer_b) = listener.accept().await.unwrap();
+        assert_eq!(peer_a.ip(), peer_b.ip());
+        assert_ne!(peer_a.port(), peer_b.port());
+
+        let endpoint_a = peer_a.to_string();
+        let client_a = BackboneClient::new_from_stream(sock_a, endpoint_a.clone());
+        assert_eq!(client_a.endpoint(), endpoint_a);
+        assert_eq!(
+            client_a.remote.as_deref(),
+            Some(peer_a.ip().to_string()).as_deref()
+        );
+
+        let endpoint_b = peer_b.to_string();
+        let client_b = BackboneClient::new_from_stream(sock_b, endpoint_b.clone());
+        assert_eq!(
+            client_b.remote.as_deref(),
+            Some(peer_b.ip().to_string()).as_deref()
+        );
+
+        let mut manager = InterfaceManager::new(4);
+        let id_a = manager.spawn_named(&endpoint_a, client_a, BackboneClient::spawn);
+        let id_b = manager.spawn_named(&endpoint_b, client_b, BackboneClient::spawn);
+        let (map, ambiguous) = manager.classify_stable_ids();
+        assert!(
+            ambiguous.is_empty(),
+            "concurrent peers from one IP must not share a stable id"
+        );
+        assert!(map.values().any(|address| *address == id_a));
+        assert!(map.values().any(|address| *address == id_b));
     }
 }

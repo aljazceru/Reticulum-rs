@@ -5202,6 +5202,42 @@ fn write_hashlist(storage: &dyn Storage, hashes: &[Hash]) -> bool {
     }
 }
 
+/// One destination-table row. Live paths and paths still waiting for an
+/// interface share this field list.
+fn destination_table_row(
+    destination: &[u8],
+    stable_iface: &[u8],
+    hops: u64,
+    learned_unix: u64,
+    mode: u64,
+    gravity: Option<i64>,
+    unresponsive: bool,
+    blobs: Vec<rmpv::Value>,
+    announce: Option<Vec<u8>>,
+    received_from: &[u8],
+    packet_hash: &[u8],
+) -> rmpv::Value {
+    rmpv::Value::Array(vec![
+        rmpv::Value::Binary(destination.to_vec()),
+        rmpv::Value::Binary(stable_iface.to_vec()),
+        rmpv::Value::from(hops),
+        rmpv::Value::from(learned_unix),
+        rmpv::Value::from(mode),
+        match gravity {
+            Some(gravity) => rmpv::Value::from(gravity),
+            None => rmpv::Value::Nil,
+        },
+        rmpv::Value::Boolean(unresponsive),
+        rmpv::Value::Array(blobs),
+        match announce {
+            Some(bytes) => rmpv::Value::Binary(bytes),
+            None => rmpv::Value::Nil,
+        },
+        rmpv::Value::Binary(received_from.to_vec()),
+        rmpv::Value::Binary(packet_hash.to_vec()),
+    ])
+}
+
 fn write_path_table(
     handler: &TransportHandler,
     cache: &PacketCache,
@@ -5224,25 +5260,19 @@ fn write_path_table(
             .iter()
             .map(|blob| rmpv::Value::Binary(blob.to_vec()))
             .collect();
-        entries.push(rmpv::Value::Array(vec![
-            rmpv::Value::Binary(destination.as_slice().to_vec()),
-            rmpv::Value::Binary(iface.as_slice().to_vec()),
-            rmpv::Value::from(u64::from(entry.hops)),
-            rmpv::Value::from(learned_unix),
-            rmpv::Value::from(entry.mode as u64),
-            match entry.gravity {
-                Some(gravity) => rmpv::Value::from(gravity),
-                None => rmpv::Value::Nil,
-            },
-            rmpv::Value::Boolean(entry.unresponsive),
-            rmpv::Value::Array(blobs),
-            match announce {
-                Some(bytes) => rmpv::Value::Binary(bytes),
-                None => rmpv::Value::Nil,
-            },
-            rmpv::Value::Binary(entry.received_from.as_slice().to_vec()),
-            rmpv::Value::Binary(entry.packet_hash.as_slice().to_vec()),
-        ]));
+        entries.push(destination_table_row(
+            destination.as_slice(),
+            iface.as_slice(),
+            u64::from(entry.hops),
+            learned_unix,
+            entry.mode as u64,
+            entry.gravity,
+            entry.unresponsive,
+            blobs,
+            announce,
+            entry.received_from.as_slice(),
+            entry.packet_hash.as_slice(),
+        ));
     }
     // Paths whose interface was not live at load time are not in the
     // table yet. Writing the table without them would drop them for good.
@@ -5256,22 +5286,19 @@ fn write_path_table(
                 .iter()
                 .map(|blob| rmpv::Value::Binary(blob.to_vec()))
                 .collect();
-            entries.push(rmpv::Value::Array(vec![
-                rmpv::Value::Binary(path.destination.as_slice().to_vec()),
-                rmpv::Value::Binary(path.stable_iface.as_slice().to_vec()),
-                rmpv::Value::from(u64::from(path.hops)),
-                rmpv::Value::from(path.stored_unix),
-                rmpv::Value::from(u64::from(path.mode)),
-                match path.gravity {
-                    Some(gravity) => rmpv::Value::from(gravity),
-                    None => rmpv::Value::Nil,
-                },
-                rmpv::Value::Boolean(path.unresponsive),
-                rmpv::Value::Array(blobs),
-                rmpv::Value::Binary(path.announce.clone()),
-                rmpv::Value::Binary(path.received_from.as_slice().to_vec()),
-                rmpv::Value::Binary(path.packet_hash.as_slice().to_vec()),
-            ]));
+            entries.push(destination_table_row(
+                path.destination.as_slice(),
+                path.stable_iface.as_slice(),
+                u64::from(path.hops),
+                path.stored_unix,
+                u64::from(path.mode),
+                path.gravity,
+                path.unresponsive,
+                blobs,
+                Some(path.announce.clone()),
+                path.received_from.as_slice(),
+                path.packet_hash.as_slice(),
+            ));
         }
     }
     let mut buf = Vec::new();
@@ -5528,7 +5555,7 @@ async fn load_persisted_state(handler: &mut TransportHandler) {
             handler.persisted_loaded = true;
             return;
         }
-        (manager.stable_to_live(), manager.ambiguous_stable_ids())
+        manager.classify_stable_ids()
     };
     // No interface yet. An empty map must retry; do not commit.
     if stable_to_live.is_empty() && ambiguous.is_empty() {

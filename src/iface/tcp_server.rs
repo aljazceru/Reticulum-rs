@@ -158,12 +158,7 @@ impl TcpServer {
                             );
 
                             let _address = if let Some(key) = inherited {
-                                iface_manager.spawn_with_ifac(
-                                    &peer_endpoint,
-                                    peer,
-                                    TcpClient::spawn,
-                                    key,
-                                )
+                                iface_manager.spawn_with_ifac(peer, TcpClient::spawn, key)
                             } else {
                                 iface_manager.spawn_named(
                                     &peer_endpoint,

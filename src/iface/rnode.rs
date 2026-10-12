@@ -1577,6 +1577,10 @@ impl Interface for RnodeInterface {
     fn mtu() -> usize {
         500
     }
+
+    fn should_ingress_limit() -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1691,6 +1695,7 @@ impl RnodeMultiInterface {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let stats = context.channel.stats.clone();
+        let parent_address = context.channel.address;
         let inner = context.inner.clone();
         let state = { context.inner.lock().unwrap().state.clone() };
         let (_parent_rx, _parent_tx) = context.channel.split();
@@ -1817,6 +1822,13 @@ impl RnodeMultiInterface {
 
             {
                 let mut manager = iface_manager.lock().await;
+                let parent_name = manager
+                    .stats()
+                    .into_iter()
+                    .find(|stat| stat.address == parent_address)
+                    .map(|stat| stat.name)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "RnodeMultiInterface".to_string());
                 for vport in &vports {
                     // Per-vport configuration with the SEL_INT prefix.
                     for frame in vport.configuration_frames(RADIO_STATE_ON) {
@@ -1830,9 +1842,14 @@ impl RnodeMultiInterface {
                         .unwrap_or_else(|e| e.into_inner())
                         .insert(vport.index, peer_in_tx);
 
-                    let address = manager.spawn(
+                    // Parent name plus vport index, recorded before the
+                    // worker starts and before this lock is released.
+                    let label = format!("{parent_name}/{}", vport.index);
+                    let address = manager.spawn_named(
+                        &label,
                         RnodeVportPeer {
                             index: vport.index,
+                            endpoint: label.clone(),
                             outbound: vport_tx.clone(),
                             inbound: Some(peer_in_rx),
                             outgoing: !receive_only.contains(&vport.index),
@@ -2045,6 +2062,10 @@ impl Interface for RnodeMultiInterface {
     fn mtu() -> usize {
         500
     }
+
+    fn should_ingress_limit() -> bool {
+        false
+    }
 }
 
 /// Inbound data senders by virtual port (parent -> peer).
@@ -2056,6 +2077,8 @@ pub type VportInbound =
 /// writer pump (Python `RNodeMultiInterfacePeer`).
 pub struct RnodeVportPeer {
     pub index: u8,
+    /// Parent interface name plus the vport index. Stable across restart.
+    endpoint: String,
     /// Outbound pump to the parent device writer.
     pub outbound: mpsc::UnboundedSender<(u8, Vec<u8>)>,
     /// Inbound data from the parent device reader (taken by the worker).
@@ -2126,6 +2149,14 @@ impl RnodeVportPeer {
 impl Interface for RnodeVportPeer {
     fn mtu() -> usize {
         500
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    fn should_ingress_limit() -> bool {
+        false
     }
 }
 
@@ -2276,6 +2307,7 @@ mod tests {
         let silent = manager.spawn(
             RnodeVportPeer {
                 index: 1,
+                endpoint: "parent/1".into(),
                 outbound: silent_tx,
                 inbound: Some(silent_in_rx),
                 outgoing: false,
@@ -2285,6 +2317,7 @@ mod tests {
         let live = manager.spawn(
             RnodeVportPeer {
                 index: 0,
+                endpoint: "parent/0".into(),
                 outbound: live_tx,
                 inbound: Some(live_in_rx),
                 outgoing: true,
@@ -2313,5 +2346,45 @@ mod tests {
         assert!(!forwarded.1.is_empty());
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(silent_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn vport_stable_ids_follow_parent_name_and_index() {
+        let mut manager = InterfaceManager::new(4);
+        let mut register = |parent: &str, index: u8| {
+            let label = format!("{parent}/{index}");
+            let (outbound, _dropped) = mpsc::unbounded_channel();
+            let (_dropped, inbound) = mpsc::unbounded_channel();
+            manager.spawn_named(
+                &label,
+                RnodeVportPeer {
+                    index,
+                    endpoint: label.clone(),
+                    outbound,
+                    inbound: Some(inbound),
+                    outgoing: true,
+                },
+                RnodeVportPeer::spawn,
+            )
+        };
+        let a0 = register("radio-a", 0);
+        let a1 = register("radio-a", 1);
+        let b0 = register("radio-b", 0);
+        register("radio-b", 1);
+
+        let (map, ambiguous) = manager.classify_stable_ids();
+        assert!(ambiguous.is_empty());
+        assert_eq!(map.len(), 4);
+        let id_of = |address| {
+            map.iter()
+                .find(|(_, live)| **live == address)
+                .map(|(id, _)| *id)
+        };
+        assert_ne!(id_of(a0), id_of(a1), "two ports on one radio must differ");
+        assert_ne!(
+            id_of(a0),
+            id_of(b0),
+            "port 0 on two radios with different parent names must differ"
+        );
     }
 }
