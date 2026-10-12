@@ -3,32 +3,37 @@ use core::convert::From;
 
 use aes::cipher::BlockDecryptMut;
 use aes::cipher::Key;
+use aes::cipher::KeySizeUser;
 use aes::cipher::Unsigned;
 use cbc::cipher::BlockEncryptMut;
 use cbc::cipher::KeyIvInit;
 use cipher::block_padding::Pkcs7;
-use crypto_common::{IvSizeUser, KeySizeUser, OutputSizeUser};
+use crypto_common::OutputSizeUser;
 use hmac::{Hmac, Mac};
 use rand_core::CryptoRngCore;
 use sha2::Sha256;
 
 use crate::error::RnsError;
 
+// `Fernet::new` / `new_rand` keep the historical compile-time size so
+// existing call sites still type-check. Token construction from key bytes
+// selects AES-128 or AES-256 at runtime (Python `Token.__init__`).
 #[cfg(feature = "fernet-aes128")]
 type AesAlgo = aes::Aes128;
 #[cfg(not(feature = "fernet-aes128"))]
 type AesAlgo = aes::Aes256;
 
 type AesCbcEnc = cbc::Encryptor<AesAlgo>;
-type AesCbcDec = cbc::Decryptor<AesAlgo>;
 type AesKey = Key<AesAlgo>;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const HMAC_OUT_SIZE: usize = <<HmacSha256 as OutputSizeUser>::OutputSize as Unsigned>::USIZE;
 const AES_KEY_SIZE: usize = <<AesAlgo as KeySizeUser>::KeySize as Unsigned>::USIZE;
-const IV_KEY_SIZE: usize = <<AesCbcEnc as IvSizeUser>::IvSize as Unsigned>::USIZE;
+const IV_KEY_SIZE: usize = 16;
 const FERNET_OVERHEAD_SIZE: usize = IV_KEY_SIZE + HMAC_OUT_SIZE;
+const AES128_KEY_SIZE: usize = 16;
+const AES256_KEY_SIZE: usize = 32;
 
 pub struct PlainText<'a>(pub &'a [u8]);
 pub struct VerifiedToken<'a>(&'a [u8]);
@@ -43,8 +48,18 @@ pub struct Token<'a>(&'a [u8]);
 // implementation, since they incur overhead and leak initiator metadata.
 pub struct Fernet<R: CryptoRngCore> {
     rng: R,
-    sign_key: [u8; AES_KEY_SIZE],
-    enc_key: AesKey,
+    cipher: TokenCipher,
+}
+
+enum TokenCipher {
+    Aes128 {
+        sign_key: [u8; AES128_KEY_SIZE],
+        enc_key: Key<aes::Aes128>,
+    },
+    Aes256 {
+        sign_key: [u8; AES256_KEY_SIZE],
+        enc_key: Key<aes::Aes256>,
+    },
 }
 
 impl<'a> PlainText<'a> {
@@ -85,25 +100,45 @@ impl<'a> From<&'a [u8]> for Token<'a> {
 
 impl<R: CryptoRngCore + Copy> Fernet<R> {
     pub fn new(sign_key: [u8; AES_KEY_SIZE], enc_key: AesKey, rng: R) -> Self {
-        Self {
-            rng,
-            sign_key,
-            enc_key,
+        Self::new_from_slices(&sign_key, enc_key.as_slice(), rng)
+    }
+
+    /// Python `Token(key)`: a 32-byte key is AES-128, a 64-byte key is AES-256.
+    pub fn new_from_key(key: &[u8], rng: R) -> Result<Self, RnsError> {
+        match key.len() {
+            32 => Ok(Self::new_from_slices(&key[..16], &key[16..], rng)),
+            64 => Ok(Self::new_from_slices(&key[..32], &key[32..], rng)),
+            _ => Err(RnsError::InvalidArgument),
         }
     }
 
     pub fn new_from_slices(sign_key: &[u8], enc_key: &[u8], rng: R) -> Self {
-        let mut sign_key_bytes = [0u8; AES_KEY_SIZE];
-        sign_key_bytes[..cmp::min(AES_KEY_SIZE, sign_key.len())].copy_from_slice(sign_key);
+        // Python `Token` uses AES-128 when each half is 16 bytes and
+        // AES-256 when each half is 32 bytes. Longer halves are truncated
+        // the way the fixed-size constructor used to.
+        let cipher = if sign_key.len() <= AES128_KEY_SIZE && enc_key.len() <= AES128_KEY_SIZE {
+            let mut sign = [0u8; AES128_KEY_SIZE];
+            let mut enc = [0u8; AES128_KEY_SIZE];
+            sign[..sign_key.len()].copy_from_slice(sign_key);
+            enc[..enc_key.len()].copy_from_slice(enc_key);
+            TokenCipher::Aes128 {
+                sign_key: sign,
+                enc_key: enc.into(),
+            }
+        } else {
+            let sign_len = cmp::min(AES256_KEY_SIZE, sign_key.len());
+            let enc_len = cmp::min(AES256_KEY_SIZE, enc_key.len());
+            let mut sign = [0u8; AES256_KEY_SIZE];
+            let mut enc = [0u8; AES256_KEY_SIZE];
+            sign[..sign_len].copy_from_slice(&sign_key[..sign_len]);
+            enc[..enc_len].copy_from_slice(&enc_key[..enc_len]);
+            TokenCipher::Aes256 {
+                sign_key: sign,
+                enc_key: enc.into(),
+            }
+        };
 
-        let mut enc_key_bytes = [0u8; AES_KEY_SIZE];
-        enc_key_bytes[..cmp::min(AES_KEY_SIZE, enc_key.len())].copy_from_slice(enc_key);
-
-        Self {
-            rng,
-            sign_key: sign_key_bytes,
-            enc_key: enc_key_bytes.into(),
-        }
+        Self { rng, cipher }
     }
 
     /// A no-op RNG for decrypt-only usage: the decrypt/verify paths never
@@ -118,10 +153,13 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         rng.fill_bytes(&mut sign_key);
         let enc_key = AesCbcEnc::generate_key(&mut rng);
 
-        Self {
-            rng,
-            sign_key,
-            enc_key,
+        Self::new(sign_key, enc_key, rng)
+    }
+
+    fn sign_key(&self) -> &[u8] {
+        match &self.cipher {
+            TokenCipher::Aes128 { sign_key, .. } => sign_key,
+            TokenCipher::Aes256 { sign_key, .. } => sign_key,
         }
     }
 
@@ -141,32 +179,14 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
             return Err(RnsError::InvalidArgument);
         }
 
-        let mut out_len = 0;
-
-        // Generate random IV
-        let iv = AesCbcEnc::generate_iv(self.rng);
-        out_buf[..iv.len()].copy_from_slice(iv.as_slice());
-
-        out_len += iv.len();
-
-        let chiper_len = AesCbcEnc::new(&self.enc_key, &iv)
-            .encrypt_padded_b2b_mut::<Pkcs7>(text.0, &mut out_buf[out_len..])
-            .map_err(|_| RnsError::InvalidArgument)?
-            .len();
-
-        out_len += chiper_len;
-
-        let mut hmac = <HmacSha256 as Mac>::new_from_slice(&self.sign_key)
-            .map_err(|_| RnsError::InvalidArgument)?;
-
-        hmac.update(&out_buf[..out_len]);
-
-        let tag = hmac.finalize().into_bytes();
-
-        out_buf[out_len..out_len + tag.len()].copy_from_slice(tag.as_slice());
-        out_len += tag.len();
-
-        Ok(Token(&out_buf[..out_len]))
+        match &self.cipher {
+            TokenCipher::Aes128 { sign_key, enc_key } => {
+                encrypt_aes128(enc_key, sign_key, self.rng, text.0, out_buf)
+            }
+            TokenCipher::Aes256 { sign_key, enc_key } => {
+                encrypt_aes256(enc_key, sign_key, self.rng, text.0, out_buf)
+            }
+        }
     }
 
     pub fn verify<'a>(&self, token: Token<'a>) -> Result<VerifiedToken<'a>, RnsError> {
@@ -178,7 +198,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let expected_tag = &token_data[token_data.len() - HMAC_OUT_SIZE..];
 
-        let mut hmac = <HmacSha256 as Mac>::new_from_slice(&self.sign_key)
+        let mut hmac = <HmacSha256 as Mac>::new_from_slice(self.sign_key())
             .map_err(|_| RnsError::InvalidArgument)?;
 
         hmac.update(&token_data[..token_data.len() - HMAC_OUT_SIZE]);
@@ -217,12 +237,88 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let ciphertext = &token_data[IV_KEY_SIZE..tag_start_index];
 
-        let msg = AesCbcDec::new(&self.enc_key, &iv.into())
-            .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
-            .map_err(|_| RnsError::CryptoError)?;
+        let msg = match &self.cipher {
+            TokenCipher::Aes128 { enc_key, .. } => {
+                decrypt_aes128(enc_key, &iv, ciphertext, out_buf)?
+            }
+            TokenCipher::Aes256 { enc_key, .. } => {
+                decrypt_aes256(enc_key, &iv, ciphertext, out_buf)?
+            }
+        };
 
         Ok(PlainText(msg))
     }
+}
+
+fn seal_token<'a>(
+    iv: &[u8],
+    cipher_len: usize,
+    sign_key: &[u8],
+    out_buf: &'a mut [u8],
+) -> Result<Token<'a>, RnsError> {
+    let mut out_len = iv.len();
+    out_buf[..out_len].copy_from_slice(iv);
+    out_len += cipher_len;
+
+    let mut hmac =
+        <HmacSha256 as Mac>::new_from_slice(sign_key).map_err(|_| RnsError::InvalidArgument)?;
+    hmac.update(&out_buf[..out_len]);
+    let tag = hmac.finalize().into_bytes();
+    out_buf[out_len..out_len + tag.len()].copy_from_slice(tag.as_slice());
+    out_len += tag.len();
+    Ok(Token(&out_buf[..out_len]))
+}
+
+fn encrypt_aes128<'a>(
+    enc_key: &Key<aes::Aes128>,
+    sign_key: &[u8],
+    rng: impl CryptoRngCore,
+    text: &[u8],
+    out_buf: &'a mut [u8],
+) -> Result<Token<'a>, RnsError> {
+    let iv = cbc::Encryptor::<aes::Aes128>::generate_iv(rng);
+    let cipher_len = cbc::Encryptor::<aes::Aes128>::new(enc_key, &iv)
+        .encrypt_padded_b2b_mut::<Pkcs7>(text, &mut out_buf[iv.len()..])
+        .map_err(|_| RnsError::InvalidArgument)?
+        .len();
+    seal_token(iv.as_slice(), cipher_len, sign_key, out_buf)
+}
+
+fn encrypt_aes256<'a>(
+    enc_key: &Key<aes::Aes256>,
+    sign_key: &[u8],
+    rng: impl CryptoRngCore,
+    text: &[u8],
+    out_buf: &'a mut [u8],
+) -> Result<Token<'a>, RnsError> {
+    let iv = cbc::Encryptor::<aes::Aes256>::generate_iv(rng);
+    let cipher_len = cbc::Encryptor::<aes::Aes256>::new(enc_key, &iv)
+        .encrypt_padded_b2b_mut::<Pkcs7>(text, &mut out_buf[iv.len()..])
+        .map_err(|_| RnsError::InvalidArgument)?
+        .len();
+    seal_token(iv.as_slice(), cipher_len, sign_key, out_buf)
+}
+
+fn decrypt_aes128<'a>(
+    enc_key: &Key<aes::Aes128>,
+    iv: &[u8; IV_KEY_SIZE],
+    ciphertext: &[u8],
+    out_buf: &'a mut [u8],
+) -> Result<&'a [u8], RnsError> {
+    cbc::Decryptor::<aes::Aes128>::new(enc_key, &(*iv).into())
+        .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
+        .map_err(|_| RnsError::CryptoError)
+}
+
+fn decrypt_aes256<'a>(
+    enc_key: &Key<aes::Aes256>,
+    iv: &[u8; IV_KEY_SIZE],
+    ciphertext: &[u8],
+    out_buf: &'a mut [u8],
+) -> Result<&'a [u8], RnsError> {
+    cbc::Decryptor::<aes::Aes256>::new(enc_key, &(*iv).into())
+        .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
+        .map_err(|_| RnsError::CryptoError)
 }
 
 #[cfg(test)]
@@ -262,6 +358,108 @@ mod tests {
 
         let mut out_buf = [0u8; 12];
         assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
+    }
+
+    #[test]
+    fn key_length_selects_cipher() {
+        let message = b"token size selects the cipher";
+        let mut key128 = [0u8; 32];
+        let mut key256 = [0u8; 64];
+        for (i, byte) in key128.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(3).wrapping_add(1);
+        }
+        for (i, byte) in key256.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(5).wrapping_add(9);
+        }
+
+        let aes128 = Fernet::new_from_key(&key128, OsRng).expect("aes-128 key");
+        let aes256 = Fernet::new_from_key(&key256, OsRng).expect("aes-256 key");
+
+        let mut buf128 = [0u8; 256];
+        let mut buf256 = [0u8; 256];
+        let raw128 = aes128
+            .encrypt(message.as_slice().into(), &mut buf128)
+            .expect("aes-128 token")
+            .as_bytes()
+            .to_vec();
+        let raw256 = aes256
+            .encrypt(message.as_slice().into(), &mut buf256)
+            .expect("aes-256 token")
+            .as_bytes()
+            .to_vec();
+
+        let mut out = [0u8; 256];
+        let plain = aes128
+            .decrypt(aes128.verify(raw128.as_slice().into()).unwrap(), &mut out)
+            .expect("aes-128 decrypts its token");
+        assert_eq!(plain.as_slice(), message);
+        assert!(aes128.verify(raw256.as_slice().into()).is_err());
+
+        let plain = aes256
+            .decrypt(aes256.verify(raw256.as_slice().into()).unwrap(), &mut out)
+            .expect("aes-256 decrypts its token");
+        assert_eq!(plain.as_slice(), message);
+        assert!(aes256.verify(raw128.as_slice().into()).is_err());
+
+        assert!(hmac_matches(&key128[..16], &raw128));
+        assert!(hmac_matches(&key256[..32], &raw256));
+        // The 64-byte key's signing half is 32 bytes; the first 16 alone
+        // must not verify it.
+        assert!(!hmac_matches(&key256[..16], &raw256));
+
+        // Ciphertext itself is AES-128 for a 32-byte key and AES-256 for a
+        // 64-byte key, not the other mode with a zero-padded key.
+        let mut padded = [0u8; 32];
+        padded[..16].copy_from_slice(&key128[16..]);
+        assert_eq!(
+            aes128_plain(&key128[16..], &raw128).as_deref(),
+            Some(message.as_slice())
+        );
+        assert!(aes256_plain(&padded, &raw128).is_none());
+        assert_eq!(
+            aes256_plain(&key256[32..], &raw256).as_deref(),
+            Some(message.as_slice())
+        );
+        assert!(aes128_plain(&key256[32..48], &raw256).is_none());
+    }
+
+    fn hmac_matches(sign_key: &[u8], token: &[u8]) -> bool {
+        use hmac::Mac;
+        use sha2::Sha256;
+
+        let mut hmac = hmac::Hmac::<Sha256>::new_from_slice(sign_key).unwrap();
+        hmac.update(&token[..token.len() - 32]);
+        hmac.verify_slice(&token[token.len() - 32..]).is_ok()
+    }
+
+    fn aes128_plain(enc_key: &[u8], token: &[u8]) -> Option<Vec<u8>> {
+        use aes::cipher::BlockDecryptMut;
+        use cbc::cipher::KeyIvInit;
+        use cipher::block_padding::Pkcs7;
+
+        let key: [u8; 16] = enc_key.try_into().ok()?;
+        let iv: [u8; 16] = token[..16].try_into().ok()?;
+        let ciphertext = &token[16..token.len() - 32];
+        let mut out = vec![0u8; ciphertext.len()];
+        cbc::Decryptor::<aes::Aes128>::new(&key.into(), &iv.into())
+            .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, &mut out)
+            .ok()
+            .map(|plain| plain.to_vec())
+    }
+
+    fn aes256_plain(enc_key: &[u8], token: &[u8]) -> Option<Vec<u8>> {
+        use aes::cipher::BlockDecryptMut;
+        use cbc::cipher::KeyIvInit;
+        use cipher::block_padding::Pkcs7;
+
+        let key: [u8; 32] = enc_key.try_into().ok()?;
+        let iv: [u8; 16] = token[..16].try_into().ok()?;
+        let ciphertext = &token[16..token.len() - 32];
+        let mut out = vec![0u8; ciphertext.len()];
+        cbc::Decryptor::<aes::Aes256>::new(&key.into(), &iv.into())
+            .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, &mut out)
+            .ok()
+            .map(|plain| plain.to_vec())
     }
 }
 
