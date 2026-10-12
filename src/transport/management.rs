@@ -124,13 +124,10 @@ pub fn encode_interface_stats(stats: &[crate::iface::InterfaceStats]) -> Vec<u8>
         mp::write_str(&mut out, "status").ok();
         mp::write_str(&mut out, if stat.online { "online" } else { "offline" }).ok();
         mp::write_str(&mut out, "bitrate").ok();
-        // Python reports the configured bitrate adaptation; the daemon
-        // reports the nominal rate. Adapting here keeps the key present.
-        mp::write_u64(
-            &mut out,
-            crate::iface::control::ANNOUNCE_CAP as u64 * 31_250,
-        )
-        .ok();
+        // `InterfaceStats` does not carry a per-interface bitrate. Report
+        // Python's default (`Interface.bitrate`) rather than deriving a
+        // rate from the announce-cap fraction.
+        mp::write_u64(&mut out, crate::iface::control::DEFAULT_BITRATE).ok();
         mp::write_str(&mut out, "sent").ok();
         mp::write_u64(&mut out, stat.sent).ok();
         mp::write_str(&mut out, "received").ok();
@@ -181,7 +178,7 @@ pub enum ManagementRequest {
 }
 
 pub fn decode_management_request(data: &[u8]) -> ManagementRequest {
-    use rmpv::{decode::read_value, Value};
+    use rmpv::{Value, decode::read_value};
 
     let mut cursor = std::io::Cursor::new(data);
     let value = match read_value(&mut cursor) {
