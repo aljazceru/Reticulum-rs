@@ -1,11 +1,12 @@
 use rand_core::OsRng;
 use reticulum::{
-    channel,
+    channel::{self, Message, CHANNEL_MDU},
     destination::link::LinkEvent,
     destination::DestinationName,
     error::RnsError,
     identity::PrivateIdentity,
     iface::udp::UdpInterface,
+    packet::PACKET_MDU,
     transport::{Transport, TransportConfig},
 };
 use std::sync::Once;
@@ -106,4 +107,120 @@ async fn channel_send() {
         .recv()
         .await
         .unwrap());
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TypedMessage {
+    message_type: u16,
+    data: Vec<u8>,
+}
+
+impl Message for TypedMessage {
+    fn unpack(packed: &[u8], message_type: u16) -> Result<Self, RnsError> {
+        if message_type == 0x0001 {
+            Ok(Self {
+                message_type,
+                data: packed.to_vec(),
+            })
+        } else {
+            Err(RnsError::ChannelUnknownMessageType)
+        }
+    }
+
+    fn pack(&self) -> Vec<u8> {
+        self.data.clone()
+    }
+
+    fn message_type(&self) -> u16 {
+        self.message_type
+    }
+}
+
+/// Link MDU minus the 6-byte envelope is enforced, and a user type plus
+/// system type 0xff00 can be registered on the same channel.
+#[tokio::test]
+async fn channel_mdu_and_registered_types() {
+    setup();
+
+    let id_a = PrivateIdentity::new_from_rand(OsRng);
+    let id_b = PrivateIdentity::new_from_rand(OsRng);
+    let transport_a =
+        Transport::new(TransportConfig::new("a", &id_a).set_link_mtu_discovery(false));
+    let transport_b =
+        Transport::new(TransportConfig::new("b", &id_b).set_link_mtu_discovery(false));
+    transport_a.iface_manager().lock().await.spawn(
+        UdpInterface::new("127.0.0.1:8093", Some("127.0.0.1:8094"), false),
+        UdpInterface::spawn,
+    );
+    transport_b.iface_manager().lock().await.spawn(
+        UdpInterface::new("127.0.0.1:8094", Some("127.0.0.1:8093"), false),
+        UdpInterface::spawn,
+    );
+
+    let mut in_link_events = transport_a.in_link_events();
+    let mut out_link_events = transport_b.out_link_events();
+    let mut recv_announces = transport_b.recv_announces().await;
+    let dest = transport_a
+        .add_destination(id_a, DestinationName::new("test", "channels.mdu"))
+        .await;
+    transport_a.send_announce(&dest, None).await;
+    let announce = recv_announces.recv().await.unwrap();
+
+    let link = transport_b
+        .link(announce.destination.lock().await.desc)
+        .await;
+    let (channel_b, mut incoming_b) = transport_b.mk_channel::<TypedMessage>(link).await.unwrap();
+
+    let event = in_link_events.recv().await.unwrap();
+    let (channel_a, _incoming_a) = match event.event {
+        LinkEvent::Activated => {
+            let link = transport_a.find_in_link(&event.id).await.unwrap();
+            transport_a.mk_channel::<TypedMessage>(link).await.unwrap()
+        }
+        _ => unreachable!(),
+    };
+    assert!(matches!(
+        out_link_events.recv().await.unwrap().event,
+        LinkEvent::Activated
+    ));
+
+    let link_mdu = channel_a.link.lock().await.mdu();
+    assert_eq!(channel_a.mdu().await, link_mdu - 6);
+    assert_eq!(channel_a.mdu().await, CHANNEL_MDU);
+    assert!(channel_a.mdu().await < PACKET_MDU);
+    assert_eq!(channel_a.window().await, 2);
+
+    assert_eq!(
+        channel_b.register_message_type(0xff00, false).err(),
+        Some(RnsError::ChannelError)
+    );
+    let mut system_rx = channel_b.register_message_type(0xff00, true).unwrap();
+
+    let oversize = TypedMessage {
+        message_type: 0x0001,
+        data: vec![0xab; channel_a.mdu().await + 1],
+    };
+    assert_eq!(
+        channel_a.send(&oversize).await,
+        Err(RnsError::ChannelMessageTooBig)
+    );
+
+    let exact = TypedMessage {
+        message_type: 0x0001,
+        data: vec![0xcd; channel_a.mdu().await],
+    };
+    channel_a.send(&exact).await.unwrap();
+
+    let system = TypedMessage {
+        message_type: 0xff00,
+        data: b"buf".to_vec(),
+    };
+    channel_a.send(&system).await.unwrap();
+
+    let got = incoming_b.recv().await.unwrap();
+    assert_eq!(got.data.len(), CHANNEL_MDU);
+    assert!(got.data.iter().all(|byte| *byte == 0xcd));
+
+    let raw = system_rx.recv().await.unwrap();
+    assert_eq!(raw, b"buf");
 }
