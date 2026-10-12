@@ -15,10 +15,13 @@
 //! Firmware >= 1.52 is required, validated on connect
 //! (Python `REQUIRED_FW_VER_*`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
@@ -58,6 +61,8 @@ pub const CMD_STAT_PHYPRM: u8 = 0x26;
 pub const CMD_STAT_BAT: u8 = 0x27;
 pub const CMD_STAT_CSMA: u8 = 0x28;
 pub const CMD_STAT_TEMP: u8 = 0x29;
+/// RNodeMulti port inventory query (Python `CMD_INTERFACES`).
+pub const CMD_INTERFACES: u8 = 0x71;
 pub const CMD_BLINK: u8 = 0x30;
 pub const CMD_RANDOM: u8 = 0x40;
 pub const CMD_FB_EXT: u8 = 0x41;
@@ -88,6 +93,13 @@ pub const REQUIRED_FW_VER_MIN: u8 = 52;
 pub const Q_SNR_MIN_BASE: f32 = -9.0;
 pub const Q_SNR_MAX: f32 = 6.0;
 pub const Q_SNR_STEP: f32 = 2.0;
+
+/// Encoded identification-beacon limit (Python `CALLSIGN_MAX_LEN`).
+pub const CALLSIGN_MAX_LEN: usize = 32;
+
+/// 2.4 GHz chip kinds from `CMD_INTERFACES` (Python `SX128X` / `SX1280`).
+const KIND_SX128X: u8 = 0x20;
+const KIND_SX1280: u8 = 0x21;
 
 /// RNodeMulti virtual-port selection (Python `CMD_SEL_INT`).
 pub const CMD_SEL_INT: u8 = 0x1F;
@@ -130,6 +142,52 @@ pub fn detect_request() -> Vec<u8> {
     out.extend_from_slice(&kiss_frame(CMD_PLATFORM, &[0x00]));
     out.extend_from_slice(&kiss_frame(CMD_MCU, &[0x00]));
     out
+}
+
+/// RNodeMulti detection burst (Python `RNodeMultiInterface.detect`):
+/// the single-radio probe plus `CMD_INTERFACES`.
+pub fn multi_detect_request() -> Vec<u8> {
+    let mut out = detect_request();
+    out.extend_from_slice(&kiss_frame(CMD_INTERFACES, &[0x00]));
+    out
+}
+
+/// On-air bitrate in bits per second (Python `updateBitrate`).
+///
+/// `None` when spreading factor, coding rate, or bandwidth is zero or the
+/// result is not a positive finite rate.
+pub fn on_air_bitrate(sf: u8, cr: u8, bandwidth_hz: u32) -> Option<f64> {
+    if sf == 0 || cr == 0 || bandwidth_hz == 0 {
+        return None;
+    }
+    let sf = sf as f64;
+    let cr = cr as f64;
+    let bandwidth = bandwidth_hz as f64;
+    let bitrate = sf * ((4.0 / cr) / (2.0_f64.powf(sf) / (bandwidth / 1000.0))) * 1000.0;
+    (bitrate.is_finite() && bitrate > 0.0).then_some(bitrate)
+}
+
+/// Whether `frequency` is in the band for a `CMD_INTERFACES` kind byte.
+///
+/// Python `interface_type_to_str` maps every kind other than SX128X/SX1280
+/// onto the sub-GHz limits.
+pub fn reported_kind_accepts_frequency(kind: u8, frequency: u64) -> bool {
+    match kind {
+        KIND_SX128X | KIND_SX1280 => (2_200_000_000..=2_600_000_000).contains(&frequency),
+        _ => (137_000_000..=1_000_000_000).contains(&frequency),
+    }
+}
+
+fn beacon_config(interval_secs: u64, callsign: &[u8]) -> Option<(u64, Vec<u8>)> {
+    if callsign.len() <= CALLSIGN_MAX_LEN {
+        Some((interval_secs, callsign.to_vec()))
+    } else {
+        log::error!(
+            "rnode: encoded id callsign is {} bytes; max is {CALLSIGN_MAX_LEN}",
+            callsign.len()
+        );
+        None
+    }
 }
 
 /// Tell the device the host is leaving (Python `RNodeInterface.leave`).
@@ -226,6 +284,9 @@ pub struct RnodeEchoState {
     pub radio_state: Option<u8>,
     pub st_alock: Option<f32>,
     pub lt_alock: Option<f32>,
+    /// RNodeMulti port this report belongs to, when the device has
+    /// selected one.
+    pub vport: Option<u8>,
 }
 
 impl RnodeEchoState {
@@ -254,6 +315,16 @@ impl RnodeEchoState {
         if other.lt_alock.is_some() {
             self.lt_alock = other.lt_alock;
         }
+        if other.vport.is_some() {
+            self.vport = other.vport;
+        }
+    }
+
+    pub fn on_air_bitrate(&self) -> Option<f64> {
+        match (self.spreadingfactor, self.codingrate, self.bandwidth) {
+            (Some(sf), Some(cr), Some(bandwidth)) => on_air_bitrate(sf, cr, bandwidth),
+            _ => None,
+        }
     }
 }
 
@@ -266,8 +337,51 @@ pub struct RnodeStatus {
     pub snr: Option<f32>,
     /// Derived link quality percentage (Python `r_stat_q`).
     pub quality: Option<f32>,
+    /// Battery charge percent 0–100 (Python `r_battery_percent`).
     pub battery: Option<u16>,
+    /// Battery state byte (Python `r_battery_state`).
+    pub battery_state: Option<u8>,
+    /// MCU temperature in °C when the report is in range (Python
+    /// `r_temperature`).
     pub temperature: Option<i16>,
+    /// `Some` when this event is a temperature frame. The inner value is
+    /// `None` for an out-of-range reading, which clears a stored temperature.
+    pub temperature_report: Option<Option<i16>>,
+    /// CSMA contention window (Python `r_csma_cw_band` / `min` / `max`).
+    pub csma_cw_band: Option<u8>,
+    pub csma_cw_min: Option<u8>,
+    pub csma_cw_max: Option<u8>,
+    /// CSMA slot time in milliseconds (Python `r_csma_slot_time_ms`).
+    pub csma_slot_time_ms: Option<u16>,
+    /// DIFS time in milliseconds (Python `r_csma_difs_ms`).
+    pub csma_difs_ms: Option<u16>,
+    /// Symbol time in milliseconds (Python `r_symbol_time_ms`).
+    pub symbol_time_ms: Option<f32>,
+    /// Symbol rate in baud (Python `r_symbol_rate`).
+    pub symbol_rate: Option<u16>,
+    /// Preamble length in symbols (Python `r_preamble_symbols`).
+    pub preamble_symbols: Option<u16>,
+    /// Preamble time in milliseconds (Python `r_premable_time_ms`).
+    pub preamble_time_ms: Option<u16>,
+    /// Short-term airtime percent (Python `r_airtime_short`).
+    pub airtime_short: Option<f32>,
+    /// Long-term airtime percent (Python `r_airtime_long`).
+    pub airtime_long: Option<f32>,
+    /// Short-term channel load percent (Python `r_channel_load_short`).
+    pub channel_load_short: Option<f32>,
+    /// Long-term channel load percent (Python `r_channel_load_long`).
+    pub channel_load_long: Option<f32>,
+    /// Instantaneous RSSI from a channel-time report (Python `r_current_rssi`).
+    pub current_rssi: Option<i16>,
+    /// Noise floor from a channel-time report (Python `r_noise_floor`).
+    pub noise_floor: Option<i16>,
+    /// Interference RSSI (Python `r_interference`).
+    pub interference: Option<i16>,
+    /// `Some` when this event is an 11-byte channel-time frame. The inner
+    /// value is `None` when the radio reports no interference (`0xFF`).
+    pub interference_report: Option<Option<i16>>,
+    /// RNodeMulti port this report belongs to.
+    pub vport: Option<u8>,
 }
 
 impl RnodeStatus {
@@ -279,6 +393,81 @@ impl RnodeStatus {
         let q_min = Q_SNR_MIN_BASE - sfs * Q_SNR_STEP;
         let span = Q_SNR_MAX - q_min;
         Some((((snr - q_min) / span) * 100.0).clamp(0.0, 100.0))
+    }
+
+    fn merge_from(&mut self, src: &RnodeStatus) {
+        if let Some(value) = src.stat_rx {
+            self.stat_rx = Some(value);
+        }
+        if let Some(value) = src.stat_tx {
+            self.stat_tx = Some(value);
+        }
+        if let Some(value) = src.rssi {
+            self.rssi = Some(value);
+        }
+        if let Some(value) = src.snr {
+            self.snr = Some(value);
+        }
+        if let Some(value) = src.quality {
+            self.quality = Some(value);
+        }
+        if let Some(value) = src.battery {
+            self.battery = Some(value);
+        }
+        if let Some(value) = src.battery_state {
+            self.battery_state = Some(value);
+        }
+        if let Some(reading) = src.temperature_report {
+            self.temperature = reading;
+        }
+        if let Some(value) = src.csma_cw_band {
+            self.csma_cw_band = Some(value);
+        }
+        if let Some(value) = src.csma_cw_min {
+            self.csma_cw_min = Some(value);
+        }
+        if let Some(value) = src.csma_cw_max {
+            self.csma_cw_max = Some(value);
+        }
+        if let Some(value) = src.csma_slot_time_ms {
+            self.csma_slot_time_ms = Some(value);
+        }
+        if let Some(value) = src.csma_difs_ms {
+            self.csma_difs_ms = Some(value);
+        }
+        if let Some(value) = src.symbol_time_ms {
+            self.symbol_time_ms = Some(value);
+        }
+        if let Some(value) = src.symbol_rate {
+            self.symbol_rate = Some(value);
+        }
+        if let Some(value) = src.preamble_symbols {
+            self.preamble_symbols = Some(value);
+        }
+        if let Some(value) = src.preamble_time_ms {
+            self.preamble_time_ms = Some(value);
+        }
+        if let Some(value) = src.airtime_short {
+            self.airtime_short = Some(value);
+        }
+        if let Some(value) = src.airtime_long {
+            self.airtime_long = Some(value);
+        }
+        if let Some(value) = src.channel_load_short {
+            self.channel_load_short = Some(value);
+        }
+        if let Some(value) = src.channel_load_long {
+            self.channel_load_long = Some(value);
+        }
+        if let Some(value) = src.current_rssi {
+            self.current_rssi = Some(value);
+        }
+        if let Some(value) = src.noise_floor {
+            self.noise_floor = Some(value);
+        }
+        if let Some(reading) = src.interference_report {
+            self.interference = reading;
+        }
     }
 }
 
@@ -303,6 +492,9 @@ pub enum RnodeEvent {
     Echo(RnodeEchoState),
     Status(RnodeStatus),
     Error(u8),
+    /// One virtual port from `CMD_INTERFACES`, in report order.
+    /// The kind byte is Python `command_buffer[1]`.
+    InterfaceKind(u8),
     /// Raw random bytes from CMD_RANDOM.
     Random(Vec<u8>),
 }
@@ -428,61 +620,187 @@ impl RnodeParser {
             CMD_PLATFORM if !data.is_empty() => on_event(RnodeEvent::Platform(data[0])),
             CMD_MCU if !data.is_empty() => on_event(RnodeEvent::Mcu(data[0])),
             CMD_READY if !data.is_empty() => on_event(RnodeEvent::Ready(data[0] == 0x01)),
-            CMD_FREQUENCY if data.len() >= 4 => on_event(RnodeEvent::Echo(RnodeEchoState {
-                frequency: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64),
-                ..Default::default()
-            })),
-            CMD_BANDWIDTH if data.len() >= 4 => on_event(RnodeEvent::Echo(RnodeEchoState {
-                bandwidth: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]])),
-                ..Default::default()
-            })),
-            CMD_TXPOWER if !data.is_empty() => on_event(RnodeEvent::Echo(RnodeEchoState {
-                txpower: Some(data[0]),
-                ..Default::default()
-            })),
-            CMD_SF if !data.is_empty() => on_event(RnodeEvent::Echo(RnodeEchoState {
-                spreadingfactor: Some(data[0]),
-                ..Default::default()
-            })),
-            CMD_CR if !data.is_empty() => on_event(RnodeEvent::Echo(RnodeEchoState {
-                codingrate: Some(data[0]),
-                ..Default::default()
-            })),
-            CMD_RADIO_STATE if !data.is_empty() => on_event(RnodeEvent::Echo(RnodeEchoState {
-                radio_state: Some(data[0]),
-                ..Default::default()
-            })),
-            CMD_ST_ALOCK if data.len() >= 2 => on_event(RnodeEvent::Echo(RnodeEchoState {
-                st_alock: Some(u16::from_be_bytes([data[0], data[1]]) as f32 / 100.0),
-                ..Default::default()
-            })),
-            CMD_LT_ALOCK if data.len() >= 2 => on_event(RnodeEvent::Echo(RnodeEchoState {
-                lt_alock: Some(u16::from_be_bytes([data[0], data[1]]) as f32 / 100.0),
-                ..Default::default()
-            })),
-            CMD_STAT_RSSI if !data.is_empty() => on_event(RnodeEvent::Status(RnodeStatus {
-                rssi: Some(data[0] as i16 - RSSI_OFFSET),
-                ..Default::default()
-            })),
+            CMD_FREQUENCY if data.len() >= 4 => {
+                self.emit_echo(
+                    RnodeEchoState {
+                        frequency: Some(
+                            u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64
+                        ),
+                        ..Default::default()
+                    },
+                    on_event,
+                )
+            }
+            CMD_BANDWIDTH if data.len() >= 4 => self.emit_echo(
+                RnodeEchoState {
+                    bandwidth: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]])),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_TXPOWER if !data.is_empty() => self.emit_echo(
+                RnodeEchoState {
+                    txpower: Some(data[0]),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_SF if !data.is_empty() => self.emit_echo(
+                RnodeEchoState {
+                    spreadingfactor: Some(data[0]),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_CR if !data.is_empty() => self.emit_echo(
+                RnodeEchoState {
+                    codingrate: Some(data[0]),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_RADIO_STATE if !data.is_empty() => self.emit_echo(
+                RnodeEchoState {
+                    radio_state: Some(data[0]),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_ST_ALOCK if data.len() >= 2 => self.emit_echo(
+                RnodeEchoState {
+                    st_alock: Some(u16::from_be_bytes([data[0], data[1]]) as f32 / 100.0),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_LT_ALOCK if data.len() >= 2 => self.emit_echo(
+                RnodeEchoState {
+                    lt_alock: Some(u16::from_be_bytes([data[0], data[1]]) as f32 / 100.0),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_STAT_RSSI if !data.is_empty() => self.emit_status(
+                RnodeStatus {
+                    rssi: Some(data[0] as i16 - RSSI_OFFSET),
+                    ..Default::default()
+                },
+                on_event,
+            ),
             CMD_STAT_SNR if !data.is_empty() => {
                 let snr = data[0] as i8 as f32 * 0.25;
-                on_event(RnodeEvent::Status(RnodeStatus {
-                    snr: Some(snr),
-                    ..Default::default()
-                }))
+                self.emit_status(
+                    RnodeStatus {
+                        snr: Some(snr),
+                        ..Default::default()
+                    },
+                    on_event,
+                )
             }
-            CMD_STAT_RX if data.len() >= 4 => on_event(RnodeEvent::Status(RnodeStatus {
-                stat_rx: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]])),
-                ..Default::default()
-            })),
-            CMD_STAT_TX if data.len() >= 4 => on_event(RnodeEvent::Status(RnodeStatus {
-                stat_tx: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]])),
-                ..Default::default()
-            })),
+            CMD_STAT_RX if data.len() >= 4 => self.emit_status(
+                RnodeStatus {
+                    stat_rx: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]])),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_STAT_TX if data.len() >= 4 => self.emit_status(
+                RnodeStatus {
+                    stat_tx: Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]])),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_STAT_BAT if data.len() >= 2 => {
+                let percent = data[1].min(100);
+                self.emit_status(
+                    RnodeStatus {
+                        battery_state: Some(data[0]),
+                        battery: Some(u16::from(percent)),
+                        ..Default::default()
+                    },
+                    on_event,
+                )
+            }
+            CMD_STAT_TEMP if !data.is_empty() => {
+                let temp = data[0] as i16 - 120;
+                let reading = (-30..=90).contains(&temp).then_some(temp);
+                self.emit_status(
+                    RnodeStatus {
+                        temperature: reading,
+                        temperature_report: Some(reading),
+                        ..Default::default()
+                    },
+                    on_event,
+                )
+            }
+            CMD_STAT_CSMA if data.len() >= 3 => self.emit_status(
+                RnodeStatus {
+                    csma_cw_band: Some(data[0]),
+                    csma_cw_min: Some(data[1]),
+                    csma_cw_max: Some(data[2]),
+                    ..Default::default()
+                },
+                on_event,
+            ),
+            CMD_STAT_CHTM if data.len() >= 8 => {
+                let mut status = RnodeStatus {
+                    airtime_short: Some(u16::from_be_bytes([data[0], data[1]]) as f32 / 100.0),
+                    airtime_long: Some(u16::from_be_bytes([data[2], data[3]]) as f32 / 100.0),
+                    channel_load_short: Some(u16::from_be_bytes([data[4], data[5]]) as f32 / 100.0),
+                    channel_load_long: Some(u16::from_be_bytes([data[6], data[7]]) as f32 / 100.0),
+                    ..Default::default()
+                };
+                // Single-radio reports are 11 bytes and add RSSI. An 8-byte
+                // multi report leaves a previous interference reading alone.
+                if data.len() >= 11 {
+                    let interference = (data[10] != 0xFF).then_some(data[10] as i16 - RSSI_OFFSET);
+                    status.current_rssi = Some(data[8] as i16 - RSSI_OFFSET);
+                    status.noise_floor = Some(data[9] as i16 - RSSI_OFFSET);
+                    status.interference = interference;
+                    status.interference_report = Some(interference);
+                }
+                self.emit_status(status, on_event)
+            }
+            CMD_STAT_PHYPRM if data.len() >= 10 => {
+                let mut status = RnodeStatus {
+                    symbol_time_ms: Some(u16::from_be_bytes([data[0], data[1]]) as f32 / 1000.0),
+                    symbol_rate: Some(u16::from_be_bytes([data[2], data[3]])),
+                    preamble_symbols: Some(u16::from_be_bytes([data[4], data[5]])),
+                    preamble_time_ms: Some(u16::from_be_bytes([data[6], data[7]])),
+                    csma_slot_time_ms: Some(u16::from_be_bytes([data[8], data[9]])),
+                    ..Default::default()
+                };
+                if data.len() >= 12 {
+                    status.csma_difs_ms = Some(u16::from_be_bytes([data[10], data[11]]));
+                }
+                self.emit_status(status, on_event)
+            }
+            CMD_INTERFACES if data.len() >= 2 => {
+                let mut index = 0;
+                while index + 1 < data.len() {
+                    on_event(RnodeEvent::InterfaceKind(data[index + 1]));
+                    index += 2;
+                }
+            }
             CMD_ERROR if !data.is_empty() => on_event(RnodeEvent::Error(data[0])),
             CMD_RANDOM => on_event(RnodeEvent::Random(data)),
             _ => {}
         }
+    }
+
+    fn emit_echo(&mut self, mut echo: RnodeEchoState, on_event: &mut impl FnMut(RnodeEvent)) {
+        if self.multi {
+            echo.vport = self.selected_vport;
+        }
+        on_event(RnodeEvent::Echo(echo));
+    }
+
+    fn emit_status(&mut self, mut status: RnodeStatus, on_event: &mut impl FnMut(RnodeEvent)) {
+        if self.multi {
+            status.vport = self.selected_vport;
+        }
+        on_event(RnodeEvent::Status(status));
     }
 }
 
@@ -500,6 +818,93 @@ pub struct RnodeShared {
     pub detected: bool,
     /// Flow control: tx paused until CMD_READY.
     pub interface_ready: bool,
+    /// On-air bitrate in bits per second (Python `bitrate`), rounded.
+    pub bitrate: u64,
+    /// Kinds reported by `CMD_INTERFACES`, vport 0 first.
+    pub subinterface_kinds: Vec<u8>,
+    /// Per-virtual-port modem echoes (RNodeMulti).
+    pub vport_echo: HashMap<u8, RnodeEchoState>,
+    /// Per-virtual-port on-air bitrate in bits per second.
+    pub vport_bitrate: HashMap<u8, u64>,
+}
+
+impl RnodeShared {
+    /// Fold a modem echo into the shared state. Returns `(vport, bps)` when
+    /// the on-air rate can be computed.
+    pub fn note_echo(&mut self, echo: RnodeEchoState) -> Option<(Option<u8>, u64)> {
+        let vport = echo.vport;
+        let rate = if let Some(vport) = vport {
+            let slot = self.vport_echo.entry(vport).or_default();
+            slot.merge(echo);
+            slot.on_air_bitrate()
+        } else {
+            self.echo.merge(echo);
+            self.echo.on_air_bitrate()
+        }?;
+        let bps = rate.round() as u64;
+        if bps == 0 {
+            return None;
+        }
+        if let Some(vport) = vport {
+            self.vport_bitrate.insert(vport, bps);
+        } else {
+            self.bitrate = bps;
+        }
+        Some((vport, bps))
+    }
+
+    /// Fold a telemetry report into the shared status. Recomputes link
+    /// quality when the report carries an SNR.
+    pub fn note_status(&mut self, status: RnodeStatus) -> (Option<i16>, Option<f32>, Option<f32>) {
+        let snr = status.snr;
+        let sf = if let Some(vport) = status.vport {
+            self.vport_echo
+                .get(&vport)
+                .and_then(|echo| echo.spreadingfactor)
+                .or(self.echo.spreadingfactor)
+        } else {
+            self.echo.spreadingfactor
+        };
+        self.status.merge_from(&status);
+        if let Some(snr) = snr {
+            if let Some(quality) = RnodeStatus::quality_for(snr, sf) {
+                self.status.quality = Some(quality);
+            }
+        }
+        (self.status.rssi, self.status.snr, self.status.quality)
+    }
+}
+
+/// Identification beacon (Python `first_tx` / `id_interval`).
+/// Opens after a successful non-beacon write and closes after the beacon
+/// frame is written.
+struct IdBeacon {
+    interval: Duration,
+    callsign: Vec<u8>,
+    first_tx: Option<Instant>,
+}
+
+impl IdBeacon {
+    fn new(interval_secs: u64, callsign: Vec<u8>) -> Self {
+        Self {
+            interval: Duration::from_secs(interval_secs),
+            callsign,
+            first_tx: None,
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.first_tx
+            .map(|start| start + self.interval + Duration::from_nanos(1))
+    }
+
+    fn on_written(&mut self, payload: &[u8], now: Instant) {
+        if payload == self.callsign.as_slice() {
+            self.first_tx = None;
+        } else if self.first_tx.is_none() {
+            self.first_tx = Some(now);
+        }
+    }
 }
 
 async fn wait_for_interface_ready(
@@ -635,7 +1040,26 @@ pub async fn detect_and_validate(
     config: &RnodeRadioConfig,
     shared: &SharedRnodeState,
 ) -> Result<(), RnsError> {
-    link.write(&detect_request()).await?;
+    detect_and_configure(link, config, shared, false).await
+}
+
+async fn detect_and_configure(
+    link: &mut RnodeLink,
+    config: &RnodeRadioConfig,
+    shared: &SharedRnodeState,
+    probe_interfaces: bool,
+) -> Result<(), RnsError> {
+    let request = if probe_interfaces {
+        shared
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .subinterface_kinds
+            .clear();
+        multi_detect_request()
+    } else {
+        detect_request()
+    };
+    link.write(&request).await?;
 
     let mut parser = RnodeParser::new(false);
     let mut buffer = [0u8; 4096];
@@ -661,28 +1085,15 @@ pub async fn detect_and_validate(
             return Err(RnsError::ConnectionError);
         }
 
-        {
-            let shared = shared.clone();
-            parser.feed(&buffer[..read], |event| {
-                let mut shared = shared.write().unwrap_or_else(|e| e.into_inner());
-                match event {
-                    RnodeEvent::Detect => shared.detected = true,
-                    RnodeEvent::FirmwareVersion { major, minor } => {
-                        shared.firmware = Some((major, minor));
-                        firmware_seen = true;
-                    }
-                    RnodeEvent::Platform(platform) => {
-                        shared.platform = Some(platform);
-                        platform_seen = true;
-                    }
-                    RnodeEvent::Mcu(mcu) => {
-                        shared.mcu = Some(mcu);
-                        mcu_seen = true;
-                    }
-                    _ => {}
-                }
-            });
-        }
+        parser.feed(&buffer[..read], |event| {
+            note_probe_event(
+                shared,
+                event,
+                &mut firmware_seen,
+                &mut platform_seen,
+                &mut mcu_seen,
+            );
+        });
 
         // The detect burst queries detect, firmware, platform and MCU;
         // answers may arrive split across reads (serial timing, TCP
@@ -690,6 +1101,27 @@ pub async fn detect_and_validate(
         // deadline above bounds the wait.
         if firmware_seen && platform_seen && mcu_seen {
             break;
+        }
+    }
+
+    if probe_interfaces {
+        if let Ok(Ok(read)) = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            link.read(&mut buffer),
+        )
+        .await
+        {
+            if read > 0 {
+                parser.feed(&buffer[..read], |event| {
+                    note_probe_event(
+                        shared,
+                        event,
+                        &mut firmware_seen,
+                        &mut platform_seen,
+                        &mut mcu_seen,
+                    );
+                });
+            }
         }
     }
 
@@ -749,11 +1181,38 @@ pub async fn detect_and_validate(
 
     {
         let mut shared = shared.write().unwrap_or_else(|e| e.into_inner());
-        shared.echo = collected;
+        let _ = shared.note_echo(collected);
         shared.interface_ready = true;
     }
 
     Ok(())
+}
+
+fn note_probe_event(
+    shared: &SharedRnodeState,
+    event: RnodeEvent,
+    firmware_seen: &mut bool,
+    platform_seen: &mut bool,
+    mcu_seen: &mut bool,
+) {
+    let mut shared = shared.write().unwrap_or_else(|e| e.into_inner());
+    match event {
+        RnodeEvent::Detect => shared.detected = true,
+        RnodeEvent::FirmwareVersion { major, minor } => {
+            shared.firmware = Some((major, minor));
+            *firmware_seen = true;
+        }
+        RnodeEvent::Platform(platform) => {
+            shared.platform = Some(platform);
+            *platform_seen = true;
+        }
+        RnodeEvent::Mcu(mcu) => {
+            shared.mcu = Some(mcu);
+            *mcu_seen = true;
+        }
+        RnodeEvent::InterfaceKind(kind) => shared.subinterface_kinds.push(kind),
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -775,6 +1234,8 @@ pub struct RnodeInterface {
     pub iface_manager: Option<Arc<tokio::sync::Mutex<InterfaceManager>>>,
     /// Shared radio state, exposed to embedders for diagnostics.
     pub state: SharedRnodeState,
+    id_interval: Option<u64>,
+    id_callsign: Option<Vec<u8>>,
 }
 
 impl RnodeInterface {
@@ -787,6 +1248,8 @@ impl RnodeInterface {
             flow_control: false,
             iface_manager: None,
             state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
+            id_interval: None,
+            id_callsign: None,
         }
     }
 
@@ -800,6 +1263,8 @@ impl RnodeInterface {
             flow_control: false,
             iface_manager: None,
             state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
+            id_interval: None,
+            id_callsign: None,
         }
     }
 
@@ -811,6 +1276,21 @@ impl RnodeInterface {
     pub fn with_flow_control(mut self, flow_control: bool) -> Self {
         self.flow_control = flow_control;
         self
+    }
+
+    /// Identification beacon (Python `id_interval` / `id_callsign`).
+    /// Callsigns longer than [`CALLSIGN_MAX_LEN`] are rejected and the
+    /// beacon stays disabled.
+    pub fn with_beacon(mut self, interval_secs: u64, callsign: impl AsRef<[u8]>) -> Self {
+        if let Some((interval, callsign)) = beacon_config(interval_secs, callsign.as_ref()) {
+            self.id_interval = Some(interval);
+            self.id_callsign = Some(callsign);
+        }
+        self
+    }
+
+    pub fn id_callsign(&self) -> Option<&[u8]> {
+        self.id_callsign.as_deref()
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -866,9 +1346,13 @@ impl RnodeInterface {
             };
             let mut link = link;
 
-            let (config, flow_control) = {
+            let (config, flow_control, id_beacon) = {
                 let inner = context.inner.lock().unwrap();
-                (inner.config.clone(), inner.flow_control)
+                let id_beacon = match (inner.id_interval, inner.id_callsign.clone()) {
+                    (Some(interval), Some(callsign)) => Some(IdBeacon::new(interval, callsign)),
+                    _ => None,
+                };
+                (inner.config.clone(), inner.flow_control, id_beacon)
             };
 
             // Detection + firmware + radio validation
@@ -885,9 +1369,13 @@ impl RnodeInterface {
             // Tunnel synthesis hook (RNodes participate in tunnel
             // endpoints via wants_tunnel, like Python).
             let manager_of = { inner.lock().unwrap().iface_manager.clone() };
-            if let Some(manager) = manager_of {
+            let on_air = state.read().unwrap_or_else(|e| e.into_inner()).bitrate;
+            if let Some(manager) = &manager_of {
                 let manager = manager.lock().await;
                 manager.set_iface_wants_tunnel(&iface_address, true);
+                if on_air > 0 {
+                    manager.set_iface_bitrate(&iface_address, on_air);
+                }
             }
 
             let mut writer = link.writer;
@@ -900,6 +1388,7 @@ impl RnodeInterface {
                 let stats = stats.clone();
                 let rx_channel = rx_channel.clone();
                 let state = state.clone();
+                let manager_of = manager_of.clone();
 
                 tokio::spawn(async move {
                     let mut parser = RnodeParser::new(false);
@@ -913,6 +1402,7 @@ impl RnodeInterface {
                                 Ok(0) | Err(_) => true,
                                 Ok(n) => {
                                     let mut packets: Vec<Vec<u8>> = Vec::new();
+                                    let mut bitrate_bps = None;
                                     parser.feed(&buffer[..n], |event| {
                                         match event {
                                             RnodeEvent::Data { data, .. } => packets.push(data),
@@ -920,16 +1410,15 @@ impl RnodeInterface {
                                                 state.write().unwrap_or_else(|e| e.into_inner()).interface_ready = ready;
                                             }
                                             RnodeEvent::Status(status) => {
-                                                let quality = status.snr.and_then(|snr| RnodeStatus::quality_for(snr, None));
-                                                stats.set_radio_quality(status.rssi, status.snr, quality);
                                                 let mut shared = state.write().unwrap_or_else(|e| e.into_inner());
-                                                if let Some(rssi) = status.rssi { shared.status.rssi = Some(rssi); }
-                                                if let Some(snr) = status.snr {
-                                                    shared.status.snr = Some(snr);
-                                                    shared.status.quality = RnodeStatus::quality_for(snr, None);
+                                                let (rssi, snr, quality) = shared.note_status(status);
+                                                drop(shared);
+                                                stats.set_radio_quality(rssi, snr, quality);
+                                            }
+                                            RnodeEvent::Echo(echo) => {
+                                                if let Some((_, bps)) = state.write().unwrap_or_else(|e| e.into_inner()).note_echo(echo) {
+                                                    bitrate_bps = Some(bps);
                                                 }
-                                                if let Some(stat_rx) = status.stat_rx { shared.status.stat_rx = Some(stat_rx); }
-                                                if let Some(stat_tx) = status.stat_tx { shared.status.stat_tx = Some(stat_tx); }
                                             }
                                             RnodeEvent::Error(code) => {
                                                 log::debug!("rnode: device error code {code:#x}");
@@ -937,6 +1426,12 @@ impl RnodeInterface {
                                             _ => {}
                                         }
                                     });
+
+                                    if let Some(bps) = bitrate_bps {
+                                        if let Some(manager) = &manager_of {
+                                            manager.lock().await.set_iface_bitrate(&iface_address, bps);
+                                        }
+                                    }
 
                                     let rx_channel = rx_channel.lock().await;
                                     for data in packets {
@@ -968,12 +1463,42 @@ impl RnodeInterface {
 
                 tokio::spawn(async move {
                     let mut tx_channel = tx_channel?;
+                    let mut id_beacon = id_beacon;
                     loop {
                         let mut buffer = [0u8; 2048];
+                        let beacon_at = id_beacon.as_ref().and_then(IdBeacon::deadline);
 
                         let message = tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = link_cancel.cancelled() => break,
+                            _ = async {
+                                match beacon_at {
+                                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                if let Some(beacon) = id_beacon.as_mut() {
+                                    if flow_control && !wait_for_interface_ready(&state, &cancel, &link_cancel).await {
+                                        return Some(tx_channel);
+                                    }
+                                    let callsign = beacon.callsign.clone();
+                                    let frame = kiss_frame(CMD_DATA, &callsign);
+                                    if writer.write_all(&frame).await.is_ok()
+                                        && writer.flush().await.is_ok()
+                                    {
+                                        stats.count_tx(callsign.len());
+                                        beacon.on_written(&callsign, Instant::now());
+                                        if flow_control {
+                                            state.write().unwrap_or_else(|e| e.into_inner()).interface_ready = false;
+                                        }
+                                        log::debug!("rnode: transmitted beacon data");
+                                    } else {
+                                        link_cancel.cancel();
+                                        return Some(tx_channel);
+                                    }
+                                }
+                                continue;
+                            }
                             message = tx_channel.recv() => match message {
                                 Some(message) => message,
                                 None => break,
@@ -996,6 +1521,9 @@ impl RnodeInterface {
                                 && writer.flush().await.is_ok()
                             {
                                 stats.count_tx(output.offset());
+                                if let Some(beacon) = id_beacon.as_mut() {
+                                    beacon.on_written(output.as_slice(), Instant::now());
+                                }
                                 if flow_control {
                                     state
                                         .write()
@@ -1093,6 +1621,9 @@ pub struct RnodeMultiInterface {
     /// Interface manager: peers are spawned into it.
     pub iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     pub state: SharedRnodeState,
+    receive_only: Vec<u8>,
+    id_interval: Option<u64>,
+    id_callsign: Option<Vec<u8>>,
 }
 
 impl RnodeMultiInterface {
@@ -1108,6 +1639,9 @@ impl RnodeMultiInterface {
             vports,
             iface_manager,
             state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
+            receive_only: Vec::new(),
+            id_interval: None,
+            id_callsign: None,
         }
     }
 
@@ -1125,7 +1659,37 @@ impl RnodeMultiInterface {
             vports,
             iface_manager,
             state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
+            receive_only: Vec::new(),
+            id_interval: None,
+            id_callsign: None,
         }
+    }
+
+    /// Virtual port that receives but does not transmit
+    /// (Python subinterface `outgoing = False`).
+    pub fn with_receive_only(mut self, index: u8) -> Self {
+        if !self.receive_only.contains(&index) {
+            self.receive_only.push(index);
+        }
+        self
+    }
+
+    pub fn vport_outgoing(&self, index: u8) -> bool {
+        !self.receive_only.contains(&index)
+    }
+
+    /// Identification beacon sent on every virtual port
+    /// (Python `id_interval` / `id_callsign`).
+    pub fn with_beacon(mut self, interval_secs: u64, callsign: impl AsRef<[u8]>) -> Self {
+        if let Some((interval, callsign)) = beacon_config(interval_secs, callsign.as_ref()) {
+            self.id_interval = Some(interval);
+            self.id_callsign = Some(callsign);
+        }
+        self
+    }
+
+    pub fn id_callsign(&self) -> Option<&[u8]> {
+        self.id_callsign.as_deref()
     }
 
     pub async fn spawn(context: InterfaceContext<Self>) {
@@ -1197,21 +1761,62 @@ impl RnodeMultiInterface {
                     })
             };
 
-            if let Err(error) = detect_and_validate(&mut link, &first_config, &state).await {
+            if let Err(error) = detect_and_configure(&mut link, &first_config, &state, true).await {
                 log::error!("rnode_multi: device validation failed: {error:?}");
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 continue;
             }
 
             // Configure and spawn each virtual port.
-            let (vports, iface_manager) = {
+            let (vports, iface_manager, receive_only, id_beacon) = {
                 let inner = inner.lock().unwrap();
-                (inner.vports.clone(), inner.iface_manager.clone())
+                let id_beacon = match (inner.id_interval, inner.id_callsign.clone()) {
+                    (Some(interval), Some(callsign)) => Some(IdBeacon::new(interval, callsign)),
+                    _ => None,
+                };
+                (
+                    inner.vports.clone(),
+                    inner.iface_manager.clone(),
+                    inner.receive_only.clone(),
+                    id_beacon,
+                )
             };
+
+            let kinds = state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .subinterface_kinds
+                .clone();
+            let ports_ok = vports.iter().all(|vport| {
+                match kinds.get(vport.index as usize).copied() {
+                    Some(kind) if reported_kind_accepts_frequency(kind, vport.config.frequency) => {
+                        true
+                    }
+                    Some(_) => {
+                        log::error!(
+                            "rnode_multi: frequency for virtual port {} is outside the reported band",
+                            vport.index
+                        );
+                        false
+                    }
+                    None => {
+                        log::error!(
+                            "rnode_multi: virtual port {} was not reported by CMD_INTERFACES",
+                            vport.index
+                        );
+                        false
+                    }
+                }
+            });
+            if !ports_ok {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
 
             let (vport_tx, vport_rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
             let inbound: VportInbound =
                 Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let mut vport_addresses = HashMap::new();
 
             {
                 let mut manager = iface_manager.lock().await;
@@ -1233,9 +1838,11 @@ impl RnodeMultiInterface {
                             index: vport.index,
                             outbound: vport_tx.clone(),
                             inbound: Some(peer_in_rx),
+                            outgoing: !receive_only.contains(&vport.index),
                         },
                         RnodeVportPeer::spawn,
                     );
+                    vport_addresses.insert(vport.index, address);
 
                     // RNodeMulti peers use tunnel endpoints
                     // (Python wants_tunnel on the spawned peers).
@@ -1258,12 +1865,48 @@ impl RnodeMultiInterface {
                 let stats = stats.clone();
                 let mut writer = link.writer;
                 let mut vport_rx = vport_rx;
+                let beacon_ports: Vec<u8> = vports.iter().map(|vport| vport.index).collect();
 
                 tokio::spawn(async move {
+                    let mut id_beacon = id_beacon;
                     loop {
+                        let beacon_at = if beacon_ports.is_empty() {
+                            None
+                        } else {
+                            id_beacon.as_ref().and_then(IdBeacon::deadline)
+                        };
                         let outgoing = tokio::select! {
                             _ = cancel.cancelled() => break,
                             _ = link_cancel.cancelled() => break,
+                            _ = async {
+                                match beacon_at {
+                                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                let Some(beacon) = id_beacon.as_mut() else {
+                                    continue;
+                                };
+                                let callsign = beacon.callsign.clone();
+                                let mut wrote = false;
+                                for index in &beacon_ports {
+                                    let (select, frame) = vport_transmit_frames(*index, &callsign);
+                                    if writer.write_all(&select).await.is_err()
+                                        || writer.write_all(&frame).await.is_err()
+                                        || writer.flush().await.is_err()
+                                    {
+                                        link_cancel.cancel();
+                                        return;
+                                    }
+                                    stats.count_tx(callsign.len());
+                                    wrote = true;
+                                }
+                                if wrote {
+                                    beacon.on_written(&callsign, Instant::now());
+                                    log::debug!("rnode_multi: transmitted beacon data");
+                                }
+                                continue;
+                            }
                             outgoing = vport_rx.recv() => match outgoing {
                                 Some(outgoing) => outgoing,
                                 None => break,
@@ -1280,6 +1923,9 @@ impl RnodeMultiInterface {
                             && writer.flush().await.is_ok()
                         {
                             stats.count_tx(data.len());
+                            if let Some(id_beacon) = id_beacon.as_mut() {
+                                id_beacon.on_written(&data, Instant::now());
+                            }
                         } else {
                             link_cancel.cancel();
                             break;
@@ -1297,6 +1943,8 @@ impl RnodeMultiInterface {
                 let state = state.clone();
                 let inbound = inbound.clone();
                 let rx_stats = stats.clone();
+                let iface_manager = iface_manager.clone();
+                let vport_addresses = vport_addresses.clone();
 
                 tokio::spawn(async move {
                     let mut parser = RnodeParser::new(true);
@@ -1310,20 +1958,39 @@ impl RnodeMultiInterface {
                                 Ok(0) | Err(_) => true,
                                 Ok(n) => {
                                     let mut routed: Vec<(Option<u8>, Vec<u8>)> = Vec::new();
+                                    let mut bitrate_updates = Vec::new();
                                     parser.feed(&buffer[..n], |event| {
                                         match event {
                                             RnodeEvent::Data { vport, data } => routed.push((vport, data)),
                                             RnodeEvent::SelectedVport(_) => {}
                                             RnodeEvent::Status(status) => {
-                                                let quality = status.snr.and_then(|snr| RnodeStatus::quality_for(snr, None));
-                                                rx_stats.set_radio_quality(status.rssi, status.snr, quality);
                                                 let mut shared = state.write().unwrap_or_else(|e| e.into_inner());
-                                                if let Some(rssi) = status.rssi { shared.status.rssi = Some(rssi); }
-                                                if let Some(snr) = status.snr { shared.status.snr = Some(snr); }
+                                                let (rssi, snr, quality) = shared.note_status(status);
+                                                drop(shared);
+                                                rx_stats.set_radio_quality(rssi, snr, quality);
+                                            }
+                                            RnodeEvent::Echo(echo) => {
+                                                if let Some(update) = state.write().unwrap_or_else(|e| e.into_inner()).note_echo(echo) {
+                                                    bitrate_updates.push(update);
+                                                }
+                                            }
+                                            RnodeEvent::InterfaceKind(kind) => {
+                                                state.write().unwrap_or_else(|e| e.into_inner()).subinterface_kinds.push(kind);
                                             }
                                             _ => {}
                                         }
                                     });
+
+                                    if !bitrate_updates.is_empty() {
+                                        let manager = iface_manager.lock().await;
+                                        for (vport, bps) in bitrate_updates {
+                                            if let Some(vport) = vport {
+                                                if let Some(address) = vport_addresses.get(&vport) {
+                                                    manager.set_iface_bitrate(address, bps);
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     for (vport, data) in routed {
                                         if let Some(vport) = vport {
@@ -1396,6 +2063,8 @@ pub struct RnodeVportPeer {
     pub outbound: mpsc::UnboundedSender<(u8, Vec<u8>)>,
     /// Inbound data from the parent device reader (taken by the worker).
     pub inbound: Option<mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Python subinterface `OUT`. Receive-only ports drop transmissions.
+    pub outgoing: bool,
 }
 
 impl RnodeVportPeer {
@@ -1420,14 +2089,17 @@ impl RnodeVportPeer {
 
                 message = tx_channel.recv() => match message {
                     Some(message) => {
+                        let (index, outbound, outgoing) = {
+                            let inner = context.inner.lock().unwrap();
+                            (inner.index, inner.outbound.clone(), inner.outgoing)
+                        };
+                        if !outgoing {
+                            continue;
+                        }
                         let packet = message.packet;
                         let mut buffer = [0u8; 2048];
                         let mut output = OutputBuffer::new(&mut buffer[..]);
                         if packet.serialize(&mut output).is_ok() {
-                            let (index, outbound) = {
-                                let inner = context.inner.lock().unwrap();
-                                (inner.index, inner.outbound.clone())
-                            };
                             let _ = outbound.send((index, output.as_slice().to_vec()));
                             stats.count_tx(output.offset());
                         }
@@ -1505,5 +2177,144 @@ mod tests {
         assert!(!waiter.is_finished());
         link_cancel.cancel();
         assert!(!waiter.await.unwrap());
+    }
+
+    #[test]
+    fn on_air_bitrate_matches_the_modem_formula() {
+        let sf9 = on_air_bitrate(9, 5, 125_000).unwrap();
+        assert!((sf9 - 1757.8125).abs() < 1e-6);
+        assert_eq!(sf9.round() as u64, 1758);
+        assert_eq!(on_air_bitrate(7, 5, 125_000).unwrap().round() as u64, 5469);
+        assert_eq!(on_air_bitrate(12, 8, 62_500).unwrap().round() as u64, 92);
+        assert_eq!(on_air_bitrate(8, 6, 250_000).unwrap().round() as u64, 5208);
+        assert!(on_air_bitrate(0, 5, 125_000).is_none());
+        assert!(on_air_bitrate(9, 0, 125_000).is_none());
+        assert!(on_air_bitrate(9, 5, 0).is_none());
+    }
+
+    #[test]
+    fn id_beacon_window_tracks_successful_writes() {
+        let mut beacon = IdBeacon::new(60, b"N0CALL".to_vec());
+        let now = Instant::now();
+        assert!(beacon.deadline().is_none());
+
+        beacon.on_written(b"N0CALL", now);
+        assert!(beacon.deadline().is_none());
+
+        beacon.on_written(b"packet", now);
+        let due = beacon.deadline().unwrap();
+        assert!(due > now + Duration::from_secs(60));
+
+        beacon.on_written(b"N0CALL", now + Duration::from_secs(61));
+        assert!(beacon.deadline().is_none());
+    }
+
+    #[test]
+    fn echo_and_status_update_bitrate_and_telemetry() {
+        let mut shared = RnodeShared::default();
+        assert_eq!(
+            shared.note_echo(RnodeEchoState {
+                spreadingfactor: Some(9),
+                codingrate: Some(5),
+                bandwidth: Some(125_000),
+                ..RnodeEchoState::default()
+            }),
+            Some((None, 1758))
+        );
+        assert_eq!(shared.bitrate, 1758);
+
+        assert_eq!(
+            shared.note_echo(RnodeEchoState {
+                spreadingfactor: Some(7),
+                codingrate: Some(5),
+                bandwidth: Some(125_000),
+                vport: Some(1),
+                ..RnodeEchoState::default()
+            }),
+            Some((Some(1), 5469))
+        );
+        assert_eq!(shared.bitrate, 1758);
+        assert_eq!(shared.vport_bitrate.get(&1).copied(), Some(5469));
+
+        let mut events = Vec::new();
+        let mut parser = RnodeParser::new(false);
+        parser.feed(&kiss_frame(CMD_STAT_SNR, &[0xFC]), |event| {
+            events.push(event)
+        });
+        let RnodeEvent::Status(status) = events.pop().unwrap() else {
+            panic!("expected snr status");
+        };
+        let (_rssi, snr, quality) = shared.note_status(status);
+        assert_eq!(snr, Some(-1.0));
+        let expected = RnodeStatus::quality_for(-1.0, Some(9)).unwrap();
+        assert_eq!(quality, Some(expected));
+        assert!((shared.status.quality.unwrap() - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn multi_probe_and_band_limits() {
+        let detect = detect_request();
+        let multi = multi_detect_request();
+        assert!(multi.starts_with(&detect));
+        assert!(multi.ends_with(&kiss_frame(CMD_INTERFACES, &[0x00])));
+
+        assert!(reported_kind_accepts_frequency(0x11, 867_500_000));
+        assert!(!reported_kind_accepts_frequency(0x21, 867_500_000));
+        assert!(reported_kind_accepts_frequency(0x21, 2_400_000_000));
+        assert!(!reported_kind_accepts_frequency(0x11, 2_400_000_000));
+        assert!(reported_kind_accepts_frequency(0xFE, 867_500_000));
+    }
+
+    #[tokio::test]
+    async fn receive_only_vport_drops_transmissions() {
+        use crate::iface::{InterfaceManager, TxMessage, TxMessageType};
+        use crate::packet::Packet;
+
+        let (silent_tx, mut silent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_silent_in_tx, silent_in_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (live_tx, mut live_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_live_in_tx, live_in_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut manager = InterfaceManager::new(4);
+        let silent = manager.spawn(
+            RnodeVportPeer {
+                index: 1,
+                outbound: silent_tx,
+                inbound: Some(silent_in_rx),
+                outgoing: false,
+            },
+            RnodeVportPeer::spawn,
+        );
+        let live = manager.spawn(
+            RnodeVportPeer {
+                index: 0,
+                outbound: live_tx,
+                inbound: Some(live_in_rx),
+                outgoing: true,
+            },
+            RnodeVportPeer::spawn,
+        );
+
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(silent),
+                packet: Packet::default(),
+            })
+            .await;
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(live),
+                packet: Packet::default(),
+            })
+            .await;
+
+        let forwarded = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .expect("outgoing vport forwards")
+            .expect("outgoing channel open");
+        assert_eq!(forwarded.0, 0);
+        assert!(!forwarded.1.is_empty());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(silent_rx.try_recv().is_err());
     }
 }

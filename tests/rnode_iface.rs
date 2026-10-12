@@ -4,13 +4,15 @@
 
 #![cfg(feature = "iface-rnode")]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand_core::OsRng;
 use reticulum::destination::{DestinationName, SingleInputDestination};
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::rnode::*;
+use reticulum::iface::{TxMessage, TxMessageType};
+use reticulum::packet::Packet;
 use reticulum::transport::TransportConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -360,5 +362,516 @@ async fn rnode_parser_and_framing() {
             assert_eq!(data, b"vport data");
         }
         _ => panic!("expected vport data event"),
+    }
+}
+
+fn be_u16(value: u16) -> [u8; 2] {
+    value.to_be_bytes()
+}
+
+/// Fold device frames through the parser into shared radio state.
+fn apply_frames(shared: &mut RnodeShared, frames: &[u8]) {
+    let mut parser = RnodeParser::new(false);
+    parser.feed(frames, |event| match event {
+        RnodeEvent::Echo(echo) => {
+            let _ = shared.note_echo(echo);
+        }
+        RnodeEvent::Status(status) => {
+            let _ = shared.note_status(status);
+        }
+        RnodeEvent::InterfaceKind(kind) => shared.subinterface_kinds.push(kind),
+        _ => {}
+    });
+}
+
+#[test]
+fn rnode_framed_telemetry_bitrate_and_multi_probe() {
+    let multi = multi_detect_request();
+    let frames = parse_frames(&multi);
+    assert_eq!(frames.len(), 5);
+    assert_eq!(
+        &multi[..detect_request().len()],
+        detect_request().as_slice()
+    );
+    assert_eq!(frames[4], (CMD_INTERFACES, vec![0x00]));
+
+    let mut stream = Vec::new();
+    // SF9 / CR5 / 125 kHz → 1757.8125 bps, published as 1758.
+    stream.extend_from_slice(&kiss_frame(CMD_SF, &[9]));
+    stream.extend_from_slice(&kiss_frame(CMD_CR, &[5]));
+    stream.extend_from_slice(&kiss_frame(CMD_BANDWIDTH, &125_000u32.to_be_bytes()));
+    stream.extend_from_slice(&kiss_frame(CMD_STAT_BAT, &[0x02, 80]));
+    stream.extend_from_slice(&kiss_frame(CMD_STAT_BAT, &[0x01, 150]));
+    stream.extend_from_slice(&kiss_frame(CMD_STAT_TEMP, &[145])); // 145 - 120 = 25
+    stream.extend_from_slice(&kiss_frame(CMD_STAT_CSMA, &[4, 3, 7]));
+
+    let mut chtm = Vec::new();
+    chtm.extend_from_slice(&be_u16(1000));
+    chtm.extend_from_slice(&be_u16(2500));
+    chtm.extend_from_slice(&be_u16(100));
+    chtm.extend_from_slice(&be_u16(200));
+    chtm.extend_from_slice(&[157, 147, 0xFF]);
+    stream.extend_from_slice(&kiss_frame(CMD_STAT_CHTM, &chtm));
+
+    let mut phy = Vec::new();
+    phy.extend_from_slice(&be_u16(1000));
+    phy.extend_from_slice(&be_u16(488));
+    phy.extend_from_slice(&be_u16(8));
+    phy.extend_from_slice(&be_u16(16));
+    phy.extend_from_slice(&be_u16(20));
+    phy.extend_from_slice(&be_u16(40));
+    stream.extend_from_slice(&kiss_frame(CMD_STAT_PHYPRM, &phy));
+
+    let mut shared = RnodeShared::default();
+    apply_frames(&mut shared, &stream);
+
+    assert_eq!(shared.bitrate, 1758);
+    assert_eq!(shared.status.battery_state, Some(0x01));
+    assert_eq!(shared.status.battery, Some(100));
+    assert_eq!(shared.status.temperature, Some(25));
+    assert_eq!(shared.status.csma_cw_band, Some(4));
+    assert_eq!(shared.status.csma_cw_min, Some(3));
+    assert_eq!(shared.status.csma_cw_max, Some(7));
+    assert_eq!(shared.status.airtime_short, Some(10.0));
+    assert_eq!(shared.status.airtime_long, Some(25.0));
+    assert_eq!(shared.status.channel_load_short, Some(1.0));
+    assert_eq!(shared.status.channel_load_long, Some(2.0));
+    assert_eq!(shared.status.current_rssi, Some(0));
+    assert_eq!(shared.status.noise_floor, Some(-10));
+    assert_eq!(shared.status.interference, None);
+    assert_eq!(shared.status.symbol_time_ms, Some(1.0));
+    assert_eq!(shared.status.symbol_rate, Some(488));
+    assert_eq!(shared.status.preamble_symbols, Some(8));
+    assert_eq!(shared.status.preamble_time_ms, Some(16));
+    assert_eq!(shared.status.csma_slot_time_ms, Some(20));
+    assert_eq!(shared.status.csma_difs_ms, Some(40));
+
+    // Out-of-range temperature clears the stored reading.
+    apply_frames(&mut shared, &kiss_frame(CMD_STAT_TEMP, &[0]));
+    assert_eq!(shared.status.temperature, None);
+
+    // Explicit interference, then an 8-byte channel-time frame must not clear it.
+    let mut interference = chtm[..8].to_vec();
+    interference.extend_from_slice(&[157, 147, 180]);
+    apply_frames(&mut shared, &kiss_frame(CMD_STAT_CHTM, &interference));
+    assert_eq!(shared.status.interference, Some(180 - RSSI_OFFSET));
+    apply_frames(&mut shared, &kiss_frame(CMD_STAT_CHTM, &chtm[..8]));
+    assert_eq!(shared.status.interference, Some(23));
+
+    // 10-byte PHY (RNodeMulti) has no DIFS and leaves the previous one.
+    apply_frames(&mut shared, &kiss_frame(CMD_STAT_PHYPRM, &phy[..10]));
+    assert_eq!(shared.status.csma_difs_ms, Some(40));
+    assert_eq!(shared.status.csma_slot_time_ms, Some(20));
+
+    let mut kinds = RnodeShared::default();
+    apply_frames(
+        &mut kinds,
+        &kiss_frame(CMD_INTERFACES, &[0x00, 0x11, 0x01, 0x21]),
+    );
+    assert_eq!(kinds.subinterface_kinds, vec![0x11, 0x21]);
+    assert!(reported_kind_accepts_frequency(0x11, 867_500_000));
+    assert!(!reported_kind_accepts_frequency(0x21, 867_500_000));
+    assert!(reported_kind_accepts_frequency(0x21, 2_400_000_000));
+
+    let beacon = RnodeInterface::tcp("127.0.0.1:1", CONFIG).with_beacon(30, b"N0CALL");
+    assert_eq!(beacon.id_callsign(), Some(b"N0CALL".as_slice()));
+    let rejected = RnodeInterface::tcp("127.0.0.1:1", CONFIG).with_beacon(30, &[0u8; 33]);
+    assert!(rejected.id_callsign().is_none());
+
+    let manager = Arc::new(tokio::sync::Mutex::new(
+        reticulum::iface::InterfaceManager::new(1),
+    ));
+    let multi = RnodeMultiInterface::tcp("127.0.0.1:1", Vec::new(), manager)
+        .with_receive_only(1)
+        .with_beacon(30, b"N0CALL");
+    assert!(!multi.vport_outgoing(1));
+    assert!(multi.vport_outgoing(0));
+    assert_eq!(multi.id_callsign(), Some(b"N0CALL".as_slice()));
+}
+
+/// Mock device that records every host frame and echoes detect/config.
+async fn recording_rnode(
+    listener: TcpListener,
+    recorded: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
+    interfaces: Option<Vec<u8>>,
+) {
+    loop {
+        let Ok((socket, _)) = listener.accept().await else {
+            return;
+        };
+        socket.set_nodelay(true).ok();
+        let recorded = recorded.clone();
+        let interfaces = interfaces.clone();
+        tokio::spawn(async move {
+            let (mut reader, mut writer) = socket.into_split();
+            let mut carry = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let Ok(n) = reader.read(&mut buffer).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                carry.extend_from_slice(&buffer[..n]);
+                let (complete, rest) = finished_frames(&carry);
+                carry = rest;
+                for (command, payload) in complete {
+                    recorded.lock().unwrap().push((command, payload.clone()));
+                    let reply = match command {
+                        CMD_DETECT if payload.first() == Some(&DETECT_REQ) => {
+                            Some(kiss_frame(CMD_DETECT, &[DETECT_RESP]))
+                        }
+                        CMD_FW_VERSION => Some(kiss_frame(CMD_FW_VERSION, &[1, 60])),
+                        CMD_PLATFORM => Some(kiss_frame(CMD_PLATFORM, &[0x40])),
+                        CMD_MCU => Some(kiss_frame(CMD_MCU, &[0x30])),
+                        CMD_SEL_INT | CMD_RADIO_STATE | CMD_FREQUENCY | CMD_BANDWIDTH
+                        | CMD_TXPOWER | CMD_SF | CMD_CR => Some(kiss_frame(command, &payload)),
+                        CMD_INTERFACES => interfaces
+                            .as_ref()
+                            .map(|kinds| kiss_frame(CMD_INTERFACES, kinds)),
+                        _ => None,
+                    };
+                    if let Some(reply) = reply {
+                        if writer.write_all(&reply).await.is_err() || writer.flush().await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Complete KISS frames, leaving a trailing partial frame in the remainder.
+fn finished_frames(bytes: &[u8]) -> (Vec<(u8, Vec<u8>)>, Vec<u8>) {
+    let mut frames = Vec::new();
+    let mut current: Option<(u8, Vec<u8>)> = None;
+    let mut escaped = false;
+    let mut last_end = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == FEND {
+            if let Some(frame) = current.take() {
+                frames.push(frame);
+                last_end = index + 1;
+            }
+            continue;
+        }
+        match current.as_mut() {
+            None => current = Some((byte, Vec::new())),
+            Some((_, payload)) => {
+                if escaped {
+                    escaped = false;
+                    payload.push(match byte {
+                        TFEND => FEND,
+                        TFESC => FESC,
+                        _ => byte,
+                    });
+                } else if byte == FESC {
+                    escaped = true;
+                } else {
+                    payload.push(byte);
+                }
+            }
+        }
+    }
+    (frames, bytes[last_end..].to_vec())
+}
+
+fn data_by_vport(frames: &[(u8, Vec<u8>)]) -> Vec<(Option<u8>, Vec<u8>)> {
+    let mut selected = None;
+    let mut out = Vec::new();
+    for (command, payload) in frames {
+        if *command == CMD_SEL_INT && payload.len() == 1 {
+            selected = Some(payload[0]);
+        } else if *command == CMD_DATA {
+            out.push((selected, payload.clone()));
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn rnode_id_beacon_is_unpadded_callsign() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(recording_rnode(listener, recorded.clone(), None));
+
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let transport = Arc::new(TransportConfig::new("rnode-beacon", &identity).build());
+    let address = {
+        let manager = transport.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            RnodeInterface::tcp(format!("127.0.0.1:{port}"), CONFIG)
+                .with_manager(transport.iface_manager())
+                .with_beacon(1, b"N0CALL"),
+            RnodeInterface::spawn,
+        )
+    };
+
+    let online = async {
+        for _ in 0..100 {
+            let up = transport
+                .interface_stats()
+                .await
+                .iter()
+                .any(|stats| stats.address == address && stats.online);
+            if up {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+    .await;
+    assert!(online, "rnode must validate and come online");
+
+    let bitrate = transport
+        .iface_manager()
+        .lock()
+        .await
+        .with_control(&address, |control| control.bitrate);
+    assert_eq!(bitrate, Some(1758));
+
+    let destination = SingleInputDestination::new(
+        PrivateIdentity::new_from_rand(OsRng),
+        DestinationName::new("rnode", "beacon"),
+    );
+    transport
+        .send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), None)
+        .await;
+
+    let saw_beacon = async {
+        for _ in 0..60 {
+            let frames = recorded.lock().unwrap().clone();
+            if data_by_vport(&frames)
+                .iter()
+                .any(|(_, payload)| payload.as_slice() == b"N0CALL")
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+    .await;
+    assert!(saw_beacon, "id beacon must be the raw callsign");
+    let frames = recorded.lock().unwrap().clone();
+    assert!(data_by_vport(&frames)
+        .iter()
+        .any(|(_, payload)| payload.as_slice() == b"N0CALL"));
+}
+
+#[tokio::test]
+async fn rnode_multi_probes_interfaces_and_honors_outgoing() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(recording_rnode(
+        listener,
+        recorded.clone(),
+        Some(vec![0x00, 0x01, 0x01, 0x21]),
+    ));
+
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let transport = Arc::new(TransportConfig::new("rnode-multi", &identity).build());
+    let high = RnodeRadioConfig {
+        frequency: 2_400_000_000,
+        ..CONFIG
+    };
+    let parent = {
+        let manager = transport.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            RnodeMultiInterface::tcp(
+                format!("127.0.0.1:{port}"),
+                vec![
+                    RnodeVport {
+                        index: 0,
+                        config: CONFIG,
+                    },
+                    RnodeVport {
+                        index: 1,
+                        config: high,
+                    },
+                ],
+                transport.iface_manager(),
+            )
+            .with_receive_only(1)
+            .with_beacon(1, b"N0CALL"),
+            RnodeMultiInterface::spawn,
+        )
+    };
+
+    let peers = async {
+        for _ in 0..100 {
+            let stats = transport.interface_stats().await;
+            let peers: Vec<_> = stats
+                .iter()
+                .filter(|stats| stats.kind == "RnodeVportPeer")
+                .map(|stats| stats.address)
+                .collect();
+            let parent_up = stats
+                .iter()
+                .any(|stats| stats.address == parent && stats.online);
+            if parent_up && peers.len() == 2 {
+                return Some(peers);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+    .await;
+    let peers = peers.expect("both virtual ports must come online");
+
+    let parent_bitrate = transport
+        .iface_manager()
+        .lock()
+        .await
+        .with_control(&parent, |control| control.bitrate);
+    assert_eq!(parent_bitrate, Some(62_500));
+
+    {
+        let manager = transport.iface_manager();
+        let manager = manager.lock().await;
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(peers[0]),
+                packet: Packet::default(),
+            })
+            .await;
+    }
+
+    let packet_out = async {
+        for _ in 0..40 {
+            let frames = recorded.lock().unwrap().clone();
+            let data = data_by_vport(&frames);
+            if data
+                .iter()
+                .any(|(index, payload)| *index == Some(0) && payload.as_slice() != b"N0CALL")
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+    .await;
+    assert!(
+        packet_out,
+        "outgoing port transmits and the receive-only port does not"
+    );
+
+    {
+        let manager = transport.iface_manager();
+        let manager = manager.lock().await;
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(peers[1]),
+                packet: Packet::default(),
+            })
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    {
+        let frames = recorded.lock().unwrap().clone();
+        assert!(data_by_vport(&frames)
+            .iter()
+            .all(|(index, payload)| *index != Some(1) || payload.as_slice() == b"N0CALL"));
+    }
+
+    let beaconed = async {
+        for _ in 0..40 {
+            let frames = recorded.lock().unwrap().clone();
+            let data = data_by_vport(&frames);
+            let on_low = data
+                .iter()
+                .any(|(index, payload)| *index == Some(0) && payload.as_slice() == b"N0CALL");
+            let on_high = data
+                .iter()
+                .any(|(index, payload)| *index == Some(1) && payload.as_slice() == b"N0CALL");
+            if on_low && on_high {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+    .await;
+    assert!(
+        beaconed,
+        "beacon is sent on every virtual port, including receive-only"
+    );
+
+    let frames = recorded.lock().unwrap().clone();
+    assert!(frames
+        .iter()
+        .any(|(command, payload)| *command == CMD_INTERFACES && payload.as_slice() == [0x00]));
+}
+
+#[tokio::test]
+async fn rnode_multi_stays_offline_without_interface_probe() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(recording_rnode(
+        listener,
+        recorded.clone(),
+        Some(vec![0x00, 0x01]),
+    ));
+
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let transport = Arc::new(TransportConfig::new("rnode-multi-miss", &identity).build());
+    let address = {
+        let manager = transport.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            RnodeMultiInterface::tcp(
+                format!("127.0.0.1:{port}"),
+                vec![
+                    RnodeVport {
+                        index: 0,
+                        config: CONFIG,
+                    },
+                    RnodeVport {
+                        index: 1,
+                        config: CONFIG,
+                    },
+                ],
+                transport.iface_manager(),
+            ),
+            RnodeMultiInterface::spawn,
+        )
+    };
+
+    let mut probed = false;
+    for _ in 0..40 {
+        let frames = recorded.lock().unwrap().clone();
+        probed = frames
+            .iter()
+            .any(|(command, payload)| *command == CMD_INTERFACES && payload.as_slice() == [0x00]);
+        let online = transport
+            .interface_stats()
+            .await
+            .iter()
+            .any(|stats| stats.address == address && stats.online);
+        assert!(!online, "missing virtual port must keep the device offline");
+        if probed {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(probed, "RNodeMulti must send CMD_INTERFACES");
+    for _ in 0..30 {
+        let online = transport
+            .interface_stats()
+            .await
+            .iter()
+            .any(|stats| stats.address == address && stats.online);
+        assert!(!online, "missing virtual port must keep the device offline");
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
