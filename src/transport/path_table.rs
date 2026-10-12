@@ -48,18 +48,15 @@ pub struct PathEntry {
     pub gravity: Option<i64>,
 }
 
-/// Big-endian emission time stored in bytes `[5:10]` of one announce
-/// random blob (Python `Transport.timebase_from_random_blob`).
+/// Big-endian emission time in bytes `[5:10]` of one stored announce blob.
+/// Same 5-byte tail `announce_emitted` reads from an incoming packet.
 pub fn timebase_from_random_blob(random_blob: &[u8]) -> u64 {
-    if random_blob.len() <= 5 {
+    if random_blob.len() < RANDOM_BLOB_LEN {
         return 0;
     }
-    let bytes = &random_blob[5..random_blob.len().min(RANDOM_BLOB_LEN)];
-    let mut timebase = 0u64;
-    for byte in bytes {
-        timebase = (timebase << 8) | u64::from(*byte);
-    }
-    timebase
+    let mut bytes = [0u8; 8];
+    bytes[3..8].copy_from_slice(&random_blob[5..RANDOM_BLOB_LEN]);
+    u64::from_be_bytes(bytes)
 }
 
 /// Newest emission time among stored announce blobs
@@ -246,19 +243,19 @@ impl PathTable {
         transport_id: Option<AddressHash>,
         iface: AddressHash,
     ) {
-        // Callers that do not know the interface yet record a full-mode
-        // path with unset gravity. Transport passes the real values via
-        // `handle_announce_with_mode`.
+        // This default records full mode and unset gravity. Callers that
+        // know the interface should pass them to `handle_announce_with_mode`.
         self.handle_announce_with_mode(announce, transport_id, iface, InterfaceMode::Full, None);
     }
 
     /// Record an announce heard on an interface of `mode` with optional
-    /// `gravity` (Python path-table update in `Transport.inbound`).
+    /// `gravity`.
     ///
-    /// An equal hop count replaces the current path when the announce's
-    /// emission timebase is newer than `timebase_from_random_blobs` of the
-    /// stored blobs, or when both gravities are set and the new interface
-    /// is strictly heavier. Fewer hops still replace. More hops do not.
+    /// Fewer hops replace the current path. More hops do not. An equal hop
+    /// count replaces it when `announce_emitted` is newer than
+    /// `timebase_from_random_blobs` of the stored blobs, then when both
+    /// gravities are set and the new one is strictly heavier, then when
+    /// the path is unresponsive or `reroute_eager` is set.
     pub fn handle_announce_with_mode(
         &mut self,
         announce: &Packet,
@@ -269,9 +266,10 @@ impl PathTable {
     ) {
         let hops = announce.header.hops + 1;
         let new_blob = announce_random_blob(announce);
+        let emitted = crate::iface::control::announce_emitted(announce);
 
         let prior_blobs = if let Some(existing) = self.map.get(&announce.destination) {
-            if !self.should_replace_path(existing, hops, new_blob, gravity) {
+            if !self.should_replace_path(existing, hops, new_blob, emitted, gravity) {
                 return;
             }
             existing.random_blobs.clone()
@@ -305,15 +303,16 @@ impl PathTable {
         );
     }
 
-    /// Python's equal-or-better hop branch: a newer unseen emission wins,
-    /// and the same emission wins only when it arrived on a heavier
-    /// interface. Unresponsive paths and eager reroute keep today's
-    /// equal-hop recovery when those signals do not apply.
+    /// Fewer hops replace the path. More hops do not. Equal hops replace it
+    /// when the emission timebase is newer, then when both gravities are
+    /// set and the new one is heavier, then when the path is unresponsive
+    /// or `reroute_eager` is set.
     fn should_replace_path(
         &self,
         existing: &PathEntry,
         hops: u8,
         new_blob: Option<[u8; RANDOM_BLOB_LEN]>,
+        emitted: u64,
         gravity: Option<i64>,
     ) -> bool {
         if hops > existing.hops {
@@ -325,11 +324,10 @@ impl PathTable {
 
         let path_timebase = timebase_from_random_blobs(&existing.random_blobs);
         if let Some(blob) = new_blob {
-            let announce_emitted = timebase_from_random_blob(&blob);
-            if !existing.random_blobs.contains(&blob) && announce_emitted > path_timebase {
+            if !existing.random_blobs.contains(&blob) && emitted > path_timebase {
                 return true;
             }
-            if announce_emitted == path_timebase {
+            if emitted == path_timebase {
                 if let (Some(announce_gravity), Some(current_gravity)) = (gravity, existing.gravity)
                 {
                     if announce_gravity > current_gravity {
@@ -805,5 +803,10 @@ mod tests {
         assert_eq!(timebase_from_random_blob(&blob[..5]), 0);
         let older = [0u8; RANDOM_BLOB_LEN];
         assert_eq!(timebase_from_random_blobs(&[older, blob]), 0x1_0000);
+        let packet = announce_at(address(1), 0, 0x1_0000, 7);
+        assert_eq!(
+            crate::iface::control::announce_emitted(&packet),
+            timebase_from_random_blob(&announce_random_blob(&packet).unwrap())
+        );
     }
 }
