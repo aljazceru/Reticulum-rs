@@ -7,7 +7,7 @@ pub mod tcp_client;
 pub mod tcp_server;
 pub mod udp;
 
-#[cfg(all(feature = "iface-auto", target_os = "linux"))]
+#[cfg(feature = "iface-auto")]
 pub mod auto;
 #[cfg(feature = "iface-serial")]
 pub mod ax25;

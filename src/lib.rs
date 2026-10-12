@@ -31,7 +31,7 @@
 //! * `iface::serial::SerialInterface`, `iface::kiss::KissInterface` and AX.25
 //!   KISS via `KissInterface::new_ax25` (feature `iface-serial`): serial
 //!   ports with HDLC/KISS framing
-//! * `iface::auto::AutoInterface` (feature `iface-auto`, Linux): IPv6
+//! * `iface::auto::AutoInterface` (feature `iface-auto`): IPv6
 //!   link-local multicast peering with direct UDP unicast data
 //! * Kaonic
 //!

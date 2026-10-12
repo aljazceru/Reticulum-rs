@@ -11,13 +11,13 @@ use reticulum::storage::FsStorage;
 use reticulum::transport::TransportConfig;
 use tokio::signal;
 
-#[cfg(all(feature = "iface-auto", target_os = "linux"))]
+#[cfg(feature = "iface-auto")]
 use reticulum::iface::auto::AutoInterface;
-#[cfg(all(feature = "iface-auto", target_os = "linux"))]
+#[cfg(feature = "iface-auto")]
 use reticulum::iface::auto::AutoInterfaceConfig;
-#[cfg(all(feature = "iface-auto", target_os = "linux"))]
+#[cfg(feature = "iface-auto")]
 use reticulum::iface::auto::DiscoveryScope;
-#[cfg(all(feature = "iface-auto", target_os = "linux"))]
+#[cfg(feature = "iface-auto")]
 use reticulum::iface::auto::MulticastAddressType;
 #[cfg(feature = "iface-serial")]
 use reticulum::iface::kiss::CsmaParams;
@@ -306,7 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ignored_devices,
                 ..
             } => {
-                #[cfg(all(feature = "iface-auto", target_os = "linux"))]
+                #[cfg(feature = "iface-auto")]
                 {
                     let mut auto_config = AutoInterfaceConfig {
                         group_id: group_id.clone(),
@@ -353,7 +353,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     configure_iface(&iface_manager, &address, iface).await;
                 }
 
-                #[cfg(not(all(feature = "iface-auto", target_os = "linux")))]
+                #[cfg(not(feature = "iface-auto"))]
                 {
                     let _ = (
                         group_id,
@@ -365,7 +365,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ignored_devices,
                     );
                     log::warn!(
-                        "Interface '{}' type 'AutoInterface' requires building the daemon with --features iface-auto (Linux only)",
+                        "Interface '{}' type 'AutoInterface' requires building the daemon with --features iface-auto",
                         iface.name
                     );
                 }
