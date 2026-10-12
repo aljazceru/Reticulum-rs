@@ -112,9 +112,9 @@ pub struct PathRequests {
 /// (Python `discovery_path_requests[destination_hash]`).
 struct PendingDiscovery {
     deadline: Instant,
-    /// Wait that produced `deadline`. A later caller may lengthen it when
-    /// `medium_path_timeout` is larger, but not restart it: restarting
-    /// would let a stream of requestors keep the entry alive.
+    /// Wait that produced `deadline`. Elapsed time still counts: a longer
+    /// supplied wait extends the deadline by the difference, and a shorter
+    /// one does not shrink it.
     wait: Duration,
     ifaces: Vec<AddressHash>,
 }
@@ -257,11 +257,9 @@ impl PathRequests {
     /// the requestor was retained on a discovery that is already pending
     /// (do not search again) or when no requesting interface was given.
     ///
-    /// Batching does not restart the deadline. A supplied wait longer
-    /// than the one already stored lengthens it by the difference, which
-    /// is how a caller that only learns the medium timeout on a later
-    /// request still covers a slow link. A shorter wait does not shrink
-    /// an in-flight discovery.
+    /// Batching does not restart the deadline. Elapsed time still counts:
+    /// a longer supplied wait extends it by the difference, and a shorter
+    /// one does not shrink it.
     pub fn register_discovery_with_timeout(
         &mut self,
         destination: &AddressHash,
@@ -453,9 +451,8 @@ mod tests {
         let iface_a = AddressHash::new_from_rand(OsRng);
         let iface_b = AddressHash::new_from_rand(OsRng);
 
-        // Creation sites that still call `register_discovery` store 15s.
-        // A later caller that supplies a slower medium lengthens that
-        // wait by the difference and keeps the elapsed time.
+        // Elapsed time still counts: 40s on a pending 15s discovery
+        // extends the deadline by 25s. A shorter wait does not shrink it.
         testee.register_discovery(&dest, Some(iface_a));
         let created = testee.discovery.get(&dest).unwrap().deadline;
         assert_eq!(
