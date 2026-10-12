@@ -17,8 +17,8 @@
 //!   duplicate suppression for peers reachable over several interfaces.
 //!
 //! Local IPv6 addresses come from `/proc/net/if_inet6` on Linux and
-//! Android, `getifaddrs` on Apple, and `GetAdaptersAddresses` on Windows.
-//! Adoption and peer timing do not depend on that source.
+//! Android, `getifaddrs` on Apple and the BSDs, and `GetAdaptersAddresses`
+//! on Windows. Adoption and peer timing do not depend on that source.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -217,16 +217,11 @@ pub fn suitable_interfaces(
 /// `netinfo.ifaddresses`).
 #[cfg(any(target_os = "linux", target_os = "android", test))]
 fn parse_expanded_ipv6(hex: &str) -> Result<Ipv6Addr, ()> {
-    if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+    if hex.len() != 32 {
         return Err(());
     }
-
-    let mut bytes = [0u8; 16];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| ())?;
-    }
-
-    Ok(Ipv6Addr::from(bytes))
+    let value = u128::from_str_radix(hex, 16).map_err(|_| ())?;
+    Ok(Ipv6Addr::from(value.to_be_bytes()))
 }
 
 /// One IPv6 address reported by a platform enumerator, before adoption.
@@ -336,33 +331,27 @@ fn platform_skip_unless_allowed() -> &'static [&'static str] {
     }
 }
 
-/// `AutoInterface.descope_linklocal`: drop a `%ifname` zone and an embedded
-/// scope in the second group (`fe80:<scope>::` -> `fe80::`). `None` when
-/// the address is not a `fe80::/16` link-local.
+/// `AutoInterface.descope_linklocal`: rewrite an embedded scope in the
+/// second group (`fe80:<scope>::` -> `fe80::`). `None` when the address
+/// is not a `fe80::/16` link-local.
 fn descope_linklocal(addr: Ipv6Addr) -> Option<Ipv6Addr> {
     let text = addr.to_string();
-    let bare = text.split('%').next().unwrap_or(text.as_str());
-    if !bare.starts_with("fe80:") {
+    if !text.starts_with("fe80:") {
         return None;
     }
-    strip_embedded_scope(bare).parse().ok()
-}
-
-fn strip_embedded_scope(addr: &str) -> String {
-    let Some(rest) = addr.strip_prefix("fe80:") else {
-        return addr.to_string();
-    };
+    let rest = &text["fe80:".len()..];
     let hex_len = rest
         .bytes()
         .take_while(|byte| byte.is_ascii_hexdigit())
         .count();
-    if rest[hex_len..].starts_with("::") {
+    let rewritten = if rest[hex_len..].starts_with("::") {
         let mut out = String::from("fe80::");
         out.push_str(&rest[hex_len + 2..]);
         out
     } else {
-        addr.to_string()
-    }
+        text
+    };
+    rewritten.parse().ok()
 }
 
 fn platform_addresses() -> Vec<ObservedAddr> {
@@ -370,7 +359,12 @@ fn platform_addresses() -> Vec<ObservedAddr> {
     {
         linux_proc_addresses()
     }
-    #[cfg(target_vendor = "apple")]
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
     {
         apple_addresses()
     }
@@ -382,6 +376,9 @@ fn platform_addresses() -> Vec<ObservedAddr> {
         target_os = "linux",
         target_os = "android",
         target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
         windows
     )))]
     {
@@ -435,7 +432,13 @@ fn parse_proc_if_inet6(proc: &str) -> Vec<ObservedAddr> {
     found
 }
 
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    test
+))]
 #[repr(C)]
 struct AppleIfAddrs {
     ifa_next: *mut AppleIfAddrs,
@@ -447,7 +450,13 @@ struct AppleIfAddrs {
     ifa_data: *mut std::ffi::c_void,
 }
 
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    test
+))]
 #[repr(C)]
 struct AppleSockAddr {
     sa_len: u8,
@@ -455,7 +464,13 @@ struct AppleSockAddr {
     sa_data: [u8; 14],
 }
 
-#[cfg(any(target_vendor = "apple", test))]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    test
+))]
 #[repr(C)]
 struct AppleSockAddrIn6 {
     sin6_len: u8,
@@ -466,13 +481,27 @@ struct AppleSockAddrIn6 {
     sin6_scope_id: u32,
 }
 
-#[cfg(any(target_vendor = "apple", windows, test))]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    windows,
+    test
+))]
 fn ipv6_family() -> i32 {
     i32::from(socket2::Domain::IPV6)
 }
 
-/// Walk a `getifaddrs` list. `index_of` is `if_nametoindex` on Apple.
-#[cfg(any(target_vendor = "apple", test))]
+/// Walk a `getifaddrs` list. `index_of` is `if_nametoindex`.
+/// The `sa_len` sockaddr matches Apple, FreeBSD, NetBSD, and OpenBSD.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    test
+))]
 fn collect_apple(
     mut cur: *mut AppleIfAddrs,
     mut index_of: impl FnMut(*const std::ffi::c_char) -> u32,
@@ -502,7 +531,12 @@ fn collect_apple(
     found
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 fn apple_addresses() -> Vec<ObservedAddr> {
     extern "C" {
         fn getifaddrs(ifap: *mut *mut AppleIfAddrs) -> i32;
@@ -1142,30 +1176,26 @@ impl AutoInterface {
             return;
         }
 
-        // discovery token per interface (our own link-local address)
-        let tokens: HashMap<u32, [u8; 32]> = ifaces
-            .iter()
-            .map(|iface| {
-                (
-                    iface.ifindex,
-                    discovery_token(&config.group_id, &iface.link_local),
-                )
-            })
-            .collect();
-
-        // peer beacons: send discovery token to the multicast group
-        for (_, ifindex, socket) in &beacon_sockets {
+        // peer beacons: hash this interface's adopted link-local at send
+        // time. Index is not a key: Windows IfIndex is 0 for every
+        // IPv6-only adapter.
+        for (ifname, ifindex, socket) in &beacon_sockets {
             let cancel = cancel.clone();
-            let Some(token) = tokens.get(ifindex) else {
+            let Some(link_local) = ifaces
+                .iter()
+                .find(|iface| iface.name == *ifname)
+                .map(|iface| iface.link_local)
+            else {
                 continue;
             };
-            let token = *token;
+            let group_id = config.group_id.clone();
             let socket = socket.clone();
             let destination =
                 SocketAddrV6::new(discovery_address, config.discovery_port, 0, *ifindex);
 
             tokio::spawn(async move {
                 loop {
+                    let token = discovery_token(&group_id, &link_local);
                     let _ = socket.send_to(&token, destination).await;
 
                     tokio::select! {
@@ -1178,6 +1208,11 @@ impl AutoInterface {
 
         let reverse_peering_interval =
             Duration::from_secs_f64(ANNOUNCE_INTERVAL.as_secs_f64() * 3.25);
+
+        // Parked outside `select!`. A sleep built inside the select is
+        // dropped whenever a beacon arrives, so the 4s job would never run.
+        let mut peer_jobs = peer_job_interval();
+        peer_jobs.tick().await;
 
         stats.set_online(true);
         log::info!(
@@ -1238,7 +1273,7 @@ impl AutoInterface {
                     }
                 }
 
-                _ = tokio::time::sleep(PEER_JOB_INTERVAL) => {
+                _ = peer_jobs.tick() => {
                     let now = Instant::now();
 
                     for (addr, ifname) in discovery.expire(now, peering_timeout()) {
@@ -1251,20 +1286,27 @@ impl AutoInterface {
                     // reverse peering packets (reverse_announce): our own
                     // discovery token, unicast to the peer
                     for (addr, ifname) in discovery.take_reverse(now, reverse_peering_interval) {
-                        if let Some((_, ifindex, socket)) = beacon_sockets
+                        let Some(link_local) = ifaces
+                            .iter()
+                            .find(|iface| iface.name == ifname)
+                            .map(|iface| iface.link_local)
+                        else {
+                            continue;
+                        };
+                        let Some((_, ifindex, socket)) = beacon_sockets
                             .iter()
                             .find(|(name, _, _)| *name == ifname)
-                        {
-                            if let Some(token) = tokens.get(ifindex) {
-                                let destination = SocketAddrV6::new(
-                                    addr,
-                                    config.unicast_discovery_port(),
-                                    0,
-                                    *ifindex,
-                                );
-                                let _ = socket.send_to(token, destination).await;
-                            }
-                        }
+                        else {
+                            continue;
+                        };
+                        let token = discovery_token(&config.group_id, &link_local);
+                        let destination = SocketAddrV6::new(
+                            addr,
+                            config.unicast_discovery_port(),
+                            0,
+                            *ifindex,
+                        );
+                        let _ = socket.send_to(&token, destination).await;
                     }
                 }
             }
@@ -1313,6 +1355,14 @@ impl AutoInterface {
         log::debug!("auto: added peer {addr} on {ifname}");
         true
     }
+}
+
+/// Peer-job clock. The first tick completes immediately; callers skip it.
+/// Other `select!` branches cannot restart this wait.
+fn peer_job_interval() -> tokio::time::Interval {
+    let mut jobs = tokio::time::interval(PEER_JOB_INTERVAL);
+    jobs.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    jobs
 }
 
 fn peering_timeout() -> Duration {
@@ -1648,6 +1698,56 @@ not-a-row
         );
         assert_eq!(removed, vec![(peer, "eth0".to_string())]);
         assert_eq!(state.observe(peer, heard), DiscoveryEvent::New);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reverse_beacon_becomes_due_while_events_arrive() {
+        let mut jobs = peer_job_interval();
+        jobs.tick().await;
+
+        let peer: Ipv6Addr = "fe80::99".parse().unwrap();
+        let started = Instant::now();
+        let mut state = DiscoveryState::new(vec!["fe80::1".parse().unwrap()]);
+        state.insert(peer, "eth0", started);
+
+        let (tx, mut rx) = mpsc::channel::<()>(8);
+        let feeder = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let reverse_after = Duration::from_secs_f64(ANNOUNCE_INTERVAL.as_secs_f64() * 3.25);
+        let clock = tokio::time::Instant::now();
+        let mut due = Vec::new();
+        let mut events = 0u32;
+        for _ in 0..40 {
+            tokio::select! {
+                event = rx.recv() => {
+                    if event.is_none() {
+                        break;
+                    }
+                    events += 1;
+                    state.observe(peer, started + clock.elapsed());
+                }
+                _ = jobs.tick() => {
+                    due = state.take_reverse(started + clock.elapsed(), reverse_after);
+                    if !due.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        feeder.abort();
+
+        assert!(
+            events > 4,
+            "traffic should arrive more often than the 4s job, got {events}"
+        );
+        assert_eq!(due, vec![(peer, "eth0".to_string())]);
     }
 
     #[test]
