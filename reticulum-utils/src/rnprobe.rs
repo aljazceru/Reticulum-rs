@@ -1,12 +1,17 @@
-//! `rnprobe` — probe transport instances by measuring round-trip times
-//! to the fixed `rnstransport.probe` destination
+//! `rnprobe` — probe a destination by measuring round-trip times
 //! (Python `RNS/Utilities/rnprobe.py`).
+//!
+//! The destination hash is the probe target. An optional full name
+//! (`app.aspects`, usually `rnstransport.probe`) must hash to that
+//! destination for the recalled identity.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::common::{build_tool_transport, resolve_config_dir, ToolTransportOptions};
+use reticulum::destination::DestinationName;
 use reticulum::hash::AddressHash;
+use reticulum::identity::Identity;
 use reticulum::transport::Transport;
 
 /// Default probe payload size in bytes (Python `DEFAULT_PROBE_SIZE`).
@@ -23,6 +28,12 @@ pub struct ProbeOptions {
     pub probes: usize,
     /// UDP loopback fallback ports when the config has no interfaces.
     pub udp_loopback: Option<(u16, u16)>,
+    /// Delay before each probe after the first (`--wait`).
+    pub wait: Duration,
+    /// Full destination name in dotted notation (`app.aspects`).
+    /// When set, the recalled identity must hash to `destination` under
+    /// this name.
+    pub full_name: Option<String>,
 }
 
 impl Default for ProbeOptions {
@@ -33,7 +44,42 @@ impl Default for ProbeOptions {
             timeout: DEFAULT_TIMEOUT,
             probes: 1,
             udp_loopback: Some((4996, 4997)),
+            wait: Duration::ZERO,
+            full_name: None,
         }
+    }
+}
+
+/// Split `app.aspect.more` into the app name and the aspect string.
+pub fn split_destination_name(full_name: &str) -> Result<(String, String), String> {
+    let Some((app, aspects)) = full_name.split_once('.') else {
+        return Err(
+            "The full destination name including application name aspects must be specified"
+                .to_string(),
+        );
+    };
+    if app.is_empty() || aspects.is_empty() || aspects.split('.').any(|part| part.is_empty()) {
+        return Err(
+            "The full destination name including application name aspects must be specified"
+                .to_string(),
+        );
+    }
+    Ok((app.to_string(), aspects.to_string()))
+}
+
+/// Address hash of `full_name` for `identity`.
+pub fn destination_for_aspect_name(
+    full_name: &str,
+    identity: &Identity,
+) -> Result<AddressHash, String> {
+    let (app, aspects) = split_destination_name(full_name)?;
+    Ok(DestinationName::new(&app, &aspects).address_hash_for(identity))
+}
+
+/// Sleep between probes. The first probe (`already_sent == 0`) does not wait.
+pub async fn await_probe_gap(already_sent: usize, wait: Duration) {
+    if already_sent > 0 && !wait.is_zero() {
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -76,14 +122,32 @@ pub async fn probe_with(
         return Err(reticulum::error::RnsError::LinkNotReady);
     }
 
+    let destination = if let Some(name) = options.full_name.as_deref() {
+        let identity = transport
+            .recall(destination)
+            .await
+            .ok_or(reticulum::error::RnsError::LinkNotReady)?;
+        let addressed = destination_for_aspect_name(name, &identity)
+            .map_err(|_| reticulum::error::RnsError::InvalidArgument)?;
+        if addressed != *destination {
+            return Err(reticulum::error::RnsError::InvalidArgument);
+        }
+        addressed
+    } else {
+        *destination
+    };
+
     let mut receipts = transport.receipt_events();
     let mut results = Vec::new();
 
-    for _ in 0..options.probes {
+    for sent in 0..options.probes {
+        await_probe_gap(sent, options.wait).await;
         let payload: Vec<u8> = (0..options.size).map(|i| (i % 251) as u8).collect();
 
         let started = Instant::now();
-        transport.send_to_destination(destination, &payload).await?;
+        transport
+            .send_to_destination(&destination, &payload)
+            .await?;
 
         let proof = tokio::time::timeout(options.timeout, receipts.recv()).await;
         match proof {

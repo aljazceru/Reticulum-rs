@@ -49,6 +49,7 @@ async fn rnx_remote_execution_roundtrip() {
         config_dir: client_dir.clone(),
         timeout: Duration::from_secs(20),
         udp_loopback: Some((5004, 5003)),
+        ..Default::default()
     };
 
     // Derive the destination hash from the identity file.
@@ -121,6 +122,7 @@ async fn rnsh_session_command_roundtrip() {
 
     listener.abort();
 }
+
 
 /// Local PTY only: the child sees a tty, and the test applies `TIOCSWINSZ` on the local PTY.
 #[tokio::test]
@@ -225,4 +227,59 @@ async fn read_pty_text(
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn rnx_propagates_nonzero_remote_status_from_exit_message() {
+    let request = reticulum_utils::rnx::encode_request("exit 7", 5, Some(64), Some(64), None);
+    let response = reticulum_utils::rnx::execute_request(&request).await;
+    let decoded = reticulum_utils::rnx::decode_exec_response(&response).expect("exit message");
+    assert!(decoded.executed, "command must have run");
+    assert_eq!(reticulum_utils::rnx::remote_exit_code(&decoded), 7);
+
+    let capped = reticulum_utils::rnx::encode_request(
+        "printf stdout-data; printf stderr-data >&2",
+        5,
+        Some(6),
+        Some(3),
+        None,
+    );
+    let capped = reticulum_utils::rnx::decode_exec_response(
+        &reticulum_utils::rnx::execute_request(&capped).await,
+    )
+    .expect("capped output");
+    assert_eq!(capped.stdout, b"stdout");
+    assert_eq!(capped.stderr, b"std");
+    assert!(capped.stdout_len > capped.stdout.len() as u64);
+    assert!(capped.stderr_len > capped.stderr.len() as u64);
+
+    let dir = std::env::temp_dir().join(format!("rn-rnx-stdin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let stdin_file = dir.join("stdin.txt");
+    std::fs::write(&stdin_file, b"hello-stdin").unwrap();
+    let stdin = reticulum_utils::rnx::stdin_payload(None, Some(&stdin_file))
+        .expect("stdin file")
+        .expect("bytes");
+    let echoed = reticulum_utils::rnx::encode_request("cat", 5, Some(4), Some(0), Some(&stdin));
+    let echoed = reticulum_utils::rnx::decode_exec_response(
+        &reticulum_utils::rnx::execute_request(&echoed).await,
+    )
+    .expect("stdin echo");
+    assert_eq!(echoed.stdout, b"hell");
+    assert_eq!(echoed.stdout_len, b"hello-stdin".len() as u64);
+    assert!(echoed.stderr.is_empty());
+
+    assert!(matches!(
+        reticulum_utils::rnx::interactive_step(" exit "),
+        reticulum_utils::rnx::InteractiveStep::Stop
+    ));
+    assert!(matches!(
+        reticulum_utils::rnx::interactive_step("quit"),
+        reticulum_utils::rnx::InteractiveStep::Stop
+    ));
+    assert!(matches!(
+        reticulum_utils::rnx::interactive_step("clear"),
+        reticulum_utils::rnx::InteractiveStep::Clear
+    ));
 }

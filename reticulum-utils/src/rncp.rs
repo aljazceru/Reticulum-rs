@@ -134,6 +134,119 @@ pub fn unique_path(dir: &Path, filename: &str) -> PathBuf {
     unreachable!()
 }
 
+/// Path to store a received file under `dir`.
+///
+/// Without `allow_overwrite`, an existing file is left in place and the
+/// new file gets a `.1`, `.2`, … suffix. With `allow_overwrite`, the
+/// existing file is removed first; if that removal fails, the numbered
+/// name is used instead.
+pub fn receive_path(dir: &Path, filename: &str, allow_overwrite: bool) -> PathBuf {
+    if allow_overwrite {
+        let direct = dir.join(sanitize_filename(filename));
+        if direct.is_file() && std::fs::remove_file(&direct).is_err() {
+            log::error!(
+                "Could not overwrite existing file {}, renaming instead",
+                direct.display()
+            );
+        }
+    }
+    unique_path(dir, filename)
+}
+
+/// First existing file wins: `/etc/rncp/allowed_identities`, then
+/// `~/.config/rncp/allowed_identities`, then `~/.rncp/allowed_identities`.
+pub fn default_allowed_identity_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from("/etc/rncp/allowed_identities")];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let home = PathBuf::from(home);
+            paths.push(home.join(".config/rncp/allowed_identities"));
+            paths.push(home.join(".rncp/allowed_identities"));
+        }
+    }
+    paths
+}
+
+/// Load the first existing allowed-identities file from `paths`.
+pub fn load_allowed_identities_at(paths: &[PathBuf]) -> Result<Vec<AddressHash>, String> {
+    for path in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).map_err(|err| {
+            format!(
+                "Error while parsing allowed_identities file {}: {err}",
+                path.display()
+            )
+        })?;
+        let mut loaded = Vec::new();
+        for line in text.replace('\r', "").split('\n') {
+            if line.len() != 32 {
+                continue;
+            }
+            loaded.push(
+                crate::common::parse_hash(line)
+                    .map_err(|err| format!("Could not apply allowed identity: {err}"))?,
+            );
+        }
+        log::info!(
+            "Loaded {} allowed identities from {}",
+            loaded.len(),
+            path.display()
+        );
+        return Ok(loaded);
+    }
+    Ok(Vec::new())
+}
+
+/// Transfer progress text. `None` when `quiet` or `silent` so callers
+/// print nothing. `phy_bps` adds a physical-layer rate when `Some`.
+pub fn progress_line(
+    quiet: bool,
+    silent: bool,
+    prefix: &str,
+    percent: f64,
+    got: u64,
+    total: u64,
+    speed_bps: f64,
+    phy_bps: Option<f64>,
+) -> Option<String> {
+    if quiet || silent {
+        return None;
+    }
+    let mut line = format!(
+        "{prefix} {percent:.1}% - {} of {} - {}ps",
+        size_str(got as f64, false),
+        size_str(total as f64, false),
+        size_str(speed_bps, true),
+    );
+    if let Some(phy_bps) = phy_bps {
+        line.push_str(&format!(
+            " ({}ps at physical layer)",
+            size_str(phy_bps, true)
+        ));
+    }
+    Some(line)
+}
+
+fn size_str(mut num: f64, bits: bool) -> String {
+    if bits {
+        num *= 8.0;
+    }
+    let suffix = if bits { "b" } else { "B" };
+    const UNITS: [&str; 8] = ["", "K", "M", "G", "T", "P", "E", "Z"];
+    for unit in UNITS {
+        if num.abs() < 1000.0 {
+            if unit.is_empty() {
+                return format!("{num:.0} {unit}{suffix}");
+            }
+            return format!("{num:.2} {unit}{suffix}");
+        }
+        num /= 1000.0;
+    }
+    format!("{num:.2} Y{suffix}")
+}
+
 // ---------------------------------------------------------------------------
 // Response value packing (msgpack, like Python umsgpack.packb)
 // ---------------------------------------------------------------------------
@@ -227,6 +340,9 @@ pub struct ServeOptions {
     pub no_compress: bool,
     pub identity_path: Option<PathBuf>,
     pub udp_loopback: Option<(u16, u16)>,
+    /// Replace an existing file instead of saving `name.1`, `name.2`, …
+    /// (`-O`/`--overwrite`).
+    pub allow_overwrite: bool,
 }
 
 fn sender_allowed(
@@ -250,6 +366,7 @@ impl Default for ServeOptions {
             no_compress: false,
             identity_path: None,
             udp_loopback: None,
+            allow_overwrite: false,
         }
     }
 }
@@ -296,10 +413,17 @@ pub async fn serve_with_shutdown(
     // Authentication is opt-out only. An empty allowlist is deliberately
     // deny-all, rather than silently turning the listener into an open relay.
     let allow_all = options.no_auth;
-    if options.allowed.is_empty() && !options.no_auth {
+    let allowed_from_file = if allow_all {
+        Vec::new()
+    } else {
+        load_allowed_identities_at(&default_allowed_identity_paths())?
+    };
+    let mut allowed_ids = options.allowed.clone();
+    allowed_ids.extend(allowed_from_file);
+    if allowed_ids.is_empty() && !allow_all {
         log::warn!("No allowed identities configured, rncp will not accept any files! (use --no-auth to accept anyone)");
     }
-    let allowed: HashSet<AddressHash> = options.allowed.iter().copied().collect();
+    let allowed: HashSet<AddressHash> = allowed_ids.iter().copied().collect();
 
     let transport = Arc::new(transport);
 
@@ -520,7 +644,7 @@ pub async fn serve_with_shutdown(
                             .as_deref()
                             .and_then(unpack_metadata)
                             .unwrap_or_default();
-                        let path = unique_path(&options.save_dir, &name);
+                        let path = receive_path(&options.save_dir, &name, options.allow_overwrite);
                         if let Err(err) = std::fs::write(&path, &data) {
                             log::error!("Could not save received file to {}: {err}", path.display());
                             continue;
@@ -565,6 +689,10 @@ pub struct SendOptions {
     pub silent: bool,
     pub identity_path: Option<PathBuf>,
     pub udp_loopback: Option<(u16, u16)>,
+    /// Suppress transfer progress lines (`-q`/`--quiet`).
+    pub quiet: bool,
+    /// Append a physical-layer rate to progress lines (`-P`/`--phy-rates`).
+    pub phy_rates: bool,
 }
 
 /// Establish a link to an announced destination, identifying with the rncp
@@ -659,11 +787,11 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
         &options.destination,
         &identity,
         options.timeout,
-        options.silent,
+        options.silent || options.quiet,
     )
     .await?;
 
-    if !options.silent {
+    if !options.silent && !options.quiet {
         println!("Advertising file resource");
     }
     // Subscribe BEFORE starting the transfer: the broadcast channel has
@@ -683,11 +811,13 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
         .await
         .map_err(|err| format!("Could not start transfer: {err:?}"))?;
 
-    wait_for_transfer(
+    transfer_progress(
         &mut events,
         &resource_hash,
         options.timeout.max(Duration::from_secs(60)),
-        !options.silent,
+        options.quiet,
+        options.silent,
+        options.phy_rates,
     )
     .await?;
 
@@ -715,6 +845,12 @@ pub struct FetchOptions {
     pub save_dir: Option<PathBuf>,
     pub identity_path: Option<PathBuf>,
     pub udp_loopback: Option<(u16, u16)>,
+    /// Suppress transfer progress lines (`-q`/`--quiet`).
+    pub quiet: bool,
+    /// Append a physical-layer rate to progress lines (`-P`/`--phy-rates`).
+    pub phy_rates: bool,
+    /// Replace an existing file instead of saving `name.1`, `name.2`, …
+    pub allow_overwrite: bool,
 }
 
 /// Fetch a file from a remote rncp listener that allows fetching.
@@ -736,11 +872,11 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
         &options.destination,
         &identity,
         options.timeout,
-        options.silent,
+        options.silent || options.quiet,
     )
     .await?;
 
-    if !options.silent {
+    if !options.silent && !options.quiet {
         println!("Requesting file from remote");
     }
     // Subscribe BEFORE the request: the server starts the file resource
@@ -780,12 +916,29 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
 
     // The response resource follows; wait for it to complete.
     let deadline = tokio::time::Instant::now() + options.timeout.max(Duration::from_secs(60));
+    let started = tokio::time::Instant::now();
+    let mut last_percent = -1.0f64;
     let saved = loop {
         let event = tokio::time::timeout_at(deadline, events.recv())
             .await
             .map_err(|_| "transfer timed out".to_string())?
             .map_err(|_| "resource events closed".to_string())?;
         if event.status != ResourceStatus::Complete {
+            if let Some(line) = event_progress_line(
+                &event,
+                started.elapsed(),
+                options.quiet,
+                options.silent,
+                options.phy_rates,
+                "Transferring file",
+            ) {
+                let percent = (event.progress * 100.0 * 10.0).round() / 10.0;
+                if percent > last_percent {
+                    last_percent = percent;
+                    print!("\r{line}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+            }
             continue;
         }
         let Some(data) = event.data else { continue };
@@ -799,7 +952,7 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
             .clone()
             .unwrap_or_else(|| PathBuf::from("."));
         std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-        let path = unique_path(&dir, &name);
+        let path = receive_path(&dir, &name, options.allow_overwrite);
         std::fs::write(&path, &data).map_err(|err| err.to_string())?;
         break path;
     };
@@ -850,7 +1003,52 @@ pub async fn wait_for_transfer(
     timeout: Duration,
     show_progress: bool,
 ) -> Result<(), String> {
+    transfer_progress(events, resource_hash, timeout, false, !show_progress, false).await
+}
+
+fn event_progress_line(
+    event: &reticulum::resource::ResourceEvent,
+    elapsed: Duration,
+    quiet: bool,
+    silent: bool,
+    phy_rates: bool,
+    prefix: &str,
+) -> Option<String> {
+    let percent = (event.progress * 100.0 * 10.0).round() / 10.0;
+    let (got, total, phy_got) = event
+        .advertisement
+        .as_ref()
+        .map(|advertisement| {
+            let total = advertisement.data_size as u64;
+            let got = (event.progress * total as f64) as u64;
+            let phy_got = (event.progress * advertisement.transfer_size as f64) as u64;
+            (got, total, phy_got)
+        })
+        .unwrap_or((0, 0, 0));
+    let elapsed = elapsed.as_secs_f64().max(0.001);
+    let phy_bps = phy_rates.then_some(phy_got as f64 / elapsed);
+    progress_line(
+        quiet,
+        silent,
+        prefix,
+        percent,
+        got,
+        total,
+        got as f64 / elapsed,
+        phy_bps,
+    )
+}
+
+async fn transfer_progress(
+    events: &mut tokio::sync::broadcast::Receiver<reticulum::resource::ResourceEvent>,
+    resource_hash: &reticulum::hash::Hash,
+    timeout: Duration,
+    quiet: bool,
+    silent: bool,
+    phy_rates: bool,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + timeout;
+    let started = tokio::time::Instant::now();
     let mut last_percent = -1.0f64;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -867,18 +1065,32 @@ pub async fn wait_for_transfer(
         match event.status {
             ResourceStatus::Complete => {
                 if !is_final_segment {
-                    if show_progress {
+                    if let Some(line) = event_progress_line(
+                        &event,
+                        started.elapsed(),
+                        quiet,
+                        silent,
+                        phy_rates,
+                        "Transferring file",
+                    ) {
                         let percent = (event.progress * 100.0 * 10.0).round() / 10.0;
                         if percent > last_percent {
                             last_percent = percent;
-                            print!("\rTransferring file {percent:.1}%");
+                            print!("\r{line}");
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                         }
                     }
                     continue;
                 }
-                if show_progress {
-                    print!("\rTransfer complete  100.0%\n");
+                if let Some(line) = event_progress_line(
+                    &event,
+                    started.elapsed(),
+                    quiet,
+                    silent,
+                    phy_rates,
+                    "Transfer complete ",
+                ) {
+                    print!("\r{line}\n");
                 }
                 return Ok(());
             }
@@ -889,11 +1101,18 @@ pub async fn wait_for_transfer(
                 return Err("The file was not accepted by the remote".to_string());
             }
             status => {
-                if show_progress {
+                if let Some(line) = event_progress_line(
+                    &event,
+                    started.elapsed(),
+                    quiet,
+                    silent,
+                    phy_rates,
+                    "Transferring file",
+                ) {
                     let percent = (event.progress * 100.0 * 10.0).round() / 10.0;
                     if percent > last_percent {
                         last_percent = percent;
-                        print!("\rTransferring file {percent:.1}%");
+                        print!("\r{line}");
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                 }

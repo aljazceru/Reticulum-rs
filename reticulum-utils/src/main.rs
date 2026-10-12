@@ -122,12 +122,33 @@ struct XArgs {
     allowed: Vec<String>,
     /// Command to execute remotely
     command: Option<String>,
+    /// Same as the positional command (`--command`)
+    #[arg(long = "command")]
+    command_flag: Option<String>,
     /// Hexadecimal hash of the listener (execute mode)
     #[arg(short, long)]
     destination: Option<String>,
     /// Timeout in seconds
     #[arg(short = 'w', long)]
     timeout: Option<f64>,
+    /// Read commands until `exit`, `quit`, or EOF
+    #[arg(short = 'x', long)]
+    interactive: bool,
+    /// Exit with the remote command's status
+    #[arg(short = 'm', long)]
+    mirror: bool,
+    /// Text written to the remote command's stdin
+    #[arg(long)]
+    stdin: Option<String>,
+    /// File whose contents are written to the remote command's stdin
+    #[arg(long = "stdin-file")]
+    stdin_file: Option<PathBuf>,
+    /// Maximum bytes of stdout returned
+    #[arg(long)]
+    stdout: Option<u64>,
+    /// Maximum bytes of stderr returned
+    #[arg(long)]
+    stderr: Option<u64>,
     /// Debug helper: bind a UDP loopback interface LISTEN:FORWARD
     #[arg(long)]
     udp_loopback: Option<String>,
@@ -196,6 +217,8 @@ struct ProbeArgs {
     config: Option<PathBuf>,
     /// Hexadecimal hash of the probe destination
     destination: Option<String>,
+    /// Full destination name when given after the hash (`app.aspects`)
+    aspect_name: Option<String>,
     /// Payload size in bytes
     #[arg(short, long)]
     size: Option<usize>,
@@ -205,6 +228,12 @@ struct ProbeArgs {
     /// Timeout in seconds before giving up
     #[arg(short = 'w', long)]
     timeout: Option<f64>,
+    /// Seconds to wait between probes
+    #[arg(long, default_value_t = 0.0)]
+    wait: f64,
+    /// Full destination name (`app.aspects`), for example `rnstransport.probe`
+    #[arg(long = "name")]
+    name: Option<String>,
     /// UDP loopback ports LISTEN:FORWARD instead of configured interfaces
     #[arg(long)]
     udp_loopback: Option<String>,
@@ -258,6 +287,15 @@ struct CpArgs {
     /// Disable transfer progress output
     #[arg(short = 'S', long)]
     silent: bool,
+    /// Decrease verbosity and suppress transfer progress
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    /// Allow overwriting received files instead of adding a numeric suffix
+    #[arg(short = 'O', long)]
+    overwrite: bool,
+    /// Display physical layer transfer rates
+    #[arg(short = 'P', long)]
+    phy_rates: bool,
     /// Announce interval in seconds (0 = only at startup)
     #[arg(short = 'b', long, default_value_t = 0)]
     announce: u64,
@@ -455,7 +493,7 @@ async fn run_status(args: StatusArgs) -> Result<(), String> {
 }
 
 async fn run_cp(args: CpArgs) -> Result<(), String> {
-    init_logging(args.verbose);
+    init_logging(args.verbose.saturating_sub(args.quiet));
     let timeout = duration_arg(args.timeout, reticulum_utils::rncp::DEFAULT_TIMEOUT);
     let udp_loopback = args.udp_loopback.as_deref().and_then(parse_udp_loopback);
 
@@ -485,6 +523,7 @@ async fn run_cp(args: CpArgs) -> Result<(), String> {
             no_compress: args.no_compress,
             identity_path: args.identity.clone(),
             udp_loopback,
+            allow_overwrite: args.overwrite,
         };
         return reticulum_utils::rncp::serve(options).await;
     }
@@ -509,6 +548,9 @@ async fn run_cp(args: CpArgs) -> Result<(), String> {
             save_dir: args.save.clone(),
             identity_path: args.identity.clone(),
             udp_loopback,
+            quiet: args.quiet > 0,
+            phy_rates: args.phy_rates,
+            allow_overwrite: args.overwrite,
         };
         let message = reticulum_utils::rncp::fetch(options).await?;
         println!("{message}");
@@ -522,6 +564,8 @@ async fn run_cp(args: CpArgs) -> Result<(), String> {
             silent: args.silent,
             identity_path: args.identity.clone(),
             udp_loopback,
+            quiet: args.quiet > 0,
+            phy_rates: args.phy_rates,
         };
         let message = reticulum_utils::rncp::send(options).await?;
         println!("{message}");
@@ -548,13 +592,9 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let destination = args
-        .destination
-        .as_deref()
-        .map(parse_hash)
-        .transpose()
-        .map_err(|err| err.to_string())?
-        .ok_or("a destination hash is required (or use --loopback)")?;
+    let (destination_text, aspect_name) =
+        probe_target(args.destination, args.aspect_name, args.name)?;
+    let destination = parse_hash(&destination_text)?;
 
     let udp_loopback = parse_udp_pair(args.udp_loopback.as_deref());
 
@@ -566,6 +606,8 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
         timeout: duration_arg(args.timeout, reticulum_utils::rnprobe::DEFAULT_TIMEOUT),
         probes: args.probes,
         udp_loopback,
+        wait: Duration::from_secs_f64(args.wait.max(0.0)),
+        full_name: aspect_name,
     };
 
     let results = reticulum_utils::rnprobe::probe(&destination, &options)
@@ -577,6 +619,26 @@ async fn run_probe(args: ProbeArgs) -> Result<(), String> {
         reticulum_utils::rnprobe::render_results(&destination, &results)
     );
     Ok(())
+}
+
+fn probe_target(
+    destination: Option<String>,
+    aspect_name: Option<String>,
+    name_flag: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    let aspect = name_flag.or(aspect_name);
+    match (destination, aspect) {
+        (None, _) => Err("a destination hash is required (or use --loopback)".to_string()),
+        (Some(first), Some(second)) if first.contains('.') && !second.contains('.') => {
+            Ok((second, Some(first)))
+        }
+        (Some(first), second) => {
+            if first.contains('.') && second.is_none() {
+                return Err("a destination hash is required (or use --loopback)".to_string());
+            }
+            Ok((first, second))
+        }
+    }
 }
 
 fn parse_udp_pair(spec: Option<&str>) -> Option<(u16, u16)> {
@@ -608,9 +670,6 @@ async fn run_x(args: XArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let command = args
-        .command
-        .ok_or("a command is required (or use --serve)")?;
     let destination = args
         .destination
         .as_deref()
@@ -619,23 +678,100 @@ async fn run_x(args: XArgs) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or("a destination hash is required")?;
 
+    let stdin = match (&args.stdin, &args.stdin_file) {
+        (Some(_), Some(_)) => {
+            return Err("pass only one of --stdin and --stdin-file".to_string());
+        }
+        (inline, file) => reticulum_utils::rnx::stdin_payload(inline.as_deref(), file.as_deref())?,
+    };
     let options = reticulum_utils::rnx::ExecOptions {
         config_dir: reticulum_utils::common::resolve_config_dir(args.config.as_deref()),
         timeout: duration_arg(args.timeout, std::time::Duration::from_secs(30)),
         udp_loopback,
+        stdin,
+        stdout_limit: args.stdout,
+        stderr_limit: args.stderr,
     };
 
-    let result = reticulum_utils::rnx::execute(&destination, &command, &options).await?;
+    if let Some(command) = args.command_flag.as_deref().or(args.command.as_deref()) {
+        run_remote_command(
+            &destination,
+            command,
+            &options,
+            args.mirror && !args.interactive,
+        )
+        .await?;
+    } else if !args.interactive {
+        return Err("a command is required (or use --serve)".to_string());
+    }
+
+    if args.interactive {
+        let mut loop_options = options.clone();
+        loop_options.stdin = None;
+        let stdin = std::io::stdin();
+        let mut last_code = 0i32;
+        loop {
+            if args.mirror && last_code != 0 {
+                print!("{last_code}> ");
+            } else {
+                print!("> ");
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut line = String::new();
+            if stdin.read_line(&mut line).map_err(|err| err.to_string())? == 0 {
+                break;
+            }
+            match reticulum_utils::rnx::interactive_step(&line) {
+                reticulum_utils::rnx::InteractiveStep::Stop => break,
+                reticulum_utils::rnx::InteractiveStep::Clear => print!("\x1b[c"),
+                reticulum_utils::rnx::InteractiveStep::Run(command) if command.is_empty() => {}
+                reticulum_utils::rnx::InteractiveStep::Run(command) => {
+                    match run_remote_command(&destination, &command, &loop_options, false).await {
+                        Ok(code) => last_code = code,
+                        Err(err) => {
+                            eprintln!("{err}");
+                            last_code = 0;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_remote_command(
+    destination: &reticulum::hash::AddressHash,
+    command: &str,
+    options: &reticulum_utils::rnx::ExecOptions,
+    mirror: bool,
+) -> Result<i32, String> {
+    let result = reticulum_utils::rnx::execute(destination, command, options).await?;
     print!("{}", String::from_utf8_lossy(&result.stdout));
     if !result.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&result.stderr));
     }
-
+    let truncated = (options.stdout_limit != Some(0)
+        && (result.stdout.len() as u64) < result.stdout_len)
+        || (options.stderr_limit != Some(0) && (result.stderr.len() as u64) < result.stderr_len);
+    if truncated {
+        eprintln!("\nOutput truncated before being returned:");
+        if !result.stdout.is_empty() && (result.stdout.len() as u64) < result.stdout_len {
+            eprintln!("  stdout truncated to {} bytes", result.stdout.len());
+        }
+        if !result.stderr.is_empty() && (result.stderr.len() as u64) < result.stderr_len {
+            eprintln!("  stderr truncated to {} bytes", result.stderr.len());
+        }
+    }
     if !result.executed {
         return Err("remote did not execute the command".to_string());
     }
-
-    Ok(())
+    let code = reticulum_utils::rnx::remote_exit_code(&result);
+    if mirror && code != 0 {
+        std::process::exit(code);
+    }
+    Ok(code)
 }
 
 async fn run_sh(args: ShArgs) -> Result<(), String> {

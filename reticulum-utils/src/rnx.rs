@@ -111,6 +111,79 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
     Ok(address)
 }
 
+/// One line from an interactive session (`exit`/`quit` stop, `clear`
+/// clears the screen, anything else is a command).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InteractiveStep {
+    Stop,
+    Clear,
+    Run(String),
+}
+
+pub fn interactive_step(line: &str) -> InteractiveStep {
+    match line.trim().to_ascii_lowercase().as_str() {
+        "exit" | "quit" => InteractiveStep::Stop,
+        "clear" => InteractiveStep::Clear,
+        _ => InteractiveStep::Run(line.trim().to_string()),
+    }
+}
+
+/// Read stdin bytes from an inline string or a file. A file wins when
+/// both are set.
+pub fn stdin_payload(
+    inline: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<Option<Vec<u8>>, String> {
+    if let Some(path) = file {
+        return std::fs::read(path)
+            .map(Some)
+            .map_err(|err| format!("could not read stdin file {}: {err}", path.display()));
+    }
+    Ok(inline.map(|text| text.as_bytes().to_vec()))
+}
+
+/// Encode a `command` request:
+/// `[command, timeout, stdout_limit, stderr_limit, stdin]`.
+/// `None` limits and stdin are msgpack nil (no cap / no stdin).
+pub fn encode_request(
+    command: &str,
+    timeout_secs: u64,
+    stdout_limit: Option<u64>,
+    stderr_limit: Option<u64>,
+    stdin: Option<&[u8]>,
+) -> Vec<u8> {
+    use rmp::encode as mp;
+    let mut request = Vec::new();
+    mp::write_array_len(&mut request, 5).ok();
+    mp::write_str(&mut request, command).ok();
+    mp::write_u64(&mut request, timeout_secs).ok();
+    match stdout_limit {
+        Some(limit) => {
+            mp::write_u64(&mut request, limit).ok();
+        }
+        None => {
+            mp::write_nil(&mut request).ok();
+        }
+    }
+    match stderr_limit {
+        Some(limit) => {
+            mp::write_u64(&mut request, limit).ok();
+        }
+        None => {
+            mp::write_nil(&mut request).ok();
+        }
+    }
+    match stdin {
+        Some(data) => {
+            mp::write_bin(&mut request, data).ok();
+        }
+        None => {
+            mp::write_nil(&mut request).ok();
+        }
+    }
+    request
+}
+
 /// Decode the request payload and execute the command
 /// (Python `execute_received_command`).
 pub async fn execute_request(data: &[u8]) -> Vec<u8> {
@@ -118,129 +191,271 @@ pub async fn execute_request(data: &[u8]) -> Vec<u8> {
 
     let mut cursor = std::io::Cursor::new(data);
     let Ok(Value::Array(items)) = rmpv::decode::read_value(&mut cursor) else {
-        return pack_result(None);
+        return pack_failure(now_secs());
     };
 
-    let command = items
-        .first()
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+    let command = match items.first() {
+        Some(value) => value
+            .as_str()
+            .map(|text| text.to_string())
+            .or_else(|| {
+                value
+                    .as_slice()
+                    .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok())
+            })
+            .unwrap_or_default(),
+        None => String::new(),
+    };
 
     // [command, timeout, o_limit, e_limit, stdin]
     let timeout_secs = items
         .get(1)
-        .and_then(|v| v.as_u64())
+        .and_then(|value| value.as_u64().or_else(|| value.as_i64().map(|n| n as u64)))
         .unwrap_or(30)
         .clamp(1, 3600);
+    let stdout_limit = optional_limit(items.get(2));
+    let stderr_limit = optional_limit(items.get(3));
+    let stdin = optional_bytes(items.get(4));
 
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    let started = now_secs();
 
     // The request handler runs while the transport handler is locked, so
     // a blocking `Command::output()` (e.g. `sleep 100000`) would stall
     // the whole transport despite the client-supplied timeout. Run the
     // child asynchronously with a kill timer instead.
     Box::pin(async move {
-        let child = match tokio::process::Command::new("sh")
+        let mut command_line = tokio::process::Command::new("sh");
+        command_line
             .arg("-c")
             .arg(&command)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .stdin(std::process::Stdio::null())
-            .spawn()
-        {
+            .stdin(if stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            });
+        let mut child = match command_line.spawn() {
             Ok(child) => child,
-            Err(_) => return pack_result(None),
+            Err(_) => return pack_failure(started),
         };
 
-        // wait_with_output consumes the child; use a kill-on-timeout
-        // wrapper that keeps a handle for start_kill.
-        let mut child = child;
-        let wait = async {
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let mut stdin_pipe = child.stdin.take();
+
+        let stdout_task = tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut stdout = Vec::new();
-            let mut stderr = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
+            if let Some(mut pipe) = stdout_pipe {
                 let _ = pipe.read_to_end(&mut stdout).await;
             }
-            if let Some(mut pipe) = child.stderr.take() {
+            stdout
+        });
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = stderr_pipe {
                 let _ = pipe.read_to_end(&mut stderr).await;
             }
-            let status = child.wait().await.ok();
-            status.map(|status| std::process::Output {
-                status,
-                stdout,
-                stderr,
-            })
+            stderr
+        });
+
+        if let (Some(data), Some(mut pipe)) = (stdin.as_ref(), stdin_pipe.take()) {
+            use tokio::io::AsyncWriteExt;
+            let _ = pipe.write_all(data).await;
+        }
+
+        let status = tokio::select! {
+            status = child.wait() => status.ok(),
+            _ = tokio::time::sleep(Duration::from_secs(timeout_secs.max(1))) => {
+                let _ = child.start_kill();
+                None
+            }
         };
 
-        let output =
-            match tokio::time::timeout(Duration::from_secs(timeout_secs.max(1)), wait).await {
-                Ok(Some(output)) => Some(output),
-                // timed out: kill the child so it cannot linger.
-                Err(_) => {
-                    let _ = child.start_kill();
-                    None
-                }
-                _ => None,
-            };
+        let stdout = match tokio::time::timeout(Duration::from_secs(1), stdout_task).await {
+            Ok(Ok(stdout)) => stdout,
+            _ => Vec::new(),
+        };
+        let stderr = match tokio::time::timeout(Duration::from_secs(1), stderr_task).await {
+            Ok(Ok(stderr)) => stderr,
+            _ => Vec::new(),
+        };
 
-        let concluded = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let Some(status) = status else {
+            return pack_failure(started);
+        };
 
-        match output {
-            Some(output) => pack_result(Some((output, started, concluded))),
-            None => pack_result(None),
-        }
+        let stdout_len = stdout.len() as u64;
+        let stderr_len = stderr.len() as u64;
+        let stdout = cap_output(&stdout, stdout_limit);
+        let stderr = cap_output(&stderr, stderr_limit);
+        pack_success(
+            status.code().unwrap_or(-1) as i64,
+            &stdout,
+            &stderr,
+            stdout_len,
+            stderr_len,
+            started,
+            now_secs(),
+        )
     })
     .await
 }
 
-/// Pack the response list (Python `result` layout).
-fn pack_result(result: Option<(std::process::Output, f64, f64)>) -> Vec<u8> {
-    use rmp::encode as mp;
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
-    let mut out = Vec::new();
-    mp::write_array_len(&mut out, 8).ok();
+fn optional_limit(value: Option<&rmpv::Value>) -> Option<u64> {
+    let value = value?;
+    if value.is_nil() {
+        return None;
+    }
+    value.as_u64().or_else(|| {
+        value
+            .as_i64()
+            .filter(|number| *number >= 0)
+            .map(|number| number as u64)
+    })
+}
 
-    match result {
-        Some((output, started, concluded)) => {
-            mp::write_bool(&mut out, true).ok();
-            mp::write_i64(&mut out, output.status.code().unwrap_or(-1) as i64).ok();
-            mp::write_bin(&mut out, &output.stdout).ok();
-            mp::write_bin(&mut out, &output.stderr).ok();
-            mp::write_u64(&mut out, output.stdout.len() as u64).ok();
-            mp::write_u64(&mut out, output.stderr.len() as u64).ok();
-            mp::write_f64(&mut out, started).ok();
-            mp::write_f64(&mut out, concluded).ok();
-        }
-        None => {
-            mp::write_bool(&mut out, false).ok();
-            for _ in 0..5 {
-                mp::write_nil(&mut out).ok();
+fn optional_bytes(value: Option<&rmpv::Value>) -> Option<Vec<u8>> {
+    match value? {
+        rmpv::Value::Nil => None,
+        rmpv::Value::Binary(bytes) => Some(bytes.clone()),
+        rmpv::Value::String(text) => text.as_str().map(|text| text.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn cap_output(data: &[u8], limit: Option<u64>) -> Vec<u8> {
+    match limit {
+        None => data.to_vec(),
+        Some(0) => Vec::new(),
+        Some(limit) => {
+            let limit = limit as usize;
+            if data.len() > limit {
+                data[..limit].to_vec()
+            } else {
+                data.to_vec()
             }
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-            mp::write_f64(&mut out, now).ok();
-            mp::write_nil(&mut out).ok();
         }
     }
+}
 
+fn pack_failure(started: f64) -> Vec<u8> {
+    use rmp::encode as mp;
+    let mut out = Vec::new();
+    mp::write_array_len(&mut out, 8).ok();
+    mp::write_bool(&mut out, false).ok();
+    for _ in 0..5 {
+        mp::write_nil(&mut out).ok();
+    }
+    mp::write_f64(&mut out, started).ok();
+    mp::write_nil(&mut out).ok();
     out
 }
 
+fn pack_success(
+    retval: i64,
+    stdout: &[u8],
+    stderr: &[u8],
+    stdout_len: u64,
+    stderr_len: u64,
+    started: f64,
+    concluded: f64,
+) -> Vec<u8> {
+    use rmp::encode as mp;
+    let mut out = Vec::new();
+    mp::write_array_len(&mut out, 8).ok();
+    mp::write_bool(&mut out, true).ok();
+    mp::write_i64(&mut out, retval).ok();
+    mp::write_bin(&mut out, stdout).ok();
+    mp::write_bin(&mut out, stderr).ok();
+    mp::write_u64(&mut out, stdout_len).ok();
+    mp::write_u64(&mut out, stderr_len).ok();
+    mp::write_f64(&mut out, started).ok();
+    mp::write_f64(&mut out, concluded).ok();
+    out
+}
+
+/// Decode a command response into the remote status and captured output.
+pub fn decode_exec_response(data: &[u8]) -> Result<ExecResult, String> {
+    let mut cursor = std::io::Cursor::new(data);
+    let value =
+        rmpv::decode::read_value(&mut cursor).map_err(|err| format!("invalid response: {err}"))?;
+    let rmpv::Value::Array(items) = value else {
+        return Err("invalid response shape".to_string());
+    };
+    let executed = items
+        .first()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let retval = items
+        .get(1)
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|number| number as i64))
+        })
+        .unwrap_or(-1);
+    let stdout = bytes_field(items.get(2));
+    let stderr = bytes_field(items.get(3));
+    let stdout_len = items
+        .get(4)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(stdout.len() as u64);
+    let stderr_len = items
+        .get(5)
+        .and_then(|value| value.as_u64())
+        .unwrap_or(stderr.len() as u64);
+    Ok(ExecResult {
+        executed,
+        retval,
+        stdout,
+        stderr,
+        stdout_len,
+        stderr_len,
+    })
+}
+
+fn bytes_field(value: Option<&rmpv::Value>) -> Vec<u8> {
+    match value {
+        Some(rmpv::Value::Binary(bytes)) => bytes.clone(),
+        Some(rmpv::Value::String(text)) => text
+            .as_str()
+            .map(|text| text.as_bytes().to_vec())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Process status to propagate for a decoded result. A command that did
+/// not run yields 248; otherwise the remote code, clamped to a byte.
+pub fn remote_exit_code(result: &ExecResult) -> i32 {
+    if !result.executed {
+        return 248;
+    }
+    result.retval.clamp(0, 255) as i32
+}
+
 /// Options for executing a command remotely (`rnx <command>`).
+#[derive(Clone)]
 pub struct ExecOptions {
     pub config_dir: PathBuf,
     pub timeout: Duration,
     pub udp_loopback: Option<(u16, u16)>,
+    /// Bytes written to the remote command's stdin.
+    pub stdin: Option<Vec<u8>>,
+    /// Maximum stdout bytes returned. `None` means no cap.
+    pub stdout_limit: Option<u64>,
+    /// Maximum stderr bytes returned. `None` means no cap.
+    pub stderr_limit: Option<u64>,
 }
 
 impl Default for ExecOptions {
@@ -249,6 +464,9 @@ impl Default for ExecOptions {
             config_dir: resolve_config_dir(None),
             timeout: Duration::from_secs(30),
             udp_loopback: Some((4996, 4997)),
+            stdin: None,
+            stdout_limit: None,
+            stderr_limit: None,
         }
     }
 }
@@ -258,6 +476,10 @@ pub struct ExecResult {
     pub retval: i64,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Untruncated stdout length reported by the remote.
+    pub stdout_len: u64,
+    /// Untruncated stderr length reported by the remote.
+    pub stderr_len: u64,
 }
 
 /// Execute `command` on the remote listener identified by the announce
@@ -308,14 +530,13 @@ pub async fn execute(
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let mut request = Vec::new();
-    use rmp::encode as mp;
-    mp::write_array_len(&mut request, 5).ok();
-    mp::write_str(&mut request, command).ok();
-    mp::write_u64(&mut request, options.timeout.as_secs()).ok();
-    mp::write_u64(&mut request, 1024 * 1024).ok();
-    mp::write_u64(&mut request, 1024 * 1024).ok();
-    mp::write_bin(&mut request, &[]).ok();
+    let request = encode_request(
+        command,
+        options.timeout.as_secs(),
+        options.stdout_limit,
+        options.stderr_limit,
+        options.stdin.as_deref(),
+    );
 
     let rid = transport
         .request(&link, "command", &request)
@@ -327,35 +548,5 @@ pub async fn execute(
         .await
         .ok_or("no response from remote")?;
 
-    let mut cursor = std::io::Cursor::new(&response);
-    let value =
-        rmpv::decode::read_value(&mut cursor).map_err(|e| format!("invalid response: {e}"))?;
-
-    let rmpv::Value::Array(items) = value else {
-        return Err("invalid response shape".to_string());
-    };
-
-    let executed = items.first().and_then(|v| v.as_bool()).unwrap_or(false);
-    let retval = items.get(1).and_then(|v| v.as_i64()).unwrap_or(-1);
-    let stdout = items
-        .get(2)
-        .and_then(|v| match v {
-            rmpv::Value::Binary(bytes) => Some(bytes.to_vec()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let stderr = items
-        .get(3)
-        .and_then(|v| match v {
-            rmpv::Value::Binary(bytes) => Some(bytes.to_vec()),
-            _ => None,
-        })
-        .unwrap_or_default();
-
-    Ok(ExecResult {
-        executed,
-        retval,
-        stdout,
-        stderr,
-    })
+    decode_exec_response(&response)
 }
