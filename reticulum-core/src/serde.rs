@@ -48,6 +48,10 @@ impl Header {
     pub fn deserialize(buffer: &mut InputBuffer) -> Result<Header, RnsError> {
         let mut header = Header::from_meta(buffer.read_byte()?);
         header.hops = buffer.read_byte()?;
+        // Python Packet.unpack rejects hops >= Transport.PATHFINDER_M.
+        if header.hops >= crate::packet::PATHFINDER_M {
+            return Err(RnsError::PacketError);
+        }
 
         Ok(header)
     }

@@ -52,6 +52,9 @@ pub const TRUNCATED_HASHLENGTH_BYTES: usize = 16;
 /// Full hash length in bytes.
 pub const HASHLENGTH_BYTES: usize = 32;
 
+/// Python `RNS.Transport.PATHFINDER_M`. Unpack rejects a hop byte at or above this.
+pub(crate) const PATHFINDER_M: u8 = 128;
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum IfacFlag {
     Open = 0b0,
@@ -343,5 +346,34 @@ impl fmt::Display for Packet {
         write!(f, " 0x[{}]]", self.data.len())?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::buffer::InputBuffer;
+    use crate::error::RnsError;
+    use crate::packet::Packet;
+
+    /// Header type 1: flags, hops, 16-byte destination, context, one data byte.
+    fn wire(hops: u8) -> [u8; 20] {
+        let mut raw = [0u8; 20];
+        raw[1] = hops;
+        raw[19] = 1;
+        raw
+    }
+
+    #[test]
+    fn unpack_rejects_hop_128() {
+        let raw = wire(128);
+        let err = Packet::deserialize(&mut InputBuffer::new(&raw)).unwrap_err();
+        assert_eq!(err, RnsError::PacketError);
+    }
+
+    #[test]
+    fn unpack_accepts_hop_127() {
+        let raw = wire(127);
+        let packet = Packet::deserialize(&mut InputBuffer::new(&raw)).expect("hop 127 is valid");
+        assert_eq!(packet.header.hops, 127);
     }
 }
