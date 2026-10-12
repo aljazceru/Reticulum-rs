@@ -10,10 +10,11 @@
 //! `CommandExitedMessage`.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use reticulum::channel::Message;
 use reticulum::destination::{DestinationName, ProofStrategy};
@@ -63,6 +64,10 @@ pub enum RnshMessage {
         pipe_stdout: bool,
         pipe_stderr: bool,
         term: Option<String>,
+        rows: Option<u32>,
+        cols: Option<u32>,
+        hpix: Option<u32>,
+        vpix: Option<u32>,
     },
     StreamData {
         stream_id: u16,
@@ -187,6 +192,10 @@ impl Message for RnshMessage {
                 pipe_stdout,
                 pipe_stderr,
                 term,
+                rows,
+                cols,
+                hpix,
+                vpix,
             } => {
                 let cmdline = match cmdline {
                     Some(args) => rmpv::Value::Array(
@@ -201,15 +210,15 @@ impl Message for RnshMessage {
                     (*pipe_stdin).into(),
                     (*pipe_stdout).into(),
                     (*pipe_stderr).into(),
-                    rmpv::Value::Nil, // tcflags (terminal attributes, unused)
+                    rmpv::Value::Nil, // tcflags
                     match term {
                         Some(t) => rmpv::Value::String(t.as_str().into()),
                         None => rmpv::Value::Nil,
                     },
-                    rmpv::Value::Nil, // rows
-                    rmpv::Value::Nil, // cols
-                    rmpv::Value::Nil, // hpix
-                    rmpv::Value::Nil, // vpix
+                    pack_opt_u32(*rows),
+                    pack_opt_u32(*cols),
+                    pack_opt_u32(*hpix),
+                    pack_opt_u32(*vpix),
                 ]);
                 rmpv_to_bytes(&tuple)
             }
@@ -290,6 +299,10 @@ impl Message for RnshMessage {
                     pipe_stdout: items.get(2).map(unpack_opt_bool).unwrap_or(false),
                     pipe_stderr: items.get(3).map(unpack_opt_bool).unwrap_or(false),
                     term: items.get(5).and_then(unpack_opt_string),
+                    rows: items.get(6).and_then(unpack_opt_u32),
+                    cols: items.get(7).and_then(unpack_opt_u32),
+                    hpix: items.get(8).and_then(unpack_opt_u32),
+                    vpix: items.get(9).and_then(unpack_opt_u32),
                 })
             }
             MSG_STREAM_DATA => {
@@ -420,6 +433,10 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
     let allowed: HashSet<AddressHash> = options.allowed.iter().copied().collect();
     let default_command = options.default_command.clone();
     let allow_remote_command = options.allow_remote_command;
+    let config_dir = options.config_dir.clone();
+    if !allow_all && allowed.is_empty() && load_allowed_identity_files(&config_dir).is_empty() {
+        log::warn!("No allowed identities configured, rnsh will not accept any connections");
+    }
     tokio::spawn(async move {
         let mut link_events = event_transport.in_link_events();
         loop {
@@ -433,23 +450,30 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
                         event.id,
                         default_command.clone(),
                         allow_remote_command,
+                        None,
                     )
                     .await;
                 }
                 reticulum::destination::link::LinkEvent::RemoteIdentified(identity)
-                    if !allow_all && remote_authorized(false, &allowed, Some(&identity)) =>
+                    if !allow_all =>
                 {
-                    start_session(
-                        event_transport.clone(),
-                        event.id,
-                        default_command.clone(),
-                        allow_remote_command,
-                    )
-                    .await;
-                }
-                reticulum::destination::link::LinkEvent::RemoteIdentified(_) if !allow_all => {
-                    log::warn!("rnsh: unauthorized identity attempted a session");
-                    let _ = event_transport.link_close(event.id).await;
+                    // Reload on each link, same as the Python listener.
+                    let mut effective = allowed.clone();
+                    effective.extend(load_allowed_identity_files(&config_dir));
+                    if remote_authorized(false, &effective, Some(&identity)) {
+                        let remote = crate::common::prettyhexrep(identity.address_hash.as_slice());
+                        start_session(
+                            event_transport.clone(),
+                            event.id,
+                            default_command.clone(),
+                            allow_remote_command,
+                            Some(remote),
+                        )
+                        .await;
+                    } else {
+                        log::warn!("rnsh: unauthorized identity attempted a session");
+                        let _ = event_transport.link_close(event.id).await;
+                    }
                 }
                 _ => {}
             }
@@ -475,6 +499,7 @@ async fn start_session(
     link_id: reticulum::destination::link::LinkId,
     default_command: Option<Vec<String>>,
     allow_remote_command: bool,
+    remote_identity: Option<String>,
 ) {
     let Some(link) = find_link(&transport, link_id).await else {
         return;
@@ -485,13 +510,8 @@ async fn start_session(
     };
 
     tokio::spawn(async move {
-        let mut child: Option<tokio::process::Child> = None;
+        let mut session: Option<SessionProcess> = None;
         let mut version_exchanged = false;
-        // Subscribe before consuming the execute command: stdin frames
-        // arriving right after it must not be missed by a subscription
-        // created only later (Python keeps one message handler across
-        // the whole session).
-        let stdin_receiver = channel.subscribe();
 
         while let Ok(message) = receiver.recv().await {
             match message {
@@ -527,7 +547,13 @@ async fn start_session(
                 RnshMessage::ExecuteCommand {
                     cmdline,
                     pipe_stdin,
-                    ..
+                    pipe_stdout,
+                    pipe_stderr,
+                    term,
+                    rows,
+                    cols,
+                    hpix,
+                    vpix,
                 } if version_exchanged => {
                     let mut command = default_command.clone().unwrap_or_default();
                     match cmdline {
@@ -554,22 +580,16 @@ async fn start_session(
                         command = vec![std::env::var("SHELL").unwrap_or_else(|_| "sh".into())];
                     }
 
-                    let mut builder = tokio::process::Command::new(&command[0]);
-                    builder.args(&command[1..]);
-                    builder.stdout(std::process::Stdio::piped());
-                    builder.stderr(std::process::Stdio::piped());
-                    builder.stdin(if pipe_stdin {
-                        std::process::Stdio::piped()
-                    } else {
-                        std::process::Stdio::null()
-                    });
-                    builder.env(
-                        "TERM",
-                        std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
-                    );
-
-                    match builder.spawn() {
-                        Ok(spawned) => child = Some(spawned),
+                    match spawn_session_process(
+                        &command,
+                        pipe_stdin,
+                        pipe_stdout,
+                        pipe_stderr,
+                        term.as_deref(),
+                        remote_identity.as_deref(),
+                        winsize_tuple(rows, cols, hpix, vpix),
+                    ) {
+                        Ok(spawned) => session = Some(spawned),
                         Err(err) => {
                             let _ = send_when_ready(
                                 &channel,
@@ -588,16 +608,17 @@ async fn start_session(
             }
         }
 
-        let Some(mut child) = child else { return };
+        let Some(mut session) = session else { return };
 
-        // Stream stdout and stderr back as StreamDataMessages.
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
+        let stdout = session.take_stdout();
+        let stderr = session.take_stderr();
+        let mut stdin = session.take_stdin();
+        let winsize = session.winsize_fd.clone();
 
         let channel_out = channel.clone();
         let stdout_task = tokio::spawn(async move {
-            if let Some(mut stdout) = stdout {
+            let mut stdout = stdout;
+            if let Some(stdout) = stdout.as_mut() {
                 let mut buffer = vec![0u8; stream_chunk_size(&channel_out.link).await];
                 loop {
                     match stdout.read(&mut buffer).await {
@@ -629,7 +650,8 @@ async fn start_session(
 
         let channel_err = channel.clone();
         let stderr_task = tokio::spawn(async move {
-            if let Some(mut stderr) = stderr {
+            let mut stderr = stderr;
+            if let Some(stderr) = stderr.as_mut() {
                 let mut buffer = vec![0u8; stream_chunk_size(&channel_err.link).await];
                 loop {
                     match stderr.read(&mut buffer).await {
@@ -650,37 +672,415 @@ async fn start_session(
             }
         });
 
-        // If the initiator wants to pipe stdin, forward stream data to
-        // the child process.
-        if let Some(mut stdin) = stdin {
-            tokio::spawn(async move {
-                let mut receiver = stdin_receiver;
-                while let Ok(message) = receiver.recv().await {
-                    if let RnshMessage::StreamData {
+        // Same receiver that accepted ExecuteCommand, so a WindowSize or
+        // stdin frame that follows it is not dropped.
+        tokio::spawn(async move {
+            while let Ok(message) = receiver.recv().await {
+                match message {
+                    RnshMessage::WindowSize {
+                        rows,
+                        cols,
+                        hpix,
+                        vpix,
+                    } => {
+                        if let Some(fd) = &winsize {
+                            let _ = apply_winsize(fd, rows, cols, hpix, vpix);
+                        }
+                    }
+                    RnshMessage::StreamData {
                         stream_id: STREAM_ID_STDIN,
                         data,
                         eof,
-                    } = message
-                    {
-                        if !data.is_empty() && stdin.write_all(&data).await.is_err() {
-                            break;
+                    } => {
+                        if let Some(writer) = stdin.as_mut() {
+                            if !data.is_empty() && writer.write_all(&data).await.is_err() {
+                                break;
+                            }
                         }
                         if eof {
-                            stdin.flush().await.ok();
-                            break;
+                            stdin.take();
                         }
                     }
+                    _ => {}
                 }
-            });
-        }
+            }
+        });
 
         let _ = stdout_task.await;
         let _ = stderr_task.await;
 
-        let status = child.wait().await;
+        let status = session.wait().await;
         let return_code = status.ok().and_then(|s| s.code());
         let _ = send_when_ready(&channel, RnshMessage::CommandExited { return_code }).await;
     });
+}
+
+/// Child process for one listener session.
+///
+/// A PTY is opened unless stdin, stdout, and stderr are all pipes.
+pub struct SessionProcess {
+    child: tokio::process::Child,
+    stdin: Option<SessionWriter>,
+    stdout: Option<SessionReader>,
+    stderr: Option<SessionReader>,
+    winsize_fd: Option<Arc<std::fs::File>>,
+}
+
+/// Read end of a session pipe or PTY master.
+pub struct SessionReader {
+    inner: Box<dyn AsyncRead + Send + Unpin>,
+}
+
+/// Write end of a session pipe or PTY master.
+pub struct SessionWriter {
+    inner: Box<dyn AsyncWrite + Send + Unpin>,
+}
+
+impl SessionReader {
+    pub async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).await
+    }
+}
+
+impl SessionWriter {
+    pub async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(data).await
+    }
+}
+
+impl SessionProcess {
+    pub fn take_stdin(&mut self) -> Option<SessionWriter> {
+        self.stdin.take()
+    }
+
+    pub fn take_stdout(&mut self) -> Option<SessionReader> {
+        self.stdout.take()
+    }
+
+    pub fn take_stderr(&mut self) -> Option<SessionReader> {
+        self.stderr.take()
+    }
+
+    /// Apply a window-size update (`TIOCSWINSZ` on the PTY master).
+    pub fn set_window_size(
+        &self,
+        rows: Option<u32>,
+        cols: Option<u32>,
+        hpix: Option<u32>,
+        vpix: Option<u32>,
+    ) -> std::io::Result<()> {
+        match &self.winsize_fd {
+            Some(fd) => apply_winsize(fd, rows, cols, hpix, vpix),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child.wait().await
+    }
+
+    pub fn start_kill(&mut self) -> std::io::Result<()> {
+        self.child.start_kill()
+    }
+}
+
+/// Spawn `argv`. `initial` is applied to the PTY before exec when one is opened.
+pub fn spawn_session_process(
+    argv: &[String],
+    pipe_stdin: bool,
+    pipe_stdout: bool,
+    pipe_stderr: bool,
+    term: Option<&str>,
+    remote_identity: Option<&str>,
+    initial: Option<(u16, u16, u16, u16)>,
+) -> std::io::Result<SessionProcess> {
+    if argv.is_empty() || argv[0].is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty command",
+        ));
+    }
+
+    let use_pty = !(pipe_stdin && pipe_stdout && pipe_stderr);
+    let mut master = None;
+    let mut slave = None;
+    if use_pty {
+        let (master_fd, slave_fd) = open_pty_pair()?;
+        if let Some((rows, cols, hpix, vpix)) = initial {
+            let _ = apply_winsize_raw(master_fd.as_raw_fd(), rows, cols, hpix, vpix);
+        }
+        master = Some(master_fd);
+        slave = Some(slave_fd);
+    }
+
+    let mut builder = tokio::process::Command::new(&argv[0]);
+    builder.args(&argv[1..]);
+    builder.kill_on_drop(true);
+    builder.env(
+        "TERM",
+        term.map(str::to_string)
+            .or_else(|| std::env::var("TERM").ok())
+            .unwrap_or_else(|| "xterm".to_string()),
+    );
+    builder.env("RNS_REMOTE_IDENTITY", remote_identity.unwrap_or(""));
+
+    if pipe_stdin {
+        builder.stdin(std::process::Stdio::piped());
+    } else if let Some(slave) = slave.as_ref() {
+        builder.stdin(std::process::Stdio::from(slave.try_clone()?));
+    } else {
+        builder.stdin(std::process::Stdio::null());
+    }
+    if pipe_stdout {
+        builder.stdout(std::process::Stdio::piped());
+    } else if let Some(slave) = slave.as_ref() {
+        builder.stdout(std::process::Stdio::from(slave.try_clone()?));
+    } else {
+        builder.stdout(std::process::Stdio::null());
+    }
+    if pipe_stderr {
+        builder.stderr(std::process::Stdio::piped());
+    } else if let Some(slave) = slave.as_ref() {
+        builder.stderr(std::process::Stdio::from(slave.try_clone()?));
+    } else {
+        builder.stderr(std::process::Stdio::null());
+    }
+
+    if use_pty {
+        let tty_fd = if !pipe_stdin {
+            0
+        } else if !pipe_stdout {
+            1
+        } else {
+            2
+        };
+        unsafe {
+            builder.pre_exec(move || {
+                prepare_child_tty(tty_fd);
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = builder.spawn()?;
+    drop(slave);
+
+    let mut winsize_fd = None;
+    let mut stdin = None;
+    let mut stdout = None;
+    let mut stderr = None;
+    if let Some(master) = master {
+        let shared = Arc::new(master);
+        winsize_fd = Some(Arc::clone(&shared));
+        if !pipe_stdin {
+            if let Ok(dup) = shared.try_clone() {
+                stdin = Some(file_writer(dup));
+            }
+        }
+        if !pipe_stdout {
+            if let Ok(dup) = shared.try_clone() {
+                stdout = Some(file_reader(dup));
+            }
+        } else if !pipe_stderr {
+            if let Ok(dup) = shared.try_clone() {
+                stderr = Some(file_reader(dup));
+            }
+        }
+    }
+    if pipe_stdin {
+        if let Some(pipe) = child.stdin.take() {
+            stdin = Some(SessionWriter {
+                inner: Box::new(pipe),
+            });
+        }
+    }
+    if pipe_stdout {
+        if let Some(pipe) = child.stdout.take() {
+            stdout = Some(SessionReader {
+                inner: Box::new(pipe),
+            });
+        }
+    }
+    if pipe_stderr {
+        if let Some(pipe) = child.stderr.take() {
+            stderr = Some(SessionReader {
+                inner: Box::new(pipe),
+            });
+        }
+    }
+
+    Ok(SessionProcess {
+        child,
+        stdin,
+        stdout,
+        stderr,
+        winsize_fd,
+    })
+}
+
+fn file_reader(file: std::fs::File) -> SessionReader {
+    SessionReader {
+        inner: Box::new(tokio::fs::File::from_std(file)),
+    }
+}
+
+fn file_writer(file: std::fs::File) -> SessionWriter {
+    SessionWriter {
+        inner: Box::new(tokio::fs::File::from_std(file)),
+    }
+}
+
+fn open_pty_pair() -> std::io::Result<(std::fs::File, std::fs::File)> {
+    let mut master = -1;
+    let mut slave = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let master = unsafe { std::fs::File::from(OwnedFd::from_raw_fd(master)) };
+    let slave = unsafe { std::fs::File::from(OwnedFd::from_raw_fd(slave)) };
+    set_cloexec(master.as_raw_fd());
+    set_cloexec(slave.as_raw_fd());
+    Ok((master, slave))
+}
+
+fn set_cloexec(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
+}
+
+/// `setsid`, controlling tty, and canonical input. Runs after fork.
+fn prepare_child_tty(tty_fd: i32) {
+    unsafe {
+        let _ = libc::setsid();
+        let _ = libc::ioctl(tty_fd, libc::TIOCSCTTY, 0);
+        let _ = libc::setpgid(0, 0);
+        let pgid = libc::getpgrp();
+        let _ = libc::ioctl(tty_fd, libc::TIOCSPGRP, &pgid);
+        let mut attr: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(tty_fd, &mut attr) == 0 {
+            attr.c_lflag |= libc::ICANON | libc::ISIG | libc::ECHO;
+            let _ = libc::tcsetattr(tty_fd, libc::TCSANOW, &attr);
+        }
+    }
+}
+
+fn winsize_tuple(
+    rows: Option<u32>,
+    cols: Option<u32>,
+    hpix: Option<u32>,
+    vpix: Option<u32>,
+) -> Option<(u16, u16, u16, u16)> {
+    let rows = u16::try_from(rows?).ok()?;
+    let cols = u16::try_from(cols?).ok()?;
+    let hpix = hpix.and_then(|v| u16::try_from(v).ok()).unwrap_or(0);
+    let vpix = vpix.and_then(|v| u16::try_from(v).ok()).unwrap_or(0);
+    Some((rows, cols, hpix, vpix))
+}
+
+fn apply_winsize(
+    fd: &std::fs::File,
+    rows: Option<u32>,
+    cols: Option<u32>,
+    hpix: Option<u32>,
+    vpix: Option<u32>,
+) -> std::io::Result<()> {
+    let Some((rows, cols, hpix, vpix)) = winsize_tuple(rows, cols, hpix, vpix) else {
+        return Ok(());
+    };
+    apply_winsize_raw(fd.as_raw_fd(), rows, cols, hpix, vpix)
+}
+
+fn apply_winsize_raw(fd: i32, rows: u16, cols: u16, hpix: u16, vpix: u16) -> std::io::Result<()> {
+    let ws = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: hpix,
+        ws_ypixel: vpix,
+    };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &ws) };
+    if rc == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Identity hashes from `allowed_identities`, one 32-character hex line each.
+///
+/// Looks at `{config_dir}/allowed_identities` and, when present, the Python
+/// default files `~/.config/rnsh/allowed_identities` and `~/.rnsh/allowed_identities`.
+fn load_allowed_identity_files(config_dir: &Path) -> HashSet<AddressHash> {
+    let mut allowed = HashSet::new();
+    let mut paths = Vec::new();
+    let configured = config_dir.join("allowed_identities");
+    if configured.is_file() {
+        paths.push(configured);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for rel in [
+            ".config/rnsh/allowed_identities",
+            ".rnsh/allowed_identities",
+        ] {
+            let path = home.join(rel);
+            if path.is_file() && !paths.iter().any(|existing| existing == &path) {
+                paths.push(path);
+            }
+        }
+    }
+    for path in paths {
+        allowed.extend(load_allowed_identities(&path));
+    }
+    allowed
+}
+
+fn load_allowed_identities(path: &Path) -> HashSet<AddressHash> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    let mut allowed = HashSet::new();
+    for (index, line) in text.replace('\r', "").split('\n').enumerate() {
+        if line.len() != 32 {
+            continue;
+        }
+        match parse_allowed_identity_line(line) {
+            Some(hash) => {
+                allowed.insert(hash);
+            }
+            None => {
+                log::debug!(
+                    "discarded invalid identity hash in {} at line {}",
+                    path.display(),
+                    index + 1
+                );
+            }
+        }
+    }
+    allowed
+}
+
+fn parse_allowed_identity_line(line: &str) -> Option<AddressHash> {
+    if line.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&line[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(AddressHash::new(bytes))
 }
 
 /// Maximum payload of one StreamDataMessage: the link MDU minus the
@@ -755,13 +1155,18 @@ pub struct CommandOutcome {
     pub exit_code: Option<i32>,
 }
 
-/// Run one command in a session on the remote listener
-/// (`rnsh --command <cmd> <destination>`), streaming stdin when piped.
-pub async fn run_command(
+struct ClientLink {
+    transport: Transport,
+    channel: reticulum::channel::Channel<RnshMessage>,
+    receiver: tokio::sync::broadcast::Receiver<RnshMessage>,
+}
+
+/// Link, identify, and exchange version info. The transport is returned so
+/// the caller can keep the instance alive for the rest of the session.
+async fn connect_client(
     destination: &AddressHash,
-    command: &str,
     options: &ServeOptions,
-) -> Result<CommandOutcome, String> {
+) -> Result<ClientLink, String> {
     let transport = build_tool_transport(ToolTransportOptions {
         config_dir: &options.config_dir,
         instance_name: "rnsh-client",
@@ -844,6 +1249,25 @@ pub async fn run_command(
         }
     }
 
+    Ok(ClientLink {
+        transport,
+        channel,
+        receiver,
+    })
+}
+
+/// Run one command in a session on the remote listener
+/// (`rnsh --command <cmd> <destination>`), streaming stdin when piped.
+pub async fn run_command(
+    destination: &AddressHash,
+    command: &str,
+    options: &ServeOptions,
+) -> Result<CommandOutcome, String> {
+    let connected = connect_client(destination, options).await?;
+    let _transport = connected.transport;
+    let channel = connected.channel;
+    let mut receiver = connected.receiver;
+
     // Whether stdin is a pipe determines pipe_stdin on the wire. An
     // already-closed or empty stdin (e.g. `/dev/null`) is not advertised
     // at all: the Python listener closes the child's stdin on EOF and
@@ -866,6 +1290,10 @@ pub async fn run_command(
             pipe_stdout: true,
             pipe_stderr: true,
             term: std::env::var("TERM").ok(),
+            rows: None,
+            cols: None,
+            hpix: None,
+            vpix: None,
         },
     )
     .await
@@ -938,16 +1366,352 @@ pub async fn run_command(
     Ok(outcome)
 }
 
-fn atty_or_true() -> bool {
-    // Best-effort TTY detection without an extra dependency: assume a
-    // terminal when stdout is a character device.
-    unsafe { libc::isatty(0) == 1 }
+fn is_tty(fd: i32) -> bool {
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// Interactive client session.
+///
+/// `command` `None` or `""` asks the listener for its default shell.
+/// [`run_command`] remains the non-interactive `--command` path.
+pub async fn run_interactive(
+    destination: &AddressHash,
+    command: Option<&str>,
+    options: &ServeOptions,
+) -> Result<i32, String> {
+    let connected = connect_client(destination, options).await?;
+    let _transport = connected.transport;
+    let channel = connected.channel;
+    let mut receiver = connected.receiver;
+
+    let pipe_stdin = !is_tty(0);
+    let pipe_stdout = !is_tty(1);
+    let pipe_stderr = !is_tty(2);
+    let (rows, cols, hpix, vpix) = local_winsize();
+    let cmdline = match command {
+        Some(text) if !text.is_empty() => {
+            Some(vec!["sh".to_string(), "-c".to_string(), text.to_string()])
+        }
+        _ => None,
+    };
+
+    if !send_when_ready(
+        &channel,
+        RnshMessage::ExecuteCommand {
+            cmdline,
+            pipe_stdin,
+            pipe_stdout,
+            pipe_stderr,
+            term: std::env::var("TERM").ok(),
+            rows,
+            cols,
+            hpix,
+            vpix,
+        },
+    )
+    .await
+    {
+        return Err("could not send execute command".into());
+    }
+
+    let _raw = if is_tty(0) { enter_raw(0).ok() } else { None };
+
+    let (stdin_tx, mut stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                if stdin_tx.blocking_send(buf[..n as usize].to_vec()).is_err() {
+                    break;
+                }
+            } else if n == 0 {
+                let _ = stdin_tx.blocking_send(Vec::new());
+                break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                let _ = stdin_tx.blocking_send(Vec::new());
+                break;
+            }
+        }
+    });
+
+    let mut winch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()).ok();
+    let mut keys = InteractiveKeys::new();
+    let filter_keys = is_tty(0);
+    let mut sent_eof = false;
+
+    let code = loop {
+        tokio::select! {
+            message = receiver.recv() => {
+                match message {
+                    Ok(RnshMessage::StreamData { stream_id, data, .. }) => {
+                        let fd = if stream_id == STREAM_ID_STDOUT {
+                            1
+                        } else if stream_id == STREAM_ID_STDERR {
+                            2
+                        } else {
+                            continue;
+                        };
+                        if !data.is_empty() {
+                            let _ = write_fd(fd, &data);
+                        }
+                    }
+                    Ok(RnshMessage::CommandExited { return_code }) => {
+                        break return_code.unwrap_or(255);
+                    }
+                    Ok(RnshMessage::Error { msg, fatal: true }) => {
+                        return Err(msg.unwrap_or_else(|| "remote error".into()));
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => break 255,
+                }
+            }
+            chunk = stdin_rx.recv() => {
+                match chunk {
+                    Some(chunk) if chunk.is_empty() && !sent_eof => {
+                        if filter_keys {
+                            let _ = send_stream_data(&channel, STREAM_ID_STDIN, vec![0x04]).await;
+                        }
+                        let _ = send_when_ready(
+                            &channel,
+                            RnshMessage::StreamData {
+                                stream_id: STREAM_ID_STDIN,
+                                eof: true,
+                                data: Vec::new(),
+                            },
+                        )
+                        .await;
+                        sent_eof = true;
+                    }
+                    Some(chunk) if !chunk.is_empty() => {
+                        let data = if filter_keys {
+                            let (data, quit) = keys.push(&chunk);
+                            if quit {
+                                break 0;
+                            }
+                            data
+                        } else {
+                            chunk
+                        };
+                        if !data.is_empty()
+                            && !send_stream_data(&channel, STREAM_ID_STDIN, data).await
+                        {
+                            return Err("could not stream stdin".into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = wait_winch(&mut winch) => {
+                let (rows, cols, hpix, vpix) = local_winsize();
+                if rows.is_some() && cols.is_some() {
+                    let _ = send_when_ready(
+                        &channel,
+                        RnshMessage::WindowSize { rows, cols, hpix, vpix },
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+    Ok(code)
+}
+
+async fn wait_winch(winch: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(winch) = winch {
+        let _ = winch.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+fn local_winsize() -> (Option<u32>, Option<u32>, Option<u32>, Option<u32>) {
+    for fd in [0, 1, 2] {
+        if let Some((rows, cols, hpix, vpix)) = tty_winsize(fd) {
+            return (
+                Some(u32::from(rows)),
+                Some(u32::from(cols)),
+                Some(u32::from(hpix)),
+                Some(u32::from(vpix)),
+            );
+        }
+    }
+    (None, None, None, None)
+}
+
+fn tty_winsize(fd: i32) -> Option<(u16, u16, u16, u16)> {
+    let mut ws = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+    if rc == -1 {
+        None
+    } else {
+        Some((ws.ws_row, ws.ws_col, ws.ws_xpixel, ws.ws_ypixel))
+    }
+}
+
+struct RawTermios {
+    fd: i32,
+    saved: libc::termios,
+}
+
+impl Drop for RawTermios {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSADRAIN, &self.saved);
+        }
+    }
+}
+
+fn enter_raw(fd: i32) -> std::io::Result<RawTermios> {
+    unsafe {
+        let mut saved: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut saved) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut raw = saved;
+        libc::cfmakeraw(&mut raw);
+        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(RawTermios { fd, saved })
+    }
+}
+
+fn write_fd(fd: i32, data: &[u8]) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        let n = unsafe { libc::write(fd, data[offset..].as_ptr().cast(), data.len() - offset) };
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if n == 0 {
+            break;
+        }
+        offset += n as usize;
+    }
+    Ok(())
+}
+
+/// Escape handling for a local tty (`~~`, `~.`, `~L`, `~?`).
+struct InteractiveKeys {
+    line_mode: bool,
+    pre_esc: bool,
+    esc: bool,
+    line_buffer: Vec<u8>,
+    blind: usize,
+}
+
+impl InteractiveKeys {
+    fn new() -> Self {
+        Self {
+            line_mode: false,
+            pre_esc: true,
+            esc: false,
+            line_buffer: Vec::new(),
+            blind: 0,
+        }
+    }
+
+    fn push(&mut self, input: &[u8]) -> (Vec<u8>, bool) {
+        const FLUSH: &[u8] = &[
+            0x01, 0x03, 0x04, 0x05, 0x0c, 0x11, 0x13, 0x15, 0x19, b'\t', 0x1a, 0x1b,
+        ];
+        let mut data = Vec::new();
+        let mut line_flush = false;
+        let mut quit = false;
+        for &byte in input {
+            if byte == b'\r' {
+                self.pre_esc = true;
+                line_flush = true;
+                data.push(byte);
+            } else if self.line_mode && FLUSH.contains(&byte) {
+                self.pre_esc = false;
+                line_flush = true;
+                data.push(byte);
+            } else if self.line_mode && (byte == 0x08 || byte == 0x7f) {
+                self.pre_esc = false;
+                if !self.line_buffer.is_empty() {
+                    self.line_buffer.pop();
+                    self.blind = self.blind.saturating_sub(1);
+                    let _ = write_fd(1, b"\x08 \x08");
+                }
+            } else if self.pre_esc && byte == b'~' {
+                self.pre_esc = false;
+                self.esc = true;
+            } else if self.esc {
+                self.esc = false;
+                match byte {
+                    b'?' => {
+                        let _ = write_fd(
+                            1,
+                            b"\n\r\n\rSupported rnsh escape sequences:\n\r  ~~  Send the escape character by typing it twice\n\r  ~.  Terminate session and exit immediately\n\r  ~L  Toggle line-interactive mode\n\r  ~?  Display this quick reference\n\r\n\r(Escape sequences are only recognized immediately after newline)\n\r",
+                        );
+                    }
+                    b'.' => quit = true,
+                    b'L' => {
+                        self.line_mode = !self.line_mode;
+                        if self.line_mode {
+                            let _ = write_fd(1, b"\n\rLine-interactive mode enabled\n\r");
+                        } else {
+                            let _ = write_fd(1, b"\n\rLine-interactive mode disabled\n\r");
+                        }
+                    }
+                    other => {
+                        if other != b'~' {
+                            data.push(b'~');
+                        }
+                        data.push(other);
+                    }
+                }
+            } else {
+                self.pre_esc = false;
+                data.push(byte);
+            }
+        }
+
+        if quit {
+            return (Vec::new(), true);
+        }
+        if !self.line_mode {
+            return (data, false);
+        }
+        if line_flush {
+            self.line_buffer.extend_from_slice(&data);
+            let out = std::mem::take(&mut self.line_buffer);
+            if self.blind > 0 {
+                let erase = b"\x08 \x08".repeat(self.blind);
+                let _ = write_fd(1, &erase);
+                self.blind = 0;
+            }
+            (out, false)
+        } else {
+            let _ = write_fd(1, &data);
+            self.line_buffer.extend_from_slice(&data);
+            self.blind += data.len();
+            (Vec::new(), false)
+        }
+    }
 }
 
 /// Read the initial stdin contents (Python's initiator buffers all of
 /// stdin at startup). Returns whether a stdin pipe should be advertised
-/// and the buffered data: a TTY or a non-empty read means the remote
-/// should pipe stdin, an immediately-empty closed stdin does not.
+/// and the buffered data. A TTY advertises no pipe. A non-empty read
+/// advertises a pipe. An immediately empty closed stdin does not.
 fn read_initial_stdin() -> (bool, Vec<u8>) {
     // Python's initiator sets `pipe_stdin = not os.isatty(0)` and sends
     // a stdin EOF once its buffer drains. An immediately-closed, empty
@@ -957,7 +1721,7 @@ fn read_initial_stdin() -> (bool, Vec<u8>) {
     // commands before their output has been streamed back, losing the
     // response entirely. Real piped input keeps the pipe and a delayed
     // EOF so EOF-dependent commands still terminate.
-    if atty_or_true() {
+    if is_tty(0) {
         return (false, Vec::new());
     }
     use std::io::Read;
@@ -1060,6 +1824,10 @@ mod tests {
             pipe_stdout: true,
             pipe_stderr: false,
             term: Some("xterm".into()),
+            rows: Some(24),
+            cols: Some(80),
+            hpix: None,
+            vpix: Some(0),
         };
         let packed = message.pack();
         let unpacked = RnshMessage::unpack(&packed, MSG_EXECUTE_COMMAND).expect("unpack exec");
@@ -1070,14 +1838,41 @@ mod tests {
                 pipe_stdout,
                 pipe_stderr,
                 term,
+                rows,
+                cols,
+                hpix,
+                vpix,
             } => {
                 assert_eq!(cmdline, Some(vec!["echo".into(), "hi".into()]));
                 assert!(pipe_stdin);
                 assert!(pipe_stdout);
                 assert!(!pipe_stderr);
                 assert_eq!(term, Some("xterm".into()));
+                assert_eq!(rows, Some(24));
+                assert_eq!(cols, Some(80));
+                assert_eq!(hpix, None);
+                assert_eq!(vpix, Some(0));
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn allowed_identities_file_matches_python_line_rules() {
+        let dir = std::env::temp_dir().join(format!("rnsh-allow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = "ab".repeat(16);
+        let text = format!(
+            "\n# short\n{hash}\r\n{hash_upper}\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n",
+            hash_upper = hash.to_uppercase()
+        );
+        // 32 z's is the right length but not hex.
+        let path = dir.join("allowed_identities");
+        std::fs::write(&path, text).unwrap();
+        let loaded = load_allowed_identities(&path);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded.contains(&parse_allowed_identity_line(&hash).unwrap()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

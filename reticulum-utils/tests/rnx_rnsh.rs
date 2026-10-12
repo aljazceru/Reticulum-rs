@@ -121,3 +121,126 @@ async fn rnsh_session_command_roundtrip() {
 
     listener.abort();
 }
+
+/// Local PTY only: the child sees a tty, and a window-size message changes it.
+#[tokio::test]
+async fn rnsh_pty_resize_without_network() {
+    let script = r#"
+import os, sys, fcntl, struct, termios, time
+fd = sys.stdout.fileno()
+print("tty" if os.isatty(fd) else "notty", flush=True)
+print(os.ttyname(fd), flush=True)
+def winsz():
+    return struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0"*8))
+print("%d %d %d %d" % winsz(), flush=True)
+initial = winsz()
+for _ in range(100):
+    time.sleep(0.05)
+    now = winsz()
+    if now != initial:
+        print("%d %d %d %d" % now, flush=True)
+        sys.exit(0)
+print("unchanged", flush=True)
+sys.exit(1)
+"#;
+    let argv = vec!["python3".to_string(), "-c".to_string(), script.to_string()];
+    let mut proc = reticulum_utils::rnsh::spawn_session_process(
+        &argv,
+        false,
+        false,
+        false,
+        Some("xterm"),
+        None,
+        None,
+    )
+    .expect("spawn pty");
+    let mut stdout = proc.take_stdout().expect("pty stdout");
+
+    let first = read_pty_text(&mut stdout, 3).await;
+    let lines: Vec<&str> = first
+        .split(|c| c == '\n' || c == '\r')
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(
+        lines.first().is_some_and(|line| *line == "tty"),
+        "child stdout should be a tty, got {first:?}"
+    );
+    assert!(
+        lines.get(1).is_some_and(|line| line.starts_with("/dev/")),
+        "expected a pty path, got {first:?}"
+    );
+    let initial = lines
+        .get(2)
+        .and_then(|line| parse_winsz(line))
+        .unwrap_or_else(|| panic!("initial winsize missing in {first:?}"));
+
+    let (rows, cols, hpix, vpix) = if initial.0 == 48 {
+        (50, 130, 11, 22)
+    } else {
+        (48, 123, 640, 480)
+    };
+    let message = reticulum_utils::rnsh::RnshMessage::WindowSize {
+        rows: Some(rows),
+        cols: Some(cols),
+        hpix: Some(hpix),
+        vpix: Some(vpix),
+    };
+    let reticulum_utils::rnsh::RnshMessage::WindowSize {
+        rows,
+        cols,
+        hpix,
+        vpix,
+    } = message
+    else {
+        unreachable!();
+    };
+    proc.set_window_size(rows, cols, hpix, vpix)
+        .expect("TIOCSWINSZ");
+
+    let rest = read_pty_text(&mut stdout, 1).await;
+    let updated = rest
+        .split(|c| c == '\n' || c == '\r')
+        .filter(|line| !line.is_empty())
+        .find_map(parse_winsz)
+        .unwrap_or_else(|| panic!("resize did not change winsize, output {rest:?}"));
+    assert_eq!(
+        updated,
+        (rows.unwrap(), cols.unwrap(), hpix.unwrap(), vpix.unwrap())
+    );
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), proc.wait()).await;
+    let _ = proc.start_kill();
+}
+
+fn parse_winsz(line: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut parts = line.split_whitespace();
+    let rows = parts.next()?.parse().ok()?;
+    let cols = parts.next()?.parse().ok()?;
+    let hpix = parts.next()?.parse().ok()?;
+    let vpix = parts.next()?.parse().ok()?;
+    Some((rows, cols, hpix, vpix))
+}
+
+async fn read_pty_text(
+    reader: &mut reticulum_utils::rnsh::SessionReader,
+    min_lines: usize,
+) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let lines = out.iter().filter(|b| **b == b'\n').count();
+        if lines >= min_lines {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(200), reader.read(&mut buf))
+            .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Err(_) if lines >= min_lines => break,
+            Err(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}

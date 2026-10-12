@@ -663,9 +663,6 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let command = args
-        .command
-        .ok_or("a command is required (or use --serve)")?;
     let destination = args
         .destination
         .as_deref()
@@ -683,7 +680,14 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
         udp_loopback,
     };
 
-    let outcome = reticulum_utils::rnsh::run_command(&destination, &command, &options).await?;
+    // `--command` stays a non-interactive capture. With no command, run a
+    // session against the listener's shell.
+    let Some(command) = args.command.as_deref() else {
+        let code = reticulum_utils::rnsh::run_interactive(&destination, None, &options).await?;
+        std::process::exit(code);
+    };
+
+    let outcome = reticulum_utils::rnsh::run_command(&destination, command, &options).await?;
     {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
