@@ -169,8 +169,9 @@ pub fn on_air_bitrate(sf: u8, cr: u8, bandwidth_hz: u32) -> Option<f64> {
 
 /// Whether `frequency` is in the band for a `CMD_INTERFACES` kind byte.
 ///
-/// Python `interface_type_to_str` maps every kind other than SX128X/SX1280
-/// onto the sub-GHz limits.
+/// Python `interface_type_to_str` only picks the chip name. Unknown kinds
+/// become `"SX127X"`. `RNodeSubInterface` accepts 137000000–1000000000 for
+/// SX126X/SX127X and 2200000000–2600000000 for SX128X.
 pub fn reported_kind_accepts_frequency(kind: u8, frequency: u64) -> bool {
     match kind {
         KIND_SX128X | KIND_SX1280 => (2_200_000_000..=2_600_000_000).contains(&frequency),
@@ -875,9 +876,9 @@ impl RnodeShared {
     }
 }
 
-/// Identification beacon (Python `first_tx` / `id_interval`).
-/// Opens after a successful non-beacon write and closes after the beacon
-/// frame is written.
+/// Identification beacon window.
+/// Opens only after a non-beacon write succeeds and clears only after the
+/// beacon write succeeds.
 struct IdBeacon {
     interval: Duration,
     callsign: Vec<u8>,
@@ -1672,10 +1673,6 @@ impl RnodeMultiInterface {
             self.receive_only.push(index);
         }
         self
-    }
-
-    pub fn vport_outgoing(&self, index: u8) -> bool {
-        !self.receive_only.contains(&index)
     }
 
     /// Identification beacon sent on every virtual port

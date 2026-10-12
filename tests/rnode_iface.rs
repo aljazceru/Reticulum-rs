@@ -365,10 +365,6 @@ async fn rnode_parser_and_framing() {
     }
 }
 
-fn be_u16(value: u16) -> [u8; 2] {
-    value.to_be_bytes()
-}
-
 /// Fold device frames through the parser into shared radio state.
 fn apply_frames(shared: &mut RnodeShared, frames: &[u8]) {
     let mut parser = RnodeParser::new(false);
@@ -406,20 +402,20 @@ fn rnode_framed_telemetry_bitrate_and_multi_probe() {
     stream.extend_from_slice(&kiss_frame(CMD_STAT_CSMA, &[4, 3, 7]));
 
     let mut chtm = Vec::new();
-    chtm.extend_from_slice(&be_u16(1000));
-    chtm.extend_from_slice(&be_u16(2500));
-    chtm.extend_from_slice(&be_u16(100));
-    chtm.extend_from_slice(&be_u16(200));
+    chtm.extend_from_slice(&1000u16.to_be_bytes());
+    chtm.extend_from_slice(&2500u16.to_be_bytes());
+    chtm.extend_from_slice(&100u16.to_be_bytes());
+    chtm.extend_from_slice(&200u16.to_be_bytes());
     chtm.extend_from_slice(&[157, 147, 0xFF]);
     stream.extend_from_slice(&kiss_frame(CMD_STAT_CHTM, &chtm));
 
     let mut phy = Vec::new();
-    phy.extend_from_slice(&be_u16(1000));
-    phy.extend_from_slice(&be_u16(488));
-    phy.extend_from_slice(&be_u16(8));
-    phy.extend_from_slice(&be_u16(16));
-    phy.extend_from_slice(&be_u16(20));
-    phy.extend_from_slice(&be_u16(40));
+    phy.extend_from_slice(&1000u16.to_be_bytes());
+    phy.extend_from_slice(&488u16.to_be_bytes());
+    phy.extend_from_slice(&8u16.to_be_bytes());
+    phy.extend_from_slice(&16u16.to_be_bytes());
+    phy.extend_from_slice(&20u16.to_be_bytes());
+    phy.extend_from_slice(&40u16.to_be_bytes());
     stream.extend_from_slice(&kiss_frame(CMD_STAT_PHYPRM, &phy));
 
     let mut shared = RnodeShared::default();
@@ -484,8 +480,6 @@ fn rnode_framed_telemetry_bitrate_and_multi_probe() {
     let multi = RnodeMultiInterface::tcp("127.0.0.1:1", Vec::new(), manager)
         .with_receive_only(1)
         .with_beacon(30, b"N0CALL");
-    assert!(!multi.vport_outgoing(1));
-    assert!(multi.vport_outgoing(0));
     assert_eq!(multi.id_callsign(), Some(b"N0CALL".as_slice()));
 }
 
