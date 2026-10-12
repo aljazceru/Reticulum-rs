@@ -320,10 +320,6 @@ impl IdBeacon {
         }
     }
 
-    fn from_config(config: &KissBeacon) -> Self {
-        Self::new(config.interval, config.data.clone())
-    }
-
     /// Delay until the ID may be queued. `None` until a real payload has
     /// been sent. The extra millisecond matches Python's strict `>`.
     fn time_until_due(&self, now: StdInstant) -> Option<Duration> {
@@ -332,40 +328,45 @@ impl IdBeacon {
         Some(due.saturating_duration_since(now))
     }
 
-    /// The padded ID payload when the interval has elapsed.
+    /// Padded ID payload when the interval has elapsed.
     ///
-    /// Clears `first_tx` the way `readLoop` does before `process_outgoing`.
-    /// The caller must [`IdBeacon::note_sent`] only if the frame is written,
-    /// not if flow control merely queues it.
-    fn take_if_due(&mut self, now: StdInstant) -> Option<Vec<u8>> {
+    /// Does not clear `first_tx`. A queued or failed write must still be
+    /// able to retry; [`IdBeacon::note_sent`] commits the window only once
+    /// the bytes are on the port.
+    fn take_if_due(&self, now: StdInstant) -> Option<Vec<u8>> {
         let started = self.first_tx?;
         if now > started + self.interval {
-            self.first_tx = None;
-            Some(pad_id_frame(&self.callsign))
+            let mut frame = self.callsign.clone();
+            if frame.len() < 15 {
+                frame.resize(15, 0x00);
+            }
+            Some(frame)
         } else {
             None
         }
     }
 
-    /// `process_outgoing` bookkeeping. An exact (unpadded) callsign clears
-    /// the window; any other payload arms it if it is not already armed.
+    /// `process_outgoing` bookkeeping, applied to the raw payload that was
+    /// actually written. An exact callsign clears the window. A shorter ID
+    /// (padded with zeros) restarts it at the write. Any other payload arms
+    /// it only when it is still clear, including one that waited in the
+    /// flow-control queue.
     fn note_sent(&mut self, data: &[u8], now: StdInstant) {
         if data == self.callsign.as_slice() {
             self.first_tx = None;
+        } else if self.is_padded_id(data) {
+            self.first_tx = Some(now);
         } else if self.first_tx.is_none() {
             self.first_tx = Some(now);
         }
     }
-}
 
-/// Python pads the ID with `0x00` until it is 15 bytes. Longer callsigns
-/// are sent as-is.
-fn pad_id_frame(callsign: &[u8]) -> Vec<u8> {
-    let mut frame = callsign.to_vec();
-    if frame.len() < 15 {
-        frame.resize(15, 0x00);
+    fn is_padded_id(&self, data: &[u8]) -> bool {
+        self.callsign.len() < 15
+            && data.len() == 15
+            && data.starts_with(&self.callsign)
+            && data[self.callsign.len()..].iter().all(|byte| *byte == 0)
     }
-    frame
 }
 
 /// Shared transmit state: flow-control readiness and the packet queue
@@ -475,6 +476,14 @@ impl KissInterface {
             queue: VecDeque::new(),
         }));
         let ready_notify = Arc::new(Notify::new());
+        // Python keeps `first_tx` on the interface, so a dropped port must
+        // not start the ID interval over.
+        let id_beacon = Arc::new(std::sync::Mutex::new(match (&mode, &beacon) {
+            (KissMode::Kiss, Some(config)) => {
+                Some(IdBeacon::new(config.interval, config.data.clone()))
+            }
+            _ => None,
+        }));
 
         loop {
             if context.cancel.is_cancelled() {
@@ -618,69 +627,192 @@ impl KissInterface {
                 let tx_state = tx_state.clone();
                 let ready_notify = ready_notify.clone();
                 let channel_ifac = channel_ifac.clone();
-                let beacon = beacon.clone();
                 let mode = mode.clone();
+                let id_beacon = id_beacon.clone();
                 let mut write_half = write_half;
 
                 tokio::spawn(async move {
-                    // AX.25 identifies in the UI header. Only plain KISS
-                    // sends the `id_callsign` beacon.
-                    let mut id_beacon = match (&mode, beacon) {
-                        (KissMode::Kiss, Some(config)) => Some(IdBeacon::from_config(&config)),
-                        _ => None,
-                    };
-
-                    let encode = |data: &[u8]| match &mode {
-                        KissMode::Kiss => encode_frame(data),
+                    // Bytes handed to KISS escape: AX.25 header included,
+                    // framing not yet applied. The flow-control queue stores
+                    // these raw payloads, matching `packet_queue`.
+                    let pack = |data: &[u8]| match &mode {
+                        KissMode::Kiss => data.to_vec(),
                         KissMode::Ax25 { callsign, ssid } => {
-                            encode_frame(&ax25::pack_ax25_frame(data, callsign, *ssid))
+                            ax25::pack_ax25_frame(data, callsign, *ssid)
                         }
                     };
 
-                    /// transmit `data` honouring flow control; returns whether
-                    /// the frame was written now (queued otherwise)
-                    async fn transmit<W>(
+                    /// Escape, write, and `note_sent`. A failed `write_all`
+                    /// drops the connection and leaves `first_tx` alone.
+                    async fn write_now<W>(
                         write: &mut W,
-                        frame: Vec<u8>,
-                        payload_len: usize,
+                        packed: &[u8],
                         flow_control: bool,
                         tx_state: &Arc<std::sync::Mutex<TxState>>,
                         stats: &Arc<super::InterfaceCounters>,
+                        id_beacon: &Arc<std::sync::Mutex<Option<IdBeacon>>>,
+                        stop: &tokio_util::sync::CancellationToken,
                     ) -> bool
                     where
                         W: tokio::io::AsyncWrite + Unpin,
                     {
-                        {
-                            let mut state = tx_state.lock().unwrap();
-                            if !state.ready && flow_control {
-                                state.queue.push_back(frame);
-                                return false;
-                            }
-                        }
-
-                        if write.write_all(&frame).await.is_err() {
+                        let wire = encode_frame(packed);
+                        if write.write_all(&wire).await.is_err() {
+                            stop.cancel();
                             return false;
                         }
                         let _ = write.flush().await;
-                        stats.count_tx(payload_len);
-
+                        stats.count_tx(packed.len());
                         if flow_control {
                             tx_state.lock().unwrap().ready = false;
                         }
-
+                        if let Some(beacon) = id_beacon.lock().unwrap().as_mut() {
+                            let id_frame =
+                                beacon.is_padded_id(packed) || packed == beacon.callsign.as_slice();
+                            beacon.note_sent(packed, StdInstant::now());
+                            if id_frame {
+                                log::debug!("kiss: transmitted beacon data");
+                            }
+                        }
                         true
+                    }
+
+                    /// Queue the raw payload when flow control is closed.
+                    /// Returns whether the caller still needs to write it.
+                    fn enqueue_if_blocked(
+                        packed: Vec<u8>,
+                        flow_control: bool,
+                        tx_state: &Arc<std::sync::Mutex<TxState>>,
+                    ) -> bool {
+                        let mut state = tx_state.lock().unwrap();
+                        if flow_control && !state.ready {
+                            state.queue.push_back(packed);
+                            false
+                        } else {
+                            true
+                        }
+                    }
+
+                    /// One `process_queue` step: write the oldest raw payload.
+                    async fn drain_one<W>(
+                        write: &mut W,
+                        flow_control: bool,
+                        tx_state: &Arc<std::sync::Mutex<TxState>>,
+                        stats: &Arc<super::InterfaceCounters>,
+                        id_beacon: &Arc<std::sync::Mutex<Option<IdBeacon>>>,
+                        stop: &tokio_util::sync::CancellationToken,
+                    ) -> bool
+                    where
+                        W: tokio::io::AsyncWrite + Unpin,
+                    {
+                        let packed = {
+                            let mut state = tx_state.lock().unwrap();
+                            if flow_control && !state.ready {
+                                return false;
+                            }
+                            state.queue.pop_front()
+                        };
+                        let Some(packed) = packed else {
+                            return false;
+                        };
+                        if !write_now(
+                            write,
+                            &packed,
+                            flow_control,
+                            tx_state,
+                            stats,
+                            id_beacon,
+                            stop,
+                        )
+                        .await
+                        {
+                            tx_state.lock().unwrap().queue.push_front(packed);
+                            return false;
+                        }
+                        true
+                    }
+
+                    async fn send_id_if_due<W>(
+                        write: &mut W,
+                        flow_control: bool,
+                        tx_state: &Arc<std::sync::Mutex<TxState>>,
+                        stats: &Arc<super::InterfaceCounters>,
+                        id_beacon: &Arc<std::sync::Mutex<Option<IdBeacon>>>,
+                        stop: &tokio_util::sync::CancellationToken,
+                    ) where
+                        W: tokio::io::AsyncWrite + Unpin,
+                    {
+                        let due = {
+                            let mut guard = id_beacon.lock().unwrap();
+                            let Some(beacon) = guard.as_mut() else {
+                                return;
+                            };
+                            beacon.take_if_due(StdInstant::now())
+                        };
+                        let Some(payload) = due else {
+                            return;
+                        };
+                        // `take_if_due` leaves `first_tx` set, so a later wake
+                        // sees the same ID. Do not queue a second copy while
+                        // the first is still waiting for READY.
+                        {
+                            let state = tx_state.lock().unwrap();
+                            if flow_control
+                                && !state.ready
+                                && state.queue.iter().any(|queued| queued == &payload)
+                            {
+                                return;
+                            }
+                        }
+                        if !enqueue_if_blocked(payload.clone(), flow_control, tx_state) {
+                            return;
+                        }
+                        let _ = write_now(
+                            write,
+                            &payload,
+                            flow_control,
+                            tx_state,
+                            stats,
+                            id_beacon,
+                            stop,
+                        )
+                        .await;
                     }
 
                     loop {
                         let mut tx_channel = tx_channel.lock().await;
 
-                        let beacon_wait = async {
-                            match id_beacon
+                        let beacon_wait = {
+                            let now = StdInstant::now();
+                            // A due ID already sitting in the flow-control
+                            // queue must not schedule a zero delay: `first_tx`
+                            // stays set until the write, and sleeping 0 would
+                            // spin until READY.
+                            let held = id_beacon
+                                .lock()
+                                .unwrap()
                                 .as_ref()
-                                .and_then(|beacon| beacon.time_until_due(StdInstant::now()))
-                            {
-                                Some(delay) => tokio::time::sleep(delay).await,
-                                None => std::future::pending::<()>().await,
+                                .and_then(|beacon| beacon.take_if_due(now))
+                                .is_some_and(|frame| {
+                                    let state = tx_state.lock().unwrap();
+                                    flow_control
+                                        && !state.ready
+                                        && state.queue.iter().any(|queued| queued == &frame)
+                                });
+                            let delay = if held {
+                                None
+                            } else {
+                                id_beacon
+                                    .lock()
+                                    .unwrap()
+                                    .as_ref()
+                                    .and_then(|beacon| beacon.time_until_due(now))
+                            };
+                            async move {
+                                match delay {
+                                    Some(delay) => tokio::time::sleep(delay).await,
+                                    None => std::future::pending::<()>().await,
+                                }
                             }
                         };
 
@@ -699,79 +831,61 @@ impl KissInterface {
                             _ = beacon_wait => Wake::Beacon,
                         };
 
-                        if matches!(wake, Wake::Beacon) {
-                            if let Some(beacon) = id_beacon.as_mut() {
-                                if let Some(payload) = beacon.take_if_due(StdInstant::now()) {
-                                    let transmitted = transmit(
-                                        &mut write_half,
-                                        encode(&payload),
-                                        payload.len(),
-                                        flow_control,
-                                        &tx_state,
-                                        &stats,
-                                    )
-                                    .await;
-                                    // note_sent only after a real write. A
-                                    // flow-control queue holds framed bytes,
-                                    // and Python restarts `first_tx` only
-                                    // once the ID hits the port.
-                                    if transmitted {
-                                        log::debug!("kiss: transmitted beacon data");
-                                        beacon.note_sent(&payload, StdInstant::now());
-                                    }
+                        // `process_queue` runs before the idle ID check, so a
+                        // beacon wake that lands with READY still sends one
+                        // queued data frame first.
+                        let message = match wake {
+                            Wake::Beacon | Wake::Flow | Wake::Message(None) => {
+                                let _ = drain_one(
+                                    &mut write_half,
+                                    flow_control,
+                                    &tx_state,
+                                    &stats,
+                                    &id_beacon,
+                                    &stop,
+                                )
+                                .await;
+                                if stop.is_cancelled() {
+                                    break;
                                 }
+                                send_id_if_due(
+                                    &mut write_half,
+                                    flow_control,
+                                    &tx_state,
+                                    &stats,
+                                    &id_beacon,
+                                    &stop,
+                                )
+                                .await;
+                                if stop.is_cancelled() {
+                                    break;
+                                }
+                                continue;
                             }
+                            Wake::Message(Some(message)) => message,
+                        };
+                        let packet = message.packet;
+                        let mut buffer = [0u8; 2048];
+                        let mut output = OutputBuffer::new(&mut buffer[..]);
+                        if packet.serialize(&mut output).is_err() {
                             continue;
                         }
-
-                        let data = match wake {
-                            Wake::Message(Some(message)) => {
-                                let packet = message.packet;
-                                let mut buffer = [0u8; 2048];
-                                let mut output = OutputBuffer::new(&mut buffer[..]);
-                                if packet.serialize(&mut output).is_err() {
-                                    continue;
-                                }
-                                let ifac = channel_ifac.read().expect("ifac lock").clone();
-                                Some(crate::iface::ifac::encode(
-                                    output.as_slice(),
-                                    ifac.as_deref(),
-                                ))
-                            }
-                            Wake::Flow | Wake::Message(None) => {
-                                // process_queue: exactly one queued packet
-                                let queued = tx_state.lock().unwrap().queue.pop_front();
-                                if let Some(frame) = queued {
-                                    let _ = transmit(
-                                        &mut write_half,
-                                        frame,
-                                        0,
-                                        flow_control,
-                                        &tx_state,
-                                        &stats,
-                                    )
-                                    .await;
-                                }
-                                None
-                            }
-                            Wake::Beacon => None,
-                        };
-
-                        let Some(data) = data else { continue };
-
-                        let transmitted = transmit(
-                            &mut write_half,
-                            encode(&data),
-                            data.len(),
-                            flow_control,
-                            &tx_state,
-                            &stats,
-                        )
-                        .await;
-
-                        if transmitted {
-                            if let Some(beacon) = id_beacon.as_mut() {
-                                beacon.note_sent(&data, StdInstant::now());
+                        let ifac = channel_ifac.read().expect("ifac lock").clone();
+                        let data = crate::iface::ifac::encode(output.as_slice(), ifac.as_deref());
+                        let packed = pack(&data);
+                        if enqueue_if_blocked(packed.clone(), flow_control, &tx_state) {
+                            let _ = write_now(
+                                &mut write_half,
+                                &packed,
+                                flow_control,
+                                &tx_state,
+                                &stats,
+                                &id_beacon,
+                                &stop,
+                            )
+                            .await;
+                            if stop.is_cancelled() {
+                                break;
                             }
                         }
                     }
@@ -803,8 +917,8 @@ impl Interface for KissInterface {
 
     fn should_ingress_limit() -> bool {
         // Plain KISS and AX.25 KISS share this type. Both Python classes
-        // return false; the AX.25 override is `ax25::should_ingress_limit`.
-        ax25::should_ingress_limit()
+        // return false and forward announce bursts.
+        false
     }
 }
 
@@ -942,11 +1056,14 @@ mod tests {
         }
         assert!(queue.is_empty());
 
-        if let Some(frame) =
-            beacon.take_if_due(t0 + Duration::from_secs(600) + Duration::from_millis(1))
-        {
-            queue.push_back(frame);
-        }
+        let due_at = t0 + Duration::from_secs(600) + Duration::from_millis(1);
+        let frame = beacon.take_if_due(due_at).expect("id due");
+        // Still due until a successful write commits the window.
+        assert_eq!(
+            beacon.take_if_due(due_at).as_deref(),
+            Some(frame.as_slice())
+        );
+        queue.push_back(frame);
         assert_eq!(queue.len(), 1);
 
         let mut expected = b"MYCALL-0".to_vec();
@@ -972,6 +1089,31 @@ mod tests {
             .expect("next id");
         queue.push_back(next);
         assert_eq!(queue.len(), 2);
+
+        // A 15-byte callsign is the ID itself, so writing it clears the
+        // window. The next non-ID payload arms a clear window.
+        let mut exact = IdBeacon::new(600, vec![0x41; 15]);
+        let id = vec![0x41; 15];
+        exact.note_sent(b"reticulum-packet", t0);
+        assert_eq!(exact.take_if_due(due_at).as_deref(), Some(id.as_slice()));
+        exact.note_sent(&id, sent_at);
+        assert!(
+            exact
+                .take_if_due(sent_at + Duration::from_secs(10_000))
+                .is_none()
+        );
+        let armed_at = sent_at + Duration::from_secs(5);
+        exact.note_sent(b"queued-payload", armed_at);
+        assert!(
+            exact
+                .take_if_due(armed_at + Duration::from_secs(600))
+                .is_none()
+        );
+        assert!(
+            exact
+                .take_if_due(armed_at + Duration::from_secs(600) + Duration::from_millis(1))
+                .is_some()
+        );
     }
 
     #[tokio::test]

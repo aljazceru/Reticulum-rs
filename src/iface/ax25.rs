@@ -103,14 +103,6 @@ pub fn pack_ax25_frame_to(
     frame
 }
 
-/// Python `AX25KISSInterface.should_ingress_limit`.
-///
-/// Plain KISS uses the same override (`KissInterface::should_ingress_limit`).
-/// AX.25 does not send an `id_callsign` beacon; the header callsign is the ID.
-pub fn should_ingress_limit() -> bool {
-    false
-}
-
 /// Strip the AX.25 header from a received frame (`process_incoming`):
 /// only frames longer than [`HEADER_SIZE`] carry data.
 pub fn strip_ax25_header(frame: &[u8]) -> Option<&[u8]> {
@@ -216,9 +208,12 @@ mod tests {
 
     #[test]
     fn announce_burst_is_not_held() {
-        use crate::iface::control::{hold_announce_burst, IfaceControlState};
+        use crate::iface::Interface;
+        use crate::iface::control::{IfaceControlState, hold_announce_burst};
+        use crate::iface::kiss::KissInterface;
 
-        assert!(!should_ingress_limit());
+        // AX.25 KISS is a `KissInterface`; both modes share the override.
+        assert!(!KissInterface::should_ingress_limit());
 
         let t0 = tokio::time::Instant::now();
         let mut generic = IfaceControlState::new(t0);
@@ -228,7 +223,7 @@ mod tests {
         );
 
         let mut state = IfaceControlState::new(t0);
-        state.set_announce_ingress_limit(should_ingress_limit());
+        state.set_announce_ingress_limit(KissInterface::should_ingress_limit());
         assert_eq!(hold_announce_burst(&mut state, t0), 0);
     }
 }

@@ -15,10 +15,10 @@ use tokio_serial::SerialStream;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
+use crate::iface::RxMessage;
 use crate::iface::hdlc::Hdlc;
 use crate::iface::hdlc::HdlcDecoder;
 use crate::iface::kiss::SerialPortConfig;
-use crate::iface::RxMessage;
 use crate::packet::Packet;
 use crate::serde::Serialize;
 
@@ -259,27 +259,22 @@ impl SerialInterface {
     }
 }
 
-/// Python `SerialInterface.should_ingress_limit`.
-pub fn should_ingress_limit() -> bool {
-    false
-}
-
 impl Interface for SerialInterface {
     fn mtu() -> usize {
         HW_MTU
     }
 
     fn should_ingress_limit() -> bool {
-        // Free function, not the trait method: same Python override.
-        crate::iface::serial::should_ingress_limit()
+        // Python `SerialInterface.should_ingress_limit` returns false.
+        false
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iface::control::{hold_announce_burst, IfaceControlState};
     use crate::iface::InterfaceManager;
+    use crate::iface::control::{IfaceControlState, hold_announce_burst};
 
     #[test]
     fn constructor_without_beacon_stays_quiet() {
@@ -287,7 +282,7 @@ mod tests {
         // constructor takes only the port and must keep working.
         let iface = SerialInterface::new(SerialPortConfig::new("/dev/null", 9600));
         assert!(iface.stream.is_none());
-        assert!(!should_ingress_limit());
+        assert!(!SerialInterface::should_ingress_limit());
     }
 
     #[tokio::test]
