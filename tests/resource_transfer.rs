@@ -803,7 +803,10 @@ async fn request_allow_list_requires_an_identified_peer() {
         .register_request_handler_with_config(
             &dest_hash,
             "closed",
-            RequestHandlerConfig::python_default(),
+            RequestHandlerConfig {
+                allow: RequestAllow::None,
+                ..Default::default()
+            },
             |_ctx| Some(RequestResponse::Element(msgpack_bin(b"no"))),
         )
         .await;
@@ -1140,6 +1143,63 @@ async fn per_request_timeout_ignores_a_late_response() {
     }
     assert!(saw_failed, "request did not fail when its timeout elapsed");
     assert!(!saw_response, "late response was delivered");
+}
+
+#[tokio::test]
+async fn per_request_timeout_ignores_a_late_resource_response() {
+    let (server, client, link) = connected_pair(4871, 4872).await;
+    let dest_hash = dest_hash(&server, &link).await;
+    // Larger than the link MDU and incompressible, so the response is a
+    // resource rather than a single RESPONSE packet.
+    let payload = incompressible(48 * 1024, 0xA11C_F);
+    server
+        .register_async_request_handler(&dest_hash, "slowres", move |_ctx| {
+            let payload = payload.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Some(msgpack_bin(&payload))
+            }
+        })
+        .await;
+
+    let mut request_events = client.request_events().await;
+    let rid = client
+        .request_with_options(
+            &link,
+            "slowres",
+            b"x",
+            RequestOptions {
+                timeout: Some(0.4),
+                max_response_size: None,
+            },
+        )
+        .await
+        .expect("request");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_failed = false;
+    let mut saw_response = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, request_events.recv()).await {
+            Ok(Ok(event)) => match event.event {
+                RequestEvent::Failed { request_id } if request_id == rid => {
+                    saw_failed = true;
+                }
+                RequestEvent::Response { request_id, .. } if request_id == rid => {
+                    saw_response = true;
+                    break;
+                }
+                _ => {}
+            },
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        saw_failed,
+        "resource request did not fail when its timeout elapsed"
+    );
+    assert!(!saw_response, "late resource response was delivered");
 }
 
 #[tokio::test]

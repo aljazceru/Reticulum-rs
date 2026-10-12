@@ -1407,15 +1407,8 @@ impl Transport {
         data: Vec<u8>,
         options: ResourceOptions,
     ) -> Result<crate::hash::Hash, RnsError> {
-        let mut handler = self.handler.lock().await;
-        let mut link_guard = link.lock().await;
-        if link_guard.status() != LinkStatus::Active {
-            return Err(RnsError::LinkNotReady);
-        }
-
-        let resource =
-            crate::resource::outbound::OutgoingResource::new(data, &link_guard, options)?;
-        enqueue_resource(&mut handler, &mut link_guard, resource).await
+        let staged = crate::resource::outbound::OutgoingResource::stage_bytes(data, &options)?;
+        self.enqueue_staged(link, staged, options).await
     }
 
     /// Send a file as a resource. Only the first segment is read before
@@ -1426,19 +1419,13 @@ impl Transport {
         path: &std::path::Path,
         options: ResourceOptions,
     ) -> Result<crate::hash::Hash, RnsError> {
-        let mut handler = self.handler.lock().await;
-        let mut link_guard = link.lock().await;
-        if link_guard.status() != LinkStatus::Active {
-            return Err(RnsError::LinkNotReady);
-        }
-        let resource =
-            crate::resource::outbound::OutgoingResource::from_path(path, &link_guard, options)?;
-        enqueue_resource(&mut handler, &mut link_guard, resource).await
+        let staged = crate::resource::outbound::OutgoingResource::stage_path(path, &options)?;
+        self.enqueue_staged(link, staged, options).await
     }
 
     /// Send a seekable stream as a resource. Seeking to discover the length
     /// does not read the body, and only the first segment is read before
-    /// the advertisement.
+    /// the advertisement. The reader does not need to be `Sync`.
     pub async fn send_resource_from_reader<R>(
         &self,
         link: &Arc<Mutex<Link>>,
@@ -1446,20 +1433,15 @@ impl Transport {
         options: ResourceOptions,
     ) -> Result<crate::hash::Hash, RnsError>
     where
-        R: std::io::Read + std::io::Seek + Send + Sync + 'static,
+        R: std::io::Read + std::io::Seek + Send + 'static,
     {
-        let mut handler = self.handler.lock().await;
-        let mut link_guard = link.lock().await;
-        if link_guard.status() != LinkStatus::Active {
-            return Err(RnsError::LinkNotReady);
-        }
-        let resource =
-            crate::resource::outbound::OutgoingResource::from_reader(reader, &link_guard, options)?;
-        enqueue_resource(&mut handler, &mut link_guard, resource).await
+        let staged = crate::resource::outbound::OutgoingResource::stage_reader(reader, &options)?;
+        self.enqueue_staged(link, staged, options).await
     }
 
     /// Spool a non-seekable stream to a temporary file and send that, so
-    /// the bytes are not held as a single buffer.
+    /// the bytes are not held as a single buffer. Spooling finishes before
+    /// the transport handler lock is taken.
     pub async fn send_resource_from_read<R>(
         &self,
         link: &Arc<Mutex<Link>>,
@@ -1469,13 +1451,35 @@ impl Transport {
     where
         R: std::io::Read + Send + 'static,
     {
+        let staged = crate::resource::outbound::OutgoingResource::stage_read(reader, &options)?;
+        self.enqueue_staged(link, staged, options).await
+    }
+
+    /// Encrypt a staged resource, then lock the handler only to confirm the
+    /// link is still active and to enqueue. The first-segment read already
+    /// happened, so a slow source cannot stall packet ingress.
+    async fn enqueue_staged(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        staged: crate::resource::outbound::StagedSource,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError> {
+        let resource = {
+            let link_guard = link.lock().await;
+            if link_guard.status() != LinkStatus::Active {
+                return Err(RnsError::LinkNotReady);
+            }
+            crate::resource::outbound::OutgoingResource::finish_staged(
+                staged,
+                &link_guard,
+                options,
+            )?
+        };
         let mut handler = self.handler.lock().await;
         let mut link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
             return Err(RnsError::LinkNotReady);
         }
-        let resource =
-            crate::resource::outbound::OutgoingResource::from_read(reader, &link_guard, options)?;
         enqueue_resource(&mut handler, &mut link_guard, resource).await
     }
 
@@ -1539,51 +1543,65 @@ impl Transport {
         data: &[u8],
         options: RequestOptions,
     ) -> Result<AddressHash, RnsError> {
+        let packed = pack_request(path, data);
+        let now = crate::resource::unix_time();
+
+        // Build the request before taking the handler lock. A resource
+        // request reads and encrypts its first segment here; the handler
+        // lock is only held to send or enqueue.
+        let link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
+        }
+        let link_id = *link_guard.id();
+
+        if packed.len() <= link_guard.mdu() {
+            let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
+            drop(link_guard);
+            // A packet-carried request is tracked by its packet hashable
+            // part (Python `PacketReceipt.truncated_hash`), which is the
+            // id a responder echoes back. The response timer starts now.
+            let rid = request_id_from_packet(&packet);
+            let mut handler = self.handler.lock().await;
+            handler.send_packet(packet).await;
+            handler.resources.track_request(
+                rid,
+                PendingRequest {
+                    link_id,
+                    deadline: options.timeout.map(|timeout| now + timeout),
+                    timeout: options.timeout,
+                    max_response_size: options.max_response_size,
+                },
+            );
+            return Ok(rid);
+        }
+
+        // A resource-carried request keeps the packed-payload id
+        // (Python `Link.request` sets `request_id =
+        // truncated_hash(packed_request)`). The response timer starts
+        // when that resource is proven.
+        let rid = make_request_id(&packed);
+        let opts = ResourceOptions {
+            request_id: Some(rid),
+            is_response: false,
+            timeout: options.timeout,
+            ..Default::default()
+        };
+        let resource = crate::resource::outbound::OutgoingResource::new(packed, &link_guard, opts)?;
+        drop(link_guard);
         let mut handler = self.handler.lock().await;
         let mut link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
             return Err(RnsError::LinkNotReady);
         }
-
-        let packed = pack_request(path, data);
-        let now = crate::resource::unix_time();
-
-        let (rid, awaiting_response, deadline) = if packed.len() <= link_guard.mdu() {
-            let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
-            // A packet-carried request is tracked by its packet hashable
-            // part (Python `PacketReceipt.truncated_hash`), which is the
-            // id a responder echoes back. The response timer starts now.
-            // Stamp outbound while this guard is held; `send` only try-locks.
-            let rid = request_id_from_packet(&packet);
-            handler.send_from_link(&mut link_guard, packet).await;
-            let deadline = options.timeout.map(|timeout| now + timeout);
-            (rid, true, deadline)
-        } else {
-            // A resource-carried request keeps the packed-payload id
-            // (Python `Link.request` sets `request_id =
-            // truncated_hash(packed_request)`). The response timer starts
-            // when that resource is proven.
-            let rid = make_request_id(&packed);
-            let opts = ResourceOptions {
-                request_id: Some(rid),
-                is_response: false,
-                timeout: options.timeout,
-                ..Default::default()
-            };
-            let resource =
-                crate::resource::outbound::OutgoingResource::new(packed, &link_guard, opts)?;
-            enqueue_resource(&mut handler, &mut link_guard, resource).await?;
-            (rid, false, None)
-        };
-
+        enqueue_resource(&mut handler, &mut link_guard, resource).await?;
         handler.resources.track_request(
             rid,
             PendingRequest {
-                link_id: *link_guard.id(),
-                deadline,
+                link_id,
+                deadline: None,
                 timeout: options.timeout,
                 max_response_size: options.max_response_size,
-                awaiting_response,
             },
         );
         Ok(rid)
@@ -2956,20 +2974,12 @@ async fn handle_incoming_request<'a>(
     // locks deadlocked any handler that re-entered transport APIs
     // (send_packet/request/send_resource) and stalled all packet
     // processing for slow handlers.
-    if let Some(registered) = handler
+    if let Some(async_fn) = handler
         .resources
         .async_request_handler(&destination, &path_hash)
     {
-        // Python skips the generator entirely when the peer is outside
-        // the handler's allow policy. An unidentified link has no hash
-        // to match against ALLOW_LIST.
-        if !registered.allows(&remote_identity) {
-            log::debug!("tp: async request from peer not allowed");
-            return;
-        }
-        let auto_compress = registered.auto_compress;
-        let auto_compress_limit = registered.auto_compress_limit;
-        let async_fn = registered.invoke();
+        // Async handlers have no allow policy. They send with the default
+        // compress values; the sync config path is what restricts peers.
         let link_id = *link.id();
         drop(link);
 
@@ -2998,8 +3008,8 @@ async fn handle_incoming_request<'a>(
                     &mut link,
                     &rid,
                     &RequestResponse::Element(response),
-                    auto_compress,
-                    auto_compress_limit,
+                    true,
+                    None,
                     &mut handler,
                 )
                 .await;
@@ -3016,8 +3026,8 @@ async fn handle_incoming_request<'a>(
         log::debug!("tp: request from peer not allowed");
         return;
     }
-    let auto_compress = registered.auto_compress;
-    let auto_compress_limit = registered.auto_compress_limit;
+    let auto_compress = registered.config.auto_compress;
+    let auto_compress_limit = registered.config.auto_compress_limit;
 
     let response = registered.call(RequestCtx {
         path_hash,

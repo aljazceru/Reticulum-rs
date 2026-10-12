@@ -8,13 +8,12 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::destination::link::{Link, LinkId};
-use crate::error::RnsError;
 use crate::hash::AddressHash;
 use crate::packet::Packet;
 
 use super::{
-    IncomingResource, OutgoingResource, ResourceAdvertisement, ResourceEvent, ResourceOptions,
-    ResourceStatus, ResourceTx,
+    IncomingResource, OutgoingResource, ResourceAdvertisement, ResourceEvent, ResourceStatus,
+    ResourceTx,
 };
 
 /// Default cap for decompression of incoming resources.
@@ -85,22 +84,12 @@ impl Default for RequestHandlerConfig {
     fn default() -> Self {
         Self {
             // The pre-existing register API responds to every peer. Python's
-            // own default is ALLOW_NONE; `python_default` matches that.
+            // own default is ALLOW_NONE; callers that want that set
+            // `RequestAllow::None` explicitly.
             allow: RequestAllow::All,
             allowed_list: Vec::new(),
             auto_compress: true,
             auto_compress_limit: None,
-        }
-    }
-}
-
-impl RequestHandlerConfig {
-    /// Python `register_request_handler` defaults: `ALLOW_NONE`,
-    /// `auto_compress=True`.
-    pub fn python_default() -> Self {
-        Self {
-            allow: RequestAllow::None,
-            ..Self::default()
         }
     }
 }
@@ -139,44 +128,21 @@ pub struct PendingRequest {
     pub deadline: Option<f64>,
     pub timeout: Option<f64>,
     pub max_response_size: Option<usize>,
-    pub awaiting_response: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct RegisteredHandler {
     invoke: Arc<dyn Fn(RequestContext) -> Option<RequestResponse> + Send + Sync>,
-    pub allow: RequestAllow,
-    pub allowed_list: Vec<AddressHash>,
-    pub auto_compress: bool,
-    pub auto_compress_limit: Option<usize>,
+    pub config: RequestHandlerConfig,
 }
 
 impl RegisteredHandler {
     pub fn allows(&self, remote: &Option<crate::identity::Identity>) -> bool {
-        request_allowed(self.allow, &self.allowed_list, remote)
+        request_allowed(self.config.allow, &self.config.allowed_list, remote)
     }
 
     pub fn call(&self, ctx: RequestContext) -> Option<RequestResponse> {
         (self.invoke)(ctx)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct RegisteredAsync {
-    invoke: AsyncRequestHandler,
-    pub allow: RequestAllow,
-    pub allowed_list: Vec<AddressHash>,
-    pub auto_compress: bool,
-    pub auto_compress_limit: Option<usize>,
-}
-
-impl RegisteredAsync {
-    pub fn allows(&self, remote: &Option<crate::identity::Identity>) -> bool {
-        request_allowed(self.allow, &self.allowed_list, remote)
-    }
-
-    pub fn invoke(&self) -> AsyncRequestHandler {
-        self.invoke.clone()
     }
 }
 
@@ -241,7 +207,7 @@ pub(crate) struct ResourceManager {
     /// Responses that completed before the caller began awaiting them,
     /// retained until collected (broadcast retains no history).
     /// Async request handlers by (destination, path hash).
-    pub async_request_handlers: HashMap<AddressHash, HashMap<AddressHash, RegisteredAsync>>,
+    pub async_request_handlers: HashMap<AddressHash, HashMap<AddressHash, AsyncRequestHandler>>,
     pub completed_responses: HashMap<AddressHash, Option<Vec<u8>>>,
     /// Accumulated bytes of split resources by original hash
     /// (Python appends per-segment assembled data to storage).
@@ -359,10 +325,7 @@ impl ResourceManager {
                 path_hash,
                 RegisteredHandler {
                     invoke: handler,
-                    allow: config.allow,
-                    allowed_list: config.allowed_list,
-                    auto_compress: config.auto_compress,
-                    auto_compress_limit: config.auto_compress_limit,
+                    config,
                 },
             );
     }
@@ -408,7 +371,6 @@ impl ResourceManager {
         let Some(pending) = self.pending_requests.get_mut(&request_id) else {
             return;
         };
-        pending.awaiting_response = true;
         if pending.deadline.is_none() {
             if let Some(timeout) = pending.timeout {
                 pending.deadline = Some(super::unix_time() + timeout);
@@ -437,33 +399,6 @@ impl ResourceManager {
                 progress,
             },
         });
-    }
-
-    /// Create, store and advertise an outgoing resource on `link`.
-    /// Returns the packets that must be transmitted.
-    pub fn send_resource(
-        &mut self,
-        link: &Link,
-        data: Vec<u8>,
-        opts: ResourceOptions,
-    ) -> Result<ResourceTx, RnsError> {
-        let active = self
-            .out
-            .get(link.id())
-            .map(|list| list.iter().any(|r| !r.status.is_concluded()))
-            .unwrap_or(false);
-
-        let mut resource = OutgoingResource::new(data, link, opts)?;
-        let mut tx = ResourceTx::default();
-
-        if active {
-            resource.status = ResourceStatus::Queued;
-        } else {
-            resource.advertise(link, &mut tx)?;
-        }
-
-        self.out.entry(*link.id()).or_default().push(resource);
-        Ok(tx)
     }
 
     /// Handle a decrypted resource advertisement plaintext.
@@ -515,7 +450,7 @@ impl ResourceManager {
             let request_id = adv.request_id.unwrap_or(AddressHash::new_empty());
             let known = self.pending_requests.contains_key(&request_id);
             // Python `read_size` is advertisement field `d`.
-            let size_ok = self.response_size_allowed(&request_id, adv.read_size());
+            let size_ok = self.response_size_allowed(&request_id, adv.data_size);
             if !known || !size_ok {
                 log::debug!("resource: rejecting response advertisement");
                 let mut reject = IncomingResource::reject_packet_for(&adv, link);
@@ -604,6 +539,17 @@ impl ResourceManager {
             advertisement: Some(adv.clone()),
         });
 
+        // Python stops the response timer when the response resource is
+        // accepted: `response_resource_progress` sets `RECEIVING`, and the
+        // timeout job only runs while the receipt is `DELIVERED`.
+        if adv.is_response() {
+            if let Some(request_id) = adv.request_id {
+                if let Some(pending) = self.pending_requests.get_mut(&request_id) {
+                    pending.deadline = None;
+                }
+            }
+        }
+
         // Python calls the request progress callback as soon as the
         // response resource is accepted, before any part arrives.
         if let Some((request_id, progress)) = incoming.request_progress() {
@@ -622,35 +568,11 @@ impl ResourceManager {
         path: &str,
         handler: AsyncRequestHandler,
     ) {
-        self.register_async_request_handler_with_config(
-            destination,
-            path,
-            RequestHandlerConfig::default(),
-            handler,
-        );
-    }
-
-    pub fn register_async_request_handler_with_config(
-        &mut self,
-        destination: AddressHash,
-        path: &str,
-        config: RequestHandlerConfig,
-        handler: AsyncRequestHandler,
-    ) {
         let path_hash = path_hash_of(path);
         self.async_request_handlers
             .entry(destination)
             .or_default()
-            .insert(
-                path_hash,
-                RegisteredAsync {
-                    invoke: handler,
-                    allow: config.allow,
-                    allowed_list: config.allowed_list,
-                    auto_compress: config.auto_compress,
-                    auto_compress_limit: config.auto_compress_limit,
-                },
-            );
+            .insert(path_hash, handler);
     }
 
     /// Look up the async handler for a destination/path.
@@ -658,7 +580,7 @@ impl ResourceManager {
         &self,
         destination: &AddressHash,
         path_hash: &AddressHash,
-    ) -> Option<RegisteredAsync> {
+    ) -> Option<AsyncRequestHandler> {
         self.async_request_handlers
             .get(destination)
             .and_then(|handlers| handlers.get(path_hash))
@@ -750,191 +672,232 @@ impl ResourceManager {
         link: &Link,
         tx: &mut ResourceTx,
     ) -> Option<(crate::hash::Hash, Vec<u8>)> {
-        let resources = self.incoming.get_mut(link.id())?;
-        for resource in resources.iter_mut() {
-            if resource.assembled.is_some() || resource.status != ResourceStatus::Assembling {
-                continue;
-            }
-            match resource.assemble(link, self.max_decompressed_size) {
-                Ok(data) => {
-                    resource.status = ResourceStatus::Complete;
-                    resource.prove(link, &resource.assembled.clone().unwrap(), tx);
-                    resource.last_activity = super::unix_time();
-
-                    let progress = resource.progress();
-                    let advertisement = resource.advertisement_of();
-                    let is_response = resource.is_response;
-                    let request_id = resource.request_id;
-                    let is_final = resource.segment_index == resource.total_segments;
-
-                    let (event_data, event_metadata, full_data) = if resource.split {
-                        let assembly = self
-                            .split_assembly
-                            .entry(resource.original_hash)
-                            .or_insert_with(|| SplitAssembly {
-                                data: Vec::new(),
-                                metadata: None,
-                                next_index: 1,
-                                total_segments: resource.total_segments,
-                                data_size: resource.advertisement_of().data_size,
-                                last_activity: super::unix_time(),
-                            });
-
-                        // Segment invariants: contiguous, no duplicates,
-                        // and a consistent logical transfer (index, total
-                        // and size may not change mid-assembly).
-                        let advertisement = resource.advertisement_of();
-                        let inconsistent = resource.segment_index != assembly.next_index
-                            || resource.total_segments != assembly.total_segments
-                            || advertisement.data_size != assembly.data_size;
-                        if inconsistent {
-                            resource.status = ResourceStatus::Corrupt;
-                            self.split_assembly.remove(&resource.original_hash);
+        let mut failed_requests: Vec<AddressHash> = Vec::new();
+        let completed = {
+            let resources = self.incoming.get_mut(link.id())?;
+            let mut completed = None;
+            for resource in resources.iter_mut() {
+                if resource.assembled.is_some() || resource.status != ResourceStatus::Assembling {
+                    continue;
+                }
+                match resource.assemble(link, self.max_decompressed_size) {
+                    Ok(data) => {
+                        // The request left `pending_requests` because it already
+                        // failed. Do not store or emit `Response`. Cancel the
+                        // incoming resource, matching Python's progress callback
+                        // which calls `resource.cancel()` once the receipt is FAILED.
+                        if resource.is_response
+                            && resource
+                                .request_id
+                                .is_some_and(|rid| !self.pending_requests.contains_key(&rid))
+                        {
+                            resource.status = ResourceStatus::Failed;
+                            resource.cancel_packet(link, tx);
                             let _ = self.events.send(ResourceEvent {
                                 link_id: *link.id(),
                                 hash: resource.hash,
-                                status: ResourceStatus::Corrupt,
-                                progress: 0.0,
+                                status: ResourceStatus::Failed,
+                                progress: resource.progress(),
                                 data: None,
                                 metadata: None,
-                                advertisement: Some(advertisement),
+                                advertisement: Some(resource.advertisement_of()),
                             });
                             continue;
                         }
+                        resource.status = ResourceStatus::Complete;
+                        resource.prove(link, &resource.assembled.clone().unwrap(), tx);
+                        resource.last_activity = super::unix_time();
 
-                        if resource.segment_index == 1 && assembly.metadata.is_none() {
-                            assembly.metadata = resource.metadata.clone();
-                        }
-                        assembly.data.extend_from_slice(&data);
-                        assembly.next_index += 1;
-                        assembly.last_activity = super::unix_time();
+                        let progress = resource.progress();
+                        let advertisement = resource.advertisement_of();
+                        let is_response = resource.is_response;
+                        let request_id = resource.request_id;
+                        let is_final = resource.segment_index == resource.total_segments;
 
-                        if is_final {
-                            let Some(complete) =
-                                self.split_assembly.remove(&resource.original_hash)
-                            else {
+                        let (event_data, event_metadata, full_data) = if resource.split {
+                            let assembly = self
+                                .split_assembly
+                                .entry(resource.original_hash)
+                                .or_insert_with(|| SplitAssembly {
+                                    data: Vec::new(),
+                                    metadata: None,
+                                    next_index: 1,
+                                    total_segments: resource.total_segments,
+                                    data_size: resource.advertisement_of().data_size,
+                                    last_activity: super::unix_time(),
+                                });
+
+                            // Segment invariants: contiguous, no duplicates,
+                            // and a consistent logical transfer (index, total
+                            // and size may not change mid-assembly).
+                            let advertisement = resource.advertisement_of();
+                            let inconsistent = resource.segment_index != assembly.next_index
+                                || resource.total_segments != assembly.total_segments
+                                || advertisement.data_size != assembly.data_size;
+                            if inconsistent {
                                 resource.status = ResourceStatus::Corrupt;
+                                if let Some(request_id) = resource.request_id {
+                                    failed_requests.push(request_id);
+                                }
+                                self.split_assembly.remove(&resource.original_hash);
                                 let _ = self.events.send(ResourceEvent {
                                     link_id: *link.id(),
                                     hash: resource.hash,
                                     status: ResourceStatus::Corrupt,
-                                    progress: resource.progress(),
+                                    progress: 0.0,
                                     data: None,
                                     metadata: None,
-                                    advertisement: Some(resource.advertisement_of()),
+                                    advertisement: Some(advertisement),
                                 });
                                 continue;
-                            };
-                            (
-                                Some(complete.data.clone()),
-                                complete.metadata.clone(),
-                                Some(complete.data),
-                            )
+                            }
+
+                            if resource.segment_index == 1 && assembly.metadata.is_none() {
+                                assembly.metadata = resource.metadata.clone();
+                            }
+                            assembly.data.extend_from_slice(&data);
+                            assembly.next_index += 1;
+                            assembly.last_activity = super::unix_time();
+
+                            if is_final {
+                                let Some(complete) =
+                                    self.split_assembly.remove(&resource.original_hash)
+                                else {
+                                    resource.status = ResourceStatus::Corrupt;
+                                    if let Some(request_id) = resource.request_id {
+                                        failed_requests.push(request_id);
+                                    }
+                                    let _ = self.events.send(ResourceEvent {
+                                        link_id: *link.id(),
+                                        hash: resource.hash,
+                                        status: ResourceStatus::Corrupt,
+                                        progress: resource.progress(),
+                                        data: None,
+                                        metadata: None,
+                                        advertisement: Some(resource.advertisement_of()),
+                                    });
+                                    continue;
+                                };
+                                (
+                                    Some(complete.data.clone()),
+                                    complete.metadata.clone(),
+                                    Some(complete.data),
+                                )
+                            } else {
+                                (None, None, None)
+                            }
                         } else {
-                            (None, None, None)
-                        }
-                    } else {
-                        (
-                            Some(data.clone()),
-                            resource.metadata.clone(),
-                            Some(data.clone()),
-                        )
-                    };
+                            (
+                                Some(data.clone()),
+                                resource.metadata.clone(),
+                                Some(data.clone()),
+                            )
+                        };
 
-                    let _ = self.events.send(ResourceEvent {
-                        link_id: *link.id(),
-                        hash: resource.hash,
-                        status: ResourceStatus::Complete,
-                        progress,
-                        data: event_data,
-                        metadata: event_metadata.clone(),
-                        advertisement: Some(advertisement),
-                    });
-
-                    let response_rid = if is_response && is_final {
-                        request_id
-                    } else {
-                        None
-                    };
-                    // Python `response_received` sets progress to 1.0 and
-                    // runs the progress callback before the response callback.
-                    if let Some(request_id) = response_rid {
-                        let _ = self.request_events.send(RequestEventData {
+                        let _ = self.events.send(ResourceEvent {
                             link_id: *link.id(),
-                            event: RequestEvent::Progress {
-                                request_id,
-                                progress: 1.0,
-                            },
+                            hash: resource.hash,
+                            status: ResourceStatus::Complete,
+                            progress,
+                            data: event_data,
+                            metadata: event_metadata.clone(),
+                            advertisement: Some(advertisement),
                         });
-                    }
-                    if let (Some(request_id), Some(full_data)) = (response_rid, full_data.as_ref())
-                    {
-                        let event = match unpack_response(full_data) {
-                            Some((rid, response)) if rid == request_id => {
-                                // Retain for late awaiters before emitting.
-                                self.completed_responses.insert(rid, Some(response.clone()));
-                                RequestEvent::Response {
+
+                        let response_rid = if is_response && is_final {
+                            request_id
+                        } else {
+                            None
+                        };
+                        // Python `response_received` sets progress to 1.0 and
+                        // runs the progress callback before the response callback.
+                        if let Some(request_id) = response_rid {
+                            let _ = self.request_events.send(RequestEventData {
+                                link_id: *link.id(),
+                                event: RequestEvent::Progress {
+                                    request_id,
+                                    progress: 1.0,
+                                },
+                            });
+                        }
+                        if let (Some(request_id), Some(full_data)) =
+                            (response_rid, full_data.as_ref())
+                        {
+                            let event = match unpack_response(full_data) {
+                                Some((rid, response)) if rid == request_id => {
+                                    // Retain for late awaiters before emitting.
+                                    self.completed_responses.insert(rid, Some(response.clone()));
+                                    RequestEvent::Response {
+                                        request_id: rid,
+                                        data: response,
+                                        metadata: event_metadata.clone(),
+                                    }
+                                }
+                                Some((rid, response)) => RequestEvent::Response {
                                     request_id: rid,
                                     data: response,
                                     metadata: event_metadata.clone(),
+                                },
+                                // A response resource with metadata is a FILE
+                                // response (Python `Link.resource_concluded`:
+                                // `if resource.has_metadata: handle_response(
+                                // ..., resource.data, ..., metadata=...)`):
+                                // the raw bytes are the response, no
+                                // `[rid, data]` envelope exists.
+                                None if event_metadata.is_some() => {
+                                    self.completed_responses
+                                        .insert(request_id, Some(full_data.clone()));
+                                    RequestEvent::Response {
+                                        request_id,
+                                        data: full_data.clone(),
+                                        metadata: event_metadata.clone(),
+                                    }
                                 }
-                            }
-                            Some((rid, response)) => RequestEvent::Response {
-                                request_id: rid,
-                                data: response,
-                                metadata: event_metadata.clone(),
-                            },
-                            // A response resource with metadata is a FILE
-                            // response (Python `Link.resource_concluded`:
-                            // `if resource.has_metadata: handle_response(
-                            // ..., resource.data, ..., metadata=...)`):
-                            // the raw bytes are the response, no
-                            // `[rid, data]` envelope exists.
-                            None if event_metadata.is_some() => {
-                                self.completed_responses
-                                    .insert(request_id, Some(full_data.clone()));
-                                RequestEvent::Response {
-                                    request_id,
-                                    data: full_data.clone(),
-                                    metadata: event_metadata.clone(),
-                                }
-                            }
-                            None => RequestEvent::Failed { request_id },
-                        };
-                        self.request_events
-                            .send(RequestEventData {
-                                link_id: *link.id(),
-                                event,
-                            })
-                            .ok();
-                        self.pending_requests.remove(&request_id);
-                    }
+                                None => RequestEvent::Failed { request_id },
+                            };
+                            self.request_events
+                                .send(RequestEventData {
+                                    link_id: *link.id(),
+                                    event,
+                                })
+                                .ok();
+                            self.pending_requests.remove(&request_id);
+                        }
 
-                    if let Some(full_data) = full_data {
-                        return Some((resource.hash, full_data));
+                        if let Some(full_data) = full_data {
+                            completed = Some((resource.hash, full_data));
+                            break;
+                        }
                     }
-                }
-                Err(err) => {
-                    log::debug!("resource: assembly failed: {err:?}");
-                    resource.status = ResourceStatus::Corrupt;
-                    if resource.split {
-                        self.split_assembly.remove(&resource.original_hash);
+                    Err(err) => {
+                        log::debug!("resource: assembly failed: {err:?}");
+                        resource.status = ResourceStatus::Corrupt;
+                        if let Some(request_id) = resource.request_id {
+                            failed_requests.push(request_id);
+                        }
+                        if resource.split {
+                            self.split_assembly.remove(&resource.original_hash);
+                        }
+                        let hash = resource.hash;
+                        let advertisement = resource.advertisement_of();
+                        let _ = self.events.send(ResourceEvent {
+                            link_id: *link.id(),
+                            hash,
+                            status: ResourceStatus::Corrupt,
+                            progress: resource.progress(),
+                            data: None,
+                            metadata: None,
+                            advertisement: Some(advertisement),
+                        });
                     }
-                    let hash = resource.hash;
-                    let advertisement = resource.advertisement_of();
-                    let _ = self.events.send(ResourceEvent {
-                        link_id: *link.id(),
-                        hash,
-                        status: ResourceStatus::Corrupt,
-                        progress: resource.progress(),
-                        data: None,
-                        metadata: None,
-                        advertisement: Some(advertisement),
-                    });
                 }
             }
+            completed
+        };
+        for request_id in failed_requests {
+            self.fail_request(request_id);
         }
-        None
+        completed
     }
 
     /// Handle RESOURCE_HMU plaintext.
@@ -965,7 +928,9 @@ impl ResourceManager {
 
         let mut next_to_advertise: Option<OutgoingResource> = None;
         let mut completed_hashes: Vec<(crate::hash::Hash, f64, ResourceAdvertisement)> = Vec::new();
+        let mut failed_hashes: Vec<(crate::hash::Hash, f64, ResourceAdvertisement)> = Vec::new();
         let mut delivered_requests: Vec<AddressHash> = Vec::new();
+        let mut failed_requests: Vec<AddressHash> = Vec::new();
 
         if let Some(resources) = self.out.get_mut(link.id()) {
             for resource in resources.iter_mut() {
@@ -973,6 +938,40 @@ impl ResourceManager {
                     continue;
                 }
                 if resource.validate_proof(proof_data) {
+                    // A missing or unreadable source is not "no next segment".
+                    // Tell the receiver and fail the request instead of
+                    // treating the transfer as finished.
+                    let mut prep_failed = false;
+                    if resource.split && resource.segment_index < resource.total_segments {
+                        if resource.next_segment.is_none() {
+                            match resource.prepare_next_segment(link) {
+                                Ok(next) => resource.next_segment = next,
+                                Err(error) => {
+                                    log::debug!("resource: next-segment prep failed: {error:?}");
+                                    resource.cancel_packet(link, tx);
+                                    prep_failed = true;
+                                    if let Some(request_id) = resource.request_id {
+                                        failed_requests.push(request_id);
+                                    }
+                                }
+                            }
+                        }
+                        if !prep_failed {
+                            if let Some(mut next) = resource.take_next_segment() {
+                                let _ = next.advertise(link, tx);
+                                next_to_advertise = Some(*next);
+                            }
+                        }
+                    }
+                    if prep_failed {
+                        failed_hashes.push((
+                            resource.hash,
+                            resource.progress(),
+                            resource.advertisement(),
+                        ));
+                        continue;
+                    }
+
                     // The response timer starts when the request resource
                     // itself has been delivered, not while it is still
                     // transferring (Python `request_resource_concluded`).
@@ -986,23 +985,6 @@ impl ResourceManager {
                         resource.progress(),
                         resource.advertisement(),
                     ));
-
-                    // Advertise the next segment of a split resource.
-                    if resource.split && resource.segment_index < resource.total_segments {
-                        // Prepare lazily if not pre-built.
-                        if resource.next_segment.is_none() {
-                            match resource.prepare_next_segment(link) {
-                                Ok(next) => resource.next_segment = next,
-                                Err(error) => {
-                                    log::debug!("resource: next-segment prep failed: {error:?}")
-                                }
-                            }
-                        }
-                        if let Some(mut next) = resource.take_next_segment() {
-                            let _ = next.advertise(link, tx);
-                            next_to_advertise = Some(*next);
-                        }
-                    }
                 }
             }
         }
@@ -1012,6 +994,17 @@ impl ResourceManager {
                 link_id: *link.id(),
                 hash,
                 status: ResourceStatus::Complete,
+                progress,
+                data: None,
+                metadata: None,
+                advertisement: Some(advertisement),
+            });
+        }
+        for (hash, progress, advertisement) in failed_hashes {
+            let _ = self.events.send(ResourceEvent {
+                link_id: *link.id(),
+                hash,
+                status: ResourceStatus::Failed,
                 progress,
                 data: None,
                 metadata: None,
@@ -1032,6 +1025,9 @@ impl ResourceManager {
         for request_id in delivered_requests {
             self.arm_response_timeout(request_id);
         }
+        for request_id in failed_requests {
+            self.fail_request(request_id);
+        }
     }
 
     /// Handle RESOURCE_ICL (initiator cancel) plaintext.
@@ -1043,10 +1039,14 @@ impl ResourceManager {
         hash_bytes.copy_from_slice(&plaintext[..32]);
         let resource_hash = crate::hash::Hash::new(hash_bytes);
 
+        let mut failed_requests: Vec<AddressHash> = Vec::new();
         if let Some(resources) = self.incoming.get_mut(link.id()) {
             for resource in resources.iter_mut() {
                 if resource.hash == resource_hash && !resource.status.is_concluded() {
                     resource.status = ResourceStatus::Failed;
+                    if let Some(request_id) = resource.request_id {
+                        failed_requests.push(request_id);
+                    }
                     let _ = self.events.send(ResourceEvent {
                         link_id: *link.id(),
                         hash: resource_hash,
@@ -1059,6 +1059,9 @@ impl ResourceManager {
                 }
             }
         }
+        for request_id in failed_requests {
+            self.fail_request(request_id);
+        }
     }
 
     /// Cancel an outgoing transfer on `link` (Python `Resource.cancel` from
@@ -1066,22 +1069,26 @@ impl ResourceManager {
     /// emits a `ResourceEvent` so callers learn the transfer was cancelled.
     /// Split transfers cancel every segment of the logical resource.
     pub fn cancel_outbound(&mut self, link: &Link, hash: &crate::hash::Hash) -> Option<ResourceTx> {
-        let resources = self.out.get_mut(link.id())?;
         let mut tx = ResourceTx::default();
-        let mut cancelled = false;
         let mut events: Vec<crate::hash::Hash> = Vec::new();
-        for resource in resources.iter_mut() {
-            if resource.original_hash == *hash || resource.hash == *hash {
-                if resource.status.is_concluded() {
-                    continue;
+        let mut failed_requests: Vec<AddressHash> = Vec::new();
+        {
+            let resources = self.out.get_mut(link.id())?;
+            for resource in resources.iter_mut() {
+                if resource.original_hash == *hash || resource.hash == *hash {
+                    if resource.status.is_concluded() {
+                        continue;
+                    }
+                    let event_hash = resource.hash;
+                    if let Some(request_id) = resource.request_id {
+                        failed_requests.push(request_id);
+                    }
+                    resource.cancel_packet(link, &mut tx);
+                    events.push(event_hash);
                 }
-                let event_hash = resource.hash;
-                resource.cancel_packet(link, &mut tx);
-                cancelled = true;
-                events.push(event_hash);
             }
         }
-        if !cancelled {
+        if events.is_empty() {
             return None;
         }
         for event_hash in events {
@@ -1094,6 +1101,9 @@ impl ResourceManager {
                 metadata: None,
                 advertisement: None,
             });
+        }
+        for request_id in failed_requests {
+            self.fail_request(request_id);
         }
         Some(tx)
     }
@@ -1102,23 +1112,27 @@ impl ResourceManager {
     /// the receiver): marks it `Failed`, sends the RESOURCE_RCL packet and
     /// emits a `ResourceEvent`. Returns the packets that must be transmitted.
     pub fn cancel_inbound(&mut self, link: &Link, hash: &crate::hash::Hash) -> Option<ResourceTx> {
-        let resources = self.incoming.get_mut(link.id())?;
         let mut tx = ResourceTx::default();
-        let mut cancelled = false;
         let mut events: Vec<crate::hash::Hash> = Vec::new();
-        for resource in resources.iter_mut() {
-            if resource.original_hash == *hash || resource.hash == *hash {
-                if resource.status.is_concluded() {
-                    continue;
+        let mut failed_requests: Vec<AddressHash> = Vec::new();
+        {
+            let resources = self.incoming.get_mut(link.id())?;
+            for resource in resources.iter_mut() {
+                if resource.original_hash == *hash || resource.hash == *hash {
+                    if resource.status.is_concluded() {
+                        continue;
+                    }
+                    let event_hash = resource.hash;
+                    if let Some(request_id) = resource.request_id {
+                        failed_requests.push(request_id);
+                    }
+                    resource.status = ResourceStatus::Failed;
+                    resource.cancel_packet(link, &mut tx);
+                    events.push(event_hash);
                 }
-                let event_hash = resource.hash;
-                resource.status = ResourceStatus::Failed;
-                resource.cancel_packet(link, &mut tx);
-                cancelled = true;
-                events.push(event_hash);
             }
         }
-        if !cancelled {
+        if events.is_empty() {
             return None;
         }
         for event_hash in events {
@@ -1131,6 +1145,9 @@ impl ResourceManager {
                 metadata: None,
                 advertisement: None,
             });
+        }
+        for request_id in failed_requests {
+            self.fail_request(request_id);
         }
         Some(tx)
     }
@@ -1149,10 +1166,10 @@ impl ResourceManager {
             for resource in resources.iter_mut() {
                 if resource.hash == resource_hash && !resource.status.is_concluded() {
                     resource.status = ResourceStatus::Rejected;
-                    if !resource.is_response {
-                        if let Some(request_id) = resource.request_id {
-                            rejected_requests.push(request_id);
-                        }
+                    // A rejected response has no local receipt. A rejected
+                    // request does, including when its timeout is unset.
+                    if let Some(request_id) = resource.request_id {
+                        rejected_requests.push(request_id);
                     }
                     let _ = self.events.send(ResourceEvent {
                         link_id: *link.id(),
@@ -1322,9 +1339,9 @@ impl ResourceManager {
             .pending_requests
             .iter()
             .filter_map(|(request_id, pending)| {
-                if pending.awaiting_response
-                    && pending.deadline.is_some_and(|deadline| now > deadline)
-                {
+                // Accepting a response resource clears `deadline`, which is
+                // what stops this timer. No separate awaiting flag.
+                if pending.deadline.is_some_and(|deadline| now > deadline) {
                     Some(*request_id)
                 } else {
                     None
