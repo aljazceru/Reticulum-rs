@@ -223,10 +223,8 @@ impl TcpClient {
             let (read_stream, write_stream) = stream.into_split();
 
             stats.set_online(true);
-            // A live session starts a fresh outage budget. Leaving the old
-            // count in place would make `max_reconnect_tries` a process
-            // lifetime cap instead of Python's per-drop cap.
-            note_session_live(&mut reconnect_attempts);
+            // Next outage starts at zero.
+            reconnect_attempts = 0;
             log::info!("tcp_client connected to <{}>", addr);
 
             const BUFFER_SIZE: usize = core::mem::size_of::<Packet>() * 2;
@@ -512,11 +510,6 @@ fn reconnect_permitted(attempts: u32, max_reconnect_tries: Option<u32>) -> bool 
         Some(max) => attempts <= max,
         None => true,
     }
-}
-
-/// `reconnect` assigns `attempts = 0` for the outage that follows a live session.
-fn note_session_live(attempts: &mut u32) {
-    *attempts = 0;
 }
 
 /// After `RECONNECT_WAIT`, increment and report whether the next dial may run.
@@ -841,14 +834,13 @@ mod tests {
         // A later live session clears a spent cap. The next outage counts
         // from zero after its own wait, before the next dial.
         let mut attempts = 2;
-        note_session_live(&mut attempts);
-        assert_eq!(attempts, 0);
+        assert!(!reconnect_after_wait(&mut attempts, Some(1)));
+        attempts = 0;
         assert!(reconnect_after_wait(&mut attempts, Some(1)));
-        note_session_live(&mut attempts);
+        attempts = 0;
         assert!(reconnect_after_wait(&mut attempts, Some(1)));
 
-        let mut attempts = 5;
-        note_session_live(&mut attempts);
+        let mut attempts = 0;
         assert!(!reconnect_after_wait(&mut attempts, Some(0)));
 
         let mut attempts = 0;
