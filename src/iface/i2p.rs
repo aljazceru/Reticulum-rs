@@ -25,6 +25,7 @@ use tokio::net::TcpStream;
 
 use crate::buffer::{InputBuffer, OutputBuffer};
 use crate::error::RnsError;
+use crate::hash::Hash;
 use crate::iface::hdlc::Hdlc;
 use crate::iface::{Interface, InterfaceContext, InterfaceManager, RxMessage};
 use crate::packet::Packet;
@@ -50,6 +51,11 @@ const SAM_MAX_VERSION: &str = "3.1";
 
 /// Python `Destination.default_sig_type` (`EdDSA_SHA512_Ed25519`).
 const SAM_SIGNATURE_EDDSA_SHA512_ED25519: &str = "7";
+
+/// Shortest SAM private key: the destination, the encryption private key,
+/// and a DSA-SHA1 signing private key. Python rejects anything shorter
+/// before `create_session`.
+const MIN_SAM_PRIVATE_KEY: usize = 663;
 
 /// A parsed SAM reply line.
 #[derive(Debug, Clone)]
@@ -171,9 +177,11 @@ where
         .ok_or(RnsError::PacketError)
 }
 
-/// `SESSION CREATE`. `destination` is `TRANSIENT` or a private-key blob
-/// (Python `destination.private_key.base64`). The returned string is the
-/// public destination from `SESSION STATUS`.
+/// `SESSION CREATE`. `destination` is `TRANSIENT` or the full private-key
+/// string (Python `destination.private_key.base64`).
+///
+/// `SESSION STATUS DESTINATION` is that private key again, not the address.
+/// The returned string is only the public prefix.
 async fn session_create<S>(
     io: &mut S,
     session_id: &str,
@@ -190,30 +198,47 @@ where
     if !reply.ok() {
         return Err(RnsError::ConnectionError);
     }
-    reply
+    let status_dest = reply
         .opts
         .get("DESTINATION")
-        .cloned()
-        .ok_or(RnsError::IncorrectHash)
+        .ok_or(RnsError::IncorrectHash)?;
+    public_destination_b64(status_dest)
+}
+
+/// One I2P-base64 token (`A-Za-z0-9-~=`). `=` is checked again by the decoder.
+fn is_i2p_b64_token(key: &str) -> bool {
+    !key.is_empty()
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'~' | b'='))
+}
+
+/// A key file is usable only when it decodes to a full SAM private key.
+fn validate_private_key(key: &str) -> Result<(), RnsError> {
+    if !is_i2p_b64_token(key) {
+        return Err(RnsError::Storage);
+    }
+    let bytes = i2p_b64_decode(key).ok_or(RnsError::Storage)?;
+    if bytes.len() < MIN_SAM_PRIVATE_KEY {
+        return Err(RnsError::Storage);
+    }
+    Ok(())
 }
 
 /// Read a persisted I2P private key. `Ok(None)` when the file is absent.
 ///
-/// A trailing newline is stripped: SAM requests are one line, and a text
-/// editor saving the Python key file would otherwise split `SESSION CREATE`.
+/// One trailing newline is ignored. Any other extra byte is rejected and
+/// the file is left untouched: a short or corrupt key must not be sent to
+/// SAM and must not be replaced with a newly generated one.
 fn read_destination_key(path: &Path) -> Result<Option<String>, RnsError> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let key = text.trim();
-            if key.is_empty() {
-                Err(RnsError::Storage)
-            } else {
-                Ok(Some(key.to_string()))
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(RnsError::Storage),
-    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(RnsError::Storage),
+    };
+    let key = text.strip_suffix('\n').unwrap_or(text.as_str());
+    validate_private_key(key)?;
+    Ok(Some(key.to_string()))
 }
 
 fn write_destination_key(path: &Path, key: &str) -> Result<(), RnsError> {
@@ -226,49 +251,43 @@ fn write_destination_key(path: &Path, key: &str) -> Result<(), RnsError> {
     std::fs::write(path, key).map_err(|_| RnsError::Storage)
 }
 
-/// Load or mint the private key Python passes as `DESTINATION=`.
+/// Load or mint the private key, then HELLO and `SESSION CREATE`.
 ///
 /// `connect` is one SAM socket per call. Generation uses its own socket
 /// (Python `new_destination` closes that connection before
-/// `create_session`).
-async fn destination_parameter<S, F, Fut>(
+/// `create_session`). An invalid key file returns [`RnsError::Storage`]
+/// before any socket is opened.
+async fn open_dialogue<S, F, Fut>(
+    session_id: &str,
     key_path: Option<&Path>,
-    connect: &mut F,
-) -> Result<String, RnsError>
+    mut connect: F,
+) -> Result<(String, S), RnsError>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<S, RnsError>>,
 {
-    let Some(path) = key_path else {
-        return Ok("TRANSIENT".to_string());
+    let destination_param = if let Some(path) = key_path {
+        match read_destination_key(path)? {
+            Some(key) => key,
+            None => {
+                let mut io = connect().await?;
+                let key = generate_private_key(&mut io).await?;
+                drop(io);
+                // Do not persist a blob the next start would reject.
+                validate_private_key(&key).map_err(|_| RnsError::PacketError)?;
+                write_destination_key(path, &key)?;
+                key
+            }
+        }
+    } else {
+        "TRANSIENT".to_string()
     };
-    if let Some(key) = read_destination_key(path)? {
-        return Ok(key);
-    }
-    let mut io = connect().await?;
-    let key = generate_private_key(&mut io).await?;
-    drop(io);
-    write_destination_key(path, &key)?;
-    Ok(key)
-}
 
-fn sha256_bytes(data: &[u8]) -> [u8; 32] {
-    use sha2::Digest;
-    let digest = sha2::Sha256::digest(data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
+    let mut socket = connect().await?;
+    hello(&mut socket).await?;
+    let destination = session_create(&mut socket, session_id, &destination_param).await?;
+    Ok((destination, socket))
 }
 
 /// Key file for a connectable I2P interface
@@ -283,64 +302,65 @@ pub fn i2p_destination_key_path(
     identity_hash: &[u8],
 ) -> PathBuf {
     let i2p_dir = storage_path.as_ref().join("i2p");
-    let name_hash = sha256_bytes(interface_name.as_bytes());
-    let old_path = i2p_dir.join(format!("{}.i2p", hex_encode(&sha256_bytes(&name_hash))));
+    let name_hash = Hash::new_from_slice(interface_name.as_bytes());
+    let hash = Hash::new_from_slice(name_hash.as_slice());
+    let old_path = i2p_dir.join(format!("{hash}.i2p"));
     if old_path.is_file() {
         return old_path;
     }
-    let mut material = Vec::with_capacity(64);
-    material.extend_from_slice(&name_hash);
-    material.extend_from_slice(&sha256_bytes(identity_hash));
-    i2p_dir.join(format!("{}.i2p", hex_encode(&sha256_bytes(&material))))
+    let ident_hash = Hash::new_from_slice(identity_hash);
+    let mut material = Vec::with_capacity(name_hash.as_slice().len() + ident_hash.as_slice().len());
+    material.extend_from_slice(name_hash.as_slice());
+    material.extend_from_slice(ident_hash.as_slice());
+    let hash = Hash::new_from_slice(&material);
+    i2p_dir.join(format!("{hash}.i2p"))
 }
 
 /// A SAM session handle: one stream session, plus connect/accept
 /// (Python `i2plib.create_session` + `stream_connect`/`stream_accept`).
-///
-/// `S` defaults to [`TcpStream`]. Tests pass a scripted socket instead of
-/// a live bridge.
-pub struct SamSession<S = TcpStream> {
+pub struct SamSession {
     sam_addr: String,
     session_id: String,
     /// The SAM control connection that created this session. SAM bridges
     /// invalidate a session when this socket closes, so it must live for the
     /// entire lifetime of the session handle.
-    _control_socket: S,
-    /// Base64 public destination (from `SESSION STATUS`, not the private key).
+    _control_socket: TcpStream,
+    /// Base64 public destination. The private key never leaves the key file
+    /// and the `SESSION CREATE` line.
     pub destination: String,
 }
 
-impl<S> SamSession<S>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    /// Create a STREAM session over sockets from `connect`.
-    ///
-    /// `key_path` persists the destination the way
-    /// `I2PController.server_tunnel` does. `None` asks for
-    /// `DESTINATION=TRANSIENT` (existing [`SamSession::create`] callers).
-    /// Each `connect` call is a new SAM socket: tests inject a fake
-    /// transcript here instead of opening TCP.
-    pub async fn create_on<F, Fut>(
+impl SamSession {
+    async fn open(
         sam_addr: &str,
         session_id: &str,
         key_path: Option<&Path>,
-        mut connect: F,
-    ) -> Result<Self, RnsError>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Result<S, RnsError>>,
-    {
-        let destination_param = destination_parameter(key_path, &mut connect).await?;
-        let mut socket = connect().await?;
-        hello(&mut socket).await?;
-        let destination = session_create(&mut socket, session_id, &destination_param).await?;
+    ) -> Result<Self, RnsError> {
+        let (destination, socket) =
+            open_dialogue(session_id, key_path, || tcp_sam(sam_addr)).await?;
         Ok(Self {
             sam_addr: sam_addr.to_string(),
             session_id: session_id.to_string(),
             destination,
             _control_socket: socket,
         })
+    }
+
+    /// Create a transient STREAM session on the bridge
+    /// (Python `i2plib.create_session(..., destination=TRANSIENT)`).
+    pub async fn create(sam_addr: &str, session_id: &str) -> Result<Self, RnsError> {
+        Self::open(sam_addr, session_id, None).await
+    }
+
+    /// Create a STREAM session that reuses the private key at `key_path`
+    /// (Python `I2PController.server_tunnel`). The same file makes a later
+    /// create request the same `DESTINATION=`.
+    pub async fn create_with_key(
+        sam_addr: &str,
+        session_id: &str,
+        key_path: impl AsRef<Path>,
+    ) -> Result<Self, RnsError> {
+        Self::open(sam_addr, session_id, Some(key_path.as_ref())).await
     }
 
     /// Open an outbound stream to a base64 destination; the returned
@@ -400,84 +420,160 @@ where
     }
 
     /// The `.b32.i2p` address of the local destination
-    /// (Python `Destination.base32`: base32 of `sha256(destination)`
-    /// truncated to 52 chars).
-    pub fn b32(&self) -> String {
+    /// (Python `Destination.base32`). Fails closed: a bad decode is not
+    /// hashed as an empty buffer.
+    pub fn b32(&self) -> Result<String, RnsError> {
         destination_b32(&self.destination)
     }
 }
 
-impl SamSession<TcpStream> {
-    /// Create a transient STREAM session on the bridge
-    /// (Python `i2plib.create_session(..., destination=TRANSIENT)`).
-    ///
-    /// Source-compatible with existing callers. Pass a key file to
-    /// [`SamSession::create_with_key`] or [`SamSession::create_on`] for a
-    /// stable destination.
-    pub async fn create(sam_addr: &str, session_id: &str) -> Result<Self, RnsError> {
-        Self::create_on(sam_addr, session_id, None, || tcp_sam(sam_addr)).await
-    }
-
-    /// Create a STREAM session that reuses the private key at `key_path`
-    /// (Python `I2PController.server_tunnel`). The same file makes a later
-    /// create request the same `DESTINATION=`.
-    pub async fn create_with_key(
-        sam_addr: &str,
-        session_id: &str,
-        key_path: impl AsRef<Path>,
-    ) -> Result<Self, RnsError> {
-        let path = key_path.as_ref();
-        Self::create_on(sam_addr, session_id, Some(path), || tcp_sam(sam_addr)).await
+fn i2p_b64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'-' => Some(62),
+        b'~' => Some(63),
+        _ => None,
     }
 }
 
-/// Base64 (I2P alphabet) decoding for destination handling.
+/// Decode I2P base64 (`A-Za-z0-9-~`, not URL-safe `_`). Padding must match
+/// Python `b64decode(..., validate=True)`.
 fn i2p_b64_decode(data: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    let table: Vec<u8> =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".to_vec();
-
-    let mut acc: u32 = 0;
-    let mut bits = 0;
-    for &byte in data.as_bytes() {
-        if byte == b'=' {
-            break;
-        }
-        let value = table.iter().position(|&c| c == byte)? as u32;
-        acc = (acc << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
+    let bytes = data.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
+        return None;
     }
-
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut index = 0;
+    while index < bytes.len() {
+        let mut chunk = [0u8; 4];
+        let mut pads = 0;
+        for slot in 0..4 {
+            let byte = bytes[index + slot];
+            if byte == b'=' {
+                if slot < 2 {
+                    return None;
+                }
+                pads += 1;
+                chunk[slot] = 0;
+            } else if pads > 0 {
+                return None;
+            } else {
+                chunk[slot] = i2p_b64_value(byte)?;
+            }
+        }
+        if pads > 2 {
+            return None;
+        }
+        let packed = ((chunk[0] as u32) << 18)
+            | ((chunk[1] as u32) << 12)
+            | ((chunk[2] as u32) << 6)
+            | (chunk[3] as u32);
+        out.push((packed >> 16) as u8);
+        if pads < 2 {
+            out.push((packed >> 8) as u8);
+        }
+        if pads < 1 {
+            out.push(packed as u8);
+        }
+        index += 4;
+    }
     Some(out)
 }
 
-/// Compute the `.b32.i2p` address of a base64 destination
-/// (Python `Destination.base32`).
-pub fn destination_b32(destination_b64: &str) -> String {
-    use sha2::Digest;
+fn i2p_b64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-~";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut index = 0;
+    while index + 3 <= data.len() {
+        let packed = ((data[index] as u32) << 16)
+            | ((data[index + 1] as u32) << 8)
+            | (data[index + 2] as u32);
+        out.push(ALPHABET[((packed >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((packed >> 12) & 63) as usize] as char);
+        out.push(ALPHABET[((packed >> 6) & 63) as usize] as char);
+        out.push(ALPHABET[(packed & 63) as usize] as char);
+        index += 3;
+    }
+    match data.len() - index {
+        1 => {
+            let packed = (data[index] as u32) << 16;
+            out.push(ALPHABET[((packed >> 18) & 63) as usize] as char);
+            out.push(ALPHABET[((packed >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let packed = ((data[index] as u32) << 16) | ((data[index + 1] as u32) << 8);
+            out.push(ALPHABET[((packed >> 18) & 63) as usize] as char);
+            out.push(ALPHABET[((packed >> 12) & 63) as usize] as char);
+            out.push(ALPHABET[((packed >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
 
-    let bytes = i2p_b64_decode(destination_b64).unwrap_or_default();
-    let hash = sha2::Sha256::digest(&bytes);
+/// Public destination bytes inside a SAM key.
+///
+/// Python `Destination` reads the certificate length at bytes 385..387 and
+/// keeps `data[:387+cert_len]`. A real private key is at least 663 bytes and
+/// that prefix fits. A shorter blob whose certificate does not fit is already
+/// a public destination: the mock SAM bridge answers with a 387-byte
+/// placeholder, and treating that as a private key would refuse `create`.
+fn public_key_bytes(data: &[u8]) -> Result<&[u8], RnsError> {
+    if data.len() < 387 {
+        return Err(RnsError::PacketError);
+    }
+    let cert_len = u16::from_be_bytes([data[385], data[386]]) as usize;
+    let public_len = 387 + cert_len;
+    if public_len <= data.len() {
+        return Ok(&data[..public_len]);
+    }
+    if data.len() < MIN_SAM_PRIVATE_KEY {
+        return Ok(data);
+    }
+    Err(RnsError::PacketError)
+}
 
-    // RFC 4648 base32, lower-case, truncated to 52 characters.
+fn public_destination_b64(encoded: &str) -> Result<String, RnsError> {
+    let bytes = i2p_b64_decode(encoded).ok_or(RnsError::PacketError)?;
+    Ok(i2p_b64_encode(public_key_bytes(&bytes)?))
+}
+
+/// RFC 4648 base32, lowercase. SHA-256 is 256 bits, so the last character is
+/// the leftover 1-bit quantum (Python `b32encode(digest)[:52].lower()`).
+fn base32_52(hash: &[u8]) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut out = String::new();
+    let mut out = String::with_capacity(52);
     let mut acc: u32 = 0;
     let mut bits = 0;
-    for byte in hash.iter() {
-        acc = (acc << 8) | *byte as u32;
+    for byte in hash {
+        acc = (acc << 8) | u32::from(*byte);
         bits += 8;
-        while bits >= 5 && out.len() < 52 {
+        while bits >= 5 {
             bits -= 5;
             out.push(ALPHABET[((acc >> bits) & 0x1f) as usize] as char);
         }
     }
-
+    if bits > 0 {
+        out.push(ALPHABET[((acc << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out.truncate(52);
     out
+}
+
+/// `.b32.i2p` hash of a destination (Python `Destination.base32`).
+///
+/// The hash covers only the public prefix, never a private-key suffix.
+/// Decode failure is an error: empty input is not hashed.
+pub fn destination_b32(destination_b64: &str) -> Result<String, RnsError> {
+    let bytes = i2p_b64_decode(destination_b64).ok_or(RnsError::PacketError)?;
+    let public = public_key_bytes(&bytes)?;
+    Ok(base32_52(Hash::new_from_slice(public).as_slice()))
 }
 
 /// One HDLC-framed stream peer over an established I2P stream
@@ -792,8 +888,8 @@ impl I2pServer {
         ))
     }
 
-    /// The published base64 destination of the server session, once
-    /// established (empty string before).
+    /// The published public base64 destination, once established
+    /// (empty string before). This is not the SAM private key.
     pub async fn destination(&self) -> String {
         self.session
             .read()
@@ -809,7 +905,7 @@ impl I2pServer {
             .read()
             .await
             .as_ref()
-            .map(|session| session.b32())
+            .and_then(|session| session.b32().ok())
             .unwrap_or_default()
     }
 
@@ -847,7 +943,7 @@ impl I2pServer {
             log::info!(
                 "i2p_server: session {} connectable as {}.b32.i2p",
                 session_id,
-                session.b32()
+                session.b32().unwrap_or_default()
             );
 
             *session_slot.write().await = Some(session.clone());
@@ -1091,52 +1187,75 @@ mod tests {
         assert_eq!(server.destination_key.as_deref(), Some(old.as_path()));
     }
 
+    /// 663-byte SAM private key and its public prefix, from Python
+    /// `b64encode(..., altchars=b"-~")` / `Destination.base32`.
+    const PRIVATE_KEY: &str = "AxQlNkdYaXqLnK2-z-DxAhMkNUZXaHmKm6y9zt~wARIjNEVWZ3iJmqu8zd7vABEiM0RVZneImaq7zN3u~xAhMkNUZXaHmKm6y9zt~g8gMUJTZHWGl6i5ytvs~Q4fMEFSY3SFlqe4ydrr~A0eL0BRYnOElaa3yNnq-wwdLj9QYXKDlKW2x9jp-gscLT5PYHGCk6S1xtfo-QobLD1OX3CBkqO0xdbn-AkaKzxNXm-AkaKzxNXm9wgZKjtMXW5~kKGyw9Tl9gcYKTpLXG1-j6CxwtPk9QYXKDlKW2x9jp-wwdLj9AUWJzhJWmt8jZ6vwNHi8wQVJjdIWWp7jJ2uv9Dh8gMUJTZHWGl6i5ytvs~g8QITJDVGV2h5ipusvc7f8AESIzRFVmd4iZqrvM3e7wARIjNEVWZ3iJmqu8zd7v8QITJDVGV2h5ipusvc7f4PIDFCU2R1hpeoucrb7P0OHzBBUmN0hZanuMna6~wNHi9AUWJzhJWmt8jZ6vsMHS4~UGFygwAEAQIDBPoLHC0-T2BxgpOktcbX6PkKGyw9Tl9wgZKjtMXW5~gJGis8TV5vgJGis8TV5vcIGSo7TF1uf5ChssPU5fYHGCk6S1xtfo-gscLT5PUGFyg5SltsfY6fsMHS4~QFFic4SVprfI2er8DR4vMEFSY3SFlqe4ydrr~Q4fIDFCU2R1hpeoucrb7P4PECEyQ1RldoeYqbrL3O3~ABEiM0RVZneImaq7zN3u8AESIzRFVmd4iZqrvM3e7~ECEyQ1RldoeYqbrL3O3-DyAxQlNkdYaXqLnK2-z9Dh8wQVJjdIWWp7jJ2uv8DR4vQFFic4SVprfI2er7DB0uP1BhcoOUpbbH2On6CxwtPk9gcYKTpLXG1-j5";
+    const PUBLIC_DEST: &str = "AxQlNkdYaXqLnK2-z-DxAhMkNUZXaHmKm6y9zt~wARIjNEVWZ3iJmqu8zd7vABEiM0RVZneImaq7zN3u~xAhMkNUZXaHmKm6y9zt~g8gMUJTZHWGl6i5ytvs~Q4fMEFSY3SFlqe4ydrr~A0eL0BRYnOElaa3yNnq-wwdLj9QYXKDlKW2x9jp-gscLT5PYHGCk6S1xtfo-QobLD1OX3CBkqO0xdbn-AkaKzxNXm-AkaKzxNXm9wgZKjtMXW5~kKGyw9Tl9gcYKTpLXG1-j6CxwtPk9QYXKDlKW2x9jp-wwdLj9AUWJzhJWmt8jZ6vwNHi8wQVJjdIWWp7jJ2uv9Dh8gMUJTZHWGl6i5ytvs~g8QITJDVGV2h5ipusvc7f8AESIzRFVmd4iZqrvM3e7wARIjNEVWZ3iJmqu8zd7v8QITJDVGV2h5ipusvc7f4PIDFCU2R1hpeoucrb7P0OHzBBUmN0hZanuMna6~wNHi9AUWJzhJWmt8jZ6vsMHS4~UGFygwAEAQIDBA==";
+    const PUBLIC_B32: &str = "t4lwmrkihjofp2vtlmdihepocam4pcywi6uolcxh3uwiehenmwaa";
+
+    fn status_line() -> String {
+        format!("SESSION STATUS RESULT=OK DESTINATION={PRIVATE_KEY}")
+    }
+
+    async fn dialogue(
+        key_path: Option<&Path>,
+        stages: Vec<Vec<&str>>,
+    ) -> (Result<String, RnsError>, Vec<String>) {
+        let transcript = Transcript::new(stages);
+        let result = open_dialogue("sess", key_path, || {
+            let conn = transcript.connect();
+            async move { conn }
+        })
+        .await
+        .map(|(destination, _socket)| destination);
+        (result, transcript.requests())
+    }
+
+    #[test]
+    fn public_prefix_and_base32_match_python() {
+        assert_eq!(public_destination_b64(PRIVATE_KEY).unwrap(), PUBLIC_DEST);
+        assert_eq!(destination_b32(PRIVATE_KEY).unwrap(), PUBLIC_B32);
+        assert_eq!(destination_b32(PUBLIC_DEST).unwrap(), PUBLIC_B32);
+        assert_eq!(PUBLIC_B32.len(), 52);
+        assert_ne!(PUBLIC_DEST, PRIVATE_KEY);
+        // URL-safe `_` is not I2P base64, and a failed decode is not sha256("").
+        assert!(destination_b32("____").is_err());
+        assert!(destination_b32("").is_err());
+        assert!(destination_b32("~").is_err());
+    }
+
     #[tokio::test]
     async fn second_create_requests_the_same_destination() {
         let tmp = TempDir::new();
         let key_path = tmp.0.join("i2p").join("node.i2p");
-        let private_key = "stable-priv-key";
-        let public_dest = "public-dest";
+        let generate = format!("DEST REPLY PUB={PUBLIC_DEST} PRIV={PRIVATE_KEY}");
+        let status = status_line();
 
-        let first = Transcript::new(vec![
+        let (public_dest, first_requests) = dialogue(
+            Some(key_path.as_path()),
             vec![
-                "HELLO REPLY RESULT=OK VERSION=3.1",
-                "DEST REPLY PUB=public-dest PRIV=stable-priv-key",
+                vec!["HELLO REPLY RESULT=OK VERSION=3.1", generate.as_str()],
+                vec!["HELLO REPLY RESULT=OK VERSION=3.1", status.as_str()],
             ],
-            vec![
-                "HELLO REPLY RESULT=OK VERSION=3.1",
-                "SESSION STATUS RESULT=OK DESTINATION=public-dest",
-            ],
-        ]);
-        let session = SamSession::create_on("injected", "sess", Some(key_path.as_path()), || {
-            let conn = first.connect();
-            async move { conn }
-        })
-        .await
-        .expect("first create");
-        assert_eq!(session.destination, public_dest);
-        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), private_key);
-        let first_requests = first.requests();
+        )
+        .await;
+        let public_dest = public_dest.expect("first create");
+        assert_eq!(public_dest, PUBLIC_DEST);
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), PRIVATE_KEY);
         assert!(
             first_requests
                 .iter()
                 .any(|line| line == "DEST GENERATE SIGNATURE_TYPE=7"),
             "missing key must be minted with DEST GENERATE: {first_requests:?}"
         );
-        assert_eq!(requested_destination(&first_requests), private_key);
-        drop(session);
+        assert_eq!(requested_destination(&first_requests), PRIVATE_KEY);
 
-        let second = Transcript::new(vec![vec![
-            "HELLO REPLY RESULT=OK VERSION=3.1",
-            "SESSION STATUS RESULT=OK DESTINATION=public-dest",
-        ]]);
-        let again = SamSession::create_on("injected", "sess", Some(key_path.as_path()), || {
-            let conn = second.connect();
-            async move { conn }
-        })
-        .await
-        .expect("second create");
-        let second_requests = second.requests();
+        let (again, second_requests) = dialogue(
+            Some(key_path.as_path()),
+            vec![vec!["HELLO REPLY RESULT=OK VERSION=3.1", status.as_str()]],
+        )
+        .await;
+        assert_eq!(again.expect("second create"), PUBLIC_DEST);
         assert!(
             second_requests
                 .iter()
@@ -1147,43 +1266,70 @@ mod tests {
             requested_destination(&second_requests),
             requested_destination(&first_requests)
         );
-        assert_eq!(again.destination, public_dest);
     }
 
     #[tokio::test]
     async fn newline_terminated_key_file_is_the_same_destination() {
         let tmp = TempDir::new();
         let key_path = tmp.0.join("node.i2p");
-        std::fs::write(&key_path, "same-key\n").unwrap();
-        let transcript = Transcript::new(vec![vec![
-            "HELLO REPLY RESULT=OK VERSION=3.1",
-            "SESSION STATUS RESULT=OK DESTINATION=pub",
-        ]]);
-        let _session = SamSession::create_on("injected", "sess", Some(key_path.as_path()), || {
-            let conn = transcript.connect();
-            async move { conn }
-        })
-        .await
-        .expect("create from stored key");
-        assert_eq!(requested_destination(&transcript.requests()), "same-key");
+        std::fs::write(&key_path, format!("{PRIVATE_KEY}\n")).unwrap();
+        let status = status_line();
+        let (public_dest, requests) = dialogue(
+            Some(key_path.as_path()),
+            vec![vec!["HELLO REPLY RESULT=OK VERSION=3.1", status.as_str()]],
+        )
+        .await;
+        assert_eq!(public_dest.expect("stored key"), PUBLIC_DEST);
+        assert_eq!(requested_destination(&requests), PRIVATE_KEY);
+        assert!(requests
+            .iter()
+            .all(|line| !line.starts_with("DEST GENERATE")));
+        assert_eq!(
+            std::fs::read_to_string(&key_path).unwrap(),
+            format!("{PRIVATE_KEY}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_key_file_does_not_open_a_session() {
+        let tmp = TempDir::new();
+        for (index, contents) in ["same-key", "same-key\n", "not a key", "AAAA", "AAAA_AAA="]
+            .into_iter()
+            .enumerate()
+        {
+            let key_path = tmp.0.join(format!("bad-{index}"));
+            std::fs::write(&key_path, contents).unwrap();
+            let (result, requests) = dialogue(Some(key_path.as_path()), Vec::new()).await;
+            assert_eq!(result.unwrap_err(), RnsError::Storage, "{contents:?}");
+            assert!(
+                requests.is_empty(),
+                "invalid key must not send SAM commands: {requests:?}"
+            );
+            assert_eq!(std::fs::read_to_string(&key_path).unwrap(), contents);
+        }
+
+        // A second newline is still inside the token, so the file is not a key
+        // and must not be replaced by DEST GENERATE.
+        let doubled = format!("{PRIVATE_KEY}\n\n");
+        let key_path = tmp.0.join("doubled.i2p");
+        std::fs::write(&key_path, &doubled).unwrap();
+        let (result, requests) = dialogue(Some(key_path.as_path()), Vec::new()).await;
+        assert_eq!(result.unwrap_err(), RnsError::Storage);
+        assert!(requests.is_empty());
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), doubled);
     }
 
     #[tokio::test]
     async fn create_without_key_file_stays_transient() {
-        let transcript = Transcript::new(vec![vec![
-            "HELLO REPLY RESULT=OK VERSION=3.1",
-            "SESSION STATUS RESULT=OK DESTINATION=transient-pub",
-        ]]);
-        let session = SamSession::create_on("injected", "sess", None, || {
-            let conn = transcript.connect();
-            async move { conn }
-        })
-        .await
-        .expect("transient create");
-        assert_eq!(session.destination, "transient-pub");
-        assert_eq!(requested_destination(&transcript.requests()), "TRANSIENT");
-        assert!(transcript
-            .requests()
+        let status = status_line();
+        let (public_dest, requests) = dialogue(
+            None,
+            vec![vec!["HELLO REPLY RESULT=OK VERSION=3.1", status.as_str()]],
+        )
+        .await;
+        assert_eq!(public_dest.expect("transient create"), PUBLIC_DEST);
+        assert_eq!(requested_destination(&requests), "TRANSIENT");
+        assert!(requests
             .iter()
             .all(|line| !line.starts_with("DEST GENERATE")));
     }
