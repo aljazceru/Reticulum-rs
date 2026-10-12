@@ -844,22 +844,21 @@ impl InterfaceManager {
             .and_then(|iface| self.iface_hw_mtu(&iface.address))
     }
 
-    /// Path-signalling hardware MTU
-    /// (Python `Transport.next_hop_interface_hw_mtu`).
+    /// Path-signalling hardware MTU.
     ///
-    /// Autoconfiguring interfaces use `Interface.optimise_mtu`. When the
-    /// type's hardware MTU is lower than that tier, the type ceiling
-    /// wins. Rates below 62_500 bps yield `None`. Auto keeps its fixed
-    /// hardware MTU.
+    /// Bitrate tiers match `Interface.optimise_mtu`, including `None`
+    /// below 62_500 bps. The `min` with 524288, `TCPInterface.HW_MTU`
+    /// (262144), or 1048576 is this function's ceiling, not a step
+    /// `optimise_mtu` takes. Auto keeps its fixed hardware MTU of 1196.
     pub fn iface_hw_mtu(&self, address: &AddressHash) -> Option<usize> {
         let kind = self.iface_kind(address)?;
-        // `FIXED_MTU`: the type value, not the bitrate tier.
+        // Fixed hardware MTU, not a bitrate tier.
         if kind == "AutoInterface" || kind == "AutoPeer" {
             return Some(1_196);
         }
-        // Type hardware-MTU ceilings. Local is the 1e9 tier (524288);
-        // TCP is `TCPInterface.HW_MTU`; backbone's class value sits
-        // above every tier and is not used when the tier is `None`.
+        // Ceilings applied by this function only. `optimise_mtu` does
+        // not take `min` with these values. TCP uses `TCPInterface.HW_MTU`.
+        // 1048576 is above every tier and is not used when the tier is `None`.
         let ceiling = match kind.as_str() {
             "LocalServer" | "LocalClient" => 524_288,
             "TcpClient" | "TcpServer" => 262_144,
@@ -867,7 +866,20 @@ impl InterfaceManager {
             _ => return None,
         };
         let bitrate = self.with_control(address, |control| control.bitrate)?;
-        optimise_mtu(bitrate).map(|mtu| mtu.min(ceiling))
+        let tier = match bitrate {
+            1_000_000_000.. => 524_288,
+            750_000_000.. => 262_144,
+            400_000_000.. => 131_072,
+            200_000_000.. => 65_536,
+            100_000_000.. => 32_768,
+            10_000_000.. => 16_384,
+            5_000_000.. => 8_192,
+            2_000_000.. => 4_096,
+            1_000_000.. => 2_048,
+            62_500.. => 1_024,
+            _ => return None,
+        };
+        Some(tier.min(ceiling))
     }
 
     /// Snapshot of the statistics of all live interfaces.
@@ -1064,23 +1076,6 @@ impl Drop for InterfaceManager {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
-}
-
-/// `Interface.optimise_mtu` bitrate tiers. `None` below 62_500 bps.
-fn optimise_mtu(bitrate: u64) -> Option<usize> {
-    Some(match bitrate {
-        1_000_000_000.. => 524_288,
-        750_000_000.. => 262_144,
-        400_000_000.. => 131_072,
-        200_000_000.. => 65_536,
-        100_000_000.. => 32_768,
-        10_000_000.. => 16_384,
-        5_000_000.. => 8_192,
-        2_000_000.. => 4_096,
-        1_000_000.. => 2_048,
-        62_500.. => 1_024,
-        _ => return None,
-    })
 }
 
 /// Short type name of an interface, used as statistics `kind`.
@@ -1289,7 +1284,6 @@ mod tests {
 
         let mut manager = InterfaceManager::new(4);
         for (bitrate, expected) in tiers {
-            assert_eq!(optimise_mtu(bitrate), expected, "tier {bitrate}");
             for kind in ["BackboneClient", "BackboneServer"] {
                 let channel = manager.new_channel_named(1, kind, kind);
                 assert!(manager.set_iface_bitrate(&channel.address, bitrate));
