@@ -154,6 +154,13 @@ pub struct Link {
     status: LinkStatus,
     request_time: Duration,
     rtt: Duration,
+    /// `false` until a link proof or an LRRTT packet supplies an RTT
+    /// (Python `Link.rtt is None`).
+    rtt_known: bool,
+    keepalive: Duration,
+    stale_time: Duration,
+    /// Last initiator keepalive (0xFF). Not updated by inbound traffic.
+    last_keepalive: Duration,
     proves_messages: bool,
     /// Maximum transfer unit negotiated (or defaulted) for this link.
     mtu: usize,
@@ -169,6 +176,31 @@ pub struct Link {
 
 /// Enabled link cipher mode (Python only enables `MODE_AES256_CBC` today).
 pub const LINK_MODE_AES256_CBC: u8 = 0x01;
+
+/// Top bits of the first MTU signalling byte (Python `Link.MODE_BYTEMASK`).
+const LINK_MODE_BYTEMASK: u8 = 0xE0;
+
+/// RTT at which the keepalive interval reaches `KEEPALIVE_MAX`
+/// (Python `Link.KEEPALIVE_MAX_RTT`).
+pub const KEEPALIVE_MAX_RTT: f64 = 1.75;
+/// Multiplier in the post-stale grace sleep (Python `Link.KEEPALIVE_TIMEOUT_FACTOR`).
+pub const KEEPALIVE_TIMEOUT_FACTOR: u32 = 4;
+/// Seconds added to the post-stale sleep, and the effective close delay
+/// once `WATCHDOG_MAX_SLEEP` caps that sleep (Python `Link.STALE_GRACE`).
+pub const STALE_GRACE: Duration = Duration::from_secs(5);
+/// Upper bound on the keepalive interval (Python `Link.KEEPALIVE_MAX`).
+pub const KEEPALIVE_MAX: Duration = Duration::from_secs(360);
+/// Lower bound on the keepalive interval (Python `Link.KEEPALIVE_MIN`).
+pub const KEEPALIVE_MIN: Duration = Duration::from_secs(5);
+/// Keepalive interval before RTT is known (Python `Link.KEEPALIVE`).
+pub const KEEPALIVE: Duration = KEEPALIVE_MAX;
+/// `stale_time = keepalive * STALE_FACTOR` (Python `Link.STALE_FACTOR`).
+pub const STALE_FACTOR: u32 = 2;
+/// Inbound-silence limit before RTT is known (Python `Link.STALE_TIME`).
+pub const STALE_TIME: Duration = Duration::from_secs(KEEPALIVE_MAX.as_secs() * STALE_FACTOR as u64);
+/// Cap on a single watchdog sleep. The post-stale grace is
+/// `min(rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE, WATCHDOG_MAX_SLEEP)`.
+pub const WATCHDOG_MAX_SLEEP: Duration = Duration::from_secs(5);
 
 impl Link {
     /// Three bytes of MTU/mode signalling appended to link requests and
@@ -194,6 +226,10 @@ impl Link {
             status: LinkStatus::Pending,
             request_time: now(),
             rtt: Duration::from_secs(0),
+            rtt_known: false,
+            keepalive: KEEPALIVE,
+            stale_time: STALE_TIME,
+            last_keepalive: now(),
             proves_messages: false,
             mtu: crate::packet::PROTOCOL_MTU,
             establishment_cost: 0,
@@ -225,6 +261,9 @@ impl Link {
         if packet.data.len() < PUBLIC_KEY_LENGTH * 2 {
             return Err(RnsError::InvalidArgument);
         }
+        // Python `ENABLED_MODES` is only AES-256-CBC. `handshake` raises
+        // for anything else and `validate_request` drops the link.
+        reject_disabled_link_mode(packet)?;
 
         let peer_identity = Identity::new_from_slices(
             &packet.data.as_slice()[..PUBLIC_KEY_LENGTH],
@@ -263,6 +302,10 @@ impl Link {
             status: LinkStatus::Pending,
             request_time: now(),
             rtt: Duration::from_secs(0),
+            rtt_known: false,
+            keepalive: KEEPALIVE,
+            stale_time: STALE_TIME,
+            last_keepalive: now(),
             proves_messages: false,
             mtu,
             establishment_cost: 0,
@@ -303,8 +346,14 @@ impl Link {
         packet
     }
 
+    /// Record inbound activity and revive a stale link.
+    /// Outbound sends, including our own keepalive, must not call this:
+    /// Python only moves `last_inbound` when a packet arrives.
     pub fn touch(&mut self) {
         self.request_time = now();
+        if self.status == LinkStatus::Stale {
+            self.status = LinkStatus::Active;
+        }
     }
 
     #[cfg(feature = "std")]
@@ -760,6 +809,80 @@ impl Link {
         &self.rtt
     }
 
+    pub fn rtt_known(&self) -> bool {
+        self.rtt_known
+    }
+
+    /// Keepalive interval. `KEEPALIVE_MAX` until RTT is known, otherwise
+    /// `clamp(rtt * (KEEPALIVE_MAX / KEEPALIVE_MAX_RTT), KEEPALIVE_MIN, KEEPALIVE_MAX)`.
+    pub fn keepalive(&self) -> Duration {
+        self.keepalive
+    }
+
+    /// Inbound silence before the link is marked stale (`2 * keepalive`).
+    pub fn stale_time(&self) -> Duration {
+        self.stale_time
+    }
+
+    /// Stale threshold, using `unknown_rtt` until an RTT has been measured.
+    pub fn effective_stale(&self, unknown_rtt: Duration) -> Duration {
+        if self.rtt_known {
+            self.stale_time
+        } else {
+            unknown_rtt
+        }
+    }
+
+    /// Delay from the stale mark to teardown. Python sleeps
+    /// `rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE` and then caps that
+    /// sleep at `WATCHDOG_MAX_SLEEP`, so the effective delay is 5s.
+    pub fn close_grace(&self) -> Duration {
+        let scaled = if self.rtt_known {
+            self.rtt
+                .saturating_mul(KEEPALIVE_TIMEOUT_FACTOR)
+                .saturating_add(STALE_GRACE)
+        } else {
+            STALE_GRACE
+        };
+        scaled.min(WATCHDOG_MAX_SLEEP)
+    }
+
+    /// Whether the initiator should emit keepalive `0xFF`.
+    /// `unknown_rtt` is the interval used before RTT is known.
+    pub fn keepalive_due(&self, unknown_rtt: Duration) -> bool {
+        if self.status != LinkStatus::Active {
+            return false;
+        }
+        let interval = if self.rtt_known {
+            self.keepalive
+        } else {
+            unknown_rtt
+        };
+        now().saturating_sub(self.last_keepalive) >= interval
+    }
+
+    /// Record an outbound keepalive without touching the inbound clock.
+    pub fn mark_keepalive_sent(&mut self) {
+        self.last_keepalive = now();
+    }
+
+    fn note_rtt(&mut self, rtt: Duration) {
+        self.rtt = rtt;
+        self.rtt_known = true;
+        self.recompute_keepalive();
+    }
+
+    fn recompute_keepalive(&mut self) {
+        let secs = if self.rtt_known {
+            let scaled = self.rtt.as_secs_f64() * (KEEPALIVE_MAX.as_secs_f64() / KEEPALIVE_MAX_RTT);
+            scaled.clamp(KEEPALIVE_MIN.as_secs_f64(), KEEPALIVE_MAX.as_secs_f64())
+        } else {
+            KEEPALIVE.as_secs_f64()
+        };
+        self.keepalive = Duration::from_secs_f64(secs);
+        self.stale_time = Duration::from_secs_f64(secs * f64::from(STALE_FACTOR));
+    }
+
     fn handle_data_packet<E: LinkEventSink, P: LinkPayloadSink>(
         &mut self,
         event_tx: &E,
@@ -896,7 +1019,8 @@ impl Link {
                         // enormous RTT values; clamp to a sane range
                         // instead of panicking in Duration construction.
                         if rtt.is_finite() && (0.0..86_400.0).contains(&rtt) {
-                            self.rtt = Duration::from_secs_f64(rtt);
+                            self.note_rtt(Duration::from_secs_f64(rtt));
+                            self.touch();
                         } else {
                             log::debug!("link: ignoring invalid rtt packet ({rtt})");
                         }
@@ -941,7 +1065,7 @@ impl Link {
                         &mut buffer,
                     ) {
                         log::trace!("link({}): data over channel {}B", self.id, plain_text.len());
-                        self.request_time = now();
+                        self.touch();
 
                         channel_tx.send(LinkPayload::new_from_slice(plain_text));
 
@@ -980,7 +1104,10 @@ impl Link {
                 self.remote_identity = Some(self.destination.identity);
 
                 self.status = LinkStatus::Active;
-                self.rtt = self.elapsed();
+                // Measure before touch() restarts the inbound clock.
+                self.note_rtt(self.elapsed());
+                self.last_keepalive = now();
+                self.touch();
 
                 log::debug!("link({}): activated", self.id);
 
@@ -992,10 +1119,11 @@ impl Link {
             }
         }
 
-        if self.status == LinkStatus::Active
+        if matches!(self.status, LinkStatus::Active | LinkStatus::Stale)
             && packet.context == PacketContext::None
             && let Ok(hash) = validate_message_proof(&self.peer_identity, packet.data.as_slice())
         {
+            self.touch();
             self.post_event(event_tx, LinkEvent::Proof(hash));
         }
 
@@ -1093,6 +1221,22 @@ impl<E: LinkEventSink, P: LinkPayloadSink> LinkExtHandlePacket<E, P> for Link {
             PacketType::Proof => self.handle_proof_packet(event_tx, packet),
             _ => LinkHandleResult::None,
         }
+    }
+}
+
+/// Python `Link.mode_from_lr_packet`: absent signalling defaults to
+/// AES-256-CBC. Any other mode is not in `ENABLED_MODES`.
+fn reject_disabled_link_mode(packet: &Packet) -> Result<(), RnsError> {
+    let keys = PUBLIC_KEY_LENGTH * 2;
+    if packet.data.len() <= keys {
+        return Ok(());
+    }
+    let mode = (packet.data.as_slice()[keys] & LINK_MODE_BYTEMASK) >> 5;
+    if mode == LINK_MODE_AES256_CBC {
+        Ok(())
+    } else {
+        log::debug!("link: rejecting link request mode {mode:#04x}");
+        Err(RnsError::InvalidArgument)
     }
 }
 
@@ -1232,5 +1376,89 @@ mod mtu_tests {
         assert_eq!(link.mtu(), LINK_MTU_MIN);
         assert!(link.mdu() < link.mtu());
         assert!(link.sdu() <= link.mtu());
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod keepalive_tests {
+    use super::*;
+    use crate::destination::{DestinationName, SingleInputDestination};
+    use crate::packet::PROTOCOL_MTU;
+
+    fn fresh_link() -> Link {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let destination =
+            SingleInputDestination::new(identity, DestinationName::new("test", "link.keepalive"));
+        Link::new(destination.desc)
+    }
+
+    fn assert_close(actual: Duration, expected: f64) {
+        let delta = (actual.as_secs_f64() - expected).abs();
+        assert!(
+            delta < 1e-6,
+            "got {}s, expected {expected}s",
+            actual.as_secs_f64()
+        );
+    }
+
+    #[test]
+    fn unknown_rtt_uses_keepalive_max() {
+        let link = fresh_link();
+        assert!(!link.rtt_known());
+        assert_eq!(link.keepalive(), Duration::from_secs(360));
+        assert_eq!(link.stale_time(), Duration::from_secs(720));
+        assert_eq!(link.close_grace(), STALE_GRACE);
+    }
+
+    #[test]
+    fn small_rtt_clamps_to_keepalive_min() {
+        let mut link = fresh_link();
+        link.note_rtt(Duration::from_secs_f64(0.01));
+        assert_eq!(link.keepalive(), Duration::from_secs(5));
+        assert_eq!(link.stale_time(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn rtt_scales_keepalive_and_doubles_stale_time() {
+        let mut link = fresh_link();
+        link.note_rtt(Duration::from_secs_f64(0.1));
+        let expected = 0.1 * 360.0 / 1.75;
+        assert_close(link.keepalive(), expected);
+        assert_close(link.stale_time(), expected * 2.0);
+    }
+
+    #[test]
+    fn large_rtt_clamps_to_keepalive_max() {
+        let mut link = fresh_link();
+        link.note_rtt(Duration::from_secs(10));
+        assert_eq!(link.keepalive(), Duration::from_secs(360));
+        assert_eq!(link.stale_time(), Duration::from_secs(720));
+        // Uncapped grace would be `10 * 4 + 5`. The watchdog cap makes it 5s.
+        assert_eq!(link.close_grace(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn link_request_rejects_mode_other_than_aes256_cbc() {
+        let peer = PrivateIdentity::new_from_rand(OsRng);
+        let local = PrivateIdentity::new_from_rand(OsRng);
+        let destination =
+            SingleInputDestination::new(local.clone(), DestinationName::new("test", "link.mode"));
+        let mode: u8 = 0x02;
+        let value = (PROTOCOL_MTU & 0x1F_FFFF) + ((((mode << 5) & 0xE0) as usize) << 16);
+        let packed = (value as u32).to_be_bytes();
+        let mut data = PacketDataBuffer::new();
+        data.safe_write(peer.as_identity().public_key.as_bytes());
+        data.safe_write(peer.as_identity().verifying_key.as_bytes());
+        data.safe_write(&[packed[1], packed[2], packed[3]]);
+        let packet = Packet {
+            destination: destination.desc.address_hash,
+            data,
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            Link::new_from_request(&packet, local.sign_key().clone(), destination.desc),
+            Err(RnsError::InvalidArgument)
+        ));
     }
 }

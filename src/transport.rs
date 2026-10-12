@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 use crate::channel::{self, Channel};
 use crate::destination::link::{
     Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket, LinkHandleResult, LinkId,
-    LinkPayload, LinkPayloadSink, LinkStatus,
+    LinkPayload, LinkPayloadSink, LinkStatus, KEEPALIVE, STALE_GRACE, STALE_TIME,
 };
 use crate::destination::{
     DestinationAnnounce, DestinationDesc, DestinationHandleStatus, DestinationName,
@@ -112,13 +112,15 @@ impl Default for TimerConfig {
     fn default() -> Self {
         Self {
             link_check: Duration::from_secs(1),
-            in_link_stale: Duration::from_secs(10),
-            in_link_close: Duration::from_secs(5),
+            // Unknown-RTT defaults. Once RTT is known the link replaces
+            // these with `clamp(rtt * (360/1.75), 5, 360)` and `2 * keepalive`.
+            in_link_stale: STALE_TIME,
+            in_link_close: STALE_GRACE,
             out_link_restart: Duration::from_secs(60),
-            out_link_stale: Duration::from_secs(10),
-            out_link_close: Duration::from_secs(5),
+            out_link_stale: STALE_TIME,
+            out_link_close: STALE_GRACE,
             out_link_repeat: Duration::from_secs(6),
-            out_link_keep: Duration::from_secs(5),
+            out_link_keep: KEEPALIVE,
             iface_cleanup: Duration::from_secs(10),
             announces_retransmit: Duration::from_secs(1),
             old_announces_retransmit: Duration::from_secs(60),
@@ -934,14 +936,13 @@ impl Transport {
         let mut sent_packets = vec![];
         let handler = self.handler.lock().await;
         for link in handler.out_links.values() {
-            let mut link = link.lock().await;
+            let link = link.lock().await;
             if link.destination().address_hash == *destination
                 && link.status() == LinkStatus::Active
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
                     handler.send_packet(packet).await;
-                    link.touch();
                     sent_packets.push(packet.hash());
                 }
             }
@@ -962,7 +963,7 @@ impl Transport {
         let handler = self.handler.lock().await;
         let mut count = 0usize;
         for link in handler.in_links.values() {
-            let mut link = link.lock().await;
+            let link = link.lock().await;
 
             if link.destination().address_hash == *destination
                 && link.status() == LinkStatus::Active
@@ -970,7 +971,6 @@ impl Transport {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
                     handler.send_packet(packet).await;
-                    link.touch();
                     count += 1;
                 }
             }
@@ -4046,16 +4046,19 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     let mut links_to_remove: Vec<AddressHash> = Vec::new();
     let timer_config = handler.config.timer_config;
 
-    // Clean up input links
+    // Clean up input links. Inbound silence is per link: 720s until RTT
+    // is known, then `2 * keepalive(rtt)`. Close follows `close_grace`
+    // (the watchdog cap of 5s), not a fixed 10s stale timer.
     for link_entry in &handler.in_links {
         let mut link = link_entry.1.lock().await;
+        let stale_after = link.effective_stale(timer_config.in_link_stale);
+        let close_after =
+            stale_after.saturating_add(timer_config.in_link_close.min(link.close_grace()));
         match link.status() {
-            LinkStatus::Active if link.elapsed() > timer_config.in_link_stale => {
+            LinkStatus::Active if link.elapsed() >= stale_after => {
                 link.stale();
             }
-            LinkStatus::Stale
-                if link.elapsed() > timer_config.in_link_stale + timer_config.in_link_close =>
-            {
+            LinkStatus::Stale if link.elapsed() >= close_after => {
                 if let Some(packet) =
                     link.teardown(&handler.link_in_event_tx)
                         .unwrap_or_else(|err| {
@@ -4086,8 +4089,21 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     for link_entry in &handler.out_links {
         let mut link = link_entry.1.lock().await;
 
+        // Only the initiator emits keepalive 0xFF. Send it before the
+        // stale check so the final probe still goes out (Python watchdog
+        // order). The send does not count as inbound activity.
+        if link.keepalive_due(timer_config.out_link_keep) {
+            let packet = link.keep_alive_packet(KEEP_ALIVE_REQUEST);
+            link.mark_keepalive_sent();
+            handler.send_packet(packet).await;
+        }
+
+        let stale_after = link.effective_stale(timer_config.out_link_stale);
+        let close_after =
+            stale_after.saturating_add(timer_config.out_link_close.min(link.close_grace()));
+
         match link.status() {
-            LinkStatus::Active if link.elapsed() > timer_config.out_link_stale => {
+            LinkStatus::Active if link.elapsed() >= stale_after => {
                 link.stale();
             }
             LinkStatus::Stale => {
@@ -4095,8 +4111,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     if link.elapsed() > timer_config.out_link_restart {
                         link.restart();
                     }
-                } else if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close
-                {
+                } else if link.elapsed() >= close_after {
                     if let Some(packet) =
                         link.teardown(&handler.link_out_event_tx)
                             .unwrap_or_else(|err| {
@@ -4188,18 +4203,6 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     tx_type: TxMessageType::Broadcast(None),
                     packet,
                 })
-                .await;
-        }
-    }
-}
-
-async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
-    for link in handler.out_links.values() {
-        let link = link.lock().await;
-
-        if link.status() == LinkStatus::Active {
-            handler
-                .send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST))
                 .await;
         }
     }
@@ -4671,30 +4674,11 @@ async fn manage_transport(
                     _ = cancel.cancelled() => {
                         break;
                     },
-                    _ = time::sleep(timer_config.link_check) => {
+                    // Python caps each watchdog sleep at WATCHDOG_MAX_SLEEP.
+                    // link_check is already 1s; the min keeps a longer
+                    // configured check from missing a 5s keepalive.
+                    _ = time::sleep(timer_config.link_check.min(crate::destination::link::WATCHDOG_MAX_SLEEP)) => {
                         handle_check_links(handler.lock().await).await;
-                    }
-                }
-            }
-        });
-    }
-
-    {
-        let handler = handler.clone();
-        let cancel = cancel.clone();
-
-        tokio::spawn(async move {
-            loop {
-                if cancel.is_cancelled() {
-                    break;
-                }
-
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        break;
-                    },
-                    _ = time::sleep(timer_config.out_link_keep) => {
-                        handle_keep_links(handler.lock().await).await;
                     }
                 }
             }
