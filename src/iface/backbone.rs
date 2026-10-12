@@ -604,7 +604,11 @@ impl BackboneClient {
                                     for frame in frames.drain(..) {
                                         let plain = {
                                             let ifac = channel_ifac_rx.read().expect("ifac lock").clone();
-                                            match crate::iface::ifac::decode(&frame, ifac.as_deref()) {
+                                            match crate::iface::ifac::decode_inbound(
+                                                &frame,
+                                                ifac.as_deref(),
+                                                Some(&stats),
+                                            ) {
                                                 Some(plain) => plain,
                                                 None => {
                                                     log::debug!("backbone: dropping packet with invalid access code");

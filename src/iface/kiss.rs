@@ -572,9 +572,10 @@ impl KissInterface {
                                                             .read()
                                                             .expect("ifac lock")
                                                             .clone();
-                                                        match crate::iface::ifac::decode(
+                                                        match crate::iface::ifac::decode_inbound(
                                                             &payload,
                                                             ifac.as_deref(),
+                                                            Some(&stats),
                                                         ) {
                                                             Some(plain) => plain,
                                                             None => {

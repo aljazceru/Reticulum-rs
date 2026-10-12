@@ -237,6 +237,8 @@ pub struct IfaceControlState {
     /// The interface requested a tunnel synthesis
     /// (Python `Interface.wants_tunnel`).
     pub wants_tunnel: bool,
+    /// Path-selection weight (Python `Interface.gravity`, default 0).
+    pub gravity: i64,
 
     params: IfaceControlParams,
 
@@ -284,6 +286,7 @@ impl IfaceControlState {
             is_local_client: false,
             tunnel_id: None,
             wants_tunnel: false,
+            gravity: 0,
             params: IfaceControlParams::default(),
             announce_allowed_at: now,
             ia_freq_deque: VecDeque::new(),
@@ -667,6 +670,11 @@ impl IfaceControlState {
     /// Number of queued announces.
     pub fn queued_announces_len(&self) -> usize {
         self.announce_queue.len()
+    }
+
+    /// Drop every queued announce (Python `Transport.drop_announce_queues`).
+    pub fn clear_announce_queue(&mut self) {
+        self.announce_queue.clear();
     }
 }
 

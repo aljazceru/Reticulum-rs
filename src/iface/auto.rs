@@ -945,7 +945,11 @@ impl AutoPeer {
                 Event::Rx(datagram) => {
                     let plain = {
                         let ifac = channel_ifac.read().expect("ifac lock").clone();
-                        match crate::iface::ifac::decode(&datagram, ifac.as_deref()) {
+                        match crate::iface::ifac::decode_inbound(
+                            &datagram,
+                            ifac.as_deref(),
+                            Some(&stats),
+                        ) {
                             Some(plain) => plain,
                             None => {
                                 log::debug!(

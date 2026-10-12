@@ -207,9 +207,46 @@ pub fn encode(raw: &[u8], ifac: Option<&IfacKey>) -> Vec<u8> {
 /// configured (worker receive helper). Returns `None` when the packet
 /// must be dropped.
 pub fn decode(raw: &[u8], ifac: Option<&IfacKey>) -> Option<Vec<u8>> {
+    decode_inbound(raw, ifac, None)
+}
+
+/// [`decode`] that counts a bad access code or a truncated frame on
+/// `stats` (Python `Interface.ifac_violation` / `protocol_violation`).
+///
+/// `None` stats keeps the historical two-argument behaviour so existing
+/// callers stay source-compatible.
+pub fn decode_inbound(
+    raw: &[u8],
+    ifac: Option<&IfacKey>,
+    stats: Option<&crate::iface::InterfaceCounters>,
+) -> Option<Vec<u8>> {
+    if raw.len() <= 2 {
+        if let Some(stats) = stats {
+            stats.count_protocol_violation();
+            return None;
+        }
+    }
+
     match ifac {
-        Some(ifac) => ifac.strip(raw),
-        None => Some(raw.to_vec()),
+        Some(ifac) => match ifac.strip(raw) {
+            Some(plain) => Some(plain),
+            None => {
+                if let Some(stats) = stats {
+                    stats.count_ifac_violation();
+                }
+                None
+            }
+        },
+        None => {
+            // IFAC flag set on an interface that has no access code.
+            if stats.is_some() && raw.first().is_some_and(|byte| byte & 0x80 == 0x80) {
+                if let Some(stats) = stats {
+                    stats.count_ifac_violation();
+                }
+                return None;
+            }
+            Some(raw.to_vec())
+        }
     }
 }
 

@@ -34,6 +34,15 @@ use reticulum_core::identity::{
 /// (Python `RNS.Reticulum.storagepath + "/known_destinations"`).
 pub const KNOWN_DESTINATIONS_FILE: &str = "known_destinations";
 
+/// Duplicate-filter snapshot (Python `packet_hashlist.raw`).
+pub const PACKET_HASHLIST_FILE: &str = "packet_hashlist.raw";
+
+/// Persisted path table (Python `destination_table`).
+pub const DESTINATION_TABLE_FILE: &str = "destination_table";
+
+/// Persisted tunnel table (Python `tunnels`).
+pub const TUNNELS_FILE: &str = "tunnels";
+
 /// Directory of remembered remote ratchets
 /// (Python `RNS.Reticulum.storagepath + "/ratchets"`).
 pub const RATCHETS_DIR: &str = "ratchets";

@@ -312,9 +312,10 @@ impl TcpClient {
                                                                 .read()
                                                                 .expect("ifac lock")
                                                                 .clone();
-                                                            match crate::iface::ifac::decode(
+                                                            match crate::iface::ifac::decode_inbound(
                                                                 output.as_slice(),
                                                                 ifac.as_deref(),
+                                                                Some(&stats),
                                                             ) {
                                                                 Some(plain) => plain,
                                                                 None => {

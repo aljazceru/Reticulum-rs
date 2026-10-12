@@ -172,6 +172,23 @@ impl PathTable {
         before - self.map.len()
     }
 
+    /// Drop paths whose interface is no longer attached.
+    pub fn drop_ifaces_not_in(&mut self, live: &[AddressHash]) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, entry| live.contains(&entry.iface));
+        before - self.map.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    /// Insert an entry loaded from storage. The caller has already checked
+    /// that the interface is still attached and the identity is not blackholed.
+    pub fn restore(&mut self, destination: AddressHash, entry: PathEntry) {
+        self.map.insert(destination, entry);
+    }
+
     pub fn get(&self, destination: &AddressHash) -> Option<&PathEntry> {
         self.map
             .get(destination)
@@ -237,6 +254,7 @@ impl PathTable {
             .map(|entry| (entry.received_from, entry.iface))
     }
 
+    #[allow(dead_code)] // full-mode entry point; known interfaces use `handle_announce_with_mode`.
     pub fn handle_announce(
         &mut self,
         announce: &Packet,

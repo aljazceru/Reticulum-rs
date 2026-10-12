@@ -21,7 +21,8 @@ use reticulum::packet::{
     DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer,
     PacketType, PropagationType,
 };
-use reticulum::transport::{Transport, TransportConfig};
+use reticulum::storage::{MemoryStorage, Storage, DESTINATION_TABLE_FILE};
+use reticulum::transport::{ReceiptStatus, Transport, TransportConfig};
 
 /// Two Rust transports bridged over a UDP interface pair.
 struct Pair {
@@ -340,6 +341,177 @@ async fn await_path_resolves_for_announced_destinations() {
         .await_path(&hash, Some(Duration::from_secs(10)), None)
         .await;
     assert!(found, "await_path must resolve once the peer announces");
+}
+
+async fn wait_hops(transport: &Transport, destination: &AddressHash) -> Option<u8> {
+    for _ in 0..100 {
+        if let Some(hops) = transport.hops_to(destination).await {
+            return Some(hops);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn local_hops_delta_rewrites_egress_announces() {
+    let a = TransportConfig::new("rust-delta-a", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .set_local_hops_delta(true)
+        .build();
+    let b = TransportConfig::new("rust-delta-b", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .build();
+
+    {
+        let manager = a.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47012", Some("127.0.0.1:47013"), true),
+            UdpInterface::spawn,
+        );
+    }
+    {
+        let manager = b.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47013", Some("127.0.0.1:47012"), true),
+            UdpInterface::spawn,
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let destination = SingleInputDestination::new(
+        PrivateIdentity::new_from_rand(OsRng),
+        DestinationName::new("delta", "hops"),
+    );
+    let hash = destination.desc.address_hash;
+    a.send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), None)
+        .await;
+
+    let hops = wait_hops(&b, &hash).await.expect("path learned");
+    // Wire hops are sampled in 2..=7; the path table stores that plus one.
+    assert!(
+        (3..=8).contains(&hops),
+        "local hops delta must land in 3..=8, got {hops}"
+    );
+}
+
+#[tokio::test]
+async fn receipt_stays_sent_until_timeout_or_cull() {
+    let Pair { a, b, .. } = pair("receipt", 47014, 47015).await;
+
+    let destination = SingleInputDestination::new(
+        PrivateIdentity::new_from_rand(OsRng),
+        DestinationName::new("receipt", "peer"),
+    );
+    let hash = destination.desc.address_hash;
+    b.send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), None)
+        .await;
+    wait_hops(&a, &hash).await.expect("path");
+
+    let packet_hash = a
+        .send_to_destination(&hash, b"still in flight")
+        .await
+        .expect("send");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let info = a.receipt(&packet_hash).await.expect("receipt");
+    assert_eq!(info.status, ReceiptStatus::Sent);
+    assert!(info.timeout.is_some());
+    assert!(info.rtt.is_none());
+
+    assert!(
+        a.set_receipt_timeout(&packet_hash, Some(Duration::from_millis(1)))
+            .await
+    );
+    let failed = async {
+        for _ in 0..40 {
+            if let Some(info) = a.receipt(&packet_hash).await {
+                if info.status == ReceiptStatus::Failed {
+                    return info;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("receipt did not fail");
+    }
+    .await;
+    assert!(failed.rtt.is_some());
+
+    let culled_hash = a
+        .send_to_destination(&hash, b"cull me")
+        .await
+        .expect("send");
+    assert!(a.set_receipt_timeout(&culled_hash, None).await);
+    let culled = async {
+        for _ in 0..40 {
+            if let Some(info) = a.receipt(&culled_hash).await {
+                if info.status == ReceiptStatus::Culled {
+                    return info;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("receipt was not culled");
+    }
+    .await;
+    assert!(culled.timeout.is_none());
+    assert!(culled.rtt.is_some());
+}
+
+#[tokio::test]
+async fn path_table_reloads_on_the_same_interfaces() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let a = TransportConfig::new("rust-persist-a", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .set_storage(storage.clone())
+        .build();
+    let b = TransportConfig::new("rust-persist-b", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .build();
+
+    {
+        let manager = a.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47010", Some("127.0.0.1:47011"), true),
+            UdpInterface::spawn,
+        );
+    }
+    {
+        let manager = b.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47011", Some("127.0.0.1:47010"), true),
+            UdpInterface::spawn,
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let destination = SingleInputDestination::new(
+        PrivateIdentity::new_from_rand(OsRng),
+        DestinationName::new("persist", "path"),
+    );
+    let hash = destination.desc.address_hash;
+    b.send_announce(&Arc::new(tokio::sync::Mutex::new(destination)), None)
+        .await;
+    let hops = wait_hops(&a, &hash).await.expect("path learned");
+
+    a.persist_data().await;
+    let saved = storage
+        .read(DESTINATION_TABLE_FILE)
+        .expect("destination table written");
+    assert!(saved.len() > 16, "path table file must hold the entry");
+
+    assert!(a.drop_path(&hash).await);
+    assert!(!a.has_path(&hash).await);
+
+    a.load_persisted_state().await;
+    assert!(
+        a.has_path(&hash).await,
+        "path must reload on the live interface"
+    );
+    assert_eq!(a.hops_to(&hash).await, Some(hops));
 }
 
 fn announce_packet(hops: u8) -> Packet {

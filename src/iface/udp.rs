@@ -107,9 +107,10 @@ impl UdpInterface {
                                                 .read()
                                                 .expect("ifac lock")
                                                 .clone();
-                                            match crate::iface::ifac::decode(
+                                            match crate::iface::ifac::decode_inbound(
                                                 &rx_buffer[..n],
                                                 ifac.as_deref(),
+                                                Some(&stats),
                                             ) {
                                                 Some(plain) => plain,
                                                 None => {

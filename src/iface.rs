@@ -28,6 +28,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 pub use crate::iface::control::{IfaceControlParams, IfaceControlState, InterfaceMode};
-use crate::packet::{Packet, PacketType};
+use crate::packet::{DestinationType, HeaderType, Packet, PacketType, PropagationType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
 pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
@@ -429,6 +430,11 @@ pub struct InterfaceManager {
     /// Per-interface transport control state (Python `Interface` ingress /
     /// egress control attributes).
     controls: Mutex<HashMap<AddressHash, IfaceControlState>>,
+    /// Sampled local-client hop rewrite (Python `Transport.local_hops_delta`).
+    /// Zero disables it.
+    local_hops_delta: AtomicU8,
+    /// Transport identity inserted when an announce header is upgraded.
+    transport_identity: Mutex<Option<AddressHash>>,
 }
 
 impl InterfaceManager {
@@ -443,7 +449,34 @@ impl InterfaceManager {
             cancel: CancellationToken::new(),
             ifaces: Vec::new(),
             controls: Mutex::new(HashMap::new()),
+            local_hops_delta: AtomicU8::new(0),
+            transport_identity: Mutex::new(None),
         }
+    }
+
+    /// Enable the local-client hop rewrite sampled by transport
+    /// (Python `Transport.local_hops_delta`, 2 through 7).
+    pub fn set_local_hops_delta(&self, delta: u8, transport_id: Option<AddressHash>) {
+        self.local_hops_delta.store(delta, Ordering::Relaxed);
+        *self.transport_identity.lock().expect("transport id") = transport_id;
+    }
+
+    /// Drop queued announces on every interface
+    /// (Python `Transport.drop_announce_queues`).
+    pub fn drop_announce_queues(&self) {
+        let mut controls = self.controls.lock().expect("iface control lock");
+        for control in controls.values_mut() {
+            control.clear_announce_queue();
+        }
+    }
+
+    pub fn connected_to_shared_instance(&self) -> bool {
+        self.ifaces.iter().any(|iface| {
+            iface.kind == "LocalClient"
+                && iface.stats.online()
+                && !iface.stop.is_cancelled()
+                && !self.is_local_client_iface(&iface.address)
+        })
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
@@ -971,6 +1004,13 @@ impl InterfaceManager {
 
     pub async fn send(&self, message: TxMessage) {
         let is_announce = message.packet.header.packet_type == PacketType::Announce;
+        let hops_delta = self.local_hops_delta.load(Ordering::Relaxed);
+        let rewrite_hops = hops_delta != 0 && !self.connected_to_shared_instance();
+        let transport_id = if rewrite_hops {
+            *self.transport_identity.lock().expect("transport id")
+        } else {
+            None
+        };
 
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
@@ -1024,7 +1064,18 @@ impl InterfaceManager {
                     iface.stats.count_announce_tx(size);
                 }
 
-                let _ = iface.tx_send.send(message).await;
+                let mut outbound = message;
+                if rewrite_hops
+                    && should_apply_hops_delta(
+                        &outbound.packet,
+                        &iface.kind,
+                        self.is_local_client_iface(&iface.address),
+                    )
+                {
+                    mangle_hops(&mut outbound.packet, hops_delta, transport_id);
+                }
+
+                let _ = iface.tx_send.send(outbound).await;
             }
         }
     }
@@ -1075,6 +1126,30 @@ impl InterfaceManager {
 impl Drop for InterfaceManager {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+/// Python `Transport.should_apply_delta` for one egress interface.
+fn should_apply_hops_delta(packet: &Packet, kind: &str, local_client: bool) -> bool {
+    packet.header.hops == 0
+        && packet.header.destination_type != DestinationType::Plain
+        && packet.header.destination_type != DestinationType::Group
+        && !local_client
+        && kind != "LocalServer"
+}
+
+/// Python `Transport.mangle_hops`. Header-1 announces become header-2
+/// and carry the transport identity.
+fn mangle_hops(packet: &mut Packet, hops: u8, transport_id: Option<AddressHash>) {
+    let upgrade = packet.header.packet_type == PacketType::Announce
+        && packet.header.header_type == HeaderType::Type1;
+    packet.header.hops = hops;
+    if upgrade {
+        if let Some(transport_id) = transport_id {
+            packet.header.header_type = HeaderType::Type2;
+            packet.header.propagation_type = PropagationType::Transport;
+            packet.transport = Some(transport_id);
+        }
     }
 }
 

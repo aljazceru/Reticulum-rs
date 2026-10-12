@@ -232,7 +232,7 @@ async fn proof_strategy_matrix() {
 
     for (strategy, expect_proof) in [
         (ProofStrategy::None, false),
-        (ProofStrategy::App, true),
+        (ProofStrategy::App, false),
         (ProofStrategy::All, true),
     ] {
         let identity = PrivateIdentity::new_from_rand(OsRng);

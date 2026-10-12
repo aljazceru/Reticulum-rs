@@ -15,6 +15,7 @@ const LINK_TIMEOUT: Duration = Duration::from_secs(900);
 /// `RNS.Reticulum.DEFAULT_PER_HOP_TIMEOUT` = 6 s).
 const ESTABLISHMENT_TIMEOUT_PER_HOP: Duration = Duration::from_secs(6);
 
+#[derive(Clone, Copy)]
 pub struct LinkEntry {
     /// Transport instance ID of the next hop toward the destination
     /// (Python `IDX_LT_NEXT_HOP`). Kept for parity with the Python link
@@ -328,8 +329,11 @@ impl LinkTable {
         outcome
     }
 
-    pub fn remove_stale(&mut self) {
+    /// Remove stale entries. Unvalidated link requests that timed out are
+    /// returned so the caller can mark a one-hop path unresponsive.
+    pub fn remove_stale(&mut self) -> Vec<LinkEntry> {
         let mut stale = vec![];
+        let mut timed_out = vec![];
         let now = Instant::now();
 
         for (link_id, entry) in &self.0 {
@@ -339,12 +343,24 @@ impl LinkTable {
                 }
             } else if entry.proof_timeout <= now {
                 stale.push(*link_id);
+                timed_out.push(*entry);
             }
         }
 
         for link_id in stale {
             self.0.remove(&link_id);
         }
+        timed_out
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Drop link-table entries that use `iface` in either direction.
+    pub fn drop_iface(&mut self, iface: &AddressHash) {
+        self.0
+            .retain(|_, entry| entry.next_hop_iface != *iface && entry.receiving_iface != *iface);
     }
 
     /// Number of entries in the link table (pending + active links).

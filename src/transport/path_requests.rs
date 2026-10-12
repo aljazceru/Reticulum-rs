@@ -239,6 +239,7 @@ impl PathRequests {
     /// flight is batched: its interface is appended, and
     /// [`Self::clear_discovery`] returns every requestor so each is
     /// answered when the discovery completes.
+    #[allow(dead_code)] // 15s entry point; medium timeouts use `register_discovery_with_timeout`.
     pub fn register_discovery(
         &mut self,
         destination: &AddressHash,
