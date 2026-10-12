@@ -2,8 +2,8 @@
 //! (Phase 5.8).
 //!
 //! High-throughput TCP backbone links: the server spawns one
-//! [`BackboneClient`] peer per accepted connection (announces, ingress
-//! control and access codes are inherited), and clients reconnect with
+//! [`BackboneClient`] peer per accepted connection (announces and access
+//! codes are inherited), and clients reconnect with
 //! tunnel synthesis once connected (`wants_tunnel`).
 //!
 //! Fast-flapping connection suppression
@@ -13,9 +13,9 @@
 //! connections from that address are ignored until the block expires
 //! after `fast_flap_expiry` seconds without a flap.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -57,7 +57,7 @@ pub const fn hw_mtu_for_bitrate(bitrate: u64) -> usize {
         4_096
     } else if bitrate >= 1_000_000 {
         2_048
-    } else if bitrate >= 62_500 {
+    } else if bitrate >= GENERIC_INTERFACE_BITRATE {
         1_024
     } else {
         1_024
@@ -89,6 +89,11 @@ pub struct TransmitBuffer {
     tx_total: u64,
     tx_visible: u64,
     tx_sent: u64,
+    /// HDLC lengths in send order. A frame is one packet once `tx_sent`
+    /// covers it, including when several frames share one `try_write`.
+    frame_lens: VecDeque<u64>,
+    /// Prefix of `tx_sent` already reported to `count_tx`.
+    frames_accounted: u64,
 }
 
 impl TransmitBuffer {
@@ -129,6 +134,7 @@ impl TransmitBuffer {
             }
         }
         self.tx_total += frame.len() as u64;
+        self.frame_lens.push_back(frame.len() as u64);
         true
     }
 
@@ -186,6 +192,22 @@ impl TransmitBuffer {
                 Err(DrainError::Failed) => return false,
             }
         }
+    }
+
+    /// Lengths of frames whose bytes have fully left the socket.
+    fn completed_frame_lengths(&mut self) -> Vec<usize> {
+        let mut lengths = Vec::new();
+        let mut covered = self.tx_sent.saturating_sub(self.frames_accounted);
+        while let Some(&len) = self.frame_lens.front() {
+            if covered < len {
+                break;
+            }
+            self.frame_lens.pop_front();
+            covered -= len;
+            self.frames_accounted += len;
+            lengths.push(len as usize);
+        }
+        lengths
     }
 }
 
@@ -304,18 +326,17 @@ fn drain_write(
     buffer: &mut TransmitBuffer,
     stats: &crate::iface::InterfaceCounters,
 ) -> bool {
-    buffer.drain_to(|chunk| match stream.try_write(chunk) {
-        Ok(n) => {
-            if n > 0 {
-                stats.count_tx(n);
-            }
-            Ok(n)
-        }
+    let ok = buffer.drain_to(|chunk| match stream.try_write(chunk) {
+        Ok(n) => Ok(n),
         Err(err) if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted => {
             Err(DrainError::Blocked)
         }
         Err(_) => Err(DrainError::Failed),
-    })
+    });
+    for len in buffer.completed_frame_lengths() {
+        stats.count_tx(len);
+    }
+    ok
 }
 
 fn constructor_bitrate(rate: u64) -> u64 {
@@ -326,41 +347,53 @@ fn constructor_bitrate(rate: u64) -> u64 {
     }
 }
 
-/// Publish the constructor bitrate while `spawn_named` still holds the
-/// manager, so `configure_iface` can overwrite it (including with 62500).
+/// Addresses that already received their one constructor-rate write.
+fn published_constructor_bitrates() -> &'static Mutex<HashSet<crate::hash::AddressHash>> {
+    static PUBLISHED: OnceLock<Mutex<HashSet<crate::hash::AddressHash>>> = OnceLock::new();
+    PUBLISHED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Publish `rate` once. A later call does not write, so `configure_iface`
+/// can replace the value, including with an explicit 62500.
+fn publish_constructor_bitrate(
+    manager: &InterfaceManager,
+    address: &crate::hash::AddressHash,
+    rate: u64,
+) {
+    let mut published = published_constructor_bitrates()
+        .lock()
+        .expect("published bitrate lock");
+    if published.insert(*address) {
+        manager.set_iface_bitrate(address, constructor_bitrate(rate));
+    }
+}
+
+/// Publish the constructor bitrate (`BITRATE_GUESS`, or `with_bitrate`)
+/// once, before `configure_iface` can replace it.
 async fn prime_constructor_bitrate(
     manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
     address: &crate::hash::AddressHash,
     constructor: u64,
 ) {
-    let constructor = constructor_bitrate(constructor);
-    if manager.try_lock().is_ok() {
-        return;
-    }
     let manager = manager.lock().await;
-    let current = manager.with_control(address, |control| control.bitrate);
-    if matches!(current, None | Some(GENERIC_INTERFACE_BITRATE)) {
-        manager.set_iface_bitrate(address, constructor);
-    }
+    publish_constructor_bitrate(&manager, address, constructor);
 }
 
-/// Sample the bitrate once `configure_iface` has had the manager lock.
-/// An explicit 62500 is the low tier and is stored as itself.
+/// Read the bitrate left by the constructor publish or by `configure_iface`.
 async fn commit_installed_bitrate(
     manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
     address: &crate::hash::AddressHash,
     constructor: u64,
 ) -> u64 {
     let constructor = constructor_bitrate(constructor);
+    // Let a queued `configure_iface` store its rate before this sample.
     drop(manager.lock().await);
     tokio::task::yield_now().await;
 
     let manager = manager.lock().await;
-    let rate = manager
+    manager
         .with_control(address, |control| control.bitrate)
-        .unwrap_or(constructor);
-    manager.set_iface_bitrate(address, rate);
-    rate
+        .unwrap_or(constructor)
 }
 
 /// Enable fast-flapping suppression by default
@@ -852,7 +885,7 @@ impl BackboneServer {
 
                 let mut manager = iface_manager.lock().await;
                 // Python `spawned_interface.bitrate = self.bitrate`.
-                // 62500 is the low tier when that is the listener rate.
+                // This is the child's one constructor publish; its commit only reads.
                 let parent_bitrate = manager
                     .with_control(&server_address, |c| c.bitrate)
                     .unwrap_or(BITRATE_GUESS);
@@ -862,7 +895,7 @@ impl BackboneServer {
                         .with_bitrate(parent_bitrate),
                     BackboneClient::spawn,
                 );
-                manager.set_iface_bitrate(&address, parent_bitrate);
+                publish_constructor_bitrate(&manager, &address, parent_bitrate);
 
                 if inherited.is_some() {
                     manager.with_iface_ifac(&address, |slot| {
@@ -1015,31 +1048,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_62500_is_not_rewritten_to_bitrate_guess() {
+    async fn constructor_bitrate_is_published_once() {
         let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(16)));
-        let address = {
+
+        let untouched = {
             let mut guard = manager.lock().await;
             let channel = guard.new_channel(1);
             *channel.address()
         };
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .with_control(&untouched, |control| control.bitrate),
+            Some(GENERIC_INTERFACE_BITRATE)
+        );
+        prime_constructor_bitrate(&manager, &untouched, BITRATE_GUESS).await;
+        let rate = commit_installed_bitrate(&manager, &untouched, BITRATE_GUESS).await;
+        assert_eq!(rate, 100_000_000);
+        assert_eq!(hw_mtu_for_bitrate(rate), 32_768);
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .with_control(&untouched, |control| control.bitrate),
+            Some(BITRATE_GUESS)
+        );
 
-        let rate = commit_installed_bitrate(&manager, &address, BITRATE_GUESS).await;
-        assert_eq!(rate, GENERIC_INTERFACE_BITRATE);
-        assert_eq!(hw_mtu_for_bitrate(rate), 1_024);
+        let custom = {
+            let mut guard = manager.lock().await;
+            let channel = guard.new_channel(1);
+            *channel.address()
+        };
+        prime_constructor_bitrate(&manager, &custom, 7_500_000).await;
+        let rate = commit_installed_bitrate(&manager, &custom, 7_500_000).await;
+        assert_eq!(rate, 7_500_000);
+        assert_eq!(hw_mtu_for_bitrate(rate), 8_192);
 
+        let configured = {
+            let mut guard = manager.lock().await;
+            let channel = guard.new_channel(1);
+            *channel.address()
+        };
+        prime_constructor_bitrate(&manager, &configured, BITRATE_GUESS).await;
         {
             let guard = manager.lock().await;
-            guard.set_iface_bitrate(&address, BITRATE_GUESS);
+            guard.set_iface_bitrate(&configured, GENERIC_INTERFACE_BITRATE);
         }
-        {
-            let guard = manager.lock().await;
-            guard.set_iface_bitrate(&address, GENERIC_INTERFACE_BITRATE);
-        }
-        let rate = commit_installed_bitrate(&manager, &address, BITRATE_GUESS).await;
+        prime_constructor_bitrate(&manager, &configured, BITRATE_GUESS).await;
+        let rate = commit_installed_bitrate(&manager, &configured, BITRATE_GUESS).await;
         assert_eq!(rate, 62_500);
         assert_eq!(hw_mtu_for_bitrate(rate), 1_024);
-        let stored = manager.lock().await.with_control(&address, |c| c.bitrate);
-        assert_eq!(stored, Some(62_500));
+        assert_eq!(
+            manager
+                .lock()
+                .await
+                .with_control(&configured, |control| control.bitrate),
+            Some(62_500)
+        );
     }
 
     #[tokio::test]
@@ -1055,8 +1121,26 @@ mod tests {
         let mut buffer = TransmitBuffer::new();
         assert!(buffer.append(b"abcdef"));
         assert_eq!(stats.tx_bytes(), 0);
+        assert_eq!(stats.sent(), 0);
         assert!(drain_write(&write, &mut buffer, &stats));
         assert_eq!(stats.tx_bytes(), 6);
+        assert_eq!(stats.sent(), 1);
+
+        let mut partial = TransmitBuffer::new();
+        assert!(partial.append(b"abcdef"));
+        assert!(partial.drain_to(|_| Ok(2)));
+        assert!(partial.completed_frame_lengths().is_empty());
+        assert!(partial.drain_to(|chunk| Ok(chunk.len())));
+        assert_eq!(partial.completed_frame_lengths(), vec![6]);
+
+        let mut coalesced = TransmitBuffer::new();
+        assert!(coalesced.append(b"XXXX"));
+        assert!(coalesced.append(b"aaaa"));
+        assert!(coalesced.append(b"bbbb"));
+        let stats = InterfaceCounters::default();
+        assert!(drain_write(&write, &mut coalesced, &stats));
+        assert_eq!(stats.sent(), 3);
+        assert_eq!(stats.tx_bytes(), 12);
     }
 
     #[tokio::test]
