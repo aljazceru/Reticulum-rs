@@ -1,13 +1,18 @@
 use core::cmp;
 use core::convert::From;
 
+use aes::cipher::BlockCipher;
+use aes::cipher::BlockDecrypt;
 use aes::cipher::BlockDecryptMut;
+use aes::cipher::BlockEncrypt;
+use aes::cipher::BlockEncryptMut;
 use aes::cipher::Key;
+use aes::cipher::KeyInit;
 use aes::cipher::KeySizeUser;
 use aes::cipher::Unsigned;
-use cbc::cipher::BlockEncryptMut;
 use cbc::cipher::KeyIvInit;
 use cipher::block_padding::Pkcs7;
+use crypto_common::IvSizeUser;
 use crypto_common::OutputSizeUser;
 use hmac::{Hmac, Mac};
 use rand_core::CryptoRngCore;
@@ -156,13 +161,6 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         Self::new(sign_key, enc_key, rng)
     }
 
-    fn sign_key(&self) -> &[u8] {
-        match &self.cipher {
-            TokenCipher::Aes128 { sign_key, .. } => sign_key,
-            TokenCipher::Aes256 { sign_key, .. } => sign_key,
-        }
-    }
-
     pub fn encrypt<'a>(
         &self,
         text: PlainText,
@@ -181,10 +179,10 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         match &self.cipher {
             TokenCipher::Aes128 { sign_key, enc_key } => {
-                encrypt_aes128(enc_key, sign_key, self.rng, text.0, out_buf)
+                encrypt::<aes::Aes128>(enc_key, sign_key, self.rng, text.0, out_buf)
             }
             TokenCipher::Aes256 { sign_key, enc_key } => {
-                encrypt_aes256(enc_key, sign_key, self.rng, text.0, out_buf)
+                encrypt::<aes::Aes256>(enc_key, sign_key, self.rng, text.0, out_buf)
             }
         }
     }
@@ -197,9 +195,13 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         }
 
         let expected_tag = &token_data[token_data.len() - HMAC_OUT_SIZE..];
+        let sign_key = match &self.cipher {
+            TokenCipher::Aes128 { sign_key, .. } => sign_key.as_slice(),
+            TokenCipher::Aes256 { sign_key, .. } => sign_key.as_slice(),
+        };
 
-        let mut hmac = <HmacSha256 as Mac>::new_from_slice(self.sign_key())
-            .map_err(|_| RnsError::InvalidArgument)?;
+        let mut hmac =
+            <HmacSha256 as Mac>::new_from_slice(sign_key).map_err(|_| RnsError::InvalidArgument)?;
 
         hmac.update(&token_data[..token_data.len() - HMAC_OUT_SIZE]);
 
@@ -239,10 +241,10 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let msg = match &self.cipher {
             TokenCipher::Aes128 { enc_key, .. } => {
-                decrypt_aes128(enc_key, &iv, ciphertext, out_buf)?
+                decrypt::<aes::Aes128>(enc_key, &iv, ciphertext, out_buf)?
             }
             TokenCipher::Aes256 { enc_key, .. } => {
-                decrypt_aes256(enc_key, &iv, ciphertext, out_buf)?
+                decrypt::<aes::Aes256>(enc_key, &iv, ciphertext, out_buf)?
             }
         };
 
@@ -250,14 +252,26 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
     }
 }
 
-fn seal_token<'a>(
-    iv: &[u8],
-    cipher_len: usize,
+fn encrypt<'a, A>(
+    enc_key: &Key<A>,
     sign_key: &[u8],
+    rng: impl CryptoRngCore,
+    text: &[u8],
     out_buf: &'a mut [u8],
-) -> Result<Token<'a>, RnsError> {
+) -> Result<Token<'a>, RnsError>
+where
+    A: BlockEncrypt + BlockCipher + KeyInit + KeySizeUser,
+    cbc::Encryptor<A>: BlockEncryptMut + KeyIvInit + IvSizeUser,
+{
+    let iv = cbc::Encryptor::<A>::generate_iv(rng);
     let mut out_len = iv.len();
-    out_buf[..out_len].copy_from_slice(iv);
+    out_buf[..out_len].copy_from_slice(iv.as_slice());
+
+    let cipher_len = cbc::Encryptor::<A>::new_from_slices(enc_key, iv.as_slice())
+        .map_err(|_| RnsError::InvalidArgument)?
+        .encrypt_padded_b2b_mut::<Pkcs7>(text, &mut out_buf[out_len..])
+        .map_err(|_| RnsError::InvalidArgument)?
+        .len();
     out_len += cipher_len;
 
     let mut hmac =
@@ -266,57 +280,22 @@ fn seal_token<'a>(
     let tag = hmac.finalize().into_bytes();
     out_buf[out_len..out_len + tag.len()].copy_from_slice(tag.as_slice());
     out_len += tag.len();
+
     Ok(Token(&out_buf[..out_len]))
 }
 
-fn encrypt_aes128<'a>(
-    enc_key: &Key<aes::Aes128>,
-    sign_key: &[u8],
-    rng: impl CryptoRngCore,
-    text: &[u8],
-    out_buf: &'a mut [u8],
-) -> Result<Token<'a>, RnsError> {
-    let iv = cbc::Encryptor::<aes::Aes128>::generate_iv(rng);
-    let cipher_len = cbc::Encryptor::<aes::Aes128>::new(enc_key, &iv)
-        .encrypt_padded_b2b_mut::<Pkcs7>(text, &mut out_buf[iv.len()..])
-        .map_err(|_| RnsError::InvalidArgument)?
-        .len();
-    seal_token(iv.as_slice(), cipher_len, sign_key, out_buf)
-}
-
-fn encrypt_aes256<'a>(
-    enc_key: &Key<aes::Aes256>,
-    sign_key: &[u8],
-    rng: impl CryptoRngCore,
-    text: &[u8],
-    out_buf: &'a mut [u8],
-) -> Result<Token<'a>, RnsError> {
-    let iv = cbc::Encryptor::<aes::Aes256>::generate_iv(rng);
-    let cipher_len = cbc::Encryptor::<aes::Aes256>::new(enc_key, &iv)
-        .encrypt_padded_b2b_mut::<Pkcs7>(text, &mut out_buf[iv.len()..])
-        .map_err(|_| RnsError::InvalidArgument)?
-        .len();
-    seal_token(iv.as_slice(), cipher_len, sign_key, out_buf)
-}
-
-fn decrypt_aes128<'a>(
-    enc_key: &Key<aes::Aes128>,
+fn decrypt<'a, A>(
+    enc_key: &Key<A>,
     iv: &[u8; IV_KEY_SIZE],
     ciphertext: &[u8],
     out_buf: &'a mut [u8],
-) -> Result<&'a [u8], RnsError> {
-    cbc::Decryptor::<aes::Aes128>::new(enc_key, &(*iv).into())
-        .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
-        .map_err(|_| RnsError::CryptoError)
-}
-
-fn decrypt_aes256<'a>(
-    enc_key: &Key<aes::Aes256>,
-    iv: &[u8; IV_KEY_SIZE],
-    ciphertext: &[u8],
-    out_buf: &'a mut [u8],
-) -> Result<&'a [u8], RnsError> {
-    cbc::Decryptor::<aes::Aes256>::new(enc_key, &(*iv).into())
+) -> Result<&'a [u8], RnsError>
+where
+    A: BlockDecrypt + BlockCipher + KeyInit + KeySizeUser,
+    cbc::Decryptor<A>: BlockDecryptMut + KeyIvInit,
+{
+    cbc::Decryptor::<A>::new_from_slices(enc_key, iv)
+        .map_err(|_| RnsError::CryptoError)?
         .decrypt_padded_b2b_mut::<Pkcs7>(ciphertext, out_buf)
         .map_err(|_| RnsError::CryptoError)
 }

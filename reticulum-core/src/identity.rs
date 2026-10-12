@@ -729,9 +729,10 @@ pub struct KnownDestinationData {
 /// Recall a known destination (Python `Identity.recall`).
 ///
 /// `target_hash` is a destination hash unless `from_identity_hash` is set,
-/// in which case it is an identity hash (`truncated_hash(public_key)`, the
-/// value of [`Identity::address_hash`]) and the first matching entry in
-/// iteration order is returned.
+/// in which case it is an identity hash (truncated SHA-256 of the raw
+/// `x25519 || ed25519` public key, the same value as
+/// [`Identity::address_hash`]) and the first matching entry in iteration
+/// order is returned.
 pub fn recall<'a>(
     entries: &'a [(AddressHash, KnownDestinationData)],
     target_hash: &AddressHash,
@@ -739,11 +740,8 @@ pub fn recall<'a>(
 ) -> Option<(&'a AddressHash, &'a KnownDestinationData)> {
     if from_identity_hash {
         return entries.iter().find_map(|(destination_hash, entry)| {
-            let identity = Identity::new_from_slices(
-                &entry.public_key[..PUBLIC_KEY_LENGTH],
-                &entry.public_key[PUBLIC_KEY_LENGTH..],
-            );
-            (identity.address_hash == *target_hash).then_some((destination_hash, entry))
+            (AddressHash::new_from_slice(&entry.public_key) == *target_hash)
+                .then_some((destination_hash, entry))
         });
     }
 
