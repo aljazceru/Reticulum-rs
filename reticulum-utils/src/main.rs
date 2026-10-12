@@ -232,9 +232,9 @@ struct NodeconfArgs {
     /// Display blanking timeout in seconds, 0 to disable
     #[arg(long)]
     display_timeout: Option<u16>,
-    /// Display rotation, 0 through 3
-    #[arg(long)]
-    rotation: Option<u8>,
+    /// Display rotation. Values outside 0 through 3 are clamped.
+    #[arg(long, allow_hyphen_values = true)]
+    rotation: Option<i64>,
     /// Start display reconditioning
     #[arg(long)]
     recondition_display: bool,
@@ -939,6 +939,14 @@ async fn run_sh(args: ShArgs) -> Result<(), String> {
 }
 
 #[cfg(feature = "iface-rnode")]
+fn host_failure(action: &str, err: reticulum::error::RnsError) -> String {
+    match err {
+        reticulum::error::RnsError::ResourceMsg(msg) => msg.to_string(),
+        err => format!("{action} failed: {err:?}"),
+    }
+}
+
+#[cfg(feature = "iface-rnode")]
 fn optional_text(value: &str) -> Option<&str> {
     if value.eq_ignore_ascii_case("none") {
         None
@@ -951,9 +959,9 @@ fn optional_text(value: &str) -> Option<&str> {
 async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
     use reticulum_utils::rnodeconf::{
         bluetooth_host_frames, display_address_sequence, display_blanking_frame,
-        display_intensity_frame, display_recondition_frame, display_rotation_frame, enter_tnc_mode,
-        flash_command, normal_mode_frame, parse_eeprom, read_eeprom, render_eeprom, render_info,
-        transact, wifi_channel_frame, wifi_ip_frame, wifi_mode_code, wifi_mode_frame,
+        display_intensity_frame, display_recondition_frame, display_rotation_frame,
+        enter_normal_mode, enter_tnc_mode, flash_command, parse_eeprom, read_eeprom, render_eeprom,
+        render_info, transact, wifi_channel_frame, wifi_ip_frame, wifi_mode_code, wifi_mode_frame,
         wifi_nm_frame, wifi_psk_frame, wifi_ssid_frame, wipe_eeprom, BT_CTRL_OFF, BT_CTRL_ON,
         BT_CTRL_PAIR,
     };
@@ -1040,9 +1048,7 @@ async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
         frames.extend(display_blanking_frame(timeout.min(255) as u8));
     }
     if let Some(rotation) = args.rotation {
-        if rotation > 3 {
-            return Err("display rotation must be 0 through 3".into());
-        }
+        let rotation = rotation.clamp(0, 3) as u8;
         frames.extend(display_rotation_frame(rotation));
     }
     if args.recondition_display {
@@ -1056,6 +1062,11 @@ async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
         let byte =
             u8::from_str_radix(text, 16).map_err(|_| format!("invalid display address {addr}"))?;
         frames.extend(display_address_sequence(byte));
+        transact(&target, &frames)
+            .await
+            .map_err(|err| format!("configuration failed: {err:?}"))?;
+        println!("Display address set");
+        return Ok(());
     }
     if args.bluetooth_on {
         frames.extend(bluetooth_host_frames(BT_CTRL_ON));
@@ -1120,9 +1131,9 @@ async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
     }
 
     if args.normal {
-        transact(&target, &normal_mode_frame())
+        enter_normal_mode(&target)
             .await
-            .map_err(|err| format!("normal mode failed: {err:?}"))?;
+            .map_err(|err| host_failure("normal mode", err))?;
         println!("Device set to normal (host-controlled) operating mode");
         return Ok(());
     }
@@ -1141,7 +1152,7 @@ async fn run_nodeconf(args: NodeconfArgs) -> Result<(), String> {
         };
         enter_tnc_mode(&target, &config)
             .await
-            .map_err(|err| format!("TNC mode failed: {err:?}"))?;
+            .map_err(|err| host_failure("TNC mode", err))?;
         println!("Device set to TNC operating mode");
         return Ok(());
     }

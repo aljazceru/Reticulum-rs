@@ -47,6 +47,8 @@ pub const WIFI_AP: u8 = 0x02;
 
 /// Python `ROM.PLATFORM_ESP32`. `setTNCMode` hard-resets this platform.
 pub const PLATFORM_ESP32: u8 = 0x80;
+/// Python `ROM.PLATFORM_NRF52`. EEPROM wipe does not reset this platform.
+const PLATFORM_NRF52: u8 = 0x70;
 
 const INFO_LOCK_BYTE: u8 = 0x73;
 const CONF_OK_BYTE: u8 = 0x73;
@@ -130,18 +132,7 @@ pub struct FlashCommand {
 /// live radio status (Python `rnodeconf --device-info`).
 pub async fn device_info(target: &DeviceTarget) -> Result<DeviceInfo, RnsError> {
     let mut link = open_link(target).await?;
-
-    // Drain any pending input from previous sessions so the parser starts
-    // on a frame boundary, not mid-stream.
-    let drain = tokio::time::Instant::now() + Duration::from_millis(200);
-    let mut scratch = [0u8; 4096];
-    while tokio::time::Instant::now() < drain {
-        match tokio::time::timeout(Duration::from_millis(50), link.read(&mut scratch)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(_)) => continue,
-            _ => break,
-        }
-    }
+    drain_pending(&mut link).await;
 
     // Ask for identity and current stats.
     let mut request = detect_request();
@@ -169,26 +160,7 @@ pub async fn device_info(target: &DeviceTarget) -> Result<DeviceInfo, RnsError> 
             break;
         }
 
-        parser.feed(&buffer[..read], |event| {
-            use reticulum::iface::rnode::RnodeEvent;
-            match event {
-                RnodeEvent::Detect => info.detected = true,
-                RnodeEvent::FirmwareVersion { major, minor } => {
-                    info.firmware = Some((major, minor));
-                }
-                RnodeEvent::Platform(platform) => info.platform = Some(platform),
-                RnodeEvent::Mcu(mcu) => info.mcu = Some(mcu),
-                RnodeEvent::Status(status) => {
-                    if status.rssi.is_some() {
-                        info.rssi = status.rssi;
-                    }
-                    if status.snr.is_some() {
-                        info.snr = status.snr;
-                    }
-                }
-                _ => {}
-            }
-        });
+        parser.feed(&buffer[..read], |event| note_device_info(&mut info, event));
 
         // Wait for the complete identity (detect/fw/platform/mcu arrive as
         // separate frames; breaking on firmware alone drops the rest).
@@ -207,18 +179,7 @@ pub async fn device_info(target: &DeviceTarget) -> Result<DeviceInfo, RnsError> 
             if read == 0 {
                 break;
             }
-            parser.feed(&buffer[..read], |event| {
-                use reticulum::iface::rnode::RnodeEvent;
-                match event {
-                    RnodeEvent::Detect => info.detected = true,
-                    RnodeEvent::FirmwareVersion { major, minor } => {
-                        info.firmware = Some((major, minor));
-                    }
-                    RnodeEvent::Platform(platform) => info.platform = Some(platform),
-                    RnodeEvent::Mcu(mcu) => info.mcu = Some(mcu),
-                    _ => {}
-                }
-            });
+            parser.feed(&buffer[..read], |event| note_device_info(&mut info, event));
             if identity_complete(&info) {
                 break;
             }
@@ -306,27 +267,29 @@ pub fn firmware_info_request() -> Vec<u8> {
 pub fn absorb_device_info(bytes: &[u8]) -> DeviceInfo {
     let mut info = DeviceInfo::default();
     let mut parser = RnodeParser::new(false);
-    parser.feed(bytes, |event| {
-        use reticulum::iface::rnode::RnodeEvent;
-        match event {
-            RnodeEvent::Detect => info.detected = true,
-            RnodeEvent::FirmwareVersion { major, minor } => {
-                info.firmware = Some((major, minor));
-            }
-            RnodeEvent::Platform(platform) => info.platform = Some(platform),
-            RnodeEvent::Mcu(mcu) => info.mcu = Some(mcu),
-            RnodeEvent::Status(status) => {
-                if status.rssi.is_some() {
-                    info.rssi = status.rssi;
-                }
-                if status.snr.is_some() {
-                    info.snr = status.snr;
-                }
-            }
-            _ => {}
-        }
-    });
+    parser.feed(bytes, |event| note_device_info(&mut info, event));
     info
+}
+
+fn note_device_info(info: &mut DeviceInfo, event: reticulum::iface::rnode::RnodeEvent) {
+    use reticulum::iface::rnode::RnodeEvent;
+    match event {
+        RnodeEvent::Detect => info.detected = true,
+        RnodeEvent::FirmwareVersion { major, minor } => {
+            info.firmware = Some((major, minor));
+        }
+        RnodeEvent::Platform(platform) => info.platform = Some(platform),
+        RnodeEvent::Mcu(mcu) => info.mcu = Some(mcu),
+        RnodeEvent::Status(status) => {
+            if status.rssi.is_some() {
+                info.rssi = status.rssi;
+            }
+            if status.snr.is_some() {
+                info.snr = status.snr;
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn eeprom_read_frame() -> Vec<u8> {
@@ -599,14 +562,50 @@ pub async fn read_eeprom(target: &DeviceTarget) -> Result<Option<Vec<u8>>, RnsEr
     Ok(command_payload(&raw, CMD_ROM_READ))
 }
 
-/// Python `wipe_eeprom` waits 13 seconds for the write to finish.
+/// Wipe EEPROM on one open link: write the frame, wait 13 seconds, then
+/// hard-reset unless the platform is nRF52.
 pub async fn wipe_eeprom(target: &DeviceTarget) -> Result<(), RnsError> {
-    transact(target, &eeprom_wipe_frame()).await?;
+    let mut link = open_link(target).await?;
+    drain_pending(&mut link).await;
+
+    let mut platform = None;
+    if link.write(&firmware_info_request()).await.is_ok() {
+        if let Ok(bytes) = read_burst(&mut link).await {
+            platform = absorb_device_info(&bytes).platform;
+        }
+    }
+
+    link.write(&eeprom_wipe_frame()).await?;
+    // The wipe frame is already written. Silence or a later read error is
+    // not a failed wipe, and the port stays open for the 13 second wait.
+    let _ = read_burst(&mut link).await;
     tokio::time::sleep(Duration::from_secs(13)).await;
+
+    if platform.is_none() && link.write(&firmware_info_request()).await.is_ok() {
+        if let Ok(bytes) = read_burst(&mut link).await {
+            platform = absorb_device_info(&bytes).platform;
+        }
+    }
+    if platform != Some(PLATFORM_NRF52) {
+        link.write(&reset_request()).await?;
+    }
     Ok(())
 }
 
-/// Radio configuration, `CMD_CONF_SAVE`, then a hard reset on ESP32.
+/// `CMD_CONF_DELETE` when the EEPROM info-lock byte is `0x73`.
+pub async fn enter_normal_mode(target: &DeviceTarget) -> Result<(), RnsError> {
+    let mut link = open_link(target).await?;
+    drain_pending(&mut link).await;
+    require_info_lock(&mut link).await?;
+    link.write(&normal_mode_frame()).await?;
+    let _ = read_burst(&mut link).await;
+    Ok(())
+}
+
+/// Radio configuration and `CMD_CONF_SAVE` when the info-lock byte is `0x73`.
+///
+/// ESP32 is hard-reset. A probe that reports no platform returns an error
+/// and writes nothing.
 pub async fn enter_tnc_mode(
     target: &DeviceTarget,
     config: &RnodeRadioConfig,
@@ -615,13 +614,29 @@ pub async fn enter_tnc_mode(
     drain_pending(&mut link).await;
     link.write(&firmware_info_request()).await?;
     let info = absorb_device_info(&read_burst(&mut link).await?);
+    let Some(platform) = info.platform else {
+        return Err(RnsError::ResourceMsg("device did not report a platform"));
+    };
+    require_info_lock(&mut link).await?;
     let mut frames = tnc_mode_frames(config);
-    if info.platform == Some(PLATFORM_ESP32) {
+    if platform == PLATFORM_ESP32 {
         frames.extend_from_slice(&reset_request());
     }
     link.write(&frames).await?;
-    let _ = read_burst(&mut link).await?;
+    let _ = read_burst(&mut link).await;
     Ok(())
+}
+
+async fn require_info_lock(link: &mut RnodeLink) -> Result<(), RnsError> {
+    link.write(&eeprom_read_frame()).await?;
+    let raw = read_burst(link).await?;
+    let locked = command_payload(&raw, CMD_ROM_READ)
+        .is_some_and(|image| image.get(ADDR_INFO_LOCK) == Some(&INFO_LOCK_BYTE));
+    if locked {
+        Ok(())
+    } else {
+        Err(RnsError::ResourceMsg("EEPROM is invalid"))
+    }
 }
 
 /// Argv for an external flasher. Does not spawn a process.

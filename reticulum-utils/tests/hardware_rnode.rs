@@ -277,6 +277,7 @@ fn rnodeconf_provision_frames_match_python_and_modem_accepts_them() {
     );
     assert_eq!(tnc_save_frame(), vec![FEND, 0x53, 0x00, FEND]);
     assert_eq!(normal_mode_frame(), vec![FEND, 0x54, 0x00, FEND]);
+    assert_eq!(reset_request(), vec![FEND, 0x55, 0xF8, FEND]);
     assert_eq!(cfg_read_frame(), vec![FEND, 0x6D, 0x00, FEND]);
 
     let mut expected_tnc = Vec::new();
