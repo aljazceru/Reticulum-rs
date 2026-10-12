@@ -816,10 +816,6 @@ impl InterfaceManager {
             .map(|iface| iface.kind.clone())
     }
 
-    /// The hardware MTU of an interface (Python
-    /// `Transport.next_hop_interface_hw_mtu`): `None` for interface
-    /// types that cannot negotiate a path MTU, otherwise the type's
-    /// fixed/auto-configured MTU.
     /// The lowest bitrate of all online interfaces with a configured
     /// bitrate (Python `Transport.lowest_interface_bitrate`, recomputed
     /// on the jobs loop there; `None` when no online interface has one).
@@ -848,17 +844,30 @@ impl InterfaceManager {
             .and_then(|iface| self.iface_hw_mtu(&iface.address))
     }
 
+    /// Path-signalling hardware MTU
+    /// (Python `Transport.next_hop_interface_hw_mtu`).
+    ///
+    /// Autoconfiguring interfaces use `Interface.optimise_mtu`. When the
+    /// type's hardware MTU is lower than that tier, the type ceiling
+    /// wins. Rates below 62_500 bps yield `None`. Auto keeps its fixed
+    /// hardware MTU.
     pub fn iface_hw_mtu(&self, address: &AddressHash) -> Option<usize> {
         let kind = self.iface_kind(address)?;
-        match kind.as_str() {
-            // Python `AUTOCONFIGURE_MTU`/`FIXED_MTU` interfaces
-            // (LocalInterface 262144, TCP 262144, Backbone 1048576,
-            // AutoInterface 1196).
-            "LocalServer" | "LocalClient" | "TcpClient" | "TcpServer" => Some(262_144),
-            "BackboneClient" | "BackboneServer" => Some(1_048_576),
-            "AutoInterface" => Some(1_196),
-            _ => None,
+        // `FIXED_MTU`: the type value, not the bitrate tier.
+        if kind == "AutoInterface" || kind == "AutoPeer" {
+            return Some(1_196);
         }
+        // Type hardware-MTU ceilings. Local is the 1e9 tier (524288);
+        // TCP is `TCPInterface.HW_MTU`; backbone's class value sits
+        // above every tier and is not used when the tier is `None`.
+        let ceiling = match kind.as_str() {
+            "LocalServer" | "LocalClient" => 524_288,
+            "TcpClient" | "TcpServer" => 262_144,
+            "BackboneClient" | "BackboneServer" => 1_048_576,
+            _ => return None,
+        };
+        let bitrate = self.with_control(address, |control| control.bitrate)?;
+        optimise_mtu(bitrate).map(|mtu| mtu.min(ceiling))
     }
 
     /// Snapshot of the statistics of all live interfaces.
@@ -1057,6 +1066,23 @@ impl Drop for InterfaceManager {
     }
 }
 
+/// `Interface.optimise_mtu` bitrate tiers. `None` below 62_500 bps.
+fn optimise_mtu(bitrate: u64) -> Option<usize> {
+    Some(match bitrate {
+        1_000_000_000.. => 524_288,
+        750_000_000.. => 262_144,
+        400_000_000.. => 131_072,
+        200_000_000.. => 65_536,
+        100_000_000.. => 32_768,
+        10_000_000.. => 16_384,
+        5_000_000.. => 8_192,
+        2_000_000.. => 4_096,
+        1_000_000.. => 2_048,
+        62_500.. => 1_024,
+        _ => return None,
+    })
+}
+
 /// Short type name of an interface, used as statistics `kind`.
 fn interface_kind_name<T: ?Sized>() -> String {
     let full = std::any::type_name::<T>();
@@ -1230,5 +1256,97 @@ mod tests {
         assert_eq!(counters.rssi(), Some(-100));
         assert_eq!(counters.snr(), Some(-7.5));
         assert_eq!(counters.quality(), Some(0.0));
+    }
+
+    #[test]
+    fn hardware_mtu_follows_bitrate_tiers() {
+        // Python `Interface.optimise_mtu`, including the step just below
+        // each threshold. Backbone's class MTU is above every tier, so
+        // the reported value is the tier (never 1048576).
+        let tiers = [
+            (1_000_000_000, Some(524_288usize)),
+            (999_999_999, Some(262_144)),
+            (750_000_000, Some(262_144)),
+            (749_999_999, Some(131_072)),
+            (400_000_000, Some(131_072)),
+            (399_999_999, Some(65_536)),
+            (200_000_000, Some(65_536)),
+            (199_999_999, Some(32_768)),
+            (100_000_000, Some(32_768)),
+            (99_999_999, Some(16_384)),
+            (10_000_000, Some(16_384)),
+            (9_999_999, Some(8_192)),
+            (5_000_000, Some(8_192)),
+            (4_999_999, Some(4_096)),
+            (2_000_000, Some(4_096)),
+            (1_999_999, Some(2_048)),
+            (1_000_000, Some(2_048)),
+            (999_999, Some(1_024)),
+            (62_500, Some(1_024)),
+            (62_499, None),
+            (0, None),
+        ];
+
+        let mut manager = InterfaceManager::new(4);
+        for (bitrate, expected) in tiers {
+            assert_eq!(optimise_mtu(bitrate), expected, "tier {bitrate}");
+            for kind in ["BackboneClient", "BackboneServer"] {
+                let channel = manager.new_channel_named(1, kind, kind);
+                assert!(manager.set_iface_bitrate(&channel.address, bitrate));
+                assert_eq!(
+                    manager.iface_hw_mtu(&channel.address),
+                    expected,
+                    "{kind} at {bitrate}"
+                );
+            }
+        }
+
+        // Unset bitrate is the interface default 62500, which is the
+        // 1024 tier, not the backbone class MTU.
+        let unset = manager.new_channel_named(1, "bb", "BackboneClient");
+        assert_eq!(manager.iface_hw_mtu(&unset.address), Some(1_024));
+
+        for kind in ["TcpClient", "TcpServer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(262_144));
+            assert!(manager.set_iface_bitrate(&channel.address, 750_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(262_144));
+            assert!(manager.set_iface_bitrate(&channel.address, 400_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(131_072));
+            assert!(manager.set_iface_bitrate(&channel.address, 62_499));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), None);
+        }
+
+        for kind in ["LocalClient", "LocalServer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(524_288));
+            assert!(manager.set_iface_bitrate(&channel.address, 100_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(32_768));
+            assert!(manager.set_iface_bitrate(&channel.address, 62_499));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), None);
+        }
+
+        for kind in ["AutoInterface", "AutoPeer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_196));
+            assert!(manager.set_iface_bitrate(&channel.address, 0));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_196));
+        }
+
+        for kind in [
+            "UdpInterface",
+            "SerialInterface",
+            "KissInterface",
+            "TestIface",
+        ] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), None, "{kind}");
+        }
+
+        assert_eq!(manager.iface_hw_mtu(&AddressHash::new_empty()), None);
     }
 }
