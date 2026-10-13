@@ -26,7 +26,7 @@ listed here.
   and the device must be bonded), and Android needs the `able` /
   `BluetoothDispatcher` library.
 - **No `interfaces/` file plugins.** When the config `type` is not a
-  built-in, Python `Reticulum.__create_interface` execs
+  built-in, Python `Reticulum._synthesize_interface` execs
   `{configdir}/interfaces/<Type>.py` (`RNS/Reticulum.py`); Rust never
   loads that file. The daemon can still start an enabled unknown type
   in-process through `register_interface_factory`
