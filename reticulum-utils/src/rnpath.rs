@@ -28,6 +28,9 @@ pub struct PathResult {
     pub hops: u8,
     pub via: AddressHash,
     pub iface: AddressHash,
+    /// Interface label from a shared-instance path table. Local snapshots
+    /// leave this empty and render `Interface[<hash>]`.
+    pub iface_name: Option<String>,
 }
 
 impl PathResult {
@@ -36,13 +39,20 @@ impl PathResult {
     pub fn render(&self) -> String {
         let plural = if self.hops == 1 { "" } else { "s" };
         format!(
-            "Path found, destination {} is {} hop{} away via {} on Interface[{}]",
+            "Path found, destination {} is {} hop{} away via {} on {}",
             prettyhexrep(self.destination.as_slice()),
             self.hops,
             plural,
             prettyhexrep(self.via.as_slice()),
-            self.iface.to_hex_string()
+            self.on_interface()
         )
+    }
+
+    pub fn on_interface(&self) -> String {
+        match &self.iface_name {
+            Some(name) => name.clone(),
+            None => format!("Interface[{}]", self.iface.to_hex_string()),
+        }
     }
 }
 
@@ -84,6 +94,7 @@ async fn path_result(transport: &Transport, destination: &AddressHash) -> Option
         hops,
         via,
         iface,
+        iface_name: None,
     })
 }
 
@@ -105,10 +116,70 @@ pub async fn path_table(
             hops: entry.hops,
             via: entry.via,
             iface: entry.iface,
+            iface_name: None,
         })
         .collect();
-    entries.sort_by_key(|entry| (entry.iface.to_hex_string(), entry.hops));
+    entries.sort_by(|left, right| {
+        left.on_interface()
+            .cmp(&right.on_interface())
+            .then(left.hops.cmp(&right.hops))
+    });
     entries
+}
+
+/// Path rows from a shared-instance `path_table` response.
+pub fn paths_from_rpc(value: &rmpv::Value) -> Result<Vec<PathResult>, String> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "path table is not an array".to_string())?;
+    let mut entries = Vec::with_capacity(rows.len());
+    for row in rows {
+        let destination = rpc_hash(row, "hash")?;
+        let via = rpc_hash(row, "via")?;
+        let hops =
+            rpc_u64(row, "hops").ok_or_else(|| "path table entry is missing hops".to_string())?;
+        let interface = rpc_str(row, "interface").unwrap_or_else(|| "None".to_string());
+        entries.push(PathResult {
+            destination,
+            hops: hops as u8,
+            via,
+            iface: AddressHash::new([0; 16]),
+            iface_name: Some(interface),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.on_interface()
+            .cmp(&right.on_interface())
+            .then(left.hops.cmp(&right.hops))
+    });
+    Ok(entries)
+}
+
+fn rpc_field<'a>(row: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+    row.as_map()?
+        .iter()
+        .find(|(name, _)| name.as_str() == Some(key))
+        .map(|(_, item)| item)
+}
+
+fn rpc_hash(row: &rmpv::Value, key: &str) -> Result<AddressHash, String> {
+    let value = rpc_field(row, key).ok_or_else(|| format!("path table entry is missing {key}"))?;
+    let bytes = value
+        .as_slice()
+        .ok_or_else(|| format!("path table {key} is not bytes"))?;
+    AddressHash::new_from_raw_slice(bytes)
+        .ok_or_else(|| format!("path table {key} has the wrong length"))
+}
+
+fn rpc_u64(row: &rmpv::Value, key: &str) -> Option<u64> {
+    let value = rpc_field(row, key)?;
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|item| u64::try_from(item).ok()))
+}
+
+fn rpc_str(row: &rmpv::Value, key: &str) -> Option<String> {
+    rpc_field(row, key).and_then(|value| value.as_str().map(str::to_string))
 }
 
 /// Render a path table like Python `rnpath -t`:
@@ -123,7 +194,7 @@ pub fn render_table(entries: &[PathResult]) -> String {
             entry.hops,
             plural,
             prettyhexrep(entry.via.as_slice()),
-            entry.iface.to_hex_string()
+            entry.on_interface()
         ));
     }
     out
@@ -181,6 +252,7 @@ mod tests {
             hops: 1,
             via: AddressHash::new([2; 16]),
             iface: AddressHash::new([3; 16]),
+            iface_name: None,
         };
         assert!(result.render().contains("is 1 hop away"));
         let result = PathResult {
@@ -188,6 +260,7 @@ mod tests {
             hops: 3,
             via: AddressHash::new([2; 16]),
             iface: AddressHash::new([3; 16]),
+            iface_name: None,
         };
         assert!(result.render().contains("is 3 hops away"));
     }

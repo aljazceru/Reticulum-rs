@@ -410,8 +410,9 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
             instance_name: "rnsh",
             enable_transport: false,
             udp_loopback: options.udp_loopback,
+            require_shared_instance: false,
         })
-        .await,
+        .await?,
     );
 
     let identity_path = options.config_dir.join("storage/identities/rnsh");
@@ -1335,8 +1336,9 @@ async fn connect_client(
         instance_name: "rnsh-client",
         enable_transport: false,
         udp_loopback: options.udp_loopback,
+        require_shared_instance: false,
     })
-    .await;
+    .await?;
     let identity_path = options.config_dir.join("storage/identities/rnsh");
     let (client_identity, _) =
         load_or_create_private_identity(&identity_path).map_err(|err| err.to_string())?;

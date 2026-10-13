@@ -119,4 +119,19 @@ impl AnnounceLimits {
 
         None
     }
+
+    /// `(destination, violations, blocked_for, since_last)`.
+    /// `blocked_for` is set only while the destination is still blocked.
+    pub(super) fn snapshot(&self) -> Vec<(AddressHash, u32, Option<Duration>, Duration)> {
+        let now = Instant::now();
+        self.limits
+            .iter()
+            .map(|(destination, entry)| {
+                let blocked_for = (now < entry.blocked_until)
+                    .then(|| entry.blocked_until.saturating_duration_since(now));
+                let since_last = now.saturating_duration_since(entry.last_announce);
+                (*destination, entry.violations, blocked_for, since_last)
+            })
+            .collect()
+    }
 }

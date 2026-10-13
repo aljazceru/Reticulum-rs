@@ -18,10 +18,13 @@
 //! (`rn id`, `rn path`, `rn status`, `rn cp`).
 //!
 //! All tools take `--config <dir>` like the Python versions (default
-//! `~/.reticulum`) and run their own transport instance with the interfaces
-//! configured there. Attaching to a shared instance (Python
-//! `require_shared_instance`) is not implemented yet — see the
-//! `remote`-mode TODOs in `rnstatus`.
+//! `~/.reticulum`). When a shared instance is reachable they attach to it;
+//! otherwise they keep a direct transport. `require_shared_instance` fails
+//! when that attach cannot happen.
+//!
+//! [`rpc`] speaks the shared-instance control channel: Python's
+//! `multiprocessing.connection` authkey handshake, then one length-prefixed
+//! msgpack request.
 
 pub mod common;
 pub mod rncp;
@@ -37,3 +40,4 @@ pub mod rnprobe;
 pub mod rnsh;
 pub mod rnstatus;
 pub mod rnx;
+pub mod rpc;

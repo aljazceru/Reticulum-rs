@@ -3,3 +3,4 @@
 //! parsing and migration without spawning the binary.
 
 pub mod config;
+pub mod rpc;

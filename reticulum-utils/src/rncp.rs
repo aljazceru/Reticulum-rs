@@ -404,8 +404,9 @@ pub async fn serve_with_shutdown(
         instance_name: "rncp-listener",
         enable_transport: false,
         udp_loopback: options.udp_loopback,
+        require_shared_instance: false,
     })
-    .await;
+    .await?;
 
     let identity = rncp_identity(&config_dir, options.identity_path.as_deref())?;
     let destination_hash = serve_destination_hash(&mut transport, &identity).await;
@@ -778,8 +779,9 @@ pub async fn send(options: SendOptions) -> Result<String, String> {
         instance_name: "rncp-sender",
         enable_transport: false,
         udp_loopback: options.udp_loopback,
+        require_shared_instance: false,
     })
-    .await;
+    .await?;
 
     let identity = rncp_identity(&config_dir, options.identity_path.as_deref())?;
     let link = connect(
@@ -863,8 +865,9 @@ pub async fn fetch(options: FetchOptions) -> Result<String, String> {
         instance_name: "rncp-fetcher",
         enable_transport: false,
         udp_loopback: options.udp_loopback,
+        require_shared_instance: false,
     })
-    .await;
+    .await?;
 
     let identity = rncp_identity(&config_dir, options.identity_path.as_deref())?;
     let link = connect(

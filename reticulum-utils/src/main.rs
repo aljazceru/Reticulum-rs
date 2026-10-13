@@ -489,17 +489,42 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
             instance_name: "rnpath",
             enable_transport: false,
             udp_loopback: None,
+            require_shared_instance: false,
         },
     )
-    .await;
+    .await?;
 
     if args.table {
         let filter = match &args.destination {
             Some(destination) => Some(parse_hash(destination)?),
             None => None,
         };
-        let entries =
-            reticulum_utils::rnpath::path_table(&transport, filter.as_ref(), args.max).await;
+        let attached = transport
+            .iface_manager()
+            .lock()
+            .await
+            .connected_to_shared_instance();
+        let entries = if attached {
+            let max_hops = match args.max {
+                Some(max) => rmpv::Value::from(u64::from(max)),
+                None => rmpv::Value::Nil,
+            };
+            let response = reticulum_utils::common::shared_rpc(
+                &config_dir,
+                rmpv::Value::Map(vec![
+                    (rmpv::Value::from("get"), rmpv::Value::from("path_table")),
+                    (rmpv::Value::from("max_hops"), max_hops),
+                ]),
+            )
+            .await?;
+            let mut entries = reticulum_utils::rnpath::paths_from_rpc(&response)?;
+            if let Some(filter) = filter {
+                entries.retain(|entry| entry.destination == filter);
+            }
+            entries
+        } else {
+            reticulum_utils::rnpath::path_table(&transport, filter.as_ref(), args.max).await
+        };
         if args.json {
             #[derive(serde::Serialize)]
             struct Entry {
@@ -514,7 +539,7 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
                     hash: reticulum_utils::common::prettyhexrep(entry.destination.as_slice()),
                     hops: entry.hops,
                     via: reticulum_utils::common::prettyhexrep(entry.via.as_slice()),
-                    interface: entry.iface.to_hex_string(),
+                    interface: entry.on_interface(),
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
@@ -547,14 +572,12 @@ async fn run_status(args: StatusArgs) -> Result<(), String> {
             instance_name: "rnstatus",
             enable_transport: false,
             udp_loopback: None,
+            require_shared_instance: true,
         },
     )
-    .await;
+    .await?;
 
-    // Give interfaces a moment to come up so their status is meaningful.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let report = reticulum_utils::rnstatus::collect(&transport, false).await;
+    let report = reticulum_utils::rnstatus::collect_shared(&config_dir, &transport).await?;
     if args.json {
         println!("{}", report.to_json());
     } else {

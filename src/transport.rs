@@ -2080,6 +2080,26 @@ impl Transport {
         unretained
     }
 
+    /// Mark destination data as recently used
+    /// (Python `Identity._used_destination_data`).
+    pub async fn used_destination_data(&self, destination_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let used = handler
+            .known_destinations
+            .mark_used(destination_hash, unix_time_now());
+        persist_known_destinations(&mut handler);
+        used
+    }
+
+    /// Retain every known destination belonging to an identity
+    /// (Python `Identity._retain_identity`).
+    pub async fn retain_identity(&self, identity_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let retained = handler.known_destinations.retain_identity(identity_hash);
+        persist_known_destinations(&mut handler);
+        retained
+    }
+
     /// Number of known destinations (Python
     /// `len(RNS.Identity.known_destinations)`).
     pub async fn known_destinations_len(&self) -> usize {
@@ -6706,6 +6726,17 @@ pub struct PathTableSnapshotEntry {
     pub announce_hash: crate::hash::Hash,
 }
 
+/// One announce-rate entry (Python `Reticulum.get_rate_table`).
+/// Times are durations from now, not unix timestamps: the limiter stores
+/// [`Instant`](std::time::Instant) values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateTableEntry {
+    pub destination: AddressHash,
+    pub violations: u32,
+    pub blocked_for: Option<std::time::Duration>,
+    pub since_last: std::time::Duration,
+}
+
 /// Link table counters (Python `get_link_count` and the separate count of
 /// established inbound/outbound links kept by `Transport`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -6759,6 +6790,25 @@ impl Transport {
                 age_secs: path_table::path_age(now, entry.timestamp).as_secs(),
                 announce_hash: entry.packet_hash,
             })
+            .collect()
+    }
+
+    /// Announce rate-limit table (Python `Reticulum.get_rate_table`).
+    /// Empty only when nothing has been rate-limited.
+    pub async fn rate_table_snapshot(&self) -> Vec<RateTableEntry> {
+        let handler = self.handler.lock().await;
+        handler
+            .announce_limits
+            .snapshot()
+            .into_iter()
+            .map(
+                |(destination, violations, blocked_for, since_last)| RateTableEntry {
+                    destination,
+                    violations,
+                    blocked_for,
+                    since_last,
+                },
+            )
             .collect()
     }
 

@@ -31,8 +31,9 @@ pub async fn run(options: &Options) -> Result<(), String> {
         instance_name: APP_NAME,
         enable_transport: true,
         udp_loopback: None,
+        require_shared_instance: false,
     })
-    .await;
+    .await?;
 
     log::info!("{APP_NAME} initialised, package manager active");
     Ok(())

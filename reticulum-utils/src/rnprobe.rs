@@ -106,8 +106,10 @@ pub async fn probe(
         instance_name: "rnprobe",
         enable_transport: false,
         udp_loopback: options.udp_loopback,
+        require_shared_instance: false,
     })
-    .await;
+    .await
+    .map_err(|_| reticulum::error::RnsError::ConnectionError)?;
 
     probe_with(&transport, destination, options).await
 }
@@ -178,8 +180,10 @@ pub async fn serve(config_dir: &Path, instance_name: &str) -> std::sync::Arc<Tra
             instance_name,
             enable_transport: false,
             udp_loopback: Some((4997, 4996)),
+            require_shared_instance: false,
         })
-        .await,
+        .await
+        .expect("rnprobe serve does not require a shared instance"),
     );
 
     let probe = transport.enable_probe_destination().await;
@@ -214,8 +218,10 @@ pub async fn run_loopback() -> Result<(AddressHash, Vec<ProbeResult>), reticulum
         instance_name: "rnprobe-server",
         enable_transport: false,
         udp_loopback: Some((4997, 4996)),
+        require_shared_instance: false,
     })
-    .await;
+    .await
+    .map_err(|_| reticulum::error::RnsError::ConnectionError)?;
 
     let probe_destination = server.enable_probe_destination().await;
     server.send_announce(&probe_destination, None).await;
@@ -225,8 +231,10 @@ pub async fn run_loopback() -> Result<(AddressHash, Vec<ProbeResult>), reticulum
         instance_name: "rnprobe-client",
         enable_transport: false,
         udp_loopback: Some((4996, 4997)),
+        require_shared_instance: false,
     })
-    .await;
+    .await
+    .map_err(|_| reticulum::error::RnsError::ConnectionError)?;
 
     let destination = probe_destination.lock().await.desc.address_hash;
     let results = probe_with(&client, &destination, &ProbeOptions::default()).await?;

@@ -173,7 +173,7 @@ impl StatusReport {
                     hash: crate::common::prettyhexrep(entry.destination.as_slice()),
                     hops: entry.hops,
                     via: crate::common::prettyhexrep(entry.via.as_slice()),
-                    interface: entry.iface.to_hex_string(),
+                    interface: entry.on_interface(),
                 })
                 .collect(),
             link_counts: LinkCountsJson {
@@ -230,6 +230,152 @@ pub async fn collect(transport: &Transport, transport_enabled: bool) -> StatusRe
         link_counts: transport.link_counts().await,
         transport_enabled,
     }
+}
+
+/// Status of a reachable shared instance. Callers that required the shared
+/// instance use this instead of the local transport snapshot.
+pub async fn collect_shared(
+    config_dir: &std::path::Path,
+    transport: &Transport,
+) -> Result<StatusReport, String> {
+    let stats = crate::common::shared_rpc(config_dir, get_request("interface_stats", None)).await?;
+    let paths = crate::common::shared_rpc(
+        config_dir,
+        get_request("path_table", Some(("max_hops", rmpv::Value::Nil))),
+    )
+    .await?;
+    let link_count = crate::common::shared_rpc(config_dir, get_request("link_count", None)).await?;
+    let active =
+        crate::common::shared_rpc(config_dir, get_request("active_link_count", None)).await?;
+
+    let interfaces = map_field(&stats, "interfaces")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| "interface stats are missing interfaces".to_string())?
+        .iter()
+        .filter_map(iface_row)
+        .collect();
+
+    let transport_id = map_field(&stats, "transport_id").and_then(|value| value.as_slice());
+    let identity_hash = match transport_id {
+        Some(bytes) => crate::common::prettyhexrep(bytes),
+        None => crate::common::prettyhexrep(transport.identity_hash().await.as_slice()),
+    };
+
+    Ok(StatusReport {
+        instance_name: transport.instance_name().await,
+        identity_hash,
+        queue_pressure: (
+            field_usize(&stats, "rxqt"),
+            [
+                field_usize(&stats, "rxqd"),
+                field_usize(&stats, "rxqa"),
+                field_usize(&stats, "rxqp"),
+                field_usize(&stats, "rxqil"),
+            ],
+            [
+                field_u64(&stats, "rxqdd"),
+                field_u64(&stats, "rxqad"),
+                field_u64(&stats, "rxqpd"),
+                field_u64(&stats, "rxqild"),
+            ],
+        ),
+        interfaces,
+        paths: crate::rnpath::paths_from_rpc(&paths)?,
+        link_counts: reticulum::transport::LinkCounts {
+            link_table: value_usize(&link_count),
+            inbound: value_usize(&active),
+            outbound: 0,
+        },
+        transport_enabled: transport_id.is_some(),
+    })
+}
+
+fn get_request(path: &str, extra: Option<(&str, rmpv::Value)>) -> rmpv::Value {
+    let mut map = vec![(
+        rmpv::Value::from("get"),
+        rmpv::Value::from(path.to_string()),
+    )];
+    if let Some((key, value)) = extra {
+        map.push((rmpv::Value::from(key), value));
+    }
+    rmpv::Value::Map(map)
+}
+
+fn iface_row(value: &rmpv::Value) -> Option<IfaceRow> {
+    let name = field_str(value, "name")?;
+    let kind = field_str(value, "type").unwrap_or_default();
+    let online = map_field(value, "status").and_then(|item| item.as_bool()) == Some(true);
+    let mode = mode_label(field_u64(value, "mode"));
+    let bitrate = field_u64(value, "bitrate");
+    Some(IfaceRow {
+        name,
+        kind,
+        status: if online { "Up" } else { "Down" },
+        mode,
+        bitrate: if bitrate == 0 {
+            "Unknown".to_string()
+        } else {
+            bitrate.to_string()
+        },
+        tx: pretty_size(field_u64(value, "txb")),
+        rx: pretty_size(field_u64(value, "rxb")),
+        announces: format!(
+            "{}/{} ({}/{})",
+            field_u64(value, "atxc"),
+            field_u64(value, "arxc"),
+            pretty_size(field_u64(value, "atxb")),
+            pretty_size(field_u64(value, "arxb")),
+        ),
+        path_requests: format!("{}/{}", field_u64(value, "ptxc"), field_u64(value, "prxc")),
+        violations: format!(
+            "{}/{} (filter {})",
+            field_u64(value, "protocol_violations"),
+            field_u64(value, "ifac_violations"),
+            field_u64(value, "packet_filter_hits")
+        ),
+    })
+}
+
+fn mode_label(mode: u64) -> &'static str {
+    match mode {
+        0x02 => "PtP",
+        0x03 => "AP",
+        0x04 => "Roaming",
+        0x05 => "Boundary",
+        0x06 => "Gateway",
+        0x07 => "Internal",
+        _ => "Full",
+    }
+}
+
+fn map_field<'a>(value: &'a rmpv::Value, key: &str) -> Option<&'a rmpv::Value> {
+    value
+        .as_map()?
+        .iter()
+        .find(|(name, _)| name.as_str() == Some(key))
+        .map(|(_, item)| item)
+}
+
+fn field_str(value: &rmpv::Value, key: &str) -> Option<String> {
+    map_field(value, key).and_then(|item| item.as_str().map(str::to_string))
+}
+
+fn field_u64(value: &rmpv::Value, key: &str) -> u64 {
+    map_field(value, key).and_then(value_u64).unwrap_or(0)
+}
+
+fn field_usize(value: &rmpv::Value, key: &str) -> usize {
+    field_u64(value, key) as usize
+}
+
+fn value_usize(value: &rmpv::Value) -> usize {
+    value_u64(value).unwrap_or(0) as usize
+}
+
+fn value_u64(value: &rmpv::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|item| u64::try_from(item).ok()))
 }
 
 #[cfg(test)]

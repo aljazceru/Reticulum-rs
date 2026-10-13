@@ -11,10 +11,12 @@ use std::path::{Path, PathBuf};
 use rand_core::OsRng;
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
+use reticulum::iface::local::{LocalClient, SharedInstanceAddress};
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport, TransportConfig};
+use sha2::Digest;
 
 /// Format a hash like Python `RNS.prettyhexrep`: `<aabbcc...>`.
 pub fn prettyhexrep(bytes: &[u8]) -> String {
@@ -185,6 +187,9 @@ pub struct ToolTransportOptions<'a> {
     /// `forward_port`. Used when the config directory has no usable
     /// interfaces (e.g. ad-hoc `rn cp` runs between two machines).
     pub udp_loopback: Option<(u16, u16)>,
+    /// Fail instead of opening a direct transport when no shared instance
+    /// can be reached.
+    pub require_shared_instance: bool,
 }
 
 /// A parsed `[[interfaces]]` entry from the config file.
@@ -333,13 +338,56 @@ fn read_config_file(config_dir: &Path) -> Option<String> {
     Some(content)
 }
 
-/// Build a standalone transport for a tool run: applies the interfaces from
-/// `config_dir` (if any) or the explicit `udp_loopback` fallback.
-pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transport {
+/// Build a transport for a tool run.
+///
+/// A reachable shared instance is attached and configured interfaces are
+/// left down. Otherwise the interfaces from `config_dir` (or
+/// `udp_loopback`) are opened. `require_shared_instance` is an error when
+/// that attach cannot happen.
+pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Result<Transport, String> {
+    let settings = shared_settings(options.config_dir);
+    let reachable = if settings.share {
+        shared_instance_reachable(&settings).await
+    } else {
+        false
+    };
+    if options.require_shared_instance && !reachable {
+        return Err(
+            "No shared instance available, but application that started Reticulum required it"
+                .to_string(),
+        );
+    }
+
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let transport = TransportConfig::new(options.instance_name, &identity)
-        .set_retransmit(options.enable_transport)
+        .set_retransmit(options.enable_transport && !reachable)
         .build();
+
+    if reachable {
+        let address = shared_data_address(&settings);
+        log::info!("Connected to locally available Reticulum instance via {address:?}");
+        let manager = transport.iface_manager();
+        let mut manager = manager.lock().await;
+        let attached = manager.spawn(
+            LocalClient::new("Local shared instance", address),
+            LocalClient::spawn,
+        );
+        manager.set_iface_name(&attached, "Local shared instance");
+        drop(manager);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if transport
+                .iface_manager()
+                .lock()
+                .await
+                .connected_to_shared_instance()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        return Ok(transport);
+    }
 
     let interfaces = read_configured_interfaces(options.config_dir);
     let mut spawned = 0usize;
@@ -430,7 +478,158 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transpor
         }
     }
 
-    transport
+    Ok(transport)
+}
+
+/// One msgpack RPC against the shared instance described by `config_dir`.
+pub async fn shared_rpc(config_dir: &Path, request: rmpv::Value) -> Result<rmpv::Value, String> {
+    let settings = shared_settings(config_dir);
+    let addr = match &settings.abstract_name {
+        #[cfg(target_os = "linux")]
+        Some(name) => crate::rpc::ControlAddr::Abstract(name.clone()),
+        _ => crate::rpc::ControlAddr::Tcp(settings.control_port),
+    };
+    crate::rpc::call(&addr, &settings.authkey, &request).await
+}
+
+struct SharedSettings {
+    share: bool,
+    data_port: u16,
+    control_port: u16,
+    /// Set when the control and data sockets are Linux abstract names.
+    abstract_name: Option<String>,
+    authkey: Vec<u8>,
+}
+
+fn shared_settings(config_dir: &Path) -> SharedSettings {
+    let table = read_config_file(config_dir)
+        .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("reticulum")
+                .and_then(|item| item.as_table())
+                .cloned()
+        });
+    let share = table
+        .as_ref()
+        .and_then(|table| table.get("share_instance"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let data_port = table
+        .as_ref()
+        .and_then(|table| table.get("shared_instance_port"))
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(37428);
+    let control_port = table
+        .as_ref()
+        .and_then(|table| table.get("instance_control_port"))
+        .and_then(|value| value.as_integer())
+        .and_then(|value| u16::try_from(value).ok())
+        .unwrap_or(37429);
+    let instance_name = table
+        .as_ref()
+        .and_then(|table| table.get("instance_name"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default")
+        .to_string();
+    let instance_type = table
+        .as_ref()
+        .and_then(|table| table.get("shared_instance_type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("domain");
+    let abstract_name = if !instance_type.eq_ignore_ascii_case("tcp") && cfg!(target_os = "linux") {
+        Some(instance_name.clone())
+    } else {
+        None
+    };
+    let configured = table
+        .as_ref()
+        .and_then(|table| table.get("rpc_key"))
+        .and_then(|value| value.as_str());
+    let authkey = tool_authkey(config_dir, configured);
+    SharedSettings {
+        share,
+        data_port,
+        control_port,
+        abstract_name,
+        authkey,
+    }
+}
+
+fn tool_authkey(config_dir: &Path, configured: Option<&str>) -> Vec<u8> {
+    if let Some(identity) = load_private_identity(&config_dir.join("identity"))
+        .ok()
+        .or_else(|| {
+            load_private_identity(&config_dir.join("storage").join("transport_identity")).ok()
+        })
+    {
+        return crate::rpc::authkey(configured, &identity);
+    }
+    if let Some(text) = configured {
+        if let Some(key) = decode_configured_key(text) {
+            return key;
+        }
+        log::error!("Invalid shared instance RPC key specified, falling back to default key");
+    }
+    sha2::Sha256::digest([]).to_vec()
+}
+
+fn decode_configured_key(text: &str) -> Option<Vec<u8>> {
+    let compact: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if !compact.len().is_multiple_of(2) || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(compact.len() / 2);
+    let bytes = compact.as_bytes();
+    for index in (0..bytes.len()).step_by(2) {
+        let hex = std::str::from_utf8(&bytes[index..index + 2]).ok()?;
+        out.push(u8::from_str_radix(hex, 16).ok()?);
+    }
+    Some(out)
+}
+
+fn shared_data_address(settings: &SharedSettings) -> SharedInstanceAddress {
+    match &settings.abstract_name {
+        #[cfg(target_os = "linux")]
+        Some(name) => SharedInstanceAddress::unix_abstract(name.clone()),
+        _ => SharedInstanceAddress::tcp(settings.data_port),
+    }
+}
+
+async fn shared_instance_reachable(settings: &SharedSettings) -> bool {
+    if let Some(name) = &settings.abstract_name {
+        #[cfg(target_os = "linux")]
+        {
+            return abstract_reachable(name);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = name;
+            return false;
+        }
+    }
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        tokio::net::TcpStream::connect(("127.0.0.1", settings.data_port)),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn abstract_reachable(name: &str) -> bool {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::SocketAddr as UnixSocketAddr;
+
+    let Ok(socket_address) = UnixSocketAddr::from_abstract_name(format!("rns/{name}").as_bytes())
+    else {
+        return false;
+    };
+    std::os::unix::net::UnixStream::connect_addr(&socket_address).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -442,4 +641,120 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transpor
 /// online state — the data source for `rnstatus`).
 pub async fn interface_stats(transport: &Transport) -> Vec<reticulum::iface::InterfaceStats> {
     transport.interface_stats().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reticulum::iface::local::LocalServer;
+    use std::sync::Arc;
+
+    fn write_shared_config(dir: &Path, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    #[tokio::test]
+    async fn require_shared_instance_fails_when_nothing_is_listening() {
+        let dir = std::env::temp_dir().join(format!("rns-require-{}", std::process::id()));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        write_shared_config(
+            &dir,
+            &format!(
+                "[reticulum]\nshare_instance = true\nshared_instance_type = \"tcp\"\nshared_instance_port = {port}\n"
+            ),
+        );
+        let err = build_tool_transport(ToolTransportOptions {
+            config_dir: &dir,
+            instance_name: "require-test",
+            enable_transport: false,
+            udp_loopback: Some((9, 9)),
+            require_shared_instance: true,
+        })
+        .await;
+        let Err(err) = err else {
+            panic!("closed port should fail");
+        };
+        assert!(err.contains("No shared instance available"));
+
+        write_shared_config(
+            &dir,
+            "[reticulum]\nshare_instance = false\nshared_instance_type = \"tcp\"\n",
+        );
+        let err = build_tool_transport(ToolTransportOptions {
+            config_dir: &dir,
+            instance_name: "require-test",
+            enable_transport: false,
+            udp_loopback: None,
+            require_shared_instance: true,
+        })
+        .await;
+        let Err(err) = err else {
+            panic!("sharing disabled should fail");
+        };
+        assert!(err.contains("No shared instance available"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn attaches_when_a_shared_instance_is_listening() {
+        let dir = std::env::temp_dir().join(format!("rns-attach-{}", std::process::id()));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        write_shared_config(
+            &dir,
+            &format!(
+                "[reticulum]\nshare_instance = true\nshared_instance_type = \"tcp\"\nshared_instance_port = {port}\n"
+            ),
+        );
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let server = Arc::new(TransportConfig::new("shared-test", &identity).build());
+        let manager = server.iface_manager();
+        {
+            let mut guard = manager.lock().await;
+            let local = LocalServer::new(SharedInstanceAddress::tcp(port), manager.clone());
+            let context = guard.open(local);
+            guard.launch(context, LocalServer::spawn);
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err()
+        {
+            if tokio::time::Instant::now() >= deadline {
+                panic!("shared instance did not accept connections");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let transport = build_tool_transport(ToolTransportOptions {
+            config_dir: &dir,
+            instance_name: "attach-test",
+            enable_transport: false,
+            udp_loopback: Some((9, 9)),
+            require_shared_instance: false,
+        })
+        .await
+        .expect("attach");
+        let stats = transport.iface_manager().lock().await.stats();
+        assert!(stats
+            .iter()
+            .any(|stat| stat.kind == "LocalClient" && stat.name == "Local shared instance"));
+        assert!(stats.iter().all(|stat| stat.kind != "UdpInterface"));
+        assert!(transport
+            .iface_manager()
+            .lock()
+            .await
+            .connected_to_shared_instance());
+        let _ = fs::remove_dir_all(dir);
+    }
 }

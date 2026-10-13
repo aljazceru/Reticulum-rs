@@ -54,8 +54,9 @@ pub async fn serve(options: &ServeOptions) -> Result<AddressHash, String> {
             instance_name: "rnx",
             enable_transport: false,
             udp_loopback: options.udp_loopback,
+            require_shared_instance: false,
         })
-        .await,
+        .await?,
     );
 
     // Identity persisted per-app like Python (`<storage>/identities/rnx`).
@@ -537,8 +538,9 @@ pub async fn execute(
         instance_name: "rnx-client",
         enable_transport: false,
         udp_loopback: options.udp_loopback,
+        require_shared_instance: false,
     })
-    .await;
+    .await?;
 
     if !transport
         .await_path(destination, Some(options.timeout), None)

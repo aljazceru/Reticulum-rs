@@ -195,7 +195,8 @@ fn unapplied_warnings_skip_keys_python_does_not_apply() {
     assert!(SUPPORTED_INTERFACE_TYPES.contains(&"BackboneClientInterface"));
     assert!(KNOWN_RETICULUM_KEYS.contains(&"instance_control_port"));
     assert!(!KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS.contains(&"instance_control_port"));
-    assert!(KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS.contains(&"rpc_key"));
+    assert!(KNOWN_RETICULUM_KEYS.contains(&"rpc_key"));
+    assert!(!KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS.contains(&"rpc_key"));
 }
 
 #[test]
