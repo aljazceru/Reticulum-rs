@@ -2211,7 +2211,10 @@ mod tests {
             drop(fresh);
             manager.with_control(&address, |control| control.announce_cap)
         };
-        assert_eq!(fresh_cap, Some(ANNOUNCE_CAP / 100.0));
+        // The control-state cap is the fraction itself (PR "Announce cap
+        // fraction"): ANNOUNCE_CAP is already 0.02 and must not be divided
+        // by 100 again.
+        assert_eq!(fresh_cap, Some(ANNOUNCE_CAP));
 
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = probe.local_addr().unwrap().port();
