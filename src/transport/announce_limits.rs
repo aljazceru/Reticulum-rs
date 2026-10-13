@@ -93,4 +93,23 @@ impl AnnounceLimits {
 
         None
     }
+
+    /// Like [`Self::check`], but the first limit for `destination` is the
+    /// interface's configured rate. Later announces from another interface
+    /// replace that rate so the receiving interface's settings apply.
+    pub fn check_limited(
+        &mut self,
+        destination: &AddressHash,
+        limit: AnnounceRateLimit,
+    ) -> Option<Duration> {
+        if let Some(entry) = self.limits.get_mut(destination) {
+            entry.rate_limit = Some(limit);
+            return entry.handle_announce();
+        }
+
+        self.limits
+            .insert(*destination, AnnounceLimitEntry::new(Some(limit)));
+
+        None
+    }
 }

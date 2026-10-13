@@ -1136,6 +1136,9 @@ pub struct AnnouncedInterface {
     pub info: InterfaceInfo,
     pub announce_interval: Duration,
     pub last_announced: Option<tokio::time::Instant>,
+    /// `None` uses the announcer's stamp. Set per interface when the
+    /// config supplies `discovery_stamp_value`.
+    stamp_value: Option<u32>,
 }
 
 impl InterfaceAnnouncer {
@@ -1166,8 +1169,11 @@ impl InterfaceAnnouncer {
     }
 
     /// Register a local interface for discovery announces.
+    /// Interval is [`DISCOVERY_ANNOUNCE_INTERVAL`] and the stamp is the
+    /// announcer's stamp.
     pub async fn announce_interface(&self, info: InterfaceInfo) {
-        self.queue(info, None).await;
+        self.queue(info, None, DISCOVERY_ANNOUNCE_INTERVAL, None)
+            .await;
     }
 
     /// Register an interface whose announces are encrypted to `identity`
@@ -1177,15 +1183,37 @@ impl InterfaceAnnouncer {
         info: InterfaceInfo,
         identity: PrivateIdentity,
     ) {
-        self.queue(info, Some(identity)).await;
+        self.queue(info, Some(identity), DISCOVERY_ANNOUNCE_INTERVAL, None)
+            .await;
     }
 
-    async fn queue(&self, info: InterfaceInfo, encrypt_to: Option<PrivateIdentity>) {
+    /// Register an interface with its own announce interval and stamp.
+    /// `stamp_value` of `None` uses the announcer stamp. `encrypt_to`
+    /// encrypts the payload the same way as
+    /// [`Self::announce_encrypted_interface`].
+    pub async fn announce_interface_configured(
+        &self,
+        info: InterfaceInfo,
+        interval: Duration,
+        stamp_value: Option<u32>,
+        encrypt_to: Option<PrivateIdentity>,
+    ) {
+        self.queue(info, encrypt_to, interval, stamp_value).await;
+    }
+
+    async fn queue(
+        &self,
+        info: InterfaceInfo,
+        encrypt_to: Option<PrivateIdentity>,
+        interval: Duration,
+        stamp_value: Option<u32>,
+    ) {
         self.interfaces.write().await.push(QueuedAnnounce {
             entry: AnnouncedInterface {
                 info,
-                announce_interval: DISCOVERY_ANNOUNCE_INTERVAL,
+                announce_interval: interval,
                 last_announced: None,
+                stamp_value,
             },
             encrypt_to,
         });
@@ -1193,6 +1221,7 @@ impl InterfaceAnnouncer {
 
     async fn job(self: Arc<Self>) {
         loop {
+            let fallback_stamp = self.stamp_value;
             let due = {
                 let mut interfaces = self.interfaces.write().await;
                 let now = tokio::time::Instant::now();
@@ -1224,18 +1253,21 @@ impl InterfaceAnnouncer {
                     (
                         interfaces[index].entry.info.clone(),
                         interfaces[index].encrypt_to.clone(),
+                        interfaces[index]
+                            .entry
+                            .stamp_value
+                            .unwrap_or(fallback_stamp),
                     )
                 })
             };
 
-            let Some((info, encrypt_to)) = due else {
+            let Some((info, encrypt_to, stamp_value)) = due else {
                 // Nothing due: poll again after the interval.
                 tokio::time::sleep(self.interval).await;
                 continue;
             };
 
-            match build_discovery_payload_for_identity(&info, self.stamp_value, encrypt_to.as_ref())
-            {
+            match build_discovery_payload_for_identity(&info, stamp_value, encrypt_to.as_ref()) {
                 Some(payload) => {
                     log::debug!(
                         "reticulum-rs discovery: announcing interface {} ({} bytes)",
@@ -1307,6 +1339,21 @@ impl AutoconnectPolicy {
     }
 }
 
+/// Settings applied to an interface spawned by
+/// [`InterfaceDiscovery::connect_discovered_with`]. `None` leaves the
+/// constructor value in place, which is what
+/// [`InterfaceDiscovery::connect_discovered`] does.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AutoconnectAttach {
+    pub mode: Option<reticulum::iface::InterfaceMode>,
+    pub gravity: Option<i64>,
+    pub announces_to_internal: Option<bool>,
+    pub bitrate: Option<u64>,
+    pub announce_rate_target: Option<Duration>,
+    pub announce_rate_grace: Option<u32>,
+    pub announce_rate_penalty: Option<Duration>,
+}
+
 /// Optional discovery listener settings. [`InterfaceDiscovery::start`]
 /// uses [`Default`].
 pub struct DiscoveryOptions {
@@ -1333,6 +1380,9 @@ pub struct InterfaceDiscovery {
     discovered: RwLock<Vec<DiscoveredInterface>>,
     autoconnect: RwLock<bool>,
     max_autoconnected: RwLock<usize>,
+    /// Empty means every announcer is accepted
+    /// (Python `interface_discovery_sources`).
+    allowed_sources: RwLock<Vec<AddressHash>>,
     policy: RwLock<AutoconnectPolicy>,
     storage_path: RwLock<Option<PathBuf>>,
     network_identity: RwLock<Option<PrivateIdentity>>,
@@ -1374,6 +1424,7 @@ impl InterfaceDiscovery {
             discovered: RwLock::new(discovered),
             autoconnect: RwLock::new(autoconnect),
             max_autoconnected: RwLock::new(8),
+            allowed_sources: RwLock::new(Vec::new()),
             policy: RwLock::new(options.policy),
             storage_path: RwLock::new(options.storage_path),
             network_identity: RwLock::new(options.network_identity),
@@ -1388,6 +1439,17 @@ impl InterfaceDiscovery {
 
     pub async fn set_autoconnect_policy(&self, policy: AutoconnectPolicy) {
         *self.policy.write().await = policy;
+    }
+
+    /// Cap on simultaneously auto-connected peers. The default is 8.
+    /// Python `autoconnect_discovered_interfaces` is this maximum.
+    pub async fn set_max_autoconnected(&self, max: usize) {
+        *self.max_autoconnected.write().await = max;
+    }
+
+    /// Allow-list of announcer identity hashes. Empty accepts every source.
+    pub async fn set_interface_sources(&self, sources: Vec<AddressHash>) {
+        *self.allowed_sources.write().await = sources;
     }
 
     /// Identity used to decrypt announces with [`FLAG_ENCRYPTED`] set.
@@ -1436,6 +1498,14 @@ impl InterfaceDiscovery {
                     destination.desc.address_hash,
                 )
             };
+
+            {
+                let allowed = self.allowed_sources.read().await;
+                if !allowed.is_empty() && !allowed.contains(&announcer) {
+                    log::debug!("discovery: ignoring announce from a non-authorized identity");
+                    continue;
+                }
+            }
 
             let hops = self
                 .transport
@@ -1578,7 +1648,18 @@ impl InterfaceDiscovery {
     /// version 1.5.2 or with an implementation name other than `RNS`.
     /// Transport peers that `list` has not removed are dialed, including
     /// unknown and stale ones.
+    ///
+    /// Spawned interfaces keep their constructor mode, gravity and bitrate.
+    /// [`Self::connect_discovered_with`] applies optional attach settings.
     pub async fn connect_discovered(&self) -> usize {
+        self.connect_discovered_with(&AutoconnectAttach::default())
+            .await
+    }
+
+    /// [`Self::connect_discovered`] plus settings Python applies inside
+    /// `autoconnect()` (mode, gravity, bitrate, announce rate). Fields
+    /// left `None` are not written.
+    pub async fn connect_discovered_with(&self, attach: &AutoconnectAttach) -> usize {
         if !*self.autoconnect.read().await {
             return 0;
         }
@@ -1692,6 +1773,25 @@ impl InterfaceDiscovery {
                     16,
                 );
             }
+            manager.with_control(&ifac_address, |control| {
+                if let Some(mode) = attach.mode {
+                    control.mode = mode;
+                }
+                if let Some(gravity) = attach.gravity {
+                    control.gravity = gravity;
+                }
+                if let Some(to_internal) = attach.announces_to_internal {
+                    control.announces_to_internal = Some(to_internal);
+                }
+                if let Some(bitrate) = attach.bitrate {
+                    control.bitrate = bitrate;
+                }
+                if let Some(target) = attach.announce_rate_target {
+                    control.announce_rate_target = Some(target);
+                    control.announce_rate_grace = Some(attach.announce_rate_grace.unwrap_or(0));
+                    control.announce_rate_penalty = attach.announce_rate_penalty;
+                }
+            });
             drop(manager);
 
             log::info!("reticulum-rs discovery: auto-connected to {address} as {interface_name}");
@@ -1750,8 +1850,8 @@ impl BlackholeUpdater {
     }
 
     async fn job(self: Arc<Self>) {
-        // Python waits INITIAL_WAIT before the first round.
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        // Python `BlackholeUpdater.INITIAL_WAIT` (20s) before the first round.
+        tokio::time::sleep(Duration::from_secs(20)).await;
 
         loop {
             let sources = self.sources.read().await.clone();

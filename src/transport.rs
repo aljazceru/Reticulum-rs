@@ -3763,7 +3763,25 @@ async fn handle_announce<'a>(
         }
     }
 
-    if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
+    let interface_rate = {
+        let manager = handler.iface_manager.lock().await;
+        manager.with_control(&iface, |control| {
+            control
+                .announce_rate_target
+                .map(|target| announce_limits::AnnounceRateLimit {
+                    target,
+                    grace: control.announce_rate_grace.unwrap_or(0),
+                    penalty: control.announce_rate_penalty,
+                })
+        })
+    };
+    let blocked_until = match interface_rate.flatten() {
+        Some(limit) => handler
+            .announce_limits
+            .check_limited(&packet.destination, limit),
+        None => handler.announce_limits.check(&packet.destination),
+    };
+    if let Some(blocked_until) = blocked_until {
         log::info!(
             "tp({}): too many announces from {}, blocked for {} seconds",
             handler.config.name,

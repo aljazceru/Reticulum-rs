@@ -68,11 +68,11 @@ impl InterfaceMode {
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name.to_lowercase().as_str() {
             "full" | "default" => Self::Full,
-            "pointtopoint" | "point_to_point" | "point-to-point" => Self::PointToPoint,
-            "accesspoint" | "access_point" | "access-point" => Self::AccessPoint,
+            "pointtopoint" | "point_to_point" | "point-to-point" | "ptp" => Self::PointToPoint,
+            "accesspoint" | "access_point" | "access-point" | "ap" => Self::AccessPoint,
             "roaming" => Self::Roaming,
             "boundary" => Self::Boundary,
-            "gateway" => Self::Gateway,
+            "gateway" | "gw" => Self::Gateway,
             "internal" => Self::Internal,
             _ => return None,
         })
@@ -239,6 +239,11 @@ pub struct IfaceControlState {
     pub wants_tunnel: bool,
     /// Path-selection weight (Python `Interface.gravity`, default 0).
     pub gravity: i64,
+    /// Per-interface announce rate. `None` leaves the transport on its
+    /// existing global limiter (callers that never set these).
+    pub announce_rate_target: Option<Duration>,
+    pub announce_rate_grace: Option<u32>,
+    pub announce_rate_penalty: Option<Duration>,
 
     params: IfaceControlParams,
 
@@ -287,6 +292,9 @@ impl IfaceControlState {
             tunnel_id: None,
             wants_tunnel: false,
             gravity: 0,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
             params: IfaceControlParams::default(),
             announce_allowed_at: now,
             ia_freq_deque: VecDeque::new(),

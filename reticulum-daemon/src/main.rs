@@ -1,10 +1,16 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use rand_core::OsRng;
 use reticulum::hash::AddressHash;
+use reticulum::identity::PrivateIdentity;
+use reticulum::iface::IfaceControlParams;
+use reticulum::iface::InterfaceMode;
 use reticulum::iface::local::LocalServer;
 use reticulum::iface::local::SharedInstanceAddress;
+use reticulum::iface::tcp_client::INITIAL_CONNECT_TIMEOUT;
 use reticulum::iface::tcp_client::TcpClient;
+use reticulum::iface::tcp_client::TcpOptions;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::storage::FsStorage;
@@ -40,19 +46,16 @@ use reticulum_daemon::config::{Config, InterfaceConfig};
 /// it.
 const IDENTITY_FILE: &str = "identity";
 
-/// Parse `blackhole_sources` identity hashes (Python validates
-/// `len(hexhash) == 32` and raises otherwise).
-fn parse_blackhole_sources(values: &[String]) -> Result<Vec<AddressHash>, String> {
+/// Parse identity hashes (Python validates `len(hexhash) == 32`).
+fn parse_identity_hashes(values: &[String], what: &str) -> Result<Vec<AddressHash>, String> {
     values
         .iter()
         .map(|value| {
             if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!(
-                    "invalid identity hash for blackhole source: {value}"
-                ));
+                return Err(format!("invalid identity hash for {what}: {value}"));
             }
             AddressHash::new_from_hex_string(value)
-                .map_err(|_| format!("invalid identity hash for blackhole source: {value}"))
+                .map_err(|_| format!("invalid identity hash for {what}: {value}"))
         })
         .collect()
 }
@@ -121,10 +124,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (config, config_path) = Config::load(cmd.config_dir.as_deref())?;
-    env_logger::Builder::from_env(
+    let mut logger = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or(format!("{:?}", config.logging.loglevel)),
-    )
-    .init();
+    );
+    if !config.logging.logtimestamps {
+        logger.format_timestamp(None);
+    }
+    logger.init();
 
     log::info!("Configuration loaded from: {}", config_path.display());
     log::info!("Reticulum daemon starting");
@@ -133,15 +139,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every destination derived from it — stays stable across restarts
     // (Phase 7.4). The daemon announces nothing by default.
     let identity_path = config_path.join(IDENTITY_FILE);
-    let (identity, created) =
+    let (persisted, created) =
         reticulum_utils::common::load_or_create_private_identity(&identity_path)
             .map_err(|err| format!("could not load daemon identity: {err}"))?;
     log::info!(
         "{} daemon identity {} at {}",
         if created { "Generated" } else { "Loaded" },
-        reticulum_utils::common::prettyhexrep(identity.address_hash().as_slice()),
+        reticulum_utils::common::prettyhexrep(persisted.address_hash().as_slice()),
         identity_path.display()
     );
+    // Python replaces the running transport identity with a fresh one when
+    // transport is off and `static_transport_identity` is not set. The file
+    // above stays the persisted identity either way.
+    let identity =
+        if config.reticulum.enable_transport || config.reticulum.static_transport_identity {
+            persisted
+        } else {
+            let ephemeral = PrivateIdentity::new_from_rand(OsRng);
+            log::info!(
+                "Initialized ephemeral transport identity {}",
+                reticulum_utils::common::prettyhexrep(ephemeral.address_hash().as_slice())
+            );
+            ephemeral
+        };
+    let network_identity = match config.reticulum.network_identity.as_deref() {
+        Some(path) => Some(load_network_identity(path)?),
+        None => None,
+    };
 
     let instance_name = config
         .reticulum
@@ -153,6 +177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let transport = std::sync::Arc::new(
         TransportConfig::new(&instance_name, &identity)
             .set_retransmit(config.reticulum.enable_transport)
+            .set_implicit_proof(config.reticulum.use_implicit_proof)
+            .set_local_hops_delta(config.reticulum.local_hops_delta)
             .set_link_mtu_discovery(config.reticulum.link_mtu_discovery.unwrap_or(true))
             .set_inbound_queue_length(
                 reticulum::transport::TrafficClass::Data,
@@ -171,8 +197,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.reticulum.qlen_in_il.unwrap_or(0),
             )
             .set_blackhole_publish(config.reticulum.publish_blackhole)
-            .set_blackhole_sources(parse_blackhole_sources(
+            .set_blackhole_sources(parse_identity_hashes(
                 &config.reticulum.blackhole_sources,
+                "blackhole source",
             )?)
             .set_storage(std::sync::Arc::new(FsStorage::new(
                 config_path.join("storage").to_string_lossy().into_owned(),
@@ -210,10 +237,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         log::info!("Starting shared instance interface: LocalServer on {address:?}");
-        iface_manager.lock().await.spawn(
+        let address = iface_manager.lock().await.spawn(
             LocalServer::new(address, iface_manager.clone()),
             LocalServer::spawn,
         );
+        if let Some(bitrate) = config.reticulum.force_shared_instance_bitrate {
+            iface_manager
+                .lock()
+                .await
+                .set_iface_bitrate(&address, bitrate);
+        }
     }
 
     for iface in &config.interfaces {
@@ -252,11 +285,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     iface.name,
                     addr
                 );
-                let address = iface_manager.lock().await.spawn(
-                    TcpServer::new(addr, iface_manager.clone()),
-                    TcpServer::spawn,
-                );
-                configure_iface(&iface_manager, &address, iface).await;
+                match TcpServer::with_options(
+                    addr,
+                    iface_manager.clone(),
+                    tcp_options(iface, false),
+                ) {
+                    Ok(server) => {
+                        let address = iface_manager.lock().await.spawn(server, TcpServer::spawn);
+                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Interface '{}' has an invalid TCP configuration: {error:?}",
+                            iface.name
+                        );
+                    }
+                }
             }
             InterfaceConfig::TCPClientInterface {
                 target_host,
@@ -269,32 +313,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     iface.name,
                     addr
                 );
-                let address = iface_manager
-                    .lock()
-                    .await
-                    .spawn(TcpClient::new(addr), TcpClient::spawn);
-                configure_iface(&iface_manager, &address, iface).await;
+                match TcpClient::with_options(addr, tcp_options(iface, true)) {
+                    Ok(client) => {
+                        let address = iface_manager.lock().await.spawn(client, TcpClient::spawn);
+                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Interface '{}' has an invalid TCP configuration: {error:?}",
+                            iface.name
+                        );
+                    }
+                }
             }
             InterfaceConfig::UDPInterface {
                 listen_ip,
                 listen_port,
                 forward_ip,
                 forward_port,
+                port,
                 ..
             } => {
-                let bind_addr = format!("{}:{}", listen_ip, listen_port);
-                let forward_addr = format!("{}:{}", forward_ip, forward_port);
-                log::info!(
-                    "Enabling interface '{}': UDP {}→{}",
-                    iface.name,
-                    bind_addr,
-                    forward_addr
-                );
-                let address = iface_manager.lock().await.spawn(
-                    UdpInterface::new(bind_addr, Some(forward_addr), false),
-                    UdpInterface::spawn,
-                );
-                configure_iface(&iface_manager, &address, iface).await;
+                if iface.device.is_some() {
+                    log::warn!(
+                        "Interface '{}': UDP device is not applied; set listen_ip and forward_ip",
+                        iface.name
+                    );
+                }
+                let listen_port = listen_port.or(*port);
+                let forward_port = forward_port.or(*port);
+                if let (Some(listen_port), Some(forward_port)) = (listen_port, forward_port) {
+                    let bind_addr = format!("{}:{}", listen_ip, listen_port);
+                    let forward_addr = format!("{}:{}", forward_ip, forward_port);
+                    log::info!(
+                        "Enabling interface '{}': UDP {}→{}",
+                        iface.name,
+                        bind_addr,
+                        forward_addr
+                    );
+                    let address = iface_manager.lock().await.spawn(
+                        UdpInterface::new(bind_addr, Some(forward_addr), false),
+                        UdpInterface::spawn,
+                    );
+                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                } else {
+                    log::error!(
+                        "Interface '{}' (UDP) needs listen_port and forward_port, or port",
+                        iface.name
+                    );
+                }
             }
             InterfaceConfig::AutoInterface {
                 group_id,
@@ -350,7 +417,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         AutoInterface::new(auto_config, iface_manager.clone()),
                         AutoInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, iface).await;
+                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                 }
 
                 #[cfg(not(feature = "iface-auto"))]
@@ -400,7 +467,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         // Apply mode/bitrate/IFAC to the connectable server
                         // so spawned inbound peers inherit the protection.
-                        configure_iface(&iface_manager, &address, iface).await;
+                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                     }
 
                     for (index, peer) in peers.iter().enumerate() {
@@ -420,7 +487,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .with_manager(iface_manager.clone()),
                             reticulum::iface::i2p::I2pPeer::spawn,
                         );
-                        configure_iface(&iface_manager, &address, iface).await;
+                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                     }
 
                     if !*connectable && peers.is_empty() {
@@ -476,7 +543,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     reticulum::iface::backbone::BackboneServer::spawn,
                 );
-                configure_iface(&iface_manager, &address, iface).await;
+                configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
             }
             InterfaceConfig::BackboneClientInterface {
                 target_ip,
@@ -495,7 +562,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .with_manager(iface_manager.clone()),
                     reticulum::iface::backbone::BackboneClient::spawn,
                 );
-                configure_iface(&iface_manager, &address, iface).await;
+                configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
             }
             InterfaceConfig::RNodeInterface {
                 port,
@@ -513,7 +580,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 #[cfg(feature = "iface-rnode")]
                 {
-                    let config = reticulum::iface::rnode::RnodeRadioConfig {
+                    let radio = reticulum::iface::rnode::RnodeRadioConfig {
                         frequency: *frequency,
                         bandwidth: *bandwidth,
                         txpower: *txpower,
@@ -524,12 +591,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     let (tcp, port) = rnode_endpoint(tcp, port);
+                    if port.is_some_and(|port| port.starts_with("ble://")) {
+                        log::error!(
+                            "Interface '{}' type 'RNodeInterface' BLE is not supported",
+                            iface.name
+                        );
+                        continue;
+                    }
                     let interface = if let Some(tcp) = tcp {
                         log::info!(
                             "Enabling interface '{}': RNode over TCP {tcp} at {frequency} Hz",
                             iface.name
                         );
-                        Some(reticulum::iface::rnode::RnodeInterface::tcp(tcp, config))
+                        Some(reticulum::iface::rnode::RnodeInterface::tcp(tcp, radio))
                     } else if let Some(port) = port {
                         log::info!(
                             "Enabling interface '{}': RNode on {port} at {speed} baud, {frequency} Hz",
@@ -538,7 +612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         #[cfg(feature = "iface-serial")]
                         {
                             Some(reticulum::iface::rnode::RnodeInterface::serial(
-                                port, *speed, config,
+                                port, *speed, radio,
                             ))
                         }
                         #[cfg(not(feature = "iface-serial"))]
@@ -557,15 +631,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     };
 
-                    if let Some(interface) = interface {
+                    if let Some(mut interface) = interface {
+                        interface = interface
+                            .with_flow_control(*flow_control)
+                            .with_manager(iface_manager.clone());
+                        if let (Some(interval), Some(callsign)) =
+                            (iface.id_interval, iface.id_callsign.as_deref())
+                        {
+                            interface = interface.with_beacon(interval, callsign.as_bytes());
+                        }
                         let address = iface_manager.lock().await.spawn_named(
                             &iface.name,
-                            interface
-                                .with_flow_control(*flow_control)
-                                .with_manager(iface_manager.clone()),
+                            interface,
                             reticulum::iface::rnode::RnodeInterface::spawn,
                         );
-                        configure_iface(&iface_manager, &address, iface).await;
+                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                     }
                 }
 
@@ -618,6 +698,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .collect();
 
                     let (tcp, port) = rnode_endpoint(tcp, port);
+                    if port.is_some_and(|port| port.starts_with("ble://")) {
+                        log::error!(
+                            "Interface '{}' type 'RNodeMultiInterface' BLE is not supported",
+                            iface.name
+                        );
+                        continue;
+                    }
                     let interface = if let Some(tcp) = tcp {
                         log::info!(
                             "Enabling interface '{}': RNodeMulti over TCP {tcp} with {} virtual ports",
@@ -656,13 +743,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     };
 
-                    if let Some(interface) = interface {
+                    if let Some(mut interface) = interface {
+                        if let (Some(interval), Some(callsign)) =
+                            (iface.id_interval, iface.id_callsign.as_deref())
+                        {
+                            interface = interface.with_beacon(interval, callsign.as_bytes());
+                        }
+                        for sub in subinterfaces {
+                            if !sub.outgoing {
+                                interface = interface.with_receive_only(sub.vport);
+                            }
+                        }
                         let address = iface_manager.lock().await.spawn_named(
                             &iface.name,
                             interface,
                             RnodeMultiInterface::spawn,
                         );
-                        configure_iface(&iface_manager, &address, iface).await;
+                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                     }
                 }
 
@@ -707,12 +804,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Enabling interface '{}': KISS on {port} at {speed} baud (csma preamble={preamble} txtail={txtail} persistence={persistence} slottime={slottime})",
                         iface.name
                     );
+                    let mut kiss = KissInterface::new(serial, csma, *flow_control);
+                    if let (Some(interval), Some(callsign)) =
+                        (iface.id_interval, iface.id_callsign.as_deref())
+                    {
+                        kiss = kiss.with_beacon(interval, callsign.as_bytes());
+                    }
                     let address = iface_manager.lock().await.spawn_named(
                         &iface.name,
-                        KissInterface::new(serial, csma, *flow_control),
+                        kiss,
                         KissInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, iface).await;
+                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -759,7 +862,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         SerialInterface::new(serial),
                         SerialInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, iface).await;
+                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -790,7 +893,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         PipeInterface::new(command).with_respawn_delay(respawn_delay),
                         PipeInterface::spawn,
                     );
-                    configure_iface(&iface_manager, &address, iface).await;
+                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                 }
 
                 #[cfg(not(feature = "iface-pipe"))]
@@ -815,7 +918,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Enabling interface '{}': Local shared instance on 127.0.0.1:{listen_port}",
                         iface.name
                     );
-                    iface_manager.lock().await.spawn_named(
+                    let address = iface_manager.lock().await.spawn_named(
                         &iface.name,
                         LocalServer::new(
                             SharedInstanceAddress::tcp(*listen_port),
@@ -823,6 +926,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ),
                         LocalServer::spawn,
                     );
+                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
                 } else {
                     log::warn!(
                         "Interface '{}' type 'LocalInterface': shared instances always listen on 127.0.0.1 (got {listen_ip})",
@@ -866,11 +970,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Enabling interface '{}': AX.25 KISS {callsign}-{ssid} on {port} at {speed} baud",
                                 iface.name
                             );
-                            iface_manager.lock().await.spawn_named(
+                            let address = iface_manager.lock().await.spawn_named(
                                 &iface.name,
                                 interface,
                                 KissInterface::spawn,
                             );
+                            configure_iface(&iface_manager, &address, iface, &config.reticulum)
+                                .await;
                         }
                         Err(_) => {
                             log::error!(
@@ -908,19 +1014,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Network interface discovery (Python RNS/Discovery.py): enabled
-    // when any interface is configured `discoverable`.
+    // Network interface discovery (Python RNS/Discovery.py).
     let discoverable: Vec<_> = config
         .interfaces
         .iter()
         .filter(|iface| iface.discoverable)
         .collect();
+    let autoconnect_max = config.reticulum.autoconnect_discovered_interfaces;
+    let listen_for_discovery =
+        !discoverable.is_empty() || config.reticulum.discover_interfaces || autoconnect_max > 0;
 
     if !discoverable.is_empty() {
-        let transport_identity = transport.identity_private();
+        let announcer_identity = network_identity
+            .clone()
+            .unwrap_or_else(|| transport.identity_private());
         let announcer = reticulum_discovery::InterfaceAnnouncer::start(
             &transport,
-            &transport_identity,
+            &announcer_identity,
             reticulum_discovery::DEFAULT_STAMP_VALUE,
             reticulum_discovery::ANNOUNCER_INTERVAL,
         )
@@ -930,12 +1040,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for iface in &discoverable {
             let info = discovery_info_for(iface, &config, transport_id);
             if let Some(info) = info {
+                if iface.discovery_encrypt && network_identity.is_none() {
+                    log::error!(
+                        "Interface '{}': discovery encryption requested without a network identity",
+                        iface.name
+                    );
+                    continue;
+                }
+                let minutes = iface.discovery_announce_interval_minutes.unwrap_or(6 * 60);
+                let interval = std::time::Duration::from_secs(minutes.max(5) * 60);
+                let stamp = iface.discovery_stamp_value.filter(|value| *value > 0);
+                let encrypt_to = if iface.discovery_encrypt {
+                    network_identity.clone()
+                } else {
+                    None
+                };
                 log::info!(
                     "Announcing interface '{}' as discoverable {}",
                     iface.name,
                     info.interface_type
                 );
-                announcer.announce_interface(info).await;
+                announcer
+                    .announce_interface_configured(info, interval, stamp, encrypt_to)
+                    .await;
             } else {
                 log::warn!(
                     "Interface '{}' is discoverable but its type has no discovery mapping yet",
@@ -943,14 +1070,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+    }
 
-        // Listen for other nodes' discovery announces.
-        reticulum_discovery::InterfaceDiscovery::start(
+    if listen_for_discovery {
+        let required = config
+            .reticulum
+            .required_discovery_value
+            .filter(|value| *value > 0)
+            .unwrap_or(reticulum_discovery::DEFAULT_STAMP_VALUE);
+        let policy = reticulum_discovery::AutoconnectPolicy {
+            allow_unverified: config.reticulum.autoconnect_unverified_implementations,
+            ..reticulum_discovery::AutoconnectPolicy::default()
+        };
+        let discovery = reticulum_discovery::InterfaceDiscovery::start_with(
             &transport,
-            reticulum_discovery::DEFAULT_STAMP_VALUE,
-            false,
+            required,
+            autoconnect_max > 0,
+            reticulum_discovery::DiscoveryOptions {
+                policy,
+                storage_path: Some(config_path.join("storage")),
+                network_identity: network_identity.clone(),
+            },
         )
         .await;
+        if autoconnect_max > 0 {
+            discovery
+                .set_max_autoconnected(autoconnect_max as usize)
+                .await;
+        }
+        let sources = parse_identity_hashes(
+            &config.reticulum.interface_discovery_sources,
+            "interface discovery source",
+        )?;
+        if !sources.is_empty() {
+            discovery.set_interface_sources(sources).await;
+        }
+        if autoconnect_max > 0 {
+            let attach = autoconnect_attach(&config.reticulum);
+            tokio::spawn(async move {
+                loop {
+                    discovery.connect_discovered_with(&attach).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            });
+        }
     }
 
     // Management destinations (Python Transport.start: probe and remote
@@ -969,11 +1132,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if !config.reticulum.blackhole_sources.is_empty() {
         // Python `Reticulum.__blackhole_sources` enables the updater.
-        let sources = parse_blackhole_sources(&config.reticulum.blackhole_sources)?;
+        let sources =
+            parse_identity_hashes(&config.reticulum.blackhole_sources, "blackhole source")?;
         let _updater = reticulum_discovery::BlackholeUpdater::start(
             &transport,
             sources,
-            std::time::Duration::from_secs(12 * 60 * 60),
+            config.reticulum.blackhole_update_every(),
         )
         .await;
         log::info!(
@@ -1025,43 +1189,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Apply per-interface common options after spawning
-/// (Python `Reticulum._add_interface`: mode, bitrate, IFAC derivation).
+/// (Python `Reticulum._add_interface` / `interface_post_init`).
 async fn configure_iface(
     iface_manager: &std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
     address: &reticulum::hash::AddressHash,
     iface: &reticulum_daemon::config::NamedInterface,
+    config: &reticulum_daemon::config::ReticulumConfig,
 ) {
     let manager = iface_manager.lock().await;
 
-    if let Some(mode) = iface
-        .mode
-        .as_deref()
-        .and_then(reticulum::iface::InterfaceMode::from_name)
-    {
-        manager.set_iface_mode(address, mode);
-    } else if let Some(mode) = iface.mode.as_deref() {
+    let parsed = iface.mode.as_deref().and_then(InterfaceMode::from_name);
+    if iface.mode.is_some() && parsed.is_none() && !iface.discoverable {
         log::warn!(
-            "Interface '{}' has unknown mode '{mode}', keeping default",
-            iface.name
+            "Interface '{}' has unknown mode '{}', keeping default",
+            iface.name,
+            iface.mode.as_deref().unwrap_or("")
         );
+    }
+    let mode = if iface.discoverable
+        && !matches!(
+            parsed,
+            Some(InterfaceMode::Gateway | InterfaceMode::AccessPoint | InterfaceMode::Internal)
+        ) {
+        let corrected = match &iface.config {
+            reticulum_daemon::config::InterfaceConfig::RNodeInterface { .. }
+            | reticulum_daemon::config::InterfaceConfig::RNodeMultiInterface { .. } => {
+                InterfaceMode::AccessPoint
+            }
+            _ => InterfaceMode::Gateway,
+        };
+        if !iface.ignore_config_warnings {
+            let label = if corrected == InterfaceMode::AccessPoint {
+                "AP"
+            } else {
+                "gateway"
+            };
+            log::info!(
+                "Discovery enabled on interface {} without gateway, internal or AP mode. Auto-configured to {label} mode.",
+                iface.name
+            );
+        }
+        Some(corrected)
+    } else {
+        parsed
+    };
+    if let Some(mode) = mode {
+        manager.set_iface_mode(address, mode);
     }
 
     if let Some(bitrate) = iface.bitrate {
-        manager.set_iface_bitrate(address, bitrate);
+        if bitrate >= 5 {
+            manager.set_iface_bitrate(address, bitrate);
+        } else {
+            log::warn!(
+                "Interface '{}' bitrate {bitrate} is below the minimum of 5, ignoring",
+                iface.name
+            );
+        }
     }
 
-    if iface.networkname.is_some() || iface.passphrase.is_some() {
-        let size = iface
-            .ifac_size
-            .map(|bits| (bits / 8).max(reticulum::iface::ifac::IFAC_MIN_SIZE))
-            .unwrap_or(reticulum::iface::ifac::DEFAULT_IFAC_SIZE);
+    let gravity = iface.gravity.or(config.default_gravity).unwrap_or(0);
+    let params = control_params(config, iface);
+    let rate = announce_rate_limits(config, iface);
+    let cap = iface.announce_cap_fraction();
+    manager.with_control(address, |control| {
+        control.gravity = gravity;
+        control.announce_cap = cap;
+        control.ingress_control = iface.ingress_control.unwrap_or(true);
+        if let Some(egress) = iface.egress_control.or(config.egress_control) {
+            control.egress_control = egress;
+        }
+        control.recursive_prs = iface.recursive_prs;
+        if let Some(from_internal) = iface.announces_from_internal {
+            control.announces_from_internal = from_internal;
+        }
+        if let Some(to_internal) = iface.announces_to_internal {
+            control.announces_to_internal = Some(to_internal);
+        }
+        if let Some((target, grace, penalty)) = rate {
+            control.announce_rate_target = Some(target);
+            control.announce_rate_grace = Some(grace);
+            control.announce_rate_penalty = Some(penalty);
+        }
+    });
+    manager.with_control(address, |control| control.set_params(params));
 
-        if let Err(error) = manager.set_iface_ifac(
-            address,
-            iface.networkname.as_deref(),
-            iface.passphrase.as_deref(),
-            size,
-        ) {
+    let netname = meaningful_ifac(iface.networkname.as_deref());
+    let netkey = meaningful_ifac(iface.passphrase.as_deref());
+    if netname.is_none() && iface.networkname.as_deref() == Some("None") {
+        log::warn!(
+            "Interface '{}': ambiguous IFAC network name \"None\" is ignored",
+            iface.name
+        );
+    }
+    if netkey.is_none() && iface.passphrase.as_deref() == Some("None") {
+        log::warn!(
+            "Interface '{}': ambiguous IFAC passphrase \"None\" is ignored",
+            iface.name
+        );
+    }
+    if netname.is_some() || netkey.is_some() {
+        let type_default = match &iface.config {
+            reticulum_daemon::config::InterfaceConfig::SerialInterface { .. }
+            | reticulum_daemon::config::InterfaceConfig::KISSInterface { .. }
+            | reticulum_daemon::config::InterfaceConfig::AX25KISSInterface { .. }
+            | reticulum_daemon::config::InterfaceConfig::RNodeInterface { .. }
+            | reticulum_daemon::config::InterfaceConfig::RNodeMultiInterface { .. }
+            | reticulum_daemon::config::InterfaceConfig::PipeInterface { .. } => {
+                reticulum::iface::ifac::SERIAL_FAMILY_IFAC_SIZE
+            }
+            _ => reticulum::iface::ifac::DEFAULT_IFAC_SIZE,
+        };
+        let size = match iface.ifac_size {
+            Some(bits) if bits >= reticulum::iface::ifac::IFAC_MIN_SIZE * 8 => bits / 8,
+            _ => type_default,
+        };
+
+        if let Err(error) = manager.set_iface_ifac(address, netname, netkey, size) {
             log::error!(
                 "Interface '{}' has an invalid IFAC configuration: {error:?}",
                 iface.name
@@ -1084,49 +1328,343 @@ fn discovery_info_for(
 ) -> Option<reticulum_discovery::InterfaceInfo> {
     use reticulum_daemon::config::InterfaceConfig;
 
+    let mut frequency = iface.discovery_frequency;
+    let mut bandwidth = iface.discovery_bandwidth;
+    let mut spreadingfactor = None;
+    let mut codingrate = None;
+    let modulation = iface.discovery_modulation.clone();
+    let mut reachable_on = None;
+    let mut port = None;
+
     let interface_type = match &iface.config {
-        InterfaceConfig::TCPServerInterface { .. } => "TCPServerInterface",
+        InterfaceConfig::BackboneInterface { bind_port, .. } => {
+            reachable_on = iface.reachable_on.clone();
+            port = Some(*bind_port);
+            "BackboneInterface"
+        }
+        InterfaceConfig::TCPServerInterface { bind_port, .. } => {
+            reachable_on = iface.reachable_on.clone();
+            port = Some(*bind_port);
+            "TCPServerInterface"
+        }
+        InterfaceConfig::TCPClientInterface { .. } => {
+            if !iface.kiss_framing {
+                log::error!(
+                    "Interface '{}': TCP client discovery requires kiss_framing",
+                    iface.name
+                );
+                return None;
+            }
+            "TCPClientInterface"
+        }
+        InterfaceConfig::RNodeInterface {
+            frequency: radio_frequency,
+            bandwidth: radio_bandwidth,
+            spreadingfactor: sf,
+            codingrate: cr,
+            ..
+        } => {
+            frequency = Some(*radio_frequency);
+            bandwidth = Some(u64::from(*radio_bandwidth));
+            spreadingfactor = Some(*sf);
+            codingrate = Some(cr.to_string());
+            "RNodeInterface"
+        }
+        InterfaceConfig::I2PInterface { .. } => {
+            reachable_on = iface.reachable_on.clone();
+            "I2PInterface"
+        }
         InterfaceConfig::KISSInterface { .. } => "KISSInterface",
         _ => return None,
     };
 
-    let (reachable_on, port) = match &iface.config {
-        InterfaceConfig::TCPServerInterface { bind_port, .. } => {
-            (iface.reachable_on.clone(), Some(*bind_port))
-        }
-        _ => (None, None),
-    };
+    if matches!(interface_type, "BackboneInterface" | "TCPServerInterface")
+        && reachable_on
+            .as_deref()
+            .map(str::trim)
+            .filter(|host| !host.is_empty())
+            .is_none()
+    {
+        log::error!(
+            "Interface '{}': discovery requires reachable_on for {interface_type}",
+            iface.name
+        );
+        return None;
+    }
 
-    let _ = config;
+    let (ifac_netname, ifac_netkey) = if iface.publish_ifac {
+        let netname = meaningful_ifac(iface.networkname.as_deref()).map(str::to_string);
+        let netkey = meaningful_ifac(iface.passphrase.as_deref()).map(str::to_string);
+        if netname.is_none() && netkey.is_none() {
+            log::warn!(
+                "Interface '{}': IFAC publishing is enabled but no network name or passphrase is set",
+                iface.name
+            );
+        }
+        (netname, netkey)
+    } else {
+        (None, None)
+    };
 
     Some(reticulum_discovery::InterfaceInfo {
         interface_type: interface_type.to_string(),
         transport: config.reticulum.enable_transport,
         transport_id,
-        name: iface.discovery_name.clone().or(Some(iface.name.clone())),
-        latitude: None,
-        longitude: None,
-        height: None,
+        name: iface.discovery_name.clone(),
+        latitude: iface.latitude,
+        longitude: iface.longitude,
+        height: iface.height,
         reachable_on,
         port,
-        frequency: None,
-        bandwidth: None,
-        spreadingfactor: None,
-        codingrate: None,
+        frequency,
+        bandwidth,
+        spreadingfactor,
+        codingrate,
         channel: None,
-        modulation: None,
-        ifac_netname: None,
-        ifac_netkey: None,
-        // The 1.5.0 implementation identity is filled at pack time.
+        modulation,
+        ifac_netname,
+        ifac_netkey,
         transport_impl: None,
         transport_vers: None,
-        // Operator LXMF address published with the interface
-        // (Python `discovery_lxmf_address`).
         operator_lxmf_address: iface
             .discovery_lxmf_address
             .as_deref()
+            .filter(|hex| hex.len() == 32)
             .and_then(|hex| AddressHash::new_from_hex_string(hex).ok()),
     })
+}
+
+fn meaningful_ifac(value: Option<&str>) -> Option<&str> {
+    match value {
+        Some(text) if !text.is_empty() && text != "None" => Some(text),
+        _ => None,
+    }
+}
+
+fn tcp_options(iface: &reticulum_daemon::config::NamedInterface, client: bool) -> TcpOptions {
+    let mut options = TcpOptions {
+        kiss_framing: iface.kiss_framing,
+        prefer_ipv6: iface.prefer_ipv6,
+        device: iface.device.clone(),
+        fixed_mtu: iface.fixed_mtu,
+        max_reconnect_tries: iface.max_reconnect_tries,
+        connect_timeout: iface.connect_timeout,
+    };
+    if client && options.connect_timeout.is_none() {
+        options.connect_timeout = Some(INITIAL_CONNECT_TIMEOUT);
+    }
+    options
+}
+
+fn control_params(
+    config: &reticulum_daemon::config::ReticulumConfig,
+    iface: &reticulum_daemon::config::NamedInterface,
+) -> IfaceControlParams {
+    let mut params = IfaceControlParams::default();
+    if let Some(value) = config.ic_max_held_announces.filter(|value| *value > 0) {
+        params.ic_max_held_announces = value as usize;
+    }
+    if let Some(value) = config.ic_burst_hold.filter(|value| *value > 0.0) {
+        params.ic_burst_hold = std::time::Duration::from_secs_f64(value);
+    }
+    if let Some(value) = config.ic_burst_freq_new.filter(|value| *value > 0.0) {
+        params.ic_burst_freq_new = value;
+    }
+    if let Some(value) = config.ic_burst_freq.filter(|value| *value > 0.0) {
+        params.ic_burst_freq = value;
+    }
+    if let Some(value) = config.ic_pr_burst_freq_new.filter(|value| *value > 0.0) {
+        params.ic_pr_burst_freq_new = value;
+    }
+    if let Some(value) = config.ic_pr_burst_freq.filter(|value| *value > 0.0) {
+        params.ic_pr_burst_freq = value;
+    }
+    if let Some(value) = config.ec_pr_freq.filter(|value| *value > 0.0) {
+        params.ec_pr_freq = value;
+    }
+    if let Some(value) = config.ic_new_time.filter(|value| *value > 0.0) {
+        params.ic_new_time = std::time::Duration::from_secs_f64(value);
+    }
+    if let Some(value) = config.ic_burst_penalty.filter(|value| *value > 0.0) {
+        params.ic_burst_penalty = std::time::Duration::from_secs_f64(value);
+    }
+    if let Some(value) = config.ic_held_release_interval.filter(|value| *value > 0.0) {
+        params.ic_held_release_interval = std::time::Duration::from_secs_f64(value);
+    }
+
+    if let Some(value) = iface.ic_max_held_announces {
+        params.ic_max_held_announces = value.max(0) as usize;
+    }
+    if let Some(value) = iface.ic_burst_hold {
+        params.ic_burst_hold = finite_secs(value);
+    }
+    if let Some(value) = iface.ic_burst_freq_new {
+        params.ic_burst_freq_new = value.max(0.0);
+    }
+    if let Some(value) = iface.ic_burst_freq {
+        params.ic_burst_freq = value.max(0.0);
+    }
+    if let Some(value) = iface.ic_pr_burst_freq_new {
+        params.ic_pr_burst_freq_new = value.max(0.0);
+    }
+    if let Some(value) = iface.ic_pr_burst_freq {
+        params.ic_pr_burst_freq = value.max(0.0);
+    }
+    if let Some(value) = iface.ec_pr_freq {
+        params.ec_pr_freq = value.max(0.0);
+    }
+    if let Some(value) = iface.ic_new_time {
+        params.ic_new_time = finite_secs(value);
+    }
+    if let Some(value) = iface.ic_burst_penalty {
+        params.ic_burst_penalty = finite_secs(value);
+    }
+    if let Some(value) = iface.ic_held_release_interval {
+        params.ic_held_release_interval = finite_secs(value);
+    }
+    params
+}
+
+fn finite_secs(value: f64) -> std::time::Duration {
+    let seconds = if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    };
+    std::time::Duration::from_secs_f64(seconds)
+}
+
+/// Python fills a missing announce rate only when transport is enabled.
+/// A configured target with a missing grace or penalty uses 0.
+fn announce_rate_limits(
+    config: &reticulum_daemon::config::ReticulumConfig,
+    iface: &reticulum_daemon::config::NamedInterface,
+) -> Option<(std::time::Duration, u32, std::time::Duration)> {
+    let mut target = iface.announce_rate_target.filter(|value| *value > 0);
+    let mut grace = iface.announce_rate_grace.filter(|value| *value >= 0);
+    let mut penalty = iface.announce_rate_penalty.filter(|value| *value >= 0);
+    if target.is_some() && grace.is_none() {
+        grace = Some(0);
+    }
+    if target.is_some() && penalty.is_none() {
+        penalty = Some(0);
+    }
+    if config.enable_transport {
+        if target.is_none() {
+            target = Some(match config.default_ar_target {
+                Some(value) if value > 0 => value,
+                _ => 3600,
+            });
+        }
+        if penalty.is_none() {
+            penalty = Some(
+                config
+                    .default_ar_penalty
+                    .filter(|value| *value > 0)
+                    .unwrap_or(0),
+            );
+        }
+        if grace.is_none() {
+            grace = Some(
+                config
+                    .default_ar_grace
+                    .filter(|value| *value > 0)
+                    .unwrap_or(5),
+            );
+        }
+    }
+    target.map(|target| {
+        (
+            std::time::Duration::from_secs(target as u64),
+            grace.unwrap_or(0) as u32,
+            std::time::Duration::from_secs(penalty.unwrap_or(0) as u64),
+        )
+    })
+}
+
+fn autoconnect_attach(
+    config: &reticulum_daemon::config::ReticulumConfig,
+) -> reticulum_discovery::AutoconnectAttach {
+    let mode = config
+        .autoconnect_interface_mode
+        .as_deref()
+        .and_then(InterfaceMode::from_name)
+        .or(config.enable_transport.then_some(InterfaceMode::Gateway));
+    let rate = if config.enable_transport {
+        announce_rate_limits(config, &reticulum_daemon::config::NamedInterface::default())
+    } else {
+        None
+    };
+    reticulum_discovery::AutoconnectAttach {
+        mode,
+        gravity: config.autoconnect_interface_gravity,
+        announces_to_internal: config.autoconnect_announces_to_internal.then_some(true),
+        bitrate: Some(5_000_000),
+        announce_rate_target: rate.map(|rate| rate.0),
+        announce_rate_grace: rate.map(|rate| rate.1),
+        announce_rate_penalty: rate.map(|rate| rate.2),
+    }
+}
+
+fn load_network_identity(path: &str) -> Result<PrivateIdentity, String> {
+    let path = expand_user_path(path);
+    if path.is_file() {
+        return reticulum_utils::common::load_private_identity(&path).map_err(|err| {
+            format!(
+                "could not load network identity from {}: {err}",
+                path.display()
+            )
+        });
+    }
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("could not create {}: {err}", parent.display()))?;
+    }
+    write_raw_identity(&path, &identity).map_err(|err| {
+        format!(
+            "could not save network identity to {}: {err}",
+            path.display()
+        )
+    })?;
+    log::info!(
+        "Network identity generated and persisted to {}",
+        path.display()
+    );
+    Ok(identity)
+}
+
+fn expand_user_path(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    } else if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
+    }
+    PathBuf::from(path)
+}
+
+fn write_raw_identity(path: &Path, identity: &PrivateIdentity) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&identity.to_bytes())?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, identity.to_bytes())
+    }
 }
 
 #[cfg(test)]
