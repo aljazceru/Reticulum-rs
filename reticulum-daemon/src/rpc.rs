@@ -170,6 +170,11 @@ async fn dispatch_sections(
     {
         out.push(value);
     }
+    if map_get(call, "request").is_some()
+        && let Some(value) = request_op(state, call).await?
+    {
+        out.push(value);
+    }
     Ok(())
 }
 
@@ -346,6 +351,20 @@ async fn identity_op(state: &RpcState, call: &Value) -> Result<Option<Value>, St
     Ok(Some(Value::Boolean(
         state.transport.retain_identity(&hash).await,
     )))
+}
+
+/// `{"request":"path","destination_hash":...}` emits `Transport.request_path`.
+/// Any other `request` value is ignored so unknown ops produce no reply.
+async fn request_op(state: &RpcState, call: &Value) -> Result<Option<Value>, String> {
+    let operation = map_get(call, "request")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing request".to_string())?;
+    if operation != "path" {
+        return Ok(None);
+    }
+    let hash = required_hash(call, "destination_hash")?;
+    state.transport.request_path(&hash, None, None).await;
+    Ok(Some(Value::Boolean(true)))
 }
 
 async fn path_table(state: &RpcState, call: &Value) -> Result<Value, String> {
@@ -1084,5 +1103,32 @@ mod tests {
         assert!(ambiguous.is_empty());
         assert!(map.values().any(|address| *address == first));
         assert!(map.values().any(|address| *address == second));
+    }
+
+    #[tokio::test]
+    async fn path_request_rpc_returns_true() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let transport = Arc::new(TransportConfig::new("rpc-path", &identity).build());
+        let state = RpcState {
+            transport,
+            authkey: b"k".to_vec(),
+            manage: None,
+            transport_enabled: false,
+            network_identity: None,
+            probe_hash: None,
+            started: Instant::now(),
+        };
+        let request = Value::Map(vec![
+            (Value::from("request"), Value::from("path")),
+            (
+                Value::from("destination_hash"),
+                Value::Binary(vec![0x11; 16]),
+            ),
+        ]);
+        let out = dispatch(&state, &request).await;
+        assert_eq!(out, vec![Value::Boolean(true)]);
+
+        let unknown = Value::Map(vec![(Value::from("request"), Value::from("other"))]);
+        assert!(dispatch(&state, &unknown).await.is_empty());
     }
 }

@@ -53,13 +53,109 @@ struct IdArgs {
     /// Generate a new identity and save it to this path
     #[arg(short, long)]
     generate: Option<PathBuf>,
-    /// Inspect an existing identity: path to an identity file or a hex string
-    /// (with `--public`: a public identity hex string)
+    /// Hexadecimal Reticulum identity or destination hash, or path to an identity file
     #[arg(short, long)]
     identity: Option<String>,
-    /// Only show public key material
+    /// Only show public key material when no other rnid operation is selected
     #[arg(long)]
     public: bool,
+    /// Import a public identity (hex, base32, base64, base256, or file)
+    #[arg(short = 'm', long = "import-pub")]
+    import_pub: Option<String>,
+    /// Import a private identity (hex, base32, base64, base256, or file)
+    #[arg(short = 'M', long = "import-prv")]
+    import_prv: Option<String>,
+    /// Export the public identity
+    #[arg(short = 'x', long = "export-pub")]
+    export_pub: bool,
+    /// Export the private identity
+    #[arg(short = 'X', long = "export-prv")]
+    export_prv: bool,
+    /// Increase verbosity
+    #[arg(short = 'v', long, action = clap::ArgAction::Count)]
+    verbose: u8,
+    /// Decrease verbosity
+    #[arg(short = 'q', long, action = clap::ArgAction::Count)]
+    quiet: u8,
+    /// Announce a destination based on this identity
+    #[arg(
+        short = 'a',
+        long,
+        num_args = 0..=1,
+        default_missing_value = "rns.id"
+    )]
+    announce: Option<String>,
+    /// Show destination hashes for aspects of this identity
+    #[arg(short = 'H', long)]
+    hash: Option<String>,
+    /// Decrypt files
+    #[arg(short = 'd', long, num_args = 0..)]
+    decrypt: Vec<String>,
+    /// Encrypt files
+    #[arg(short = 'e', long, num_args = 0..)]
+    encrypt: Vec<String>,
+    /// Validate signatures
+    #[arg(short = 'V', long, num_args = 0..)]
+    validate: Vec<String>,
+    /// Sign files
+    #[arg(short = 's', long, num_args = 0..)]
+    sign: Vec<String>,
+    /// Create an embedded signed message
+    #[arg(
+        short = 'S',
+        long = "sign-message",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
+    sign_message: Option<String>,
+    /// Embed metadata from a file in a signed message
+    #[arg(short = 'E', long = "embed-meta")]
+    embed_meta: Option<String>,
+    /// Validate embedded metadata against a spec file
+    #[arg(long = "meta-spec")]
+    meta_spec: Option<String>,
+    /// Sign raw input data instead of hashing first
+    #[arg(long)]
+    raw: bool,
+    /// Output file path
+    #[arg(short = 'w', long)]
+    write: Option<String>,
+    /// Input file for operations that take optional file input
+    #[arg(short = 'r', long)]
+    read: Option<String>,
+    /// Write output even if it overwrites existing files
+    #[arg(short = 'f', long)]
+    force: bool,
+    /// Request unknown identities from the network
+    #[arg(short = 'R', long)]
+    request: bool,
+    /// Never use cached or network-sourced information
+    #[arg(short = 'N', long = "no-cache")]
+    no_cache: bool,
+    /// Identity request timeout before giving up, in seconds
+    #[arg(short = 't')]
+    timeout: Option<f64>,
+    /// Print identity info
+    #[arg(short = 'p', long = "print-identity")]
+    print_identity: bool,
+    /// Allow displaying private keys
+    #[arg(short = 'P', long = "print-private")]
+    print_private: bool,
+    /// Use base32-encoded input and output
+    #[arg(short = 'B', long)]
+    base32: bool,
+    /// Use base64-encoded input and output
+    #[arg(short = 'b', long)]
+    base64: bool,
+    /// Use base256-encoded input and output
+    #[arg(short = 'U', long)]
+    base256: bool,
+    /// Use hex-encoded input and output
+    #[arg(short = 'F', long)]
+    hex: bool,
+    /// Display RSM metadata if available
+    #[arg(long)]
+    meta: bool,
 }
 
 #[derive(Args)]
@@ -499,8 +595,38 @@ async fn main() -> ExitCode {
                 identity: args.identity,
                 public: args.public,
                 no_save: false,
+                config: args.config,
+                import_pub: args.import_pub,
+                import_prv: args.import_prv,
+                export_pub: args.export_pub,
+                export_prv: args.export_prv,
+                verbose: args.verbose,
+                quiet: args.quiet,
+                announce: args.announce,
+                hash: args.hash,
+                decrypt: args.decrypt,
+                encrypt: args.encrypt,
+                validate: args.validate,
+                sign: args.sign,
+                sign_message: args.sign_message,
+                embed_meta: args.embed_meta,
+                meta_spec: args.meta_spec,
+                raw: args.raw,
+                write: args.write,
+                read: args.read,
+                force: args.force,
+                request: args.request,
+                no_cache: args.no_cache,
+                timeout: args.timeout,
+                print_identity: args.print_identity,
+                print_private: args.print_private,
+                base32: args.base32,
+                base64: args.base64,
+                base256: args.base256,
+                hex: args.hex,
+                meta: args.meta,
             };
-            match reticulum_utils::rnid::run(options) {
+            match reticulum_utils::rnid::execute(options).await {
                 Ok(code) => ExitCode::from(code as u8),
                 Err(err) => {
                     eprintln!("{err}");
