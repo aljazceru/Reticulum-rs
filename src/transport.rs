@@ -3582,13 +3582,13 @@ async fn handle_data<'a>(
             let result = link.handle_packet(&handler.link_in_event_tx, channel_tx, packet, false);
 
             match result {
-                LinkHandleResult::KeepAlive => {
+                LinkHandleResult::KeepAlive
+                    if link.keepalive_reply_due(handler.config.timer_config.out_link_keep) =>
+                {
                     // Python answers 0xFF only when outbound has been idle
                     // for a keepalive interval.
-                    if link.keepalive_reply_due(handler.config.timer_config.out_link_keep) {
-                        let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
-                        handler.send_from_link(&mut link, packet).await;
-                    }
+                    let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
+                    handler.send_from_link(&mut link, packet).await;
                 }
                 LinkHandleResult::MessageReceived(proof) => {
                     let (strategy, app_prove) =
@@ -5348,6 +5348,8 @@ fn write_hashlist(storage: &dyn Storage, hashes: &[Hash]) -> bool {
 
 /// One destination-table row. Live paths and paths still waiting for an
 /// interface share this field list.
+// Python-parity parameter set; grouping would churn the stacked diff.
+#[allow(clippy::too_many_arguments)]
 fn destination_table_row(
     destination: &[u8],
     stable_iface: &[u8],
@@ -6253,9 +6255,7 @@ async fn manage_transport(
                             let allowed = handler.path_requests.request_allowed(&destination);
                             let mut rediscover = false;
                             let mut exclude: Option<AddressHash> = None;
-                            if !has_path {
-                                rediscover = true;
-                            } else if allowed && entry.taken_hops == 0 {
+                            if !has_path || (allowed && entry.taken_hops == 0) {
                                 rediscover = true;
                             } else if allowed && (hops == Some(1) || entry.taken_hops == 1) {
                                 rediscover = true;

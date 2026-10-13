@@ -722,7 +722,7 @@ async fn request_response_emits_progress() {
     // Incompressible so the response stays a multi-part resource. A
     // payload that bz2 shrinks under the link MDU would be one packet
     // and would never report resource progress.
-    let payload = incompressible(48 * 1024, 0xA11C_E);
+    let payload = incompressible(48 * 1024, 0x0A1_1CE);
     let response_payload = payload.clone();
     server
         .register_request_handler(&dest_hash, "progress", move |_ctx| {
@@ -1151,7 +1151,7 @@ async fn per_request_timeout_ignores_a_late_resource_response() {
     let dest_hash = dest_hash(&server, &link).await;
     // Larger than the link MDU and incompressible, so the response is a
     // resource rather than a single RESPONSE packet.
-    let payload = incompressible(48 * 1024, 0xA11C_F);
+    let payload = incompressible(48 * 1024, 0x0A1_1CF);
     server
         .register_async_request_handler(&dest_hash, "slowres", move |_ctx| {
             let payload = payload.clone();

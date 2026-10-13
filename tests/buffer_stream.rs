@@ -142,7 +142,7 @@ fn mdu_bound() {
     assert_eq!(CHANNEL_MDU, reticulum::packet::LINK_MDU - 6);
     assert_eq!(MAX_DATA_LEN, reticulum::packet::LINK_MDU - 8);
     assert_eq!(MAX_DATA_LEN, CHANNEL_MDU - 2);
-    assert!(CHANNEL_MDU < reticulum::packet::PACKET_MDU);
+    const { assert!(CHANNEL_MDU < reticulum::packet::PACKET_MDU) };
     assert_eq!(CHANNEL_MDU, 425);
 }
 

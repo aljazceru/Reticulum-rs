@@ -818,12 +818,16 @@ mod tests {
 
     #[test]
     fn fixed_mtu_below_protocol_mtu_is_rejected() {
-        let mut options = TcpOptions::default();
-        options.fixed_mtu = Some(crate::packet::PROTOCOL_MTU - 1);
+        let options = TcpOptions {
+            fixed_mtu: Some(crate::packet::PROTOCOL_MTU - 1),
+            ..TcpOptions::default()
+        };
         assert!(TcpClient::with_options("127.0.0.1:1", options).is_err());
 
-        let mut options = TcpOptions::default();
-        options.fixed_mtu = Some(crate::packet::PROTOCOL_MTU);
+        let options = TcpOptions {
+            fixed_mtu: Some(crate::packet::PROTOCOL_MTU),
+            ..TcpOptions::default()
+        };
         let client = TcpClient::with_options("127.0.0.1:1", options).unwrap();
         assert_eq!(
             client.options().fixed_mtu,
@@ -867,8 +871,10 @@ mod tests {
 
     #[test]
     fn explicit_connect_timeout_is_applied() {
-        let mut options = TcpOptions::default();
-        options.connect_timeout = Some(INITIAL_CONNECT_TIMEOUT);
+        let options = TcpOptions {
+            connect_timeout: Some(INITIAL_CONNECT_TIMEOUT),
+            ..TcpOptions::default()
+        };
         assert_eq!(
             connect_budget(&options),
             Some(Duration::from_secs(INITIAL_CONNECT_TIMEOUT))
@@ -893,7 +899,7 @@ mod tests {
         let encoded = kiss_encode(&payload);
         assert_eq!(
             encoded,
-            vec![
+            [
                 KISS_FEND,
                 KISS_CMD_DATA,
                 KISS_FESC,
@@ -906,18 +912,19 @@ mod tests {
         );
         let mut decoder = TcpKissDecoder::new(HW_MTU);
         let frames = decoder.feed(&encoded);
-        assert_eq!(frames, vec![payload.to_vec()]);
+        assert_eq!(frames, [payload.to_vec()]);
     }
 
     #[test]
     fn accepted_client_inherits_framing_and_mtu_only() {
-        let mut options = TcpOptions::default();
-        options.kiss_framing = true;
-        options.fixed_mtu = Some(1500);
-        options.max_reconnect_tries = Some(3);
-        options.prefer_ipv6 = true;
-        options.device = Some("lo".to_string());
-        options.connect_timeout = Some(2);
+        let options = TcpOptions {
+            kiss_framing: true,
+            prefer_ipv6: true,
+            device: Some("lo".to_string()),
+            fixed_mtu: Some(1500),
+            max_reconnect_tries: Some(3),
+            connect_timeout: Some(2),
+        };
         let spawned = options.for_accepted_client();
         assert!(spawned.kiss_framing);
         assert_eq!(spawned.fixed_mtu, Some(1500));

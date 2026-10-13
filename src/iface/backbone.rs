@@ -32,6 +32,7 @@ use crate::serde::Serialize;
 pub const BITRATE_GUESS: u64 = 100_000_000;
 
 /// `Interface.bitrate` default (Python `Interface.__init__`).
+#[cfg(test)]
 const GENERIC_INTERFACE_BITRATE: u64 = 62_500;
 
 /// Hardware MTU selected by Python `Interface.optimise_mtu`.
@@ -57,8 +58,6 @@ pub const fn hw_mtu_for_bitrate(bitrate: u64) -> usize {
         4_096
     } else if bitrate >= 1_000_000 {
         2_048
-    } else if bitrate >= GENERIC_INTERFACE_BITRATE {
-        1_024
     } else {
         1_024
     }
@@ -972,8 +971,8 @@ mod tests {
     fn coalesce_window_splits_above_target() {
         let mut buffer = TransmitBuffer::new();
         assert!(buffer.append(&[9u8; 16]));
-        assert!(buffer.append(&vec![1u8; COALESCE_TARGET - 4]));
-        assert!(buffer.append(&vec![2u8; 8]));
+        assert!(buffer.append(&[1u8; COALESCE_TARGET - 4]));
+        assert!(buffer.append(&[2u8; 8]));
 
         let mut writes = Vec::new();
         assert!(buffer.drain_to(|chunk| {
@@ -987,7 +986,7 @@ mod tests {
     #[test]
     fn tx_high_water_mark_rejects_another_frame() {
         let mut buffer = TransmitBuffer::new();
-        assert!(buffer.append(&vec![0u8; TX_HWM]));
+        assert!(buffer.append(&[0u8; TX_HWM]));
         assert!(!accept_outbound(false, &mut buffer, &[1]));
         assert_eq!(TX_HWM, DP_EC_HIGH_WM);
     }
@@ -1015,7 +1014,7 @@ mod tests {
         let t0 = Instant::now();
         let mut buffer = TransmitBuffer::new();
         let mut egress = EgressControl::new(t0);
-        assert!(buffer.append(&vec![0u8; DP_EC_MID_WM + 1]));
+        assert!(buffer.append(&[0u8; DP_EC_MID_WM + 1]));
 
         for tick in 0..DP_EC_STALL_TICKS {
             assert!(!egress.evaluate(&buffer, t0 + DP_EC_INTERVAL * tick));

@@ -27,6 +27,9 @@ const CONFIG: RnodeRadioConfig = RnodeRadioConfig {
     lt_alock: None,
 };
 
+/// Frames the mock RNode records, keyed by KISS command byte.
+type RecordedFrames = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+
 /// Parse complete KISS frames from a stream of bytes.
 fn parse_frames(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut frames = Vec::new();
@@ -471,7 +474,7 @@ fn rnode_framed_telemetry_bitrate_and_multi_probe() {
 
     let beacon = RnodeInterface::tcp("127.0.0.1:1", CONFIG).with_beacon(30, b"N0CALL");
     assert_eq!(beacon.id_callsign(), Some(b"N0CALL".as_slice()));
-    let rejected = RnodeInterface::tcp("127.0.0.1:1", CONFIG).with_beacon(30, &[0u8; 33]);
+    let rejected = RnodeInterface::tcp("127.0.0.1:1", CONFIG).with_beacon(30, [0u8; 33]);
     assert!(rejected.id_callsign().is_none());
 
     let manager = Arc::new(tokio::sync::Mutex::new(
@@ -486,7 +489,7 @@ fn rnode_framed_telemetry_bitrate_and_multi_probe() {
 /// Mock device that records every host frame and echoes detect/config.
 async fn recording_rnode(
     listener: TcpListener,
-    recorded: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
+    recorded: RecordedFrames,
     interfaces: Option<Vec<u8>>,
 ) {
     loop {

@@ -160,7 +160,7 @@ sys.exit(1)
 
     let first = read_pty_text(&mut stdout, 3).await;
     let lines: Vec<&str> = first
-        .split(|c| c == '\n' || c == '\r')
+        .split(['\n', '\r'])
         .filter(|line| !line.is_empty())
         .collect();
     assert!(
@@ -186,7 +186,7 @@ sys.exit(1)
 
     let rest = read_pty_text(&mut stdout, 1).await;
     let updated = rest
-        .split(|c| c == '\n' || c == '\r')
+        .split(['\n', '\r'])
         .filter(|line| !line.is_empty())
         .find_map(parse_winsz)
         .unwrap_or_else(|| panic!("resize did not change winsize, output {rest:?}"));

@@ -201,6 +201,8 @@ pub fn load_allowed_identities_at(paths: &[PathBuf]) -> Result<Vec<AddressHash>,
 
 /// Transfer progress text. `None` when `quiet` or `silent` so callers
 /// print nothing. `phy_bps` adds a physical-layer rate when `Some`.
+// Python rncp request shape; grouping would churn the stacked diff.
+#[allow(clippy::too_many_arguments)]
 pub fn progress_line(
     quiet: bool,
     silent: bool,

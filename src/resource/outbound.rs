@@ -87,7 +87,7 @@ impl PayloadSource {
                     if file_start > *len || file_end > *len {
                         return Err(RnsError::ResourceMsg("resource segment out of range"));
                     }
-                    let mut reader = reader.lock().unwrap_or_else(|err| err.into_inner());
+                    let reader = reader.get_mut().unwrap_or_else(|err| err.into_inner());
                     reader
                         .seek(SeekFrom::Start(file_start))
                         .map_err(|_| RnsError::ResourceMsg("could not read resource stream"))?;

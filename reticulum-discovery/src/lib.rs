@@ -480,31 +480,32 @@ fn encode_wire(info: &InterfaceInfo) -> Vec<u8> {
         info.interface_type.as_str()
     };
 
-    let mut fields = Vec::new();
-    fields.push((KEY_INTERFACE_TYPE, WireValue::Str(wire_type.to_string())));
-    fields.push((KEY_TRANSPORT, WireValue::Bool(info.transport)));
-    fields.push((
-        KEY_TRANSPORT_ID,
-        WireValue::Bin(info.transport_id.as_slice().to_vec()),
-    ));
-    fields.push((
-        KEY_TRANSPORT_IMPL,
-        WireValue::Str(
-            info.transport_impl
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| IMPLEMENTATION_NAME.to_string()),
+    let mut fields = vec![
+        (KEY_INTERFACE_TYPE, WireValue::Str(wire_type.to_string())),
+        (KEY_TRANSPORT, WireValue::Bool(info.transport)),
+        (
+            KEY_TRANSPORT_ID,
+            WireValue::Bin(info.transport_id.as_slice().to_vec()),
         ),
-    ));
-    fields.push((
-        KEY_TRANSPORT_VERS,
-        WireValue::Str(
-            info.transport_vers
-                .clone()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| IMPLEMENTATION_VERSION.to_string()),
+        (
+            KEY_TRANSPORT_IMPL,
+            WireValue::Str(
+                info.transport_impl
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| IMPLEMENTATION_NAME.to_string()),
+            ),
         ),
-    ));
+        (
+            KEY_TRANSPORT_VERS,
+            WireValue::Str(
+                info.transport_vers
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| IMPLEMENTATION_VERSION.to_string()),
+            ),
+        ),
+    ];
     match info.name.as_deref() {
         Some(name) => fields.push((KEY_NAME, WireValue::Str(sanitize_text(name)))),
         None => fields.push((KEY_NAME, WireValue::Nil)),
@@ -1379,20 +1380,11 @@ pub struct AutoconnectAttach {
 
 /// Optional discovery listener settings. [`InterfaceDiscovery::start`]
 /// uses [`Default`].
+#[derive(Default)]
 pub struct DiscoveryOptions {
     pub policy: AutoconnectPolicy,
     pub storage_path: Option<PathBuf>,
     pub network_identity: Option<PrivateIdentity>,
-}
-
-impl Default for DiscoveryOptions {
-    fn default() -> Self {
-        Self {
-            policy: AutoconnectPolicy::default(),
-            storage_path: None,
-            network_identity: None,
-        }
-    }
 }
 
 /// The interface discovery listener: validates announces, keeps the

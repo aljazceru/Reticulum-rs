@@ -354,9 +354,7 @@ impl IdBeacon {
     fn note_sent(&mut self, data: &[u8], now: StdInstant) {
         if data == self.callsign.as_slice() {
             self.first_tx = None;
-        } else if self.is_padded_id(data) {
-            self.first_tx = Some(now);
-        } else if self.first_tx.is_none() {
+        } else if self.is_padded_id(data) || self.first_tx.is_none() {
             self.first_tx = Some(now);
         }
     }
@@ -735,7 +733,7 @@ impl KissInterface {
 
                         enum Wake {
                             Flow,
-                            Message(Option<crate::iface::TxMessage>),
+                            Message(Option<Box<crate::iface::TxMessage>>),
                             Beacon,
                         }
 
@@ -744,7 +742,7 @@ impl KissInterface {
                             _ = stop.cancelled() => break,
                             // flow control released: send one queued packet
                             _ = ready_notify.notified() => Wake::Flow,
-                            message = tx_channel.recv() => Wake::Message(message),
+                            message = tx_channel.recv() => Wake::Message(message.map(Box::new)),
                             _ = beacon_wait => Wake::Beacon,
                         };
 

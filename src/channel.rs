@@ -1571,7 +1571,7 @@ mod tests {
         let link_mdu = fixture.link_a.lock().await.mdu();
         assert_eq!(channel.mdu().await, link_mdu - 6);
         assert_eq!(channel.mdu().await, CHANNEL_MDU);
-        assert!(CHANNEL_MDU < crate::packet::PACKET_MDU);
+        const { assert!(CHANNEL_MDU < crate::packet::PACKET_MDU) };
 
         let too_big = Blob {
             message_type: 7,

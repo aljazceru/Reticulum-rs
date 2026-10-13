@@ -431,7 +431,7 @@ fn i2p_b64_value(byte: u8) -> Option<u8> {
 /// Python `b64decode(..., validate=True)`.
 fn i2p_b64_decode(data: &str) -> Option<Vec<u8>> {
     let bytes = data.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -946,7 +946,7 @@ impl I2pServer {
             );
 
             *session_slot.write().await = Some(session.clone());
-            *b32_slot.write().expect("b32 slot") = Some(session.b32());
+            *b32_slot.write().expect("b32 slot") = session.b32().ok();
             stats.set_online(true);
 
             // Accept loop: each accepted stream becomes a spawned peer.

@@ -243,8 +243,10 @@ mod tests {
     #[test]
     fn server_rejects_fixed_mtu_below_protocol_mtu() {
         let manager = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(1)));
-        let mut options = TcpOptions::default();
-        options.fixed_mtu = Some(499);
+        let options = TcpOptions {
+            fixed_mtu: Some(499),
+            ..TcpOptions::default()
+        };
         assert!(TcpServer::with_options("0.0.0.0:1", manager, options).is_err());
     }
 }

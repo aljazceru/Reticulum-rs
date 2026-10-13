@@ -1356,6 +1356,8 @@ impl AutoInterface {
         let _ = exited.send(true);
     }
 
+    // Args mirror the spawn-loop state it mutates; a struct would just rename them.
+    #[allow(clippy::too_many_arguments)]
     async fn add_peer(
         config: &AutoInterfaceConfig,
         iface_manager: &Arc<tokio::sync::Mutex<InterfaceManager>>,
