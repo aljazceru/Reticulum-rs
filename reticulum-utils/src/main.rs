@@ -34,6 +34,20 @@ enum Command {
     X(XArgs),
     /// Remote shell sessions (rnsh)
     Sh(ShArgs),
+    /// Reticulum git repositories (rngit) — args passed through to the
+    /// rngit dispatcher: node, create, release, perms, work, fork, sync,
+    /// mirror
+    Git {
+        /// rngit arguments (e.g. `create rns://<hash>/<group>/<repo>`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Git commit signer for `gpg.ssh.program` (rngit commitsigs)
+    GitSign {
+        /// commitsigs arguments (e.g. `-Y sign -f <keyfile> <file>`)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// RNode diagnostics and validation (rnodeconf)
     Nodeconf(NodeconfArgs),
     /// RNode device emulator for interface testing
@@ -585,8 +599,60 @@ fn duration_arg(seconds: Option<f64>, default: Duration) -> Duration {
         .unwrap_or(default)
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// Python `main.py` behaviour: dispatch on argv0 when the binary is
+/// invoked as `rngit`, `git-remote-rns` or `git-sign-rns` (e.g. via a
+/// symlink), so the same executable can serve all entry points. Runs
+/// before the shared tokio runtime is created.
+fn argv0_dispatch(argv0_name: &str, args: &[String]) -> Option<ExitCode> {
+    match argv0_name {
+        "git-remote-rns" | "rngit" => {
+            init_logging(args.iter().filter(|a| a.as_str() == "-v").count() as u8);
+            let args = args.to_vec();
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            let code = match argv0_name {
+                "git-remote-rns" => {
+                    runtime.block_on(reticulum_utils::rngit::remote_helper_main(&args))
+                }
+                _ => runtime.block_on(reticulum_utils::rngit::rngit_main(&args)),
+            };
+            Some(ExitCode::from(code as u8))
+        }
+        "git-sign-rns" => Some(ExitCode::from(
+            reticulum_utils::rngit::commit_sign_main(args) as u8,
+        )),
+        _ => None,
+    }
+}
+
+fn main() -> ExitCode {
+    if let Some(argv0) = std::env::args().next() {
+        if let Some(name) = std::path::Path::new(&argv0)
+            .file_name()
+            .and_then(|n| n.to_str())
+        {
+            let args: Vec<String> = std::env::args().collect();
+            if let Some(code) = argv0_dispatch(name, &args) {
+                return code;
+            }
+        }
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map(|rt| rt.block_on(run()))
+        .unwrap_or_else(|_| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime")
+                .block_on(run())
+        })
+}
+
+async fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Id(args) => {
@@ -640,6 +706,17 @@ async fn main() -> ExitCode {
         Command::Probe(args) => exit_code(run_probe(args).await),
         Command::X(args) => exit_code(run_x(args).await),
         Command::Sh(args) => exit_code(run_sh(args).await),
+        Command::Git { args } => {
+            init_logging(0);
+            let mut argv = vec!["rngit".to_string()];
+            argv.extend(args);
+            ExitCode::from(reticulum_utils::rngit::rngit_main(&argv).await as u8)
+        }
+        Command::GitSign { args } => {
+            let mut argv = vec!["git-sign-rns".to_string()];
+            argv.extend(args);
+            ExitCode::from(reticulum_utils::rngit::commit_sign_main(&argv) as u8)
+        }
         #[cfg(feature = "iface-rnode")]
         Command::NodeSim(args) => {
             init_logging(1);

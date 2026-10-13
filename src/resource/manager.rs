@@ -583,8 +583,9 @@ impl ResourceManager {
     /// Whether any request handler is registered for the link's
     /// destination (requests without a handler can never be serviced).
     fn has_request_handlers(&self, link: &Link) -> bool {
-        self.request_handlers
-            .contains_key(&link.destination().address_hash)
+        let destination = &link.destination().address_hash;
+        self.request_handlers.contains_key(destination)
+            || self.async_request_handlers.contains_key(destination)
     }
 
     /// Handle RESOURCE_REQ plaintext for a link.
@@ -1473,15 +1474,17 @@ pub fn unpack_request(data: &[u8]) -> Option<(f64, AddressHash, Vec<u8>)> {
         return None;
     }
     let path_hash = AddressHash::new(path_bytes.try_into().ok()?);
-    // Binary payloads stay unwrapped (opaque request bytes). Any other
-    // element, including a Python management list, is kept as msgpack so
-    // the handler can decode it. Nil is an empty payload.
+    // Binary payloads stay unwrapped. Strings become their UTF-8 bytes
+    // (Python `str`). Any other element, including a management list, is
+    // kept as its original msgpack so the handler can decode it. Nil is
+    // an empty payload.
     let payload_start = cursor;
     let value = rmpv::decode::read_value(&mut cursor).ok()?;
     let raw_len = payload_start.len() - cursor.len();
     let payload = match value {
         rmpv::Value::Nil => Vec::new(),
         rmpv::Value::Binary(bytes) => bytes.to_vec(),
+        rmpv::Value::String(text) => text.into_bytes(),
         _ => payload_start[..raw_len].to_vec(),
     };
     Some((time, path_hash, payload))

@@ -29,6 +29,7 @@
 
 pub mod common;
 pub mod rncp;
+pub mod rngit;
 pub mod rnid;
 pub mod rnir;
 #[cfg(feature = "iface-rnode")]
