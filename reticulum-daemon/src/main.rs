@@ -38,7 +38,7 @@ use reticulum::iface::kiss::SerialPortConfig;
 use reticulum::iface::pipe::PipeInterface;
 #[cfg(feature = "iface-serial")]
 use reticulum::iface::serial::SerialInterface;
-#[cfg(feature = "iface-serial")]
+#[cfg(all(not(target_os = "android"), feature = "iface-serial"))]
 use reticulum::iface::weave::WeaveInterface;
 
 use reticulum_daemon::config::{Config, InterfaceConfig};
@@ -1511,7 +1511,14 @@ async fn start_configured_interface(
             }
         }
         InterfaceConfig::WeaveInterface { port, .. } => {
-            #[cfg(feature = "iface-serial")]
+            #[cfg(target_os = "android")]
+            {
+                log::error!(
+                    "Interface '{}' type 'WeaveInterface' on port {port}: Weave USB serial is not supported",
+                    iface.name
+                );
+            }
+            #[cfg(all(not(target_os = "android"), feature = "iface-serial"))]
             {
                 log::info!("Enabling interface '{}': Weave on {port}", iface.name);
                 launch_configured(
@@ -1524,7 +1531,7 @@ async fn start_configured_interface(
                 )
                 .await;
             }
-            #[cfg(not(feature = "iface-serial"))]
+            #[cfg(all(not(target_os = "android"), not(feature = "iface-serial")))]
             {
                 log::warn!(
                     "Interface '{}' type 'WeaveInterface' on port {port} requires building the daemon with --features iface-serial",
@@ -1669,15 +1676,19 @@ async fn configure_iface(
         manager.set_iface_mode(address, mode);
     }
 
-    if let Some(bitrate) = iface.bitrate {
-        if bitrate >= 5 {
-            manager.set_iface_bitrate(address, bitrate);
-        } else {
+    let bitrate = match iface.bitrate {
+        Some(bitrate) if bitrate >= 5 => Some(bitrate),
+        Some(bitrate) => {
             log::warn!(
                 "Interface '{}' bitrate {bitrate} is below the minimum of 5, ignoring",
                 iface.name
             );
+            None
         }
+        None => None,
+    };
+    if let Some(bitrate) = bitrate {
+        manager.set_iface_bitrate(address, bitrate);
     } else if matches!(
         &iface.config,
         reticulum_daemon::config::InterfaceConfig::WeaveInterface { .. }
@@ -2472,6 +2483,48 @@ mod tests {
             .unwrap();
         assert_eq!(bitrate, 100_000);
 
+        let low_address = open_udp(&manager).await;
+        let low = NamedInterface {
+            name: "weave-low".to_string(),
+            bitrate: Some(4),
+            config: InterfaceConfig::WeaveInterface {
+                enabled: true,
+                port: "/dev/weave-low".to_string(),
+            },
+            ..NamedInterface::default()
+        };
+        configure_iface(&manager, &low_address, &low, &ReticulumConfig::default()).await;
+        let bitrate = manager
+            .lock()
+            .await
+            .with_control(&low_address, |control| control.bitrate)
+            .unwrap();
+        assert_eq!(bitrate, reticulum::iface::weave::BITRATE_GUESS);
+
+        let floor_address = open_udp(&manager).await;
+        let floor = NamedInterface {
+            name: "weave-floor".to_string(),
+            bitrate: Some(5),
+            config: InterfaceConfig::WeaveInterface {
+                enabled: true,
+                port: "/dev/weave-floor".to_string(),
+            },
+            ..NamedInterface::default()
+        };
+        configure_iface(
+            &manager,
+            &floor_address,
+            &floor,
+            &ReticulumConfig::default(),
+        )
+        .await;
+        let bitrate = manager
+            .lock()
+            .await
+            .with_control(&floor_address, |control| control.bitrate)
+            .unwrap();
+        assert_eq!(bitrate, 5);
+
         let serial_address = open_udp(&manager).await;
         let serial = NamedInterface {
             name: "serial".to_string(),
@@ -2506,6 +2559,28 @@ mod tests {
             .with_control(&serial_address, |control| control.bitrate)
             .unwrap();
         assert_eq!(ifac_size, Some(8));
+        assert_eq!(bitrate, 62_500);
+
+        let slow_address = open_udp(&manager).await;
+        let slow = NamedInterface {
+            name: "serial-slow".to_string(),
+            bitrate: Some(1),
+            config: InterfaceConfig::SerialInterface {
+                enabled: true,
+                port: "/dev/ttyUSB1".to_string(),
+                speed: 9600,
+                databits: 8,
+                parity: "N".to_string(),
+                stopbits: 1,
+            },
+            ..NamedInterface::default()
+        };
+        configure_iface(&manager, &slow_address, &slow, &ReticulumConfig::default()).await;
+        let bitrate = manager
+            .lock()
+            .await
+            .with_control(&slow_address, |control| control.bitrate)
+            .unwrap();
         assert_eq!(bitrate, 62_500);
     }
 }

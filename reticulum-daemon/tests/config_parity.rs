@@ -161,6 +161,20 @@ type = "WeaveInterface"
 port = "/dev/ttyACM0"
 
 [[interfaces]]
+name = "WeaveAlias"
+type = "WeaveInterface"
+port = "/dev/ttyACM1"
+enabled = false
+interface_enabled = true
+
+[[interfaces]]
+name = "WeaveOff"
+type = "WeaveInterface"
+port = "/dev/ttyACM2"
+enabled = false
+interface_enabled = false
+
+[[interfaces]]
 name = "Future"
 type = "SomeNewInterfaceType"
 widget = 1
@@ -183,13 +197,34 @@ interface_enabled = true
     assert_eq!(config.interfaces[0].configured_type, "WeaveInterface");
     assert!(config.interfaces[0].raw_config.is_none());
 
+    match &config.interfaces[1].config {
+        InterfaceConfig::WeaveInterface { enabled, port } => {
+            assert!(
+                *enabled,
+                "interface_enabled = true must start the interface"
+            );
+            assert_eq!(port, "/dev/ttyACM1");
+        }
+        other => panic!("expected weave interface, got {other:?}"),
+    }
+    assert!(config.interfaces[1].configured_enabled);
+    assert!(config.interfaces[1].raw_config.is_none());
+
+    match &config.interfaces[2].config {
+        InterfaceConfig::WeaveInterface { enabled, .. } => {
+            assert!(!*enabled);
+        }
+        other => panic!("expected weave interface, got {other:?}"),
+    }
+    assert!(!config.interfaces[2].configured_enabled);
+
     assert!(matches!(
-        config.interfaces[1].config,
+        config.interfaces[3].config,
         InterfaceConfig::Unsupported
     ));
-    assert_eq!(config.interfaces[1].configured_type, "SomeNewInterfaceType");
-    assert!(config.interfaces[1].configured_enabled);
-    let widget = config.interfaces[1]
+    assert_eq!(config.interfaces[3].configured_type, "SomeNewInterfaceType");
+    assert!(config.interfaces[3].configured_enabled);
+    let widget = config.interfaces[3]
         .raw_config
         .as_ref()
         .and_then(|value| value.get("widget"))

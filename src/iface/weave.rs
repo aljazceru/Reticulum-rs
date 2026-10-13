@@ -29,7 +29,7 @@ use super::{
 /// `WeaveInterface.HW_MTU`
 pub const HW_MTU: usize = 1024;
 
-/// `WeaveInterface.BITRATE_GUESS` when the config omits `bitrate`.
+/// `WeaveInterface.BITRATE_GUESS` when bitrate is omitted or below 5.
 pub const BITRATE_GUESS: u64 = 250_000;
 
 /// `WeaveInterface.PEERING_TIMEOUT`
@@ -37,11 +37,11 @@ pub const PEERING_TIMEOUT: Duration = Duration::from_secs(20);
 
 const PEER_JOB_INTERVAL: Duration = Duration::from_secs(22);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(feature = "iface-serial")]
+#[cfg(all(feature = "iface-serial", not(target_os = "android")))]
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 const MULTI_IF_DEQUE_LEN: usize = 48;
 const MULTI_IF_DEQUE_TTL: Duration = Duration::from_millis(750);
-#[cfg(feature = "iface-serial")]
+#[cfg(all(feature = "iface-serial", not(target_os = "android")))]
 const SERIAL_BAUD: u32 = 3_000_000;
 
 const FLAG: u8 = 0x7e;
@@ -251,6 +251,7 @@ struct Host {
     peers: HashMap<[u8; ENDPOINT_ID_LEN], PeerSlot>,
     deque: VecDeque<(Hash, tokio::time::Instant)>,
     egress_tx: mpsc::Sender<PeerEgress>,
+    egress_rx: mpsc::Receiver<PeerEgress>,
     link_up: Arc<AtomicBool>,
     parent: AddressHash,
     parent_stats: Arc<InterfaceCounters>,
@@ -273,7 +274,7 @@ impl Host {
         let local_pub = *identity.as_identity().verifying_key_bytes();
         let mut local_switch_id = [0u8; SWITCH_ID_LEN];
         local_switch_id.copy_from_slice(&local_pub[PUBLIC_KEY_LENGTH - SWITCH_ID_LEN..]);
-        let (egress_tx, _) = mpsc::channel(1);
+        let (egress_tx, egress_rx) = mpsc::channel(64);
         Self {
             port,
             identity,
@@ -284,6 +285,7 @@ impl Host {
             peers: HashMap::new(),
             deque: VecDeque::new(),
             egress_tx,
+            egress_rx,
             link_up: Arc::new(AtomicBool::new(false)),
             parent,
             parent_stats,
@@ -294,15 +296,11 @@ impl Host {
         }
     }
 
-    fn begin_link(&mut self) -> mpsc::Receiver<PeerEgress> {
+    fn begin_link(&mut self) {
         self.remote_switch_id = None;
-        self.online = false;
-        self.link_up.store(false, Ordering::Relaxed);
+        self.set_link_online(false);
         self.deque.clear();
         self.reassembler = WdclReassembler::default();
-        let (tx, rx) = mpsc::channel(64);
-        self.egress_tx = tx;
-        rx
     }
 
     fn set_link_online(&mut self, online: bool) {
@@ -312,19 +310,6 @@ impl Host {
         for peer in self.peers.values() {
             peer.stats.set_online(online);
         }
-    }
-}
-
-async fn shutdown_peers(host: &mut Host) {
-    host.set_link_online(false);
-    host.remote_switch_id = None;
-    let peers: Vec<AddressHash> = host.peers.drain().map(|(_, peer)| peer.address).collect();
-    if peers.is_empty() {
-        return;
-    }
-    let mut manager = host.manager.lock().await;
-    for address in peers {
-        manager.stop_iface(&address);
     }
 }
 
@@ -514,7 +499,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut read, mut write) = tokio::io::split(stream);
-    let mut egress_rx = host.begin_link();
+    host.begin_link();
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let mut peer_job_at = tokio::time::Instant::now() + PEER_JOB_INTERVAL;
     let mut buf = [0u8; 1500];
@@ -523,7 +508,7 @@ where
         .await
         .is_err()
     {
-        shutdown_peers(host).await;
+        host.set_link_online(false);
         return true;
     }
     log::info!(
@@ -544,18 +529,18 @@ where
                 Some(_) => LinkEvent::ParentTx,
                 None => LinkEvent::Stop,
             },
-            egress = egress_rx.recv() => LinkEvent::Egress(egress),
+            egress = host.egress_rx.recv() => LinkEvent::Egress(egress),
             _ = tokio::time::sleep_until(peer_job_at) => LinkEvent::PeerJob,
         };
 
         match event {
             LinkEvent::Stop => {
-                shutdown_peers(host).await;
+                host.set_link_online(false);
                 return false;
             }
             LinkEvent::HandshakeTimeout => {
                 log::warn!("weave: WDCL handshake timed out for port <{}>", host.port);
-                shutdown_peers(host).await;
+                host.set_link_online(false);
                 return true;
             }
             LinkEvent::ParentTx => {}
@@ -567,13 +552,13 @@ where
             LinkEvent::Egress(Some(egress)) => {
                 if !write_egress(host, &mut write, egress).await {
                     log::warn!("weave: serial port <{}> closed", host.port);
-                    shutdown_peers(host).await;
+                    host.set_link_online(false);
                     return true;
                 }
             }
             LinkEvent::Read(Ok(0)) | LinkEvent::Read(Err(_)) => {
                 log::warn!("weave: serial port <{}> closed", host.port);
-                shutdown_peers(host).await;
+                host.set_link_online(false);
                 return true;
             }
             LinkEvent::Read(Ok(n)) => {
@@ -581,7 +566,7 @@ where
                 for frame in frames {
                     if !handle_frame(host, &mut write, &frame).await {
                         log::warn!("weave: serial port <{}> closed", host.port);
-                        shutdown_peers(host).await;
+                        host.set_link_online(false);
                         return true;
                     }
                 }
@@ -660,7 +645,11 @@ impl WeaveInterface {
         if let Some(stream) = injected {
             let _reconnect = run_link(stream, &mut tx, &mut host, &cancel, &iface_stop).await;
         } else {
-            #[cfg(feature = "iface-serial")]
+            #[cfg(target_os = "android")]
+            {
+                log::error!("Weave USB serial is not supported; not opening port <{port}>");
+            }
+            #[cfg(all(not(target_os = "android"), feature = "iface-serial"))]
             {
                 loop {
                     if cancel.is_cancelled() || iface_stop.is_cancelled() {
@@ -684,7 +673,7 @@ impl WeaveInterface {
                     }
                 }
             }
-            #[cfg(not(feature = "iface-serial"))]
+            #[cfg(all(not(target_os = "android"), not(feature = "iface-serial")))]
             {
                 log::error!("weave: port <{port}> requires building with --features iface-serial");
             }
@@ -945,6 +934,29 @@ mod tests {
         assert!(peer_stats.rx_bytes >= serialized.len() as u64);
         assert!(parent_stats.tx_bytes >= serialized.len() as u64);
         assert!(peer_stats.tx_bytes >= serialized.len() as u64);
+
+        drop(server_write);
+        drop(server_read);
+        let mut saw_close = false;
+        for _ in 0..50 {
+            let stats = manager.lock().await.stats();
+            let parent_up = stats
+                .iter()
+                .any(|stat| stat.address == parent && stat.online);
+            if parent_up {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            saw_close = true;
+            assert!(
+                stats
+                    .iter()
+                    .any(|stat| stat.address == peer_addr && stat.kind == "WeaveInterfacePeer"),
+                "peer slot removed when the mock link closed"
+            );
+            break;
+        }
+        assert!(saw_close, "mock link did not close");
 
         manager.lock().await.stop_iface(&parent);
     }

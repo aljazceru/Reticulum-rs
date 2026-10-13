@@ -11,12 +11,11 @@ use serde::{Deserialize, Serialize};
 /// In-process constructor for a configured interface type.
 ///
 /// Python loads `interfaces/{Type}.py`. This registry does not exec a file.
-pub type InterfaceFactoryFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 pub type InterfaceFactory = std::sync::Arc<
     dyn Fn(
             NamedInterface,
             std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
-        ) -> InterfaceFactoryFuture
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -128,7 +127,7 @@ fn reduce_unknown_interface(value: &toml::Value) -> toml::Value {
     toml::Value::Table(reduced)
 }
 
-fn named_interface_from_value(value: toml::Value) -> Result<NamedInterface, String> {
+fn named_interface_from_value(mut value: toml::Value) -> Result<NamedInterface, String> {
     let configured_type = value
         .get("type")
         .and_then(toml::Value::as_str)
@@ -137,6 +136,18 @@ fn named_interface_from_value(value: toml::Value) -> Result<NamedInterface, Stri
     let configured_enabled = configured_enabled_flag(value.as_table());
     let supported = SUPPORTED_INTERFACE_TYPES.contains(&configured_type.as_str());
     let raw_config = if supported { None } else { Some(value.clone()) };
+    // Serde treats `interface_enabled` as an alias of `enabled`, so both keys
+    // are a duplicate field. Collapse them to the same OR Python uses.
+    if let Some(table) = value.as_table_mut()
+        && table.contains_key("enabled")
+        && table.contains_key("interface_enabled")
+    {
+        table.insert(
+            "enabled".to_string(),
+            toml::Value::Boolean(configured_enabled),
+        );
+        table.remove("interface_enabled");
+    }
     let mut iface: NamedInterface = if let Ok(iface) = value.clone().try_into() {
         iface
     } else if !supported {
