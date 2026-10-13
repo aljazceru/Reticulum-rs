@@ -348,6 +348,9 @@ async fn timeout_peers(host: &mut Host) {
 async fn add_peer(host: &mut Host, endpoint: [u8; ENDPOINT_ID_LEN]) {
     if let Some(peer) = host.peers.get_mut(&endpoint) {
         peer.last_heard = tokio::time::Instant::now();
+        if host.online {
+            peer.stats.set_online(true);
+        }
         return;
     }
     let name = endpoint_name(&endpoint);
