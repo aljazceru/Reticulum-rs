@@ -187,6 +187,17 @@ pub async fn execute(options: IdOptions) -> Result<i32, String> {
     if let Some(code) = reject_args(&options) {
         return Ok(code);
     }
+    // Announce and `-R` build a transport. Match the other `rn` tools:
+    // `-v` raises the level and `-q` lowers it, before that transport exists.
+    let verbosity = options.verbose.saturating_sub(options.quiet);
+    let level = match verbosity {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+        .try_init();
     let config_dir = crate::common::resolve_config_dir(options.config.as_deref());
     let resolved = match resolve_async(&options, &config_dir).await {
         Ok(resolved) => resolved,
@@ -586,6 +597,9 @@ async fn resolve_async(options: &IdOptions, config_dir: &Path) -> Result<Resolve
     if path.is_file() {
         return load_identity_file(&path);
     }
+    // `-N` skips cache and network recall. A hash is still the required
+    // signer for `-V` and embedded messages.
+    let requested = unresolved_hash(identity)?;
     if options.no_cache {
         if op_requires(options) {
             println!("Could not resolve identity");
@@ -594,23 +608,9 @@ async fn resolve_async(options: &IdOptions, config_dir: &Path) -> Result<Resolve
         return Ok(Resolved {
             key: None,
             identity_arg: Some(identity.clone()),
-            requested_hash: None,
+            requested_hash: Some(requested),
         });
     }
-    if identity.len() != 32 {
-        return Ok(Resolved {
-            key: None,
-            identity_arg: Some(identity.clone()),
-            requested_hash: None,
-        });
-    }
-    let requested = match parse_hex_hash(identity) {
-        Some(hash) => hash,
-        None => {
-            println!("Invalid hexadecimal hash provided: {identity}");
-            return Err(R_INVALID_IDENTITY);
-        }
-    };
     if let Some(found) = recall_from_disk(config_dir, &requested) {
         print_recalled(&found, &requested);
         let _ = retain_identity(config_dir, found.address_hash).await;
@@ -636,6 +636,10 @@ async fn resolve_async(options: &IdOptions, config_dir: &Path) -> Result<Resolve
         });
     }
 
+    let timeout = match options.timeout {
+        None => PATH_REQUEST_TIMEOUT,
+        Some(seconds) => path_request_timeout(seconds)?,
+    };
     let id_destination = destination_hash(DEFAULT_ASPECTS, requested.as_slice());
     let transport = crate::common::build_tool_transport(crate::common::ToolTransportOptions {
         config_dir,
@@ -649,10 +653,6 @@ async fn resolve_async(options: &IdOptions, config_dir: &Path) -> Result<Resolve
         "Requesting unknown Identity for {}",
         prettyhexrep(requested.as_slice())
     );
-    let timeout = options
-        .timeout
-        .map(|seconds| Duration::from_secs_f64(seconds.max(0.0)))
-        .unwrap_or(PATH_REQUEST_TIMEOUT);
     let deadline = std::time::Instant::now() + timeout;
     let found = loop {
         if let Some(identity) =
@@ -698,6 +698,7 @@ fn load_identity_arg(
     if path.is_file() {
         return load_identity_file(&path);
     }
+    let requested = unresolved_hash(identity)?;
     if options.no_cache {
         if op_requires(options) {
             println!("Could not resolve identity");
@@ -706,44 +707,67 @@ fn load_identity_arg(
         return Ok(Resolved {
             key: None,
             identity_arg: Some(identity.to_string()),
-            requested_hash: None,
+            requested_hash: Some(requested),
         });
     }
-    if identity.len() == 32 {
-        let Some(requested) = parse_hex_hash(identity) else {
-            println!("Invalid hexadecimal hash provided: {identity}");
-            return Err(R_INVALID_IDENTITY);
-        };
-        if let Some(found) = recall_from_disk(config_dir, &requested) {
-            print_recalled(&found, &requested);
-            return Ok(Resolved {
-                key: Some(KeyMaterial::Public(Box::new(found))),
-                identity_arg: Some(identity.to_string()),
-                requested_hash: Some(requested),
-            });
-        }
-        if options.request {
-            return Err(R_NO_IDENTITY);
-        }
-        if op_requires(options) {
-            println!(
-                "Could not recall Identity for {}.",
-                prettyhexrep(requested.as_slice())
-            );
-            println!("You can query the network for unknown Identities with the -R option.");
-            return Err(R_NO_IDENTITY);
-        }
+    if let Some(found) = recall_from_disk(config_dir, &requested) {
+        print_recalled(&found, &requested);
         return Ok(Resolved {
-            key: None,
+            key: Some(KeyMaterial::Public(Box::new(found))),
             identity_arg: Some(identity.to_string()),
             requested_hash: Some(requested),
         });
     }
+    if options.request {
+        return Err(R_NO_IDENTITY);
+    }
+    if op_requires(options) {
+        println!(
+            "Could not recall Identity for {}.",
+            prettyhexrep(requested.as_slice())
+        );
+        println!("You can query the network for unknown Identities with the -R option.");
+        return Err(R_NO_IDENTITY);
+    }
     Ok(Resolved {
         key: None,
         identity_arg: Some(identity.to_string()),
-        requested_hash: None,
+        requested_hash: Some(requested),
     })
+}
+
+/// A non-file `-i` is a 16-byte hex hash. Anything else is not an identity.
+fn unresolved_hash(identity: &str) -> Result<AddressHash, i32> {
+    if identity.len() != 32 {
+        println!("Invalid identity hash length");
+        return Err(R_INVALID_IDENTITY);
+    }
+    match parse_hex_hash(identity) {
+        Some(hash) => Ok(hash),
+        None => {
+            println!("Invalid hexadecimal hash provided: {identity}");
+            Err(R_INVALID_IDENTITY)
+        }
+    }
+}
+
+/// Finite non-positive values wait zero time. Non-finite and overflowing
+/// values are rejected so `Duration` is never built from them.
+fn path_request_timeout(seconds: f64) -> Result<Duration, i32> {
+    if !seconds.is_finite() {
+        println!("Invalid identity request timeout");
+        return Err(R_INVALID_ARGS);
+    }
+    if seconds <= 0.0 {
+        return Ok(Duration::ZERO);
+    }
+    match Duration::try_from_secs_f64(seconds) {
+        Ok(duration) => Ok(duration),
+        Err(_) => {
+            println!("Invalid identity request timeout");
+            Err(R_INVALID_ARGS)
+        }
+    }
 }
 
 fn print_recalled(identity: &Identity, requested: &AddressHash) {
@@ -813,6 +837,12 @@ fn import_public(import: &str) -> Result<Resolved, i32> {
         return Err(R_INVALID_IDENTITY);
     }
     let identity = Identity::new_from_slices(&bytes[..32], &bytes[32..]);
+    // `new_from_slices` substitutes a default verifying key when the bytes
+    // are not a real Ed25519 key. Keep the imported bytes or reject them.
+    if identity.to_bytes().as_slice() != bytes.as_slice() {
+        println!("Could not create Reticulum identity from specified data");
+        return Err(R_INVALID_IDENTITY);
+    }
     Ok(Resolved {
         key: Some(KeyMaterial::Public(Box::new(identity))),
         identity_arg: None,
@@ -881,29 +911,21 @@ fn decode_key_material(import: &str, public: bool) -> Result<Vec<u8>, i32> {
 }
 
 fn recall_from_disk(config_dir: &Path, hash: &AddressHash) -> Option<Identity> {
+    // Read only. Saving this snapshot would replace the daemon's live table
+    // with whatever was on disk at load time.
     let storage =
         reticulum::storage::FsStorage::new(config_dir.join("storage").display().to_string());
     let mut known = reticulum::storage::KnownDestinations::new();
     known.load(&storage).ok()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs_f64())
-        .unwrap_or(0.0);
-    if let Some(identity) = known.recall(hash, now) {
-        let _ = known.save(&storage);
+    if let Some(identity) = known.recall_no_use(hash) {
         return Some(identity);
     }
     let entries = known.entries();
-    let (destination, data) = reticulum::identity::recall(&entries, hash, true)?;
-    let identity = Identity::new_from_slices(
+    let data = reticulum::identity::recall(&entries, hash, true)?.1;
+    Some(Identity::new_from_slices(
         &data.public_key[..reticulum::identity::PUBLIC_KEY_LENGTH],
         &data.public_key[reticulum::identity::PUBLIC_KEY_LENGTH..],
-    );
-    let destination = *destination;
-    drop(entries);
-    known.recall(&destination, now);
-    let _ = known.save(&storage);
-    Some(identity)
+    ))
 }
 
 async fn recall_loaded(
@@ -1188,6 +1210,9 @@ fn validate_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<
             return Ok(R_READ_ERROR);
         }
     };
+    if let Err(code) = require_unresolved_signer(resolved) {
+        return Ok(code);
+    }
     if signature.len() == SIG_BYTES {
         let Some(identity) = resolved.key.as_ref().map(KeyMaterial::public_identity) else {
             println!("Cannot validate legacy rsg signatures without an explicit required identity");
@@ -1212,14 +1237,15 @@ fn validate_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<
         return Ok(R_INVALID_SIGNATURE);
     }
     match check_rsg(&signature, &message, resolved) {
-        RsgCheck::Valid(label) => {
+        Ok(RsgCheck::Valid(label)) => {
             println!(
                 "Signature is valid, the file {} was signed by {label}",
                 file_path.display()
             );
             Ok(R_OK)
         }
-        RsgCheck::Invalid => {
+        Err(code) => Ok(code),
+        Ok(RsgCheck::Invalid) => {
             let extra = signer_suffix(resolved);
             println!(
                 "Invalid signature {} for file {}{extra}",
@@ -1261,6 +1287,9 @@ fn validate_message(options: &IdOptions, resolved: &Resolved, path: &Path) -> Re
         println!("The signature file \"{}\" does not exist", path.display());
         return Ok(R_NO_FILE);
     }
+    if let Err(code) = require_unresolved_signer(resolved) {
+        return Ok(code);
+    }
     let signature = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -1277,7 +1306,8 @@ fn validate_message(options: &IdOptions, resolved: &Resolved, path: &Path) -> Re
         return Ok(R_INVALID_SIGNATURE);
     };
     match check_rsg(&signature, &message, resolved) {
-        RsgCheck::Valid(label) => {
+        Err(code) => Ok(code),
+        Ok(RsgCheck::Valid(label)) => {
             if options.meta {
                 println!("RSM Metadata\n============\n");
                 print_meta(&view.meta, 1);
@@ -1298,7 +1328,7 @@ fn validate_message(options: &IdOptions, resolved: &Resolved, path: &Path) -> Re
             }
             Ok(R_OK)
         }
-        RsgCheck::Invalid => {
+        Ok(RsgCheck::Invalid) => {
             let extra = if resolved.key.is_some() || resolved.requested_hash.is_some() {
                 let label = resolved
                     .key
@@ -1342,12 +1372,34 @@ fn verify_envelope(identity: &Identity, rsg: &[u8]) -> bool {
     identity.verify(&rsg[SIG_BYTES..], &sig).is_ok()
 }
 
-fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> RsgCheck {
+/// `-N` leaves no loaded key. `-V` and embedded-message checks still require
+/// the unresolved `-i` hash to match the embedded public key.
+fn require_unresolved_signer(resolved: &Resolved) -> Result<(), i32> {
+    if resolved.key.is_some() || resolved.requested_hash.is_some() {
+        return Ok(());
+    }
+    let Some(text) = resolved.identity_arg.as_deref() else {
+        return Ok(());
+    };
+    unresolved_hash(text)?;
+    Ok(())
+}
+
+fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> Result<RsgCheck, i32> {
+    let required = if resolved.key.is_some() {
+        None
+    } else if let Some(hash) = resolved.requested_hash {
+        Some(hash)
+    } else if let Some(text) = resolved.identity_arg.as_deref() {
+        Some(unresolved_hash(text)?)
+    } else {
+        None
+    };
     let Some(view) = unpack_rsg(rsg) else {
-        return RsgCheck::Invalid;
+        return Ok(RsgCheck::Invalid);
     };
     if view.hash.as_slice() != sha256(message).as_slice() {
-        return RsgCheck::Invalid;
+        return Ok(RsgCheck::Invalid);
     }
     let loaded = Identity::new_from_slices(
         &view.pubkey[..reticulum::identity::PUBLIC_KEY_LENGTH],
@@ -1357,19 +1409,21 @@ fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> RsgCheck {
     // embedded public key. With neither, the embedded key is enough.
     if let Some(key) = resolved.key.as_ref() {
         if !verify_envelope(key.public_identity(), rsg) {
-            return RsgCheck::Invalid;
+            return Ok(RsgCheck::Invalid);
         }
-        return RsgCheck::Valid(key.label());
+        return Ok(RsgCheck::Valid(key.label()));
     }
-    if let Some(hash) = resolved.requested_hash {
+    if let Some(hash) = required {
         if loaded.address_hash != hash {
-            return RsgCheck::Invalid;
+            return Ok(RsgCheck::Invalid);
         }
     }
     if !verify_envelope(&loaded, rsg) {
-        return RsgCheck::Invalid;
+        return Ok(RsgCheck::Invalid);
     }
-    RsgCheck::Valid(prettyhexrep(loaded.address_hash.as_slice()))
+    Ok(RsgCheck::Valid(prettyhexrep(
+        loaded.address_hash.as_slice(),
+    )))
 }
 
 fn unpack_rsg(rsg: &[u8]) -> Option<SignedView> {
@@ -1792,7 +1846,7 @@ fn encrypt_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<i
     let mut wrote: u64 = 0;
     loop {
         let mut chunk = vec![0u8; ENC_CHUNK];
-        let read = match input.read(&mut chunk) {
+        let read = match read_chunk(&mut input, &mut chunk) {
             Ok(read) => read,
             Err(err) => {
                 println!(
@@ -1923,7 +1977,7 @@ fn decrypt_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<i
     let mut wrote: u64 = 0;
     loop {
         let mut chunk = vec![0u8; DEC_CHUNK];
-        let read = match input.read(&mut chunk) {
+        let read = match read_chunk(&mut input, &mut chunk) {
             Ok(read) => read,
             Err(err) => {
                 println!(
@@ -1971,6 +2025,23 @@ fn decrypt_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<i
         output_path.display()
     );
     Ok(R_OK)
+}
+
+/// Fill `buf` until it is full or the reader reaches EOF.
+///
+/// One `Read::read` may return early. A Fernet record is one full chunk,
+/// so a short read must not be encrypted or decrypted on its own.
+fn read_chunk(input: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match input.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(filled)
 }
 
 fn encrypt_chunk(identity: &Identity, chunk: &[u8]) -> Result<Vec<u8>, String> {
@@ -2766,6 +2837,7 @@ fn b256_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn generate_and_render() {
@@ -3003,5 +3075,238 @@ mod tests {
             assert_eq!(destination, hash.as_slice());
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_cache_hash_still_constrains_validation() {
+        let dir = std::env::temp_dir().join(format!("rnid-nocache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let other = PrivateIdentity::new_from_rand(OsRng);
+        let id_path = dir.join("identity");
+        std::fs::write(&id_path, identity.to_bytes()).unwrap();
+        let file = dir.join("note.txt");
+        std::fs::write(&file, b"payload").unwrap();
+        assert_eq!(
+            run(IdOptions {
+                identity: Some(id_path.display().to_string()),
+                sign: vec![file.display().to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+            0
+        );
+        let hash = identity.address_hash().to_hex_string();
+        assert_eq!(
+            run(IdOptions {
+                identity: Some(hash.clone()),
+                no_cache: true,
+                validate: vec![file.display().to_string()],
+                config: Some(dir.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            run(IdOptions {
+                identity: Some(other.address_hash().to_hex_string()),
+                no_cache: true,
+                validate: vec![file.display().to_string()],
+                config: Some(dir.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+            R_INVALID_SIGNATURE
+        );
+        assert_eq!(
+            run(IdOptions {
+                identity: Some("zz".into()),
+                no_cache: true,
+                validate: vec![file.display().to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+            R_INVALID_IDENTITY
+        );
+        assert_eq!(
+            run(IdOptions {
+                identity: Some("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".into()),
+                validate: vec![file.display().to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+            R_INVALID_IDENTITY
+        );
+
+        assert_eq!(
+            run(IdOptions {
+                identity: Some(id_path.display().to_string()),
+                sign_message: Some("hello".into()),
+                write: Some(dir.join("msg").display().to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            run(IdOptions {
+                identity: Some(hash),
+                no_cache: true,
+                validate: vec![dir.join("msg.rsm").display().to_string()],
+                config: Some(dir.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            run(IdOptions {
+                identity: Some("short".into()),
+                validate: vec![dir.join("msg.rsm").display().to_string()],
+                ..Default::default()
+            })
+            .unwrap(),
+            R_INVALID_IDENTITY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_recall_does_not_rewrite_known_destinations() {
+        let dir = std::env::temp_dir().join(format!("rnid-known-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let hash = *identity.address_hash();
+        let mut known = reticulum::storage::KnownDestinations::new();
+        known.remember(
+            [9u8; 32],
+            hash,
+            identity.as_identity().to_bytes(),
+            Some(b"keep-me".to_vec()),
+            12.0,
+        );
+        let storage_dir = dir.join("storage");
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        let storage = reticulum::storage::FsStorage::new(storage_dir.display().to_string());
+        known.save(&storage).unwrap();
+        let path = storage_dir.join("known_destinations");
+        let before = std::fs::read(&path).unwrap();
+        assert!(!before.is_empty());
+        let found = recall_from_disk(&dir, &hash).expect("disk recall");
+        assert_eq!(found.address_hash, hash);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            run(IdOptions {
+                config: Some(dir.clone()),
+                identity: Some(hash.to_hex_string()),
+                hash: Some("example.aspect".into()),
+                ..Default::default()
+            })
+            .unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_public_rejects_unparsable_verifying_key() {
+        let dir = std::env::temp_dir().join(format!("rnid-pub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let good = dir.join("good.pub");
+        std::fs::write(&good, identity.as_identity().to_bytes()).unwrap();
+        assert_eq!(
+            run(IdOptions {
+                import_pub: Some(good.display().to_string()),
+                print_identity: true,
+                ..Default::default()
+            })
+            .unwrap(),
+            0
+        );
+        let mut bad_bytes = identity.as_identity().to_bytes();
+        let mut rejected = false;
+        for tweak in 0u8..=255 {
+            bad_bytes[32] = tweak;
+            let parsed = Identity::new_from_slices(&bad_bytes[..32], &bad_bytes[32..]);
+            if parsed.to_bytes().as_slice() != bad_bytes.as_slice() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "expected an unparsable verifying key");
+        let bad = dir.join("bad.pub");
+        std::fs::write(&bad, bad_bytes).unwrap();
+        assert_eq!(
+            run(IdOptions {
+                import_pub: Some(bad.display().to_string()),
+                print_identity: true,
+                ..Default::default()
+            })
+            .unwrap(),
+            R_INVALID_IDENTITY
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeout_rejects_non_finite_and_overflow() {
+        assert_eq!(
+            path_request_timeout(f64::INFINITY).unwrap_err(),
+            R_INVALID_ARGS
+        );
+        assert_eq!(
+            path_request_timeout(f64::NEG_INFINITY).unwrap_err(),
+            R_INVALID_ARGS
+        );
+        assert_eq!(path_request_timeout(f64::NAN).unwrap_err(), R_INVALID_ARGS);
+        assert_eq!(path_request_timeout(1e20).unwrap_err(), R_INVALID_ARGS);
+        assert_eq!(path_request_timeout(0.0).unwrap(), Duration::ZERO);
+        assert_eq!(path_request_timeout(-0.0).unwrap(), Duration::ZERO);
+        assert_eq!(path_request_timeout(-1.0).unwrap(), Duration::ZERO);
+        assert_eq!(
+            path_request_timeout(1.5).unwrap(),
+            Duration::from_secs_f64(1.5)
+        );
+    }
+
+    struct StepReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        step: usize,
+    }
+
+    impl Read for StepReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let count = self.step.min(buf.len()).min(self.data.len() - self.pos);
+            buf[..count].copy_from_slice(&self.data[self.pos..self.pos + count]);
+            self.pos += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn read_chunk_fills_across_short_reads() {
+        let data = [1u8, 2, 3, 4, 5, 6, 7];
+        let mut reader = StepReader {
+            data: &data,
+            pos: 0,
+            step: 1,
+        };
+        let mut buf = [0u8; 5];
+        assert_eq!(read_chunk(&mut reader, &mut buf).unwrap(), 5);
+        assert_eq!(buf, [1, 2, 3, 4, 5]);
+        let mut rest = [0u8; 5];
+        assert_eq!(read_chunk(&mut reader, &mut rest).unwrap(), 2);
+        assert_eq!(&rest[..2], &[6, 7]);
+        assert_eq!(read_chunk(&mut reader, &mut rest).unwrap(), 0);
     }
 }
