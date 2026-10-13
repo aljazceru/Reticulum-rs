@@ -22,6 +22,7 @@ pub mod pipe;
 pub mod rnode;
 #[cfg(feature = "iface-serial")]
 pub mod serial;
+pub mod weave;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
@@ -1183,11 +1184,15 @@ impl InterfaceManager {
     /// below 62_500 bps. The `min` with 524288, `TCPInterface.HW_MTU`
     /// (262144), or 1048576 is this function's ceiling, not a step
     /// `optimise_mtu` takes. Auto keeps its fixed hardware MTU of 1196.
+    /// Weave keeps its fixed hardware MTU of 1024.
     pub fn iface_hw_mtu(&self, address: &AddressHash) -> Option<usize> {
         let kind = self.iface_kind(address)?;
         // Fixed hardware MTU, not a bitrate tier.
         if kind == "AutoInterface" || kind == "AutoPeer" {
             return Some(1_196);
+        }
+        if kind == "WeaveInterface" || kind == "WeaveInterfacePeer" {
+            return Some(weave::HW_MTU);
         }
         // Ceilings applied by this function only. `optimise_mtu` does
         // not take `min` with these values. TCP uses `TCPInterface.HW_MTU`.
@@ -1700,6 +1705,16 @@ mod tests {
             assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_196));
             assert!(manager.set_iface_bitrate(&channel.address, 0));
             assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_196));
+        }
+
+        for kind in ["WeaveInterface", "WeaveInterfacePeer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_024));
+            assert!(manager.set_iface_bitrate(&channel.address, 62_499));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_024));
+            assert!(manager.set_iface_bitrate(&channel.address, 0));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_024));
         }
 
         for kind in [

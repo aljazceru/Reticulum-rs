@@ -1,9 +1,62 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// In-process constructor for a configured interface type.
+///
+/// Python loads `interfaces/{Type}.py`. This registry does not exec a file.
+pub type InterfaceFactoryFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+pub type InterfaceFactory = std::sync::Arc<
+    dyn Fn(
+            NamedInterface,
+            std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
+        ) -> InterfaceFactoryFuture
+        + Send
+        + Sync,
+>;
+
+fn interface_factories() -> &'static Mutex<Vec<(String, InterfaceFactory)>> {
+    static REGISTRY: OnceLock<Mutex<Vec<(String, InterfaceFactory)>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register `type_name` so startup can spawn it without a new match arm.
+pub fn register_interface_factory<F, Fut>(type_name: impl Into<String>, factory: F)
+where
+    F: Fn(
+            NamedInterface,
+            std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
+        ) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let factory: InterfaceFactory =
+        std::sync::Arc::new(move |iface, manager| Box::pin(factory(iface, manager)));
+    interface_factories()
+        .lock()
+        .expect("interface factory registry")
+        .push((type_name.into(), factory));
+}
+
+/// The most recently registered factory for `type_name`.
+pub fn interface_factory(type_name: &str) -> Option<InterfaceFactory> {
+    let factories = interface_factories()
+        .lock()
+        .expect("interface factory registry");
+    factories
+        .iter()
+        .rev()
+        .find(|(name, _)| name == type_name)
+        .map(|(_, factory)| std::sync::Arc::clone(factory))
+}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -33,8 +86,72 @@ pub struct Config {
     pub reticulum: ReticulumConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_interfaces")]
     pub interfaces: Vec<NamedInterface>,
+}
+
+fn deserialize_interfaces<'de, D>(deserializer: D) -> Result<Vec<NamedInterface>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<toml::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| named_interface_from_value(value).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn configured_enabled_flag(table: Option<&toml::map::Map<String, toml::Value>>) -> bool {
+    let flag = |key: &str| {
+        table
+            .and_then(|table| table.get(key))
+            .and_then(toml::Value::as_bool)
+    };
+    match (flag("enabled"), flag("interface_enabled")) {
+        (None, None) => true,
+        (Some(enabled), None) | (None, Some(enabled)) => enabled,
+        (Some(enabled), Some(alias)) => enabled || alias,
+    }
+}
+
+/// Unknown types can carry keys the `Unsupported` variant does not accept.
+fn reduce_unknown_interface(value: &toml::Value) -> toml::Value {
+    let Some(table) = value.as_table() else {
+        return value.clone();
+    };
+    let mut reduced = toml::map::Map::new();
+    for key in ["name", "type", "enabled", "interface_enabled"] {
+        if let Some(item) = table.get(key) {
+            reduced.insert(key.to_string(), item.clone());
+        }
+    }
+    toml::Value::Table(reduced)
+}
+
+fn named_interface_from_value(value: toml::Value) -> Result<NamedInterface, String> {
+    let configured_type = value
+        .get("type")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let configured_enabled = configured_enabled_flag(value.as_table());
+    let supported = SUPPORTED_INTERFACE_TYPES.contains(&configured_type.as_str());
+    let raw_config = if supported { None } else { Some(value.clone()) };
+    let mut iface: NamedInterface = if let Ok(iface) = value.clone().try_into() {
+        iface
+    } else if !supported {
+        reduce_unknown_interface(&value)
+            .try_into()
+            .map_err(|err: toml::de::Error| err.to_string())?
+    } else {
+        return value
+            .try_into()
+            .map_err(|err: toml::de::Error| err.to_string());
+    };
+    iface.configured_type = configured_type;
+    iface.configured_enabled = configured_enabled;
+    iface.raw_config = raw_config;
+    Ok(iface)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -192,7 +309,7 @@ pub struct LoggingConfig {
 }
 
 /// One RNodeMulti virtual port (Python `[[subinterfaces]]` entry).
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RnodeSubinterface {
     /// Virtual port index.
     pub vport: u8,
@@ -210,7 +327,7 @@ pub struct RnodeSubinterface {
     pub outgoing: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NamedInterface {
     pub name: String,
     #[serde(flatten)]
@@ -329,6 +446,14 @@ pub struct NamedInterface {
     pub announces_to_internal: Option<bool>,
     #[serde(default)]
     pub ignore_config_warnings: bool,
+    /// `serde(other)` drops the tag, so startup errors can still name the type.
+    #[serde(skip)]
+    pub configured_type: String,
+    #[serde(skip)]
+    pub configured_enabled: bool,
+    /// Original table for a type this daemon does not parse itself.
+    #[serde(skip)]
+    pub raw_config: Option<toml::Value>,
 }
 
 impl NamedInterface {
@@ -342,7 +467,7 @@ impl NamedInterface {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(tag = "type")]
 pub enum InterfaceConfig {
     TCPServerInterface {
@@ -562,6 +687,11 @@ pub enum InterfaceConfig {
         listen_ip: String,
         #[serde(default = "default_shared_port")]
         listen_port: u16,
+    },
+    WeaveInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        port: String,
     },
     #[serde(other)]
     #[default]
@@ -1347,6 +1477,7 @@ pub const SUPPORTED_INTERFACE_TYPES: &[&str] = &[
     "I2PInterface",
     "BLEInterface",
     "LocalInterface",
+    "WeaveInterface",
 ];
 
 #[cfg(test)]

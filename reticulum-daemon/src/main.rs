@@ -38,6 +38,8 @@ use reticulum::iface::kiss::SerialPortConfig;
 use reticulum::iface::pipe::PipeInterface;
 #[cfg(feature = "iface-serial")]
 use reticulum::iface::serial::SerialInterface;
+#[cfg(feature = "iface-serial")]
+use reticulum::iface::weave::WeaveInterface;
 
 use reticulum_daemon::config::{Config, InterfaceConfig};
 
@@ -334,7 +336,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             false,
             &mut live_i2p_reachable,
         )
-        .await;    }
+        .await
+        .map_err(std::io::Error::other)?;
+    }
 
     // Network interface discovery (Python RNS/Discovery.py).
     let discoverable: Vec<_> = config
@@ -642,14 +646,18 @@ async fn attach_named(
         log::error!("Cannot attach interface \"{name}\", no configuration entry exists");
         return None;
     };
-    start_configured_interface(
+    if let Err(error) = start_configured_interface(
         &transport.iface_manager(),
         iface,
         &config.reticulum,
         true,
         live_i2p_reachable,
     )
-    .await;
+    .await
+    {
+        log::error!("{error}");
+        return Some(false);
+    }
     if interface_present(transport, name).await {
         log::info!("Interface \"{name}\" was attached");
         Some(true)
@@ -665,7 +673,7 @@ async fn start_configured_interface(
     reticulum: &reticulum_daemon::config::ReticulumConfig,
     force: bool,
     live_i2p_reachable: &mut Vec<(String, std::sync::Arc<std::sync::RwLock<Option<String>>>)>,
-) {
+) -> Result<(), String> {
     let enabled = match &iface.config {
         InterfaceConfig::TCPServerInterface { enabled, .. } => *enabled,
         InterfaceConfig::TCPClientInterface { enabled, .. } => *enabled,
@@ -682,11 +690,12 @@ async fn start_configured_interface(
         InterfaceConfig::SerialInterface { enabled, .. } => *enabled,
         InterfaceConfig::PipeInterface { enabled, .. } => *enabled,
         InterfaceConfig::LocalInterface { enabled, .. } => *enabled,
-        InterfaceConfig::Unsupported => false,
+        InterfaceConfig::WeaveInterface { enabled, .. } => *enabled,
+        InterfaceConfig::Unsupported => iface.configured_enabled,
     };
 
     if !force && !enabled {
-        return;
+        return Ok(());
     }
 
     match &iface.config {
@@ -1062,7 +1071,7 @@ async fn start_configured_interface(
                                 reticulum,
                             )
                             .await;
-                            return;
+                            return Ok(());
                         }
                         #[cfg(not(feature = "iface-rnode-ble"))]
                         {
@@ -1070,7 +1079,7 @@ async fn start_configured_interface(
                                 "Interface '{}' type 'RNodeInterface' BLE requires building the daemon with --features iface-rnode-ble",
                                 iface.name
                             );
-                            return;
+                            return Ok(());
                         }
                     }
                 }
@@ -1184,7 +1193,7 @@ async fn start_configured_interface(
                         "Interface '{}' type 'RNodeMultiInterface' BLE is not supported",
                         iface.name
                     );
-                    return;
+                    return Ok(());
                 }
                 let interface = if let Some(tcp) = tcp {
                     log::info!(
@@ -1501,10 +1510,51 @@ async fn start_configured_interface(
                 );
             }
         }
+        InterfaceConfig::WeaveInterface { port, .. } => {
+            #[cfg(feature = "iface-serial")]
+            {
+                log::info!("Enabling interface '{}': Weave on {port}", iface.name);
+                launch_configured(
+                    iface_manager,
+                    WeaveInterface::new(port.clone(), iface_manager.clone()),
+                    None,
+                    WeaveInterface::spawn,
+                    iface,
+                    reticulum,
+                )
+                .await;
+            }
+            #[cfg(not(feature = "iface-serial"))]
+            {
+                log::warn!(
+                    "Interface '{}' type 'WeaveInterface' on port {port} requires building the daemon with --features iface-serial",
+                    iface.name
+                );
+            }
+        }
         InterfaceConfig::Unsupported => {
-            log::warn!("Interface '{}' uses an unsupported type", iface.name);
+            let type_name = if iface.configured_type.is_empty() {
+                "unknown".to_string()
+            } else {
+                iface.configured_type.clone()
+            };
+            if let Some(factory) =
+                reticulum_daemon::config::interface_factory(&iface.configured_type)
+            {
+                factory(iface.clone(), iface_manager.clone())
+                    .await
+                    .map_err(|error| {
+                        format!("Interface '{}' type '{type_name}': {error}", iface.name)
+                    })?;
+            } else {
+                return Err(format!(
+                    "Interface '{}' type '{type_name}' is not supported",
+                    iface.name
+                ));
+            }
         }
     }
+    Ok(())
 }
 
 fn apply_daemon_transport(
@@ -1628,6 +1678,11 @@ async fn configure_iface(
                 iface.name
             );
         }
+    } else if matches!(
+        &iface.config,
+        reticulum_daemon::config::InterfaceConfig::WeaveInterface { .. }
+    ) {
+        manager.set_iface_bitrate(address, reticulum::iface::weave::BITRATE_GUESS);
     }
 
     let gravity = iface.gravity.or(config.default_gravity).unwrap_or(0);
@@ -1679,6 +1734,9 @@ async fn configure_iface(
             | reticulum_daemon::config::InterfaceConfig::RNodeMultiInterface { .. }
             | reticulum_daemon::config::InterfaceConfig::PipeInterface { .. } => {
                 reticulum::iface::ifac::SERIAL_FAMILY_IFAC_SIZE
+            }
+            reticulum_daemon::config::InterfaceConfig::WeaveInterface { .. } => {
+                reticulum::iface::ifac::DEFAULT_IFAC_SIZE
             }
             _ => reticulum::iface::ifac::DEFAULT_IFAC_SIZE,
         };
@@ -1757,6 +1815,7 @@ fn discovery_info_for(
             "I2PInterface"
         }
         InterfaceConfig::KISSInterface { .. } => "KISSInterface",
+        InterfaceConfig::WeaveInterface { .. } => "WeaveInterface",
         _ => return None,
     };
 
@@ -2233,5 +2292,220 @@ mod tests {
         assert_eq!(control.11, Some(true));
         assert_eq!(control.12, 9);
         drop(stream);
+    }
+
+    fn unsupported_iface(
+        name: &str,
+        type_name: &str,
+        enabled: bool,
+    ) -> reticulum_daemon::config::NamedInterface {
+        use reticulum_daemon::config::InterfaceConfig;
+        reticulum_daemon::config::NamedInterface {
+            name: name.to_string(),
+            config: InterfaceConfig::Unsupported,
+            configured_type: type_name.to_string(),
+            configured_enabled: enabled,
+            ..reticulum_daemon::config::NamedInterface::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_interface_type_fails_startup_with_its_name() {
+        use super::start_configured_interface;
+        use reticulum::iface::InterfaceManager;
+        use reticulum_daemon::config::ReticulumConfig;
+
+        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(4)));
+        let iface = unsupported_iface("future", "SomeNewInterfaceType", true);
+        let error = start_configured_interface(
+            &manager,
+            &iface,
+            &ReticulumConfig::default(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .expect_err("enabled unknown type");
+        assert!(error.contains("SomeNewInterfaceType"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn disabled_unknown_interface_is_skipped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::start_configured_interface;
+        use reticulum::iface::InterfaceManager;
+        use reticulum_daemon::config::ReticulumConfig;
+        use reticulum_daemon::config::register_interface_factory;
+
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&called);
+        register_interface_factory("Pr26DisabledUnknown", move |_, _| {
+            let flag = std::sync::Arc::clone(&flag);
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(4)));
+        let iface = unsupported_iface("quiet", "Pr26DisabledUnknown", false);
+        start_configured_interface(
+            &manager,
+            &iface,
+            &ReticulumConfig::default(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("disabled unknown type is skipped");
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn registered_factory_handles_unknown_type_without_a_match_arm() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use super::start_configured_interface;
+        use reticulum::iface::InterfaceManager;
+        use reticulum_daemon::config::ReticulumConfig;
+        use reticulum_daemon::config::register_interface_factory;
+
+        let called = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&called);
+        register_interface_factory("Pr26FactoryProbe", move |iface, _| {
+            let flag = std::sync::Arc::clone(&flag);
+            async move {
+                assert_eq!(iface.configured_type, "Pr26FactoryProbe");
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(4)));
+        let iface = unsupported_iface("probe", "Pr26FactoryProbe", true);
+        start_configured_interface(
+            &manager,
+            &iface,
+            &ReticulumConfig::default(),
+            false,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("factory handles the type");
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn weave_ifac_default_is_16_and_bitrate_guess_is_250k() {
+        use super::configure_iface;
+        use reticulum::iface::InterfaceManager;
+        use reticulum::iface::udp::UdpInterface;
+        use reticulum_daemon::config::InterfaceConfig;
+        use reticulum_daemon::config::NamedInterface;
+        use reticulum_daemon::config::ReticulumConfig;
+
+        let manager = std::sync::Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(4)));
+
+        async fn open_udp(
+            manager: &std::sync::Arc<tokio::sync::Mutex<InterfaceManager>>,
+        ) -> reticulum::hash::AddressHash {
+            let mut guard = manager.lock().await;
+            let context = guard.open(UdpInterface::new("127.0.0.1:9", None, false));
+            context.channel.address
+        }
+
+        let weave_address = open_udp(&manager).await;
+        let weave = NamedInterface {
+            name: "weave".to_string(),
+            networkname: Some("net".to_string()),
+            config: InterfaceConfig::WeaveInterface {
+                enabled: true,
+                port: "/dev/weave0".to_string(),
+            },
+            ..NamedInterface::default()
+        };
+        configure_iface(
+            &manager,
+            &weave_address,
+            &weave,
+            &ReticulumConfig::default(),
+        )
+        .await;
+        let ifac_size = manager
+            .lock()
+            .await
+            .with_iface_ifac(&weave_address, |slot| {
+                slot.read().expect("ifac lock").as_ref().map(|key| key.size)
+            })
+            .unwrap();
+        let bitrate = manager
+            .lock()
+            .await
+            .with_control(&weave_address, |control| control.bitrate)
+            .unwrap();
+        assert_eq!(ifac_size, Some(16));
+        assert_eq!(bitrate, reticulum::iface::weave::BITRATE_GUESS);
+
+        let explicit_address = open_udp(&manager).await;
+        let explicit = NamedInterface {
+            name: "weave-fast".to_string(),
+            bitrate: Some(100_000),
+            networkname: Some("net".to_string()),
+            config: InterfaceConfig::WeaveInterface {
+                enabled: true,
+                port: "/dev/weave1".to_string(),
+            },
+            ..NamedInterface::default()
+        };
+        configure_iface(
+            &manager,
+            &explicit_address,
+            &explicit,
+            &ReticulumConfig::default(),
+        )
+        .await;
+        let bitrate = manager
+            .lock()
+            .await
+            .with_control(&explicit_address, |control| control.bitrate)
+            .unwrap();
+        assert_eq!(bitrate, 100_000);
+
+        let serial_address = open_udp(&manager).await;
+        let serial = NamedInterface {
+            name: "serial".to_string(),
+            networkname: Some("net".to_string()),
+            config: InterfaceConfig::SerialInterface {
+                enabled: true,
+                port: "/dev/ttyUSB0".to_string(),
+                speed: 9600,
+                databits: 8,
+                parity: "N".to_string(),
+                stopbits: 1,
+            },
+            ..NamedInterface::default()
+        };
+        configure_iface(
+            &manager,
+            &serial_address,
+            &serial,
+            &ReticulumConfig::default(),
+        )
+        .await;
+        let ifac_size = manager
+            .lock()
+            .await
+            .with_iface_ifac(&serial_address, |slot| {
+                slot.read().expect("ifac lock").as_ref().map(|key| key.size)
+            })
+            .unwrap();
+        let bitrate = manager
+            .lock()
+            .await
+            .with_control(&serial_address, |control| control.bitrate)
+            .unwrap();
+        assert_eq!(ifac_size, Some(8));
+        assert_eq!(bitrate, 62_500);
     }
 }

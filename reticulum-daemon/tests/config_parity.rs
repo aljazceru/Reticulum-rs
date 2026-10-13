@@ -110,6 +110,8 @@ type = "SomeNewInterfaceType"
         kinds,
         vec!["serial", "kiss", "pipe", "local", "unsupported"]
     );
+    assert_eq!(config.interfaces[4].configured_type, "SomeNewInterfaceType");
+    assert!(config.interfaces[4].configured_enabled);
 
     match &config.interfaces[0].config {
         InterfaceConfig::SerialInterface { port, speed, .. } => {
@@ -145,6 +147,54 @@ type = "SomeNewInterfaceType"
         &config.interfaces[1].config,
         InterfaceConfig::KISSInterface { enabled: true, .. }
     ));
+}
+
+#[test]
+fn weave_interface_parses_and_unknown_type_keeps_extra_keys() {
+    let dir = temp_dir("weave");
+    std::fs::write(
+        dir.join("config.toml"),
+        r#"
+[[interfaces]]
+name = "Weave"
+type = "WeaveInterface"
+port = "/dev/ttyACM0"
+
+[[interfaces]]
+name = "Future"
+type = "SomeNewInterfaceType"
+widget = 1
+enabled = false
+interface_enabled = true
+"#,
+    )
+    .unwrap();
+
+    let config = Config::from_file(&dir).expect("config must parse");
+    assert!(SUPPORTED_INTERFACE_TYPES.contains(&"WeaveInterface"));
+    match &config.interfaces[0].config {
+        InterfaceConfig::WeaveInterface { enabled, port } => {
+            assert!(*enabled);
+            assert_eq!(port, "/dev/ttyACM0");
+        }
+        other => panic!("expected weave interface, got {other:?}"),
+    }
+    assert!(config.interfaces[0].configured_enabled);
+    assert_eq!(config.interfaces[0].configured_type, "WeaveInterface");
+    assert!(config.interfaces[0].raw_config.is_none());
+
+    assert!(matches!(
+        config.interfaces[1].config,
+        InterfaceConfig::Unsupported
+    ));
+    assert_eq!(config.interfaces[1].configured_type, "SomeNewInterfaceType");
+    assert!(config.interfaces[1].configured_enabled);
+    let widget = config.interfaces[1]
+        .raw_config
+        .as_ref()
+        .and_then(|value| value.get("widget"))
+        .and_then(toml::Value::as_integer);
+    assert_eq!(widget, Some(1));
 }
 
 #[test]

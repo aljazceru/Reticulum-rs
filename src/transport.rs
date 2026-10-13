@@ -2987,9 +2987,10 @@ async fn send_to_next_hop<'a>(
                 .iface_kind(&iface)
                 .map(|kind| {
                     // Python AUTOCONFIGURE_MTU/FIXED_MTU interfaces:
-                    // TCP, Backbone, local shared-instance links and
-                    // AutoInterface. Everything else (UDP, serial, KISS,
-                    // RNode, I2P, AX.25, pipes) disables the upgrade.
+                    // TCP, Backbone, local shared-instance links,
+                    // AutoInterface and Weave. Everything else (UDP,
+                    // serial, KISS, RNode, I2P, AX.25, pipes) disables
+                    // the upgrade.
                     matches!(
                         kind.as_str(),
                         "TcpClient"
@@ -2999,6 +3000,8 @@ async fn send_to_next_hop<'a>(
                             | "AutoInterface"
                             | "LocalServer"
                             | "LocalClient"
+                            | "WeaveInterface"
+                            | "WeaveInterfacePeer"
                     )
                 })
                 .unwrap_or(false);
