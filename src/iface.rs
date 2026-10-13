@@ -603,6 +603,20 @@ impl InterfaceManager {
         }
     }
 
+    /// Config name of the listener that spawned `address`, when that
+    /// listener is still registered.
+    pub fn spawned_parent_name(&self, address: &AddressHash) -> Option<String> {
+        let parent = self
+            .ifaces
+            .iter()
+            .find(|iface| iface.address == *address)?
+            .parent?;
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == parent)
+            .map(|iface| iface.name.clone())
+    }
+
     /// Bind or peer string recorded for `address`. Empty when none was stored.
     pub fn iface_endpoint(&self, address: &AddressHash) -> String {
         self.ifaces

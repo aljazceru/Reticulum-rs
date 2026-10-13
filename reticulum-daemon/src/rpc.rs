@@ -362,11 +362,7 @@ async fn path_table(state: &RpcState, call: &Value) -> Result<Value, String> {
             .stats()
             .into_iter()
             .map(|stat| {
-                let name = python_interface_name(
-                    &stat.kind,
-                    &stat.name,
-                    &manager.iface_endpoint(&stat.address),
-                );
+                let name = interface_display_name(&manager, &stat.kind, &stat.name, &stat.address);
                 (stat.address, name)
             })
             .collect::<Vec<_>>()
@@ -443,11 +439,7 @@ async fn interface_stats(state: &RpcState) -> Value {
     let mut interfaces = Vec::new();
     for stat in &stats {
         let mtu = manager.iface_hw_mtu(&stat.address);
-        let display = python_interface_name(
-            &stat.kind,
-            &stat.name,
-            &manager.iface_endpoint(&stat.address),
-        );
+        let display = interface_display_name(&manager, &stat.kind, &stat.name, &stat.address);
         let clients = manager.local_server_clients(&stat.address);
         let entry = manager
             .with_control(&stat.address, |control| {
@@ -689,11 +681,7 @@ async fn next_hop_if_name(state: &RpcState, destination: &AddressHash) -> String
             .into_iter()
             .find(|stat| stat.address == iface)
         {
-            return python_interface_name(
-                &stat.kind,
-                &stat.name,
-                &manager.iface_endpoint(&stat.address),
-            );
+            return interface_display_name(&manager, &stat.kind, &stat.name, &stat.address);
         }
         return "None".to_string();
     }
@@ -705,11 +693,7 @@ async fn next_hop_if_name(state: &RpcState, destination: &AddressHash) -> String
             .into_iter()
             .find(|stat| stat.kind == "LocalServer")
         {
-            return python_interface_name(
-                &stat.kind,
-                &stat.name,
-                &manager.iface_endpoint(&stat.address),
-            );
+            return interface_display_name(&manager, &stat.kind, &stat.name, &stat.address);
         }
     }
     "None".to_string()
@@ -836,6 +820,31 @@ fn phy_value(value: Option<f64>) -> Value {
         Some(value) => Value::from(value),
         None => Value::Nil,
     }
+}
+
+/// Python `str(interface)`. Spawned TCP and backbone peers are named
+/// `Client on {parent}` in that string. `short_name` on the stat stays
+/// the manager name so detach-by-config-name still finds the parent.
+fn interface_display_name(
+    manager: &reticulum::iface::InterfaceManager,
+    kind: &str,
+    short_name: &str,
+    address: &AddressHash,
+) -> String {
+    let endpoint = manager.iface_endpoint(address);
+    if let Some(parent) = manager.spawned_parent_name(address) {
+        let on_parent = format!("Client on {parent}");
+        match kind {
+            "TcpClient" => {
+                return format!("TCPInterface[{on_parent}/{}]", host_port(&endpoint));
+            }
+            "BackboneClient" => {
+                return format!("BackboneInterface[{on_parent}/{}]", host_port(&endpoint));
+            }
+            _ => {}
+        }
+    }
+    python_interface_name(kind, short_name, &endpoint)
 }
 
 /// Python `str(interface)` from the Rust kind, config name, and endpoint.
@@ -1028,5 +1037,74 @@ mod tests {
         )
         .await;
         assert!(denied.is_err());
+    }
+
+    #[tokio::test]
+    async fn spawned_peer_rpc_name_uses_client_on_parent() {
+        use reticulum::iface::InterfaceManager;
+        use reticulum::iface::tcp_client::TcpClient;
+        use reticulum::iface::tcp_server::TcpServer;
+        use std::sync::Arc;
+
+        let shared = Arc::new(tokio::sync::Mutex::new(InterfaceManager::new(4)));
+        let parent = {
+            let mut manager = shared.lock().await;
+            let server = TcpServer::new("0.0.0.0:4242", Arc::clone(&shared));
+            let context = manager.open_named("Server Interface", server);
+            context.channel.address
+        };
+        let first_endpoint = "127.0.0.1:50000";
+        let second_endpoint = "127.0.0.1:50001";
+        let (first, second) = {
+            let mut manager = shared.lock().await;
+            let open = |manager: &mut InterfaceManager, endpoint: &str| {
+                let context = manager.open_named(endpoint, TcpClient::new(endpoint));
+                let address = context.channel.address;
+                manager.note_spawned(&parent, &address);
+                address
+            };
+            (
+                open(&mut manager, first_endpoint),
+                open(&mut manager, second_endpoint),
+            )
+        };
+        let manager = shared.lock().await;
+        let tcp = super::interface_display_name(&manager, "TcpClient", first_endpoint, &first);
+        assert_eq!(
+            tcp,
+            "TCPInterface[Client on Server Interface/127.0.0.1:50000]"
+        );
+        assert!(tcp.starts_with("TCPInterface[Client"));
+        let backbone =
+            super::interface_display_name(&manager, "BackboneClient", second_endpoint, &second);
+        assert_eq!(
+            backbone,
+            "BackboneInterface[Client on Server Interface/127.0.0.1:50001]"
+        );
+        assert!(backbone.starts_with("BackboneInterface[Client on"));
+        let stats = manager.stats();
+        assert_eq!(
+            stats
+                .iter()
+                .find(|stat| stat.address == parent)
+                .unwrap()
+                .name,
+            "Server Interface"
+        );
+        assert_eq!(
+            stats
+                .iter()
+                .find(|stat| stat.address == first)
+                .unwrap()
+                .name,
+            first_endpoint
+        );
+        let auto =
+            super::interface_display_name(&manager, "AutoPeer", "AutoPeer[eth0/fe80::1]", &first);
+        assert!(auto.starts_with("AutoInterfacePeer["));
+        let (map, ambiguous) = manager.classify_stable_ids();
+        assert!(ambiguous.is_empty());
+        assert!(map.values().any(|address| *address == first));
+        assert!(map.values().any(|address| *address == second));
     }
 }

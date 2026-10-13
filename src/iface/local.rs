@@ -25,7 +25,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio_util::sync::CancellationToken;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
@@ -620,6 +619,7 @@ impl LocalClient {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
+        let exited = context.channel.exited.clone();
         let stats = context.channel.stats.clone();
         let iface_address = context.channel.address;
         let channel_ifac = context.channel.ifac.clone();
@@ -644,7 +644,7 @@ impl LocalClient {
         let server_side = stream.is_some();
 
         'outer: loop {
-            if context.cancel.is_cancelled() {
+            if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
 
@@ -660,6 +660,7 @@ impl LocalClient {
                     tokio::select! {
                         biased;
                         _ = context.cancel.cancelled() => break,
+                        _ = iface_stop.cancelled() => break,
                         Some(_) = tx_channel.recv() => continue,
                         connected = Self::connect(target) => connected,
                     }
@@ -684,6 +685,7 @@ impl LocalClient {
                         tokio::select! {
                             biased;
                             _ = context.cancel.cancelled() => break 'outer,
+                            _ = iface_stop.cancelled() => break 'outer,
                             Some(_) = tx_channel.recv() => {}
                             _ = tokio::time::sleep_until(retry_at) => break,
                         }
@@ -693,7 +695,6 @@ impl LocalClient {
             };
 
             let cancel = context.cancel.clone();
-            let stop = CancellationToken::new();
 
             let (read_half, mut write_half) = match stream {
                 StreamType::Tcp(stream) => {
@@ -714,6 +715,9 @@ impl LocalClient {
                 let frame = encode_auth_frame(&name, token);
                 if stream_write_all(&mut write_half, &frame).await.is_err() {
                     log::debug!("local_client[{}]: authentication write failed", name);
+                    if server_side || cancel.is_cancelled() || iface_stop.is_cancelled() {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -729,9 +733,9 @@ impl LocalClient {
             );
 
             // Start receive task
-            let rx_task = {
+            let mut rx_task = {
                 let cancel = cancel.clone();
-                let stop = stop.clone();
+                let iface_stop = iface_stop.clone();
                 let stats = stats.clone();
                 let rx_channel = rx_channel.clone();
                 let mut stream = read_half;
@@ -745,11 +749,10 @@ impl LocalClient {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
-                            _ = stop.cancelled() => break,
+                            _ = iface_stop.cancelled() => break,
                             result = stream_read(&mut stream, &mut buffer[..]) => match result {
                                 Ok(0) => {
                                     log::debug!("local_client: connection closed");
-                                    stop.cancel();
                                     break;
                                 }
                                 Ok(n) => {
@@ -807,7 +810,6 @@ impl LocalClient {
                                 }
                                 Err(e) => {
                                     log::debug!("local_client: connection error {}", e);
-                                    stop.cancel();
                                     break;
                                 }
                             }
@@ -817,8 +819,9 @@ impl LocalClient {
             };
 
             // Start transmit task
-            let tx_task = {
+            let mut tx_task = {
                 let cancel = cancel.clone();
+                let iface_stop = iface_stop.clone();
                 let tx_channel = tx_channel.clone();
                 let stats = stats.clone();
                 let mut stream = write_half;
@@ -830,7 +833,7 @@ impl LocalClient {
 
                         let message = tokio::select! {
                             _ = cancel.cancelled() => break,
-                            _ = stop.cancelled() => break,
+                            _ = iface_stop.cancelled() => break,
                             Some(message) = tx_channel.recv() => message,
                         };
 
@@ -858,17 +861,27 @@ impl LocalClient {
                 })
             };
 
-            tx_task.await.unwrap();
-            rx_task.await.unwrap();
+            tokio::select! {
+                _ = &mut rx_task => {
+                    tx_task.abort();
+                }
+                _ = &mut tx_task => {
+                    rx_task.abort();
+                }
+            }
+            let _ = rx_task.await;
+            let _ = tx_task.await;
 
             stats.set_online(false);
             log::debug!("local_client[{}]: disconnected", name);
 
-            if server_side {
+            // A channel stop ends the client. Do not open the socket again.
+            if server_side || cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
         }
 
+        let _ = exited.send(true);
         iface_stop.cancel();
     }
 }

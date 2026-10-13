@@ -154,9 +154,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reticulum_utils::common::prettyhexrep(persisted.address_hash().as_slice()),
         identity_path.display()
     );
-    // Hash the persisted key before an ephemeral transport identity replaces it.
-    let rpc_authkey =
-        reticulum_utils::rpc::authkey(config.reticulum.rpc_key.as_deref(), Some(&persisted));
+    // Default authkey is the persisted key at storage/transport_identity
+    // (Python `Identity.to_file` raw bytes), including when the running
+    // transport identity below is ephemeral. An explicit rpc_key overrides
+    // it. Do not hash config_dir/identity.
+    let transport_identity_path = config_path.join("storage").join("transport_identity");
+    let (transport_identity, transport_identity_created) =
+        load_persisted_transport_identity(&transport_identity_path)?;
+    if transport_identity_created {
+        log::info!(
+            "Generated transport identity {} at {}",
+            reticulum_utils::common::prettyhexrep(transport_identity.address_hash().as_slice()),
+            transport_identity_path.display()
+        );
+    }
+    let rpc_authkey = reticulum_utils::rpc::authkey(
+        config.reticulum.rpc_key.as_deref(),
+        Some(&transport_identity),
+    );
     // Python replaces the running transport identity with a fresh one when
     // transport is off and `static_transport_identity` is not set. The file
     // above stays the persisted identity either way.
@@ -1925,6 +1940,33 @@ fn autoconnect_attach(
         announce_rate_target: rate.map(|rate| rate.0),
         announce_rate_grace: rate.map(|rate| rate.1),
         announce_rate_penalty: rate.map(|rate| rate.2),
+    }
+}
+
+/// `storage/transport_identity` in Python's raw 64-byte layout.
+/// An existing file is loaded as raw or hex. A missing file is created raw
+/// so a Python peer hashes the same private key.
+fn load_persisted_transport_identity(
+    path: &Path,
+) -> Result<(PrivateIdentity, bool), Box<dyn std::error::Error>> {
+    match reticulum_utils::common::load_private_identity(path) {
+        Ok(identity) => Ok((identity, false)),
+        Err(reticulum_utils::common::IdentityLoadError::Io(err))
+            if err.kind() == std::io::ErrorKind::NotFound =>
+        {
+            let identity = PrivateIdentity::new_from_rand(OsRng);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, identity.to_bytes())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            Ok((identity, true))
+        }
+        Err(err) => Err(format!("could not load transport identity: {err}").into()),
     }
 }
 

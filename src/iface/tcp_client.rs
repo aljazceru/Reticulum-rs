@@ -174,7 +174,7 @@ impl TcpClient {
         // each time that runs). The first dial stays immediate.
         let mut reconnect_attempts: u32 = 0;
         'outer: loop {
-            if !running || context.cancel.is_cancelled() {
+            if !running || context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
 
@@ -191,6 +191,9 @@ impl TcpClient {
                         _ = context.cancel.cancelled() => {
                             break;
                         }
+                        _ = iface_stop.cancelled() => {
+                            break;
+                        }
                         Some(_) = tx_channel.recv() => {
                             continue;
                         }
@@ -204,7 +207,7 @@ impl TcpClient {
             stats.set_online(false);
             if stream.is_err() {
                 log::info!("tcp_client: couldn't connect to <{}>", addr);
-                if !pause_before_reconnect(&context.cancel, &tx_channel).await {
+                if !pause_before_reconnect(&context.cancel, &iface_stop, &tx_channel).await {
                     break 'outer;
                 }
                 // `initial_connect` failed, so this is `reconnect`: the
@@ -217,7 +220,6 @@ impl TcpClient {
             }
 
             let cancel = context.cancel.clone();
-            let stop = CancellationToken::new();
 
             let stream = stream.unwrap();
             let (read_stream, write_stream) = stream.into_split();
@@ -233,9 +235,9 @@ impl TcpClient {
             let hw_mtu = options.hardware_mtu();
 
             // Start receive task
-            let rx_task = {
+            let mut rx_task = {
                 let cancel = cancel.clone();
-                let stop = stop.clone();
+                let iface_stop = iface_stop.clone();
                 let mut stream = read_stream;
                 let rx_channel = rx_channel.clone();
                 let stats = stats.clone();
@@ -250,18 +252,15 @@ impl TcpClient {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => {
-                                    stop.cancel();
                                     break;
                             }
-                            _ = stop.cancelled() => {
-                                    stop.cancel();
+                            _ = iface_stop.cancelled() => {
                                     break;
                             }
                             result = stream.read(&mut tcp_buffer[..]) => {
                                     match result {
                                         Ok(0) => {
                                             log::warn!("tcp_client: connection closed");
-                                            stop.cancel();
                                             break;
                                         }
                                         Ok(n) => {
@@ -347,7 +346,6 @@ impl TcpClient {
                                         }
                                         Err(e) => {
                                             log::warn!("tcp_client: connection error {}", e);
-                                            stop.cancel();
                                             break;
                                         }
                                     }
@@ -358,8 +356,9 @@ impl TcpClient {
             };
 
             // Start transmit task
-            let tx_task = {
+            let mut tx_task = {
                 let cancel = cancel.clone();
+                let iface_stop = iface_stop.clone();
                 let tx_channel = tx_channel.clone();
                 let stats = stats.clone();
                 let mut stream = write_stream;
@@ -368,7 +367,7 @@ impl TcpClient {
 
                 tokio::spawn(async move {
                     loop {
-                        if stop.is_cancelled() {
+                        if cancel.is_cancelled() || iface_stop.is_cancelled() {
                             break;
                         }
 
@@ -381,7 +380,7 @@ impl TcpClient {
                             _ = cancel.cancelled() => {
                                     break;
                             }
-                            _ = stop.cancelled() => {
+                            _ = iface_stop.cancelled() => {
                                     break;
                             }
                             Some(message) = tx_channel.recv() => {
@@ -418,19 +417,28 @@ impl TcpClient {
                 })
             };
 
-            tx_task.await.unwrap();
-            rx_task.await.unwrap();
+            tokio::select! {
+                _ = &mut rx_task => {
+                    tx_task.abort();
+                }
+                _ = &mut tx_task => {
+                    rx_task.abort();
+                }
+            }
+            let _ = rx_task.await;
+            let _ = tx_task.await;
 
             stats.set_online(false);
             log::info!("tcp_client: disconnected from <{}>", addr);
 
             // Accepted sockets set `running` false and must not dial.
+            // A channel stop ends the peer; it must not dial again.
             // An initiator waits, then applies `attempts > max`, before
             // the next `connect_once`. The startup dial above is not gated.
-            if !running || context.cancel.is_cancelled() {
+            if !running || context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
-            if !pause_before_reconnect(&context.cancel, &tx_channel).await {
+            if !pause_before_reconnect(&context.cancel, &iface_stop, &tx_channel).await {
                 break;
             }
             if !reconnect_after_wait(&mut reconnect_attempts, options.max_reconnect_tries) {
@@ -526,6 +534,7 @@ fn reconnect_after_wait(attempts: &mut u32, max_reconnect_tries: Option<u32>) ->
 /// Drain outbound packets until `RECONNECT_WAIT` elapses. `false` means stop.
 async fn pause_before_reconnect(
     cancel: &CancellationToken,
+    iface_stop: &CancellationToken,
     tx_channel: &Arc<tokio::sync::Mutex<super::InterfaceTxReceiver>>,
 ) -> bool {
     let retry_at = tokio::time::Instant::now() + Duration::from_secs(RECONNECT_WAIT_SECS);
@@ -534,6 +543,9 @@ async fn pause_before_reconnect(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                return false;
+            }
+            _ = iface_stop.cancelled() => {
                 return false;
             }
             Some(_) = tx_channel.recv() => {}

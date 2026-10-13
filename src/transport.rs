@@ -5293,6 +5293,16 @@ fn value_hash(value: &rmpv::Value) -> Option<Hash> {
     Some(Hash::new(array))
 }
 
+fn value_f64(value: &rmpv::Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number as f64);
+    }
+    value.as_u64().map(|number| number as f64)
+}
+
 fn write_hashlist(storage: &dyn Storage, hashes: &[Hash]) -> bool {
     let mut raw = Vec::with_capacity(hashes.len() * 32);
     for hash in hashes {
@@ -5321,8 +5331,9 @@ fn destination_table_row(
     announce: Option<Vec<u8>>,
     received_from: &[u8],
     packet_hash: &[u8],
+    expires_unix: Option<f64>,
 ) -> rmpv::Value {
-    rmpv::Value::Array(vec![
+    let mut fields = vec![
         rmpv::Value::Binary(destination.to_vec()),
         rmpv::Value::Binary(stable_iface.to_vec()),
         rmpv::Value::from(hops),
@@ -5340,7 +5351,13 @@ fn destination_table_row(
         },
         rmpv::Value::Binary(received_from.to_vec()),
         rmpv::Value::Binary(packet_hash.to_vec()),
-    ])
+    ];
+    // Absolute expiry, separate from the sliding learn time. Rows written
+    // before this field omit it and are restored from the learn time.
+    if let Some(expires_unix) = expires_unix {
+        fields.push(rmpv::Value::from(expires_unix));
+    }
+    rmpv::Value::Array(fields)
 }
 
 fn write_path_table(
@@ -5377,6 +5394,7 @@ fn write_path_table(
             announce,
             entry.received_from.as_slice(),
             entry.packet_hash.as_slice(),
+            Some(entry.expires_unix),
         ));
     }
     // Paths whose interface was not live at load time are not in the
@@ -5403,6 +5421,7 @@ fn write_path_table(
                 Some(path.announce.clone()),
                 path.received_from.as_slice(),
                 path.packet_hash.as_slice(),
+                path.expires_unix,
             ));
         }
     }
@@ -5537,6 +5556,8 @@ struct PersistedPath {
     announce: Vec<u8>,
     received_from: AddressHash,
     packet_hash: Hash,
+    /// Absolute expiry. `None` is a row written before this element existed.
+    expires_unix: Option<f64>,
 }
 
 fn parse_persisted_paths(bytes: &[u8]) -> Vec<PersistedPath> {
@@ -5597,6 +5618,7 @@ fn parse_persisted_paths(bytes: &[u8]) -> Vec<PersistedPath> {
             announce: announce.to_vec(),
             received_from,
             packet_hash,
+            expires_unix: fields.get(11).and_then(value_f64),
         });
     }
     paths
@@ -5632,10 +5654,18 @@ async fn restore_persisted_path(
         .min(i64::MAX as u128) as i64;
     let mode = InterfaceMode::from_u8(path.mode).unwrap_or(InterfaceMode::Full);
     let lifetime = path_table::path_lifetime(mode).as_secs_f64();
-    let expires_unix = if path.stored_unix == 0 {
-        unix_now as f64 + lifetime
-    } else {
-        path.stored_unix as f64 + lifetime
+    // A stored expiry is restored as written. Only rows that predate the
+    // field are rebuilt from the learn time plus the mode lifetime.
+    let expires_unix = match path.expires_unix {
+        Some(expires) => expires,
+        None => {
+            let base = if path.stored_unix == 0 {
+                unix_now
+            } else {
+                path.stored_unix
+            };
+            base as f64 + lifetime
+        }
     };
     handler.path_table.restore(
         path.destination,
@@ -6467,6 +6497,51 @@ mod tests {
     use crate::packet::HeaderType;
     use rand_core::OsRng;
 
+    #[test]
+    fn persisted_expires_is_independent_of_learn_time() {
+        let fresh = destination_table_row(
+            &[1u8; 16],
+            &[2u8; 16],
+            3,
+            1_700_000_000,
+            1,
+            None,
+            false,
+            Vec::new(),
+            Some(vec![9, 9]),
+            &[3u8; 16],
+            &[4u8; 32],
+            Some(1_800_000_000.5),
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(vec![fresh])).unwrap();
+        let paths = parse_persisted_paths(&buf);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].stored_unix, 1_700_000_000);
+        assert_eq!(paths[0].expires_unix, Some(1_800_000_000.5));
+
+        let old = destination_table_row(
+            &[1u8; 16],
+            &[2u8; 16],
+            3,
+            1_700_000_000,
+            1,
+            None,
+            false,
+            Vec::new(),
+            Some(vec![9, 9]),
+            &[3u8; 16],
+            &[4u8; 32],
+            None,
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(vec![old])).unwrap();
+        let paths = parse_persisted_paths(&buf);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].stored_unix, 1_700_000_000);
+        assert!(paths[0].expires_unix.is_none());
+    }
+
     #[tokio::test]
     async fn synchronous_accessors_are_safe_inside_a_runtime() {
         let identity = PrivateIdentity::new_from_rand(OsRng);
@@ -7203,6 +7278,15 @@ impl Transport {
         );
 
         destination
+    }
+
+    /// Enable or disable announce retransmission after the instance exists.
+    ///
+    /// Shared-instance tools stay at the configured flag until the local
+    /// client is online, then clear it. A failed attach restores the flag
+    /// before configured interfaces are opened.
+    pub async fn set_retransmit(&self, retransmit: bool) {
+        self.handler.lock().await.config.retransmit = retransmit;
     }
 
     /// Hash of the identity this transport instance runs with

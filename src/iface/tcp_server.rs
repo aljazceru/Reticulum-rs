@@ -62,6 +62,7 @@ impl TcpServer {
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
+        let mut spawned_peers = Vec::new();
 
         loop {
             if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
@@ -181,6 +182,7 @@ impl TcpServer {
                             let address = peer_context.channel.address;
                             iface_manager.copy_spawned_control(&parent, &address);
                             iface_manager.note_spawned(&parent, &address);
+                            spawned_peers.push(address);
                             iface_manager.launch(peer_context, TcpClient::spawn);
                         }
                     }
@@ -190,9 +192,18 @@ impl TcpServer {
             drop(listener);
             stats.set_online(false);
             let _ = tokio::join!(tx_task);
+            // A peer accepted after `stop_iface` snapshotted children is
+            // still in this list. Cancel it only after the listener is
+            // gone, so nothing accepted during teardown stays up.
+            for child in spawned_peers.drain(..) {
+                iface_manager.lock().await.stop_iface(&child);
+            }
             if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
+        }
+        for child in spawned_peers.drain(..) {
+            iface_manager.lock().await.stop_iface(&child);
         }
         let _ = exited.send(true);
     }

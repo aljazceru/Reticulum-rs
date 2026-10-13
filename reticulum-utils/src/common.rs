@@ -375,8 +375,10 @@ async fn build_tool_transport_inner(
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
     let mut attached_shared = false;
+    // Python clears transport only after the shared client is connected.
+    // A failed attach must keep the configured flag.
     let transport = TransportConfig::new(options.instance_name, &identity)
-        .set_retransmit(options.enable_transport && !reachable)
+        .set_retransmit(options.enable_transport)
         .build();
 
     if reachable {
@@ -404,9 +406,18 @@ async fn build_tool_transport_inner(
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         if attached_shared {
+            transport.set_retransmit(false).await;
             return Ok(transport);
         }
-        transport.iface_manager().lock().await.stop_iface(&attached);
+        let waiter = transport.iface_manager().lock().await.stop_iface(&attached);
+        if let Some(mut waiter) = waiter {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                waiter.wait_for(|done| *done),
+            )
+            .await;
+        }
+        transport.set_retransmit(options.enable_transport).await;
     }
 
     let interfaces = read_configured_interfaces(options.config_dir);
@@ -579,11 +590,14 @@ fn shared_settings(config_dir: &Path) -> SharedSettings {
 }
 
 fn tool_authkey(config_dir: &Path, configured: Option<&str>) -> Vec<u8> {
-    let identity = load_private_identity(&config_dir.join("identity"))
-        .ok()
-        .or_else(|| {
-            load_private_identity(&config_dir.join("storage").join("transport_identity")).ok()
-        });
+    // Python hashes `storage/transport_identity`. Do not use `identity`
+    // when that file is present; the daemon identity is a different key.
+    let transport_path = config_dir.join("storage").join("transport_identity");
+    let identity = match load_private_identity(&transport_path) {
+        Ok(identity) => Some(identity),
+        Err(_) if transport_path.exists() => None,
+        Err(_) => load_private_identity(&config_dir.join("identity")).ok(),
+    };
     crate::rpc::authkey(configured, identity.as_ref())
 }
 
