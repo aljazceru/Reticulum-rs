@@ -832,19 +832,11 @@ fn interface_display_name(
     address: &AddressHash,
 ) -> String {
     let endpoint = manager.iface_endpoint(address);
-    if let Some(parent) = manager.spawned_parent_name(address) {
-        let on_parent = format!("Client on {parent}");
-        match kind {
-            "TcpClient" => {
-                return format!("TCPInterface[{on_parent}/{}]", host_port(&endpoint));
-            }
-            "BackboneClient" => {
-                return format!("BackboneInterface[{on_parent}/{}]", host_port(&endpoint));
-            }
-            _ => {}
-        }
-    }
-    python_interface_name(kind, short_name, &endpoint)
+    let label = match (kind, manager.spawned_parent_name(address)) {
+        ("TcpClient" | "BackboneClient", Some(parent)) => format!("Client on {parent}"),
+        _ => short_name.to_string(),
+    };
+    python_interface_name(kind, &label, &endpoint)
 }
 
 /// Python `str(interface)` from the Rust kind, config name, and endpoint.
