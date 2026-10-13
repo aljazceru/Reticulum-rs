@@ -4,6 +4,7 @@
 //! or `-1` plus an 8-byte length) and the bidirectional authkey handshake,
 //! then one msgpack payload. The digest on our challenges is SHA-256.
 //! A 16-byte reply is legacy HMAC-MD5; `{sha384}` is accepted too.
+//! `{sha3_256}` and `{sha3_384}` are rejected before a MAC is computed.
 
 use std::io;
 
@@ -30,8 +31,9 @@ pub enum ControlAddr {
 }
 
 /// Authkey from a configured hex `rpc_key`, otherwise the SHA-256 of
-/// `identity`'s private key bytes. Invalid hex logs and uses the identity.
-pub fn authkey(configured: Option<&str>, identity: &PrivateIdentity) -> Vec<u8> {
+/// `identity`'s private key bytes. With no identity, the fallback is the
+/// SHA-256 of an empty input. Invalid hex logs and uses that fallback.
+pub fn authkey(configured: Option<&str>, identity: Option<&PrivateIdentity>) -> Vec<u8> {
     if let Some(text) = configured {
         match decode_hex_key(text) {
             Some(key) => return key,
@@ -42,11 +44,14 @@ pub fn authkey(configured: Option<&str>, identity: &PrivateIdentity) -> Vec<u8> 
             }
         }
     }
-    Sha256::digest(identity.to_bytes()).to_vec()
+    match identity {
+        Some(identity) => Sha256::digest(identity.to_bytes()).to_vec(),
+        None => Sha256::digest([]).to_vec(),
+    }
 }
 
 /// `None` when `text` is not hex (whitespace allowed). Empty is an empty key.
-fn decode_hex_key(text: &str) -> Option<Vec<u8>> {
+pub fn decode_hex_key(text: &str) -> Option<Vec<u8>> {
     let compact: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     if !compact.len().is_multiple_of(2) || !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
@@ -287,7 +292,7 @@ fn digest_and_payload(message: &[u8]) -> Option<(&str, &[u8])> {
         return None;
     }
     let name = std::str::from_utf8(message.get(1..end)?).ok()?;
-    if !matches!(name, "md5" | "sha256" | "sha384" | "sha3_256" | "sha3_384") {
+    if !matches!(name, "md5" | "sha256" | "sha384") {
         return None;
     }
     Some((name, message.get(end + 1..)?))

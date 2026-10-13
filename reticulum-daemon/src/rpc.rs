@@ -7,16 +7,19 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use reticulum::hash::AddressHash;
+use reticulum::hash::{AddressHash, Hash};
 use reticulum::iface::{IfaceControlState, InterfaceStats};
 use reticulum::packet::PROTOCOL_MTU;
 use reticulum::transport::{RateTableEntry, Transport};
 use rmpv::Value;
 use tokio::sync::{mpsc, oneshot};
 
-const PATH_LIFETIME_SECS: f64 = 60.0 * 60.0 * 24.0 * 7.0;
 const DEFAULT_PER_HOP_TIMEOUT: f64 = 6.0;
+/// Unset control bitrate (`IfaceControlState` default). Timeout getters
+/// substitute Python's per-type guess while this value is still stored.
 const DEFAULT_BITRATE: u64 = 62_500;
+const SHARED_BITRATE_GUESS: u64 = 1_000_000_000;
+const TCP_UDP_BITRATE_GUESS: u64 = 10_000_000;
 
 pub enum BoundControl {
     Tcp(tokio::net::TcpListener),
@@ -192,18 +195,27 @@ async fn get_op(state: &RpcState, call: &Value) -> Result<Option<Value>, String>
             Some(bitrate) => Value::from(bitrate),
             None => Value::Nil,
         },
-        "medium_path_timeout" => {
-            Value::from(state.transport.medium_path_timeout().await.as_secs_f64())
-        }
+        "medium_path_timeout" => Value::from(medium_path_timeout(state).await),
         "link_count" => Value::from(state.transport.link_counts().await.link_table as u64),
-        "active_link_count" => {
-            let counts = state.transport.link_counts().await;
-            Value::from((counts.inbound + counts.outbound) as u64)
-        }
-        "packet_rssi" | "packet_snr" | "packet_q" => {
-            let _ = required_hash(call, "packet_hash")?;
-            Value::Nil
-        }
+        "active_link_count" => Value::from(state.transport.active_link_count().await as u64),
+        "packet_rssi" => phy_value(
+            state
+                .transport
+                .packet_rssi(&required_packet_hash(call, "packet_hash")?)
+                .await,
+        ),
+        "packet_snr" => phy_value(
+            state
+                .transport
+                .packet_snr(&required_packet_hash(call, "packet_hash")?)
+                .await,
+        ),
+        "packet_q" => phy_value(
+            state
+                .transport
+                .packet_q(&required_packet_hash(call, "packet_hash")?)
+                .await,
+        ),
         "profiling_results" => Value::Nil,
         "blackholed_identities" => blackholed_identities(state).await,
         "is_blackholed" => Value::Boolean(
@@ -231,7 +243,10 @@ async fn manage_op(state: &RpcState, call: &Value) -> Result<Option<Value>, Stri
         "reload_interface" => ManageOp::Reload(name),
         _ => return Ok(None),
     };
-    Ok(Some(opt_bool(ask_manage(state, op).await)))
+    Ok(Some(match ask_manage(state, op).await {
+        Some(value) => Value::Boolean(value),
+        None => Value::Nil,
+    }))
 }
 
 async fn drop_op(state: &RpcState, call: &Value) -> Result<Option<Value>, String> {
@@ -242,7 +257,7 @@ async fn drop_op(state: &RpcState, call: &Value) -> Result<Option<Value>, String
         "path" => Value::Boolean(
             state
                 .transport
-                .drop_path(&required_hash(call, "destination_hash")?)
+                .expire_path(&required_hash(call, "destination_hash")?)
                 .await,
         ),
         "all_via" => {
@@ -340,17 +355,31 @@ async fn path_table(state: &RpcState, call: &Value) -> Result<Value, String> {
         Some(as_u64(max_hops_v).ok_or_else(|| "invalid max_hops".to_string())?)
     };
     let now = unix_now();
-    let manager = state.transport.iface_manager();
-    let stats = manager.lock().await.stats();
+    let labels = {
+        let manager = state.transport.iface_manager();
+        let manager = manager.lock().await;
+        manager
+            .stats()
+            .into_iter()
+            .map(|stat| {
+                let name = python_interface_name(
+                    &stat.kind,
+                    &stat.name,
+                    &manager.iface_endpoint(&stat.address),
+                );
+                (stat.address, name)
+            })
+            .collect::<Vec<_>>()
+    };
     let mut rows = Vec::new();
     for entry in state.transport.path_table_snapshot().await {
         if max_hops.is_some_and(|max| u64::from(entry.hops) > max) {
             continue;
         }
-        let interface = stats
+        let interface = labels
             .iter()
-            .find(|stat| stat.address == entry.iface)
-            .map(|stat| iface_label(&stat.name, &stat.kind))
+            .find(|(address, _)| *address == entry.iface)
+            .map(|(_, name)| name.clone())
             .unwrap_or_else(|| "None".to_string());
         let timestamp = now - entry.age_secs as f64;
         rows.push(Value::Map(vec![
@@ -364,10 +393,7 @@ async fn path_table(state: &RpcState, call: &Value) -> Result<Value, String> {
                 Value::Binary(entry.via.as_slice().to_vec()),
             ),
             (Value::from("hops"), Value::from(u64::from(entry.hops))),
-            (
-                Value::from("expires"),
-                Value::from(timestamp + PATH_LIFETIME_SECS),
-            ),
+            (Value::from("expires"), Value::from(entry.expires_unix)),
             (Value::from("interface"), Value::from(interface)),
         ]));
     }
@@ -405,7 +431,7 @@ fn rate_row(entry: &RateTableEntry, now: f64) -> Value {
         (Value::from("blocked_until"), Value::from(blocked_until)),
         (
             Value::from("timestamps"),
-            Value::Array(vec![Value::from(last)]),
+            Value::Array(entry.timestamps.iter().copied().map(Value::from).collect()),
         ),
     ])
 }
@@ -417,11 +443,19 @@ async fn interface_stats(state: &RpcState) -> Value {
     let mut interfaces = Vec::new();
     for stat in &stats {
         let mtu = manager.iface_hw_mtu(&stat.address);
+        let display = python_interface_name(
+            &stat.kind,
+            &stat.name,
+            &manager.iface_endpoint(&stat.address),
+        );
+        let clients = manager.local_server_clients(&stat.address);
         let entry = manager
-            .with_control(&stat.address, |control| interface_entry(stat, control, mtu))
+            .with_control(&stat.address, |control| {
+                interface_entry(stat, control, mtu, &display, clients)
+            })
             .unwrap_or_else(|| {
                 let mut control = IfaceControlState::new(tokio::time::Instant::now());
-                interface_entry(stat, &mut control, mtu)
+                interface_entry(stat, &mut control, mtu, &display, clients)
             });
         interfaces.push(entry);
     }
@@ -511,12 +545,13 @@ fn interface_entry(
     stat: &InterfaceStats,
     control: &mut IfaceControlState,
     mtu: Option<usize>,
+    display_name: &str,
+    clients: Option<u64>,
 ) -> Value {
     let now = tokio::time::Instant::now();
-    let name = iface_label(&stat.name, &stat.kind);
     let mut map = vec![
-        (Value::from("name"), Value::from(name.clone())),
-        (Value::from("short_name"), Value::from(name)),
+        (Value::from("name"), Value::from(display_name.to_string())),
+        (Value::from("short_name"), Value::from(stat.name.clone())),
         (
             Value::from("hash"),
             Value::Binary(stat.address.as_slice().to_vec()),
@@ -527,7 +562,10 @@ fn interface_entry(
             Value::from("mode"),
             Value::from(u64::from(control.mode as u8)),
         ),
-        (Value::from("clients"), Value::Nil),
+        (
+            Value::from("clients"),
+            clients.map(Value::from).unwrap_or(Value::Nil),
+        ),
         (Value::from("rxb"), Value::from(stat.rx_bytes)),
         (Value::from("txb"), Value::from(stat.tx_bytes)),
         (Value::from("rxs"), Value::from(0u64)),
@@ -651,7 +689,11 @@ async fn next_hop_if_name(state: &RpcState, destination: &AddressHash) -> String
             .into_iter()
             .find(|stat| stat.address == iface)
         {
-            return iface_label(&stat.name, &stat.kind);
+            return python_interface_name(
+                &stat.kind,
+                &stat.name,
+                &manager.iface_endpoint(&stat.address),
+            );
         }
         return "None".to_string();
     }
@@ -663,20 +705,42 @@ async fn next_hop_if_name(state: &RpcState, destination: &AddressHash) -> String
             .into_iter()
             .find(|stat| stat.kind == "LocalServer")
         {
-            return iface_label(&stat.name, &stat.kind);
+            return python_interface_name(
+                &stat.kind,
+                &stat.name,
+                &manager.iface_endpoint(&stat.address),
+            );
         }
     }
     "None".to_string()
 }
 
+fn guessed_bitrate(kind: &str, bitrate: u64) -> u64 {
+    if bitrate != DEFAULT_BITRATE {
+        return bitrate;
+    }
+    match kind {
+        "LocalServer" | "LocalClient" => SHARED_BITRATE_GUESS,
+        "TcpServer" | "TcpClient" | "UdpInterface" => TCP_UDP_BITRATE_GUESS,
+        _ => bitrate,
+    }
+}
+
+async fn iface_timeout_bitrate(state: &RpcState, address: &AddressHash) -> Option<u64> {
+    let manager = state.transport.iface_manager();
+    let manager = manager.lock().await;
+    let kind = manager
+        .stats()
+        .into_iter()
+        .find(|stat| stat.address == *address)
+        .map(|stat| stat.kind)?;
+    let bitrate = manager.with_control(address, |control| control.bitrate)?;
+    Some(guessed_bitrate(&kind, bitrate))
+}
+
 async fn first_hop_timeout(state: &RpcState, destination: &AddressHash) -> f64 {
     let bitrate = if let Some((_, iface)) = state.transport.next_hop(destination).await {
-        state
-            .transport
-            .iface_manager()
-            .lock()
-            .await
-            .with_control(&iface, |control| control.bitrate)
+        iface_timeout_bitrate(state, &iface).await
     } else if state.transport.has_destination(destination).await {
         let manager = state.transport.iface_manager();
         let manager = manager.lock().await;
@@ -684,7 +748,11 @@ async fn first_hop_timeout(state: &RpcState, destination: &AddressHash) -> f64 {
             .stats()
             .into_iter()
             .find(|stat| stat.kind == "LocalServer")
-            .and_then(|stat| manager.with_control(&stat.address, |control| control.bitrate));
+            .and_then(|stat| {
+                manager.with_control(&stat.address, |control| {
+                    guessed_bitrate(&stat.kind, control.bitrate)
+                })
+            });
         Some(local.unwrap_or(DEFAULT_BITRATE))
     } else {
         None
@@ -695,6 +763,28 @@ async fn first_hop_timeout(state: &RpcState, destination: &AddressHash) -> f64 {
         }
         _ => DEFAULT_PER_HOP_TIMEOUT,
     }
+}
+
+async fn medium_path_timeout(state: &RpcState) -> f64 {
+    const MINIMUM_BITRATE: f64 = 5.0;
+    let manager = state.transport.iface_manager();
+    let manager = manager.lock().await;
+    let mut lowest: Option<u64> = None;
+    for stat in manager.stats() {
+        if !stat.online {
+            continue;
+        }
+        let Some(bitrate) = manager.with_control(&stat.address, |control| control.bitrate) else {
+            continue;
+        };
+        let bitrate = guessed_bitrate(&stat.kind, bitrate);
+        lowest = Some(lowest.map_or(bitrate, |current| current.min(bitrate)));
+    }
+    let Some(bitrate) = lowest else {
+        return 0.0;
+    };
+    2.0 * (PROTOCOL_MTU as f64 * 8.0 / (bitrate as f64).max(MINIMUM_BITRATE))
+        + DEFAULT_PER_HOP_TIMEOUT
 }
 
 async fn drop_all_via(state: &RpcState, via: &AddressHash) -> u64 {
@@ -708,7 +798,7 @@ async fn drop_all_via(state: &RpcState, via: &AddressHash) -> u64 {
         .collect();
     let mut dropped = 0u64;
     for destination in destinations {
-        if state.transport.drop_path(&destination).await {
+        if state.transport.expire_path(&destination).await {
             dropped += 1;
         }
     }
@@ -741,14 +831,66 @@ async fn ask_manage(state: &RpcState, op: ManageOp) -> Option<bool> {
     }
 }
 
-fn iface_label(name: &str, kind: &str) -> String {
-    if name.is_empty() { kind } else { name }.to_string()
+fn phy_value(value: Option<f64>) -> Value {
+    match value {
+        Some(value) => Value::from(value),
+        None => Value::Nil,
+    }
 }
 
-fn opt_bool(value: Option<bool>) -> Value {
-    match value {
-        Some(value) => Value::Boolean(value),
-        None => Value::Nil,
+/// Python `str(interface)` from the Rust kind, config name, and endpoint.
+fn python_interface_name(kind: &str, short_name: &str, endpoint: &str) -> String {
+    let short = if short_name.is_empty() {
+        kind
+    } else {
+        short_name
+    };
+    match kind {
+        "TcpServer" => format!("TCPServerInterface[{short}/{}]", host_port(endpoint)),
+        "TcpClient" => format!("TCPInterface[{short}/{}]", host_port(endpoint)),
+        "UdpInterface" => format!("UDPInterface[{short}/{}]", host_port(endpoint)),
+        "AutoInterface" => format!("AutoInterface[{short}]"),
+        "AutoPeer" => {
+            let body = short
+                .strip_prefix("AutoPeer[")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .unwrap_or(short);
+            format!("AutoInterfacePeer[{body}]")
+        }
+        "BackboneServer" | "BackboneClient" => {
+            format!("BackboneInterface[{short}/{}]", host_port(endpoint))
+        }
+        "LocalServer" => format!("Shared Instance[{}]", local_bracket(endpoint)),
+        "LocalClient" => {
+            let label = local_bracket(endpoint);
+            let label = if label.is_empty() {
+                short.to_string()
+            } else {
+                label
+            };
+            format!("LocalInterface[{label}]")
+        }
+        "I2pInterface" | "I2PInterface" => format!("I2PInterface[{short}]"),
+        other => format!("{other}[{short}]"),
+    }
+}
+
+fn host_port(endpoint: &str) -> String {
+    if let Some((host, port)) = endpoint.rsplit_once(':')
+        && host.contains(':')
+        && !host.starts_with('[')
+    {
+        return format!("[{host}]:{port}");
+    }
+    endpoint.to_string()
+}
+
+fn local_bracket(endpoint: &str) -> String {
+    let trimmed = endpoint.trim_start_matches('\0');
+    if let Some(port) = trimmed.strip_prefix("127.0.0.1:") {
+        port.to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -778,6 +920,29 @@ fn map_get<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
 fn required_hash(call: &Value, key: &str) -> Result<AddressHash, String> {
     hash_of(map_get(call, key).ok_or_else(|| format!("missing {key}"))?)
         .ok_or_else(|| format!("invalid {key}"))
+}
+
+fn required_packet_hash(call: &Value, key: &str) -> Result<Hash, String> {
+    packet_hash_of(map_get(call, key).ok_or_else(|| format!("missing {key}"))?)
+        .ok_or_else(|| format!("invalid {key}"))
+}
+
+fn packet_hash_of(value: &Value) -> Option<Hash> {
+    if let Some(bytes) = value.as_slice() {
+        let bytes: [u8; 32] = bytes.try_into().ok()?;
+        return Some(Hash::new(bytes));
+    }
+    let text = value.as_str()?;
+    let cleaned = text.trim().trim_matches(|ch| ch == '<' || ch == '>');
+    if cleaned.len() != 64 || !cleaned.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (slot, chunk) in bytes.iter_mut().zip(cleaned.as_bytes().as_chunks::<2>().0) {
+        let hex = std::str::from_utf8(chunk).ok()?;
+        *slot = u8::from_str_radix(hex, 16).ok()?;
+    }
+    Some(Hash::new(bytes))
 }
 
 fn hash_of(value: &Value) -> Option<AddressHash> {

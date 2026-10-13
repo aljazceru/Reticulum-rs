@@ -1011,6 +1011,8 @@ impl AutoInterface {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let cancel = context.cancel.clone();
+        let iface_stop = context.channel.stop.clone();
+        let exited = context.channel.exited.clone();
         let stats = context.channel.stats.clone();
 
         let config = context.inner.lock().unwrap().config.clone();
@@ -1028,15 +1030,21 @@ impl AutoInterface {
         // are separate interfaces.
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
+        let drain_stop = iface_stop.clone();
         let drain_task = tokio::spawn(async move {
             loop {
                 let mut tx_channel = tx_channel.lock().await;
-                match tx_channel.recv().await {
-                    Some(_) => {}
-                    None => break,
+                tokio::select! {
+                    _ = drain_stop.cancelled() => break,
+                    message = tx_channel.recv() => match message {
+                        Some(_) => {}
+                        None => break,
+                    },
                 }
             }
         });
+        let mut rx_tasks = Vec::new();
+        let mut beacon_tasks = Vec::new();
 
         let selected = select_interfaces(
             &platform_addresses(),
@@ -1051,6 +1059,7 @@ impl AutoInterface {
                 "auto: could not autoconfigure, no suitable interfaces with IPv6 link-local addresses"
             );
             drain_task.abort();
+            let _ = exited.send(true);
             return;
         }
 
@@ -1105,13 +1114,14 @@ impl AutoInterface {
                     }
                 };
 
-            spawn_rx_loop(
+            rx_tasks.push(spawn_rx_loop(
                 cancel.clone(),
+                iface_stop.clone(),
                 mcast_socket,
                 iface.name.clone(),
                 AutoLoopKind::Discovery,
                 event_tx.clone(),
-            );
+            ));
 
             // unicast discovery socket on discovery_port + 1
             // (Windows binds the unspecified address; see AutoInterface.py)
@@ -1127,13 +1137,14 @@ impl AutoInterface {
             };
             match udp6_bind(&unicast_bind, false, None) {
                 Ok(socket) => {
-                    spawn_rx_loop(
+                    rx_tasks.push(spawn_rx_loop(
                         cancel.clone(),
+                        iface_stop.clone(),
                         socket,
                         iface.name.clone(),
                         AutoLoopKind::Discovery,
                         event_tx.clone(),
-                    );
+                    ));
                 }
                 Err(err) => {
                     log::warn!(
@@ -1147,13 +1158,14 @@ impl AutoInterface {
             let data_bind = SocketAddrV6::new(iface.link_local, config.data_port, 0, iface.ifindex);
             match udp6_bind(&data_bind, false, None) {
                 Ok(socket) => {
-                    spawn_rx_loop(
+                    rx_tasks.push(spawn_rx_loop(
                         cancel.clone(),
+                        iface_stop.clone(),
                         socket,
                         iface.name.clone(),
                         AutoLoopKind::Data,
                         event_tx.clone(),
-                    );
+                    ));
                 }
                 Err(err) => {
                     log::warn!("auto: couldn't bind data socket on {}: {err}", iface.name);
@@ -1178,6 +1190,11 @@ impl AutoInterface {
         if beacon_sockets.is_empty() {
             log::warn!("auto: could not configure any interface");
             drain_task.abort();
+            for task in rx_tasks {
+                task.abort();
+                let _ = task.await;
+            }
+            let _ = exited.send(true);
             return;
         }
 
@@ -1186,6 +1203,7 @@ impl AutoInterface {
         // IPv6-only adapter.
         for (ifname, ifindex, socket) in &beacon_sockets {
             let cancel = cancel.clone();
+            let iface_stop = iface_stop.clone();
             let Some(link_local) = ifaces
                 .iter()
                 .find(|iface| iface.name == *ifname)
@@ -1198,17 +1216,18 @@ impl AutoInterface {
             let destination =
                 SocketAddrV6::new(discovery_address, config.discovery_port, 0, *ifindex);
 
-            tokio::spawn(async move {
+            beacon_tasks.push(tokio::spawn(async move {
                 loop {
                     let token = discovery_token(&group_id, &link_local);
                     let _ = socket.send_to(&token, destination).await;
 
                     tokio::select! {
                         _ = cancel.cancelled() => break,
+                        _ = iface_stop.cancelled() => break,
                         _ = tokio::time::sleep(ANNOUNCE_INTERVAL) => {}
                     }
                 }
-            });
+            }));
         }
 
         let reverse_peering_interval =
@@ -1228,6 +1247,7 @@ impl AutoInterface {
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = iface_stop.cancelled() => break,
 
                 event = event_rx.recv() => {
                     let Some(event) = event else { break };
@@ -1324,6 +1344,16 @@ impl AutoInterface {
         }
 
         drain_task.abort();
+        for task in beacon_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        for task in rx_tasks {
+            task.abort();
+            let _ = task.await;
+        }
+        drop(beacon_sockets);
+        let _ = exited.send(true);
     }
 
     async fn add_peer(
@@ -1355,6 +1385,7 @@ impl AutoInterface {
         }
         let address = peer_context.channel.address;
         manager.copy_spawned_control(&parent, &address);
+        manager.note_spawned(&parent, &address);
         manager.launch(peer_context, AutoPeer::spawn);
         drop(manager);
 
@@ -1397,17 +1428,19 @@ enum AutoLoopKind {
 
 fn spawn_rx_loop(
     cancel: tokio_util::sync::CancellationToken,
+    stop: tokio_util::sync::CancellationToken,
     socket: Arc<UdpSocket>,
     ifname: String,
     kind: AutoLoopKind,
     event_tx: mpsc::Sender<AutoEvent>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut buffer = vec![0u8; HW_MTU + 128];
 
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
+                _ = stop.cancelled() => break,
                 result = socket.recv_from(&mut buffer) => match result {
                     Ok((size, SocketAddr::V6(src))) => {
                         let event = match kind {
@@ -1434,7 +1467,7 @@ fn spawn_rx_loop(
                 }
             }
         }
-    });
+    })
 }
 
 /// Create a tokio UDP socket bound to `addr` (IPv6), optionally joining a

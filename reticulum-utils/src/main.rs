@@ -489,10 +489,9 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
             instance_name: "rnpath",
             enable_transport: false,
             udp_loopback: None,
-            require_shared_instance: false,
         },
     )
-    .await?;
+    .await;
 
     if args.table {
         let filter = match &args.destination {
@@ -566,13 +565,12 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
 async fn run_status(args: StatusArgs) -> Result<(), String> {
     init_logging(args.verbose as i32);
     let config_dir = reticulum_utils::common::resolve_config_dir(args.config.as_deref());
-    let transport = reticulum_utils::common::build_tool_transport(
+    let transport = reticulum_utils::common::build_tool_transport_requiring_shared(
         reticulum_utils::common::ToolTransportOptions {
             config_dir: &config_dir,
             instance_name: "rnstatus",
             enable_transport: false,
             udp_loopback: None,
-            require_shared_instance: true,
         },
     )
     .await?;

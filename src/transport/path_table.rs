@@ -41,6 +41,9 @@ pub struct PathEntry {
     /// Interface mode that learned this path. Access-point and roaming
     /// entries expire on shorter lifetimes than every other mode.
     pub mode: InterfaceMode,
+    /// Unix time the path expires, recorded when the entry is inserted.
+    /// Refreshing `timestamp` on traffic does not move it.
+    pub expires_unix: f64,
     /// Announce random blobs, oldest first. The emission timebase is the
     /// maximum of `timebase_from_random_blob` over these (Python
     /// `IDX_PT_RANDBLOBS` / `timebase_from_random_blobs`).
@@ -71,12 +74,25 @@ pub fn timebase_from_random_blobs(random_blobs: &[[u8; RANDOM_BLOB_LEN]]) -> u64
         .unwrap_or(0)
 }
 
-fn path_lifetime(mode: InterfaceMode) -> core::time::Duration {
+pub(super) fn path_lifetime(mode: InterfaceMode) -> core::time::Duration {
     match mode {
         InterfaceMode::AccessPoint => AP_PATH_TIME,
         InterfaceMode::Roaming => ROAMING_PATH_TIME,
         _ => PATHFINDER_E,
     }
+}
+
+/// Absolute expiry for a path inserted now (Python writes `IDX_PT_EXPIRES`
+/// once, from the mode lifetime, and leaves it alone afterwards).
+pub(super) fn path_expires_unix(mode: InterfaceMode) -> f64 {
+    unix_secs() + path_lifetime(mode).as_secs_f64()
+}
+
+fn unix_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 pub(super) fn monotonic_ns(now: core::time::Duration) -> i64 {
@@ -257,6 +273,7 @@ impl PathTable {
                 unresponsive: false,
                 packet_hash,
                 mode: InterfaceMode::Full,
+                expires_unix: path_expires_unix(InterfaceMode::Full),
                 random_blobs: Vec::new(),
                 gravity: None,
             },
@@ -310,6 +327,7 @@ impl PathTable {
             unresponsive: false,
             packet_hash: announce.hash(),
             mode,
+            expires_unix: path_expires_unix(mode),
             random_blobs,
             gravity,
         };

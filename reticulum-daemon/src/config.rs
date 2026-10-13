@@ -92,6 +92,10 @@ pub struct ReticulumConfig {
     /// Invalid hex falls back to the SHA-256 of the persisted identity bytes.
     #[serde(default)]
     pub rpc_key: Option<String>,
+    /// When false, attach, detach, and reload return false
+    /// (Python `enable_interface_management`, default true).
+    #[serde(default = "default_true")]
+    pub enable_interface_management: bool,
     #[serde(default)]
     pub panic_on_interface_error: bool,
     #[serde(default)]
@@ -842,6 +846,7 @@ impl Default for ReticulumConfig {
             shared_instance_type: default_shared_instance_type(),
             instance_control_port: 37429,
             rpc_key: None,
+            enable_interface_management: true,
             panic_on_interface_error: false,
             instance_name: None,
             use_implicit_proof: true,
@@ -1130,8 +1135,7 @@ pub const KNOWN_RETICULUM_KEYS: &[&str] = &[
 /// `storagepath`, `require_if_time_sync` and
 /// `enable_stranded_announce_rebroadcast` are absent: Python
 /// `__apply_config` does not read them either.
-pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] =
-    &["enable_interface_management", "panic_on_interface_error"];
+pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] = &["panic_on_interface_error"];
 
 /// Keys of the `[logging]` section the daemon understands.
 pub const KNOWN_LOGGING_KEYS: &[&str] = &["loglevel", "logdest", "logfile", "logtimestamps"];

@@ -156,7 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     // Hash the persisted key before an ephemeral transport identity replaces it.
     let rpc_authkey =
-        reticulum_utils::rpc::authkey(config.reticulum.rpc_key.as_deref(), &persisted);
+        reticulum_utils::rpc::authkey(config.reticulum.rpc_key.as_deref(), Some(&persisted));
     // Python replaces the running transport identity with a fresh one when
     // transport is off and `static_transport_identity` is not set. The file
     // above stays the persisted identity either way.
@@ -467,13 +467,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (manage_tx, mut manage_rx) =
             tokio::sync::mpsc::channel::<reticulum_daemon::rpc::ManageRequest>(8);
         let manage_transport = std::sync::Arc::clone(&transport);
-        let manage_config = std::sync::Arc::clone(&config);
+        let manage_config_dir = config_path.clone();
         tokio::spawn(async move {
             let mut attached_i2p = Vec::new();
             while let Some(request) = manage_rx.recv().await {
                 let result = apply_manage(
                     &manage_transport,
-                    &manage_config,
+                    &manage_config_dir,
                     request.op,
                     &mut attached_i2p,
                 )
@@ -526,14 +526,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn apply_manage(
     transport: &std::sync::Arc<reticulum::transport::Transport>,
-    config: &Config,
+    config_dir: &std::path::Path,
     op: reticulum_daemon::rpc::ManageOp,
     live_i2p_reachable: &mut Vec<(String, std::sync::Arc<std::sync::RwLock<Option<String>>>)>,
 ) -> Option<bool> {
+    let config = match Config::from_file(config_dir) {
+        Ok(config) => config,
+        Err(err) => {
+            log::error!("Could not read configuration for interface management: {err}");
+            return None;
+        }
+    };
+    if !config.reticulum.enable_interface_management {
+        return Some(false);
+    }
     match op {
         reticulum_daemon::rpc::ManageOp::Detach(name) => detach_named(transport, &name).await,
         reticulum_daemon::rpc::ManageOp::Attach(name) => {
-            attach_named(transport, config, &name, live_i2p_reachable).await
+            attach_named(transport, &config, &name, live_i2p_reachable).await
         }
         reticulum_daemon::rpc::ManageOp::Reload(name) => {
             if !interface_present(transport, &name).await {
@@ -542,7 +552,7 @@ async fn apply_manage(
             if detach_named(transport, &name).await != Some(true) {
                 return Some(false);
             }
-            if attach_named(transport, config, &name, live_i2p_reachable).await == Some(true) {
+            if attach_named(transport, &config, &name, live_i2p_reachable).await == Some(true) {
                 Some(true)
             } else {
                 Some(false)
@@ -574,7 +584,20 @@ async fn detach_named(
     if stat.kind == "LocalClient" || stat.kind == "LocalServer" || stat.kind.starts_with("I2p") {
         return Some(false);
     }
-    manager.stop_iface(&stat.address);
+    let kind = stat.kind.clone();
+    let waiter = manager.stop_iface(&stat.address);
+    drop(manager);
+    if matches!(
+        kind.as_str(),
+        "TcpServer" | "BackboneServer" | "AutoInterface"
+    ) && let Some(mut waiter) = waiter
+    {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            waiter.wait_for(|done| *done),
+        )
+        .await;
+    }
     Some(true)
 }
 

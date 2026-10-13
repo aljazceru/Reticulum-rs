@@ -340,6 +340,8 @@ pub struct InterfaceChannel {
     pub rx_channel: InterfaceRxSender,
     pub tx_channel: InterfaceTxReceiver,
     pub stop: CancellationToken,
+    /// Set after this worker has dropped its listener sockets.
+    pub exited: tokio::sync::watch::Sender<bool>,
     pub stats: Arc<InterfaceCounters>,
     /// Interface access code configuration for this interface
     /// (Python `interface.ifac_identity`); packets are wrapped/unwrapped
@@ -365,11 +367,13 @@ impl InterfaceChannel {
         address: AddressHash,
         stop: CancellationToken,
     ) -> Self {
+        let (exited, _) = tokio::sync::watch::channel(false);
         Self {
             address,
             rx_channel,
             tx_channel,
             stop,
+            exited,
             stats: Arc::new(InterfaceCounters::default()),
             ifac: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -419,8 +423,12 @@ struct LocalInterface {
     /// `name` so a later config-name change does not drop it. Empty when
     /// the interface recorded neither.
     endpoint: String,
+    /// Parent listener that spawned this interface, when there is one.
+    parent: Option<AddressHash>,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
+    /// Becomes true after the worker drops its listener.
+    exited: tokio::sync::watch::Receiver<bool>,
     stats: Arc<InterfaceCounters>,
     ifac: IfacSlot,
 }
@@ -511,6 +519,7 @@ impl InterfaceManager {
         let stop = CancellationToken::new();
         let stats = Arc::new(InterfaceCounters::default());
         stats.set_online(false);
+        let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
 
         let ifac: IfacSlot = Arc::new(std::sync::RwLock::new(None));
 
@@ -519,8 +528,10 @@ impl InterfaceManager {
             name: name.to_string(),
             kind: kind.to_string(),
             endpoint: String::new(),
+            parent: None,
             tx_send,
             stop: stop.clone(),
+            exited: exited_rx,
             stats: stats.clone(),
             ifac: ifac.clone(),
         });
@@ -535,6 +546,7 @@ impl InterfaceManager {
             tx_channel: tx_recv,
             address,
             stop,
+            exited: exited_tx,
             stats,
             ifac,
         }
@@ -584,19 +596,70 @@ impl InterfaceManager {
         }
     }
 
-    /// Stop a single interface by address. The interface worker observes the
-    /// stop token of its channel and terminates; the entry is removed from
-    /// the manager once it has been cleaned up.
-    pub fn stop_iface(&mut self, address: &AddressHash) {
-        if let Some(index) = self.ifaces.iter().position(|i| &i.address == address) {
-            let iface = self.ifaces.remove(index);
-            iface.stats.set_online(false);
-            iface.stop.cancel();
-            self.controls
-                .lock()
-                .expect("iface control lock")
-                .remove(address);
+    /// Record that `child` was spawned by `parent` so detach can stop both.
+    pub fn note_spawned(&mut self, parent: &AddressHash, child: &AddressHash) {
+        if let Some(iface) = self.ifaces.iter_mut().find(|iface| &iface.address == child) {
+            iface.parent = Some(*parent);
         }
+    }
+
+    /// Bind or peer string recorded for `address`. Empty when none was stored.
+    pub fn iface_endpoint(&self, address: &AddressHash) -> String {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address)
+            .map(|iface| iface.endpoint.clone())
+            .unwrap_or_default()
+    }
+
+    /// Connected clients of a `LocalServer`, or `None` for every other kind.
+    pub fn local_server_clients(&self, address: &AddressHash) -> Option<u64> {
+        let kind = self
+            .ifaces
+            .iter()
+            .find(|iface| iface.address == *address)?
+            .kind
+            .as_str();
+        if kind != "LocalServer" {
+            return None;
+        }
+        let count = self
+            .ifaces
+            .iter()
+            .filter(|iface| iface.parent == Some(*address) && !iface.stop.is_cancelled())
+            .count();
+        Some(count as u64)
+    }
+
+    /// Stop a single interface by address, and any peers it spawned.
+    ///
+    /// The returned watch becomes true after a parent worker drops its
+    /// listener. Callers that ignore it still cancel the worker.
+    pub fn stop_iface(
+        &mut self,
+        address: &AddressHash,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let children: Vec<AddressHash> = self
+            .ifaces
+            .iter()
+            .filter(|iface| iface.parent == Some(*address))
+            .map(|iface| iface.address)
+            .collect();
+        for child in children {
+            let _ = self.stop_iface(&child);
+        }
+        let index = self
+            .ifaces
+            .iter()
+            .position(|iface| &iface.address == address)?;
+        let iface = self.ifaces.remove(index);
+        iface.stats.set_online(false);
+        iface.stop.cancel();
+        self.controls
+            .lock()
+            .expect("iface control lock")
+            .remove(address);
+        Some(iface.exited)
     }
 
     /// Run `f` with the control state of one interface

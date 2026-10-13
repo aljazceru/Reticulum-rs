@@ -53,6 +53,8 @@ impl TcpServer {
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let options = { context.inner.lock().unwrap().options.clone() };
         let stats = context.channel.stats.clone();
+        let iface_stop = context.channel.stop.clone();
+        let exited = context.channel.exited.clone();
 
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let server_ifac = context.channel.ifac.clone();
@@ -62,7 +64,7 @@ impl TcpServer {
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
 
         loop {
-            if context.cancel.is_cancelled() {
+            if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 stats.set_online(false);
                 break;
             }
@@ -71,8 +73,11 @@ impl TcpServer {
                 Some(target) => target,
                 None => {
                     log::warn!("tcp_server: couldn't resolve bind address for <{}>", addr);
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    continue;
+                    tokio::select! {
+                        _ = iface_stop.cancelled() => break,
+                        _ = context.cancel.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue,
+                    }
                 }
             };
             let listener = match &bind_target {
@@ -83,8 +88,11 @@ impl TcpServer {
 
             if listener.is_err() {
                 log::warn!("tcp_server: couldn't bind to <{}>", addr);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                continue;
+                tokio::select! {
+                    _ = iface_stop.cancelled() => break,
+                    _ = context.cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => continue,
+                }
             }
 
             log::info!("tcp_server: listen on <{}>", addr);
@@ -94,11 +102,12 @@ impl TcpServer {
 
             let tx_task = {
                 let cancel = context.cancel.clone();
+                let iface_stop = iface_stop.clone();
                 let tx_channel = tx_channel.clone();
 
                 tokio::spawn(async move {
                     loop {
-                        if cancel.is_cancelled() {
+                        if cancel.is_cancelled() || iface_stop.is_cancelled() {
                             break;
                         }
 
@@ -106,6 +115,9 @@ impl TcpServer {
 
                         tokio::select! {
                             _ = cancel.cancelled() => {
+                                break;
+                            }
+                            _ = iface_stop.cancelled() => {
                                 break;
                             }
                             // Skip all tx messages
@@ -118,12 +130,15 @@ impl TcpServer {
             let cancel = context.cancel.clone();
 
             loop {
-                if cancel.is_cancelled() {
+                if cancel.is_cancelled() || iface_stop.is_cancelled() {
                     break;
                 }
 
                 tokio::select! {
                     _ = cancel.cancelled() => {
+                        break;
+                    }
+                    _ = iface_stop.cancelled() => {
                         break;
                     }
 
@@ -165,15 +180,21 @@ impl TcpServer {
                             };
                             let address = peer_context.channel.address;
                             iface_manager.copy_spawned_control(&parent, &address);
+                            iface_manager.note_spawned(&parent, &address);
                             iface_manager.launch(peer_context, TcpClient::spawn);
                         }
                     }
                 }
             }
 
+            drop(listener);
             stats.set_online(false);
             let _ = tokio::join!(tx_task);
+            if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
+                break;
+            }
         }
+        let _ = exited.send(true);
     }
 }
 

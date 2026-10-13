@@ -16,7 +16,6 @@ use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::tcp_server::TcpServer;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport, TransportConfig};
-use sha2::Digest;
 
 /// Format a hash like Python `RNS.prettyhexrep`: `<aabbcc...>`.
 pub fn prettyhexrep(bytes: &[u8]) -> String {
@@ -187,9 +186,6 @@ pub struct ToolTransportOptions<'a> {
     /// `forward_port`. Used when the config directory has no usable
     /// interfaces (e.g. ad-hoc `rn cp` runs between two machines).
     pub udp_loopback: Option<(u16, u16)>,
-    /// Fail instead of opening a direct transport when no shared instance
-    /// can be reached.
-    pub require_shared_instance: bool,
 }
 
 /// A parsed `[[interfaces]]` entry from the config file.
@@ -342,16 +338,35 @@ fn read_config_file(config_dir: &Path) -> Option<String> {
 ///
 /// A reachable shared instance is attached and configured interfaces are
 /// left down. Otherwise the interfaces from `config_dir` (or
-/// `udp_loopback`) are opened. `require_shared_instance` is an error when
-/// that attach cannot happen.
-pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Result<Transport, String> {
+/// `udp_loopback`) are opened. If the probe succeeds but the local client
+/// never comes online, configured interfaces are opened instead.
+pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Transport {
+    match build_tool_transport_inner(options, false).await {
+        Ok(transport) => transport,
+        Err(_) => unreachable!("shared instance was not required"),
+    }
+}
+
+/// [`build_tool_transport`], returning an error when no shared instance is
+/// reachable. A probe that succeeds but whose client never comes online
+/// still falls back to configured interfaces.
+pub async fn build_tool_transport_requiring_shared(
+    options: ToolTransportOptions<'_>,
+) -> Result<Transport, String> {
+    build_tool_transport_inner(options, true).await
+}
+
+async fn build_tool_transport_inner(
+    options: ToolTransportOptions<'_>,
+    require_shared_instance: bool,
+) -> Result<Transport, String> {
     let settings = shared_settings(options.config_dir);
     let reachable = if settings.share {
         shared_instance_reachable(&settings).await
     } else {
         false
     };
-    if options.require_shared_instance && !reachable {
+    if require_shared_instance && !reachable {
         return Err(
             "No shared instance available, but application that started Reticulum required it"
                 .to_string(),
@@ -359,6 +374,7 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Result<T
     }
 
     let identity = PrivateIdentity::new_from_rand(OsRng);
+    let mut attached_shared = false;
     let transport = TransportConfig::new(options.instance_name, &identity)
         .set_retransmit(options.enable_transport && !reachable)
         .build();
@@ -382,11 +398,15 @@ pub async fn build_tool_transport(options: ToolTransportOptions<'_>) -> Result<T
                 .await
                 .connected_to_shared_instance()
             {
+                attached_shared = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        return Ok(transport);
+        if attached_shared {
+            return Ok(transport);
+        }
+        transport.iface_manager().lock().await.stop_iface(&attached);
     }
 
     let interfaces = read_configured_interfaces(options.config_dir);
@@ -559,35 +579,12 @@ fn shared_settings(config_dir: &Path) -> SharedSettings {
 }
 
 fn tool_authkey(config_dir: &Path, configured: Option<&str>) -> Vec<u8> {
-    if let Some(identity) = load_private_identity(&config_dir.join("identity"))
+    let identity = load_private_identity(&config_dir.join("identity"))
         .ok()
         .or_else(|| {
             load_private_identity(&config_dir.join("storage").join("transport_identity")).ok()
-        })
-    {
-        return crate::rpc::authkey(configured, &identity);
-    }
-    if let Some(text) = configured {
-        if let Some(key) = decode_configured_key(text) {
-            return key;
-        }
-        log::error!("Invalid shared instance RPC key specified, falling back to default key");
-    }
-    sha2::Sha256::digest([]).to_vec()
-}
-
-fn decode_configured_key(text: &str) -> Option<Vec<u8>> {
-    let compact: String = text.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-    if !compact.len().is_multiple_of(2) || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(compact.len() / 2);
-    let bytes = compact.as_bytes();
-    for index in (0..bytes.len()).step_by(2) {
-        let hex = std::str::from_utf8(&bytes[index..index + 2]).ok()?;
-        out.push(u8::from_str_radix(hex, 16).ok()?);
-    }
-    Some(out)
+        });
+    crate::rpc::authkey(configured, identity.as_ref())
 }
 
 fn shared_data_address(settings: &SharedSettings) -> SharedInstanceAddress {
@@ -668,12 +665,11 @@ mod tests {
                 "[reticulum]\nshare_instance = true\nshared_instance_type = \"tcp\"\nshared_instance_port = {port}\n"
             ),
         );
-        let err = build_tool_transport(ToolTransportOptions {
+        let err = build_tool_transport_requiring_shared(ToolTransportOptions {
             config_dir: &dir,
             instance_name: "require-test",
             enable_transport: false,
             udp_loopback: Some((9, 9)),
-            require_shared_instance: true,
         })
         .await;
         let Err(err) = err else {
@@ -685,12 +681,11 @@ mod tests {
             &dir,
             "[reticulum]\nshare_instance = false\nshared_instance_type = \"tcp\"\n",
         );
-        let err = build_tool_transport(ToolTransportOptions {
+        let err = build_tool_transport_requiring_shared(ToolTransportOptions {
             config_dir: &dir,
             instance_name: "require-test",
             enable_transport: false,
             udp_loopback: None,
-            require_shared_instance: true,
         })
         .await;
         let Err(err) = err else {
@@ -741,10 +736,8 @@ mod tests {
             instance_name: "attach-test",
             enable_transport: false,
             udp_loopback: Some((9, 9)),
-            require_shared_instance: false,
         })
-        .await
-        .expect("attach");
+        .await;
         let stats = transport.iface_manager().lock().await.stats();
         assert!(stats
             .iter()

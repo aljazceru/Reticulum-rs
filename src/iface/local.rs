@@ -239,6 +239,7 @@ fn parse_auth_frame(frame: &[u8]) -> Option<(String, Vec<u8>)> {
 /// of the daemon transport.
 pub struct LocalServer {
     address: SharedInstanceAddress,
+    endpoint: String,
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     access: SharedInstanceAccessConfig,
 }
@@ -261,8 +262,10 @@ impl LocalServer {
         iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
         access: SharedInstanceAccessConfig,
     ) -> Self {
+        let endpoint = address.describe();
         Self {
             address,
+            endpoint,
             iface_manager,
             access,
         }
@@ -450,6 +453,7 @@ impl LocalServer {
                             // Parent control, including a forced shared-instance
                             // bitrate, is copied before the client worker runs.
                             iface_manager.copy_spawned_control(&parent, &address);
+                            iface_manager.note_spawned(&parent, &address);
                             // Surface the client's declared (or peer) name
                             // in interface statistics.
                             iface_manager.set_iface_name(&address, &name);
@@ -472,6 +476,10 @@ impl LocalServer {
 impl Interface for LocalServer {
     fn mtu() -> usize {
         HW_MTU
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 }
 
@@ -526,6 +534,7 @@ impl StreamType {
 pub struct LocalClient {
     name: String,
     address: Option<SharedInstanceAddress>,
+    endpoint: String,
     stream: Option<StreamType>,
     /// Access token presented to servers that require authentication.
     auth_token: Option<Vec<u8>>,
@@ -534,9 +543,11 @@ pub struct LocalClient {
 impl LocalClient {
     /// Create a client that connects to a shared instance at `address`.
     pub fn new(name: impl Into<String>, address: SharedInstanceAddress) -> Self {
+        let endpoint = address.describe();
         Self {
             name: name.into(),
             address: Some(address),
+            endpoint,
             stream: None,
             auth_token: None,
         }
@@ -551,9 +562,11 @@ impl LocalClient {
         address: SharedInstanceAddress,
         token: Vec<u8>,
     ) -> Self {
+        let endpoint = address.describe();
         Self {
             name: name.into(),
             address: Some(address),
+            endpoint,
             stream: None,
             auth_token: Some(token),
         }
@@ -575,6 +588,7 @@ impl LocalClient {
         Self {
             name: name.into(),
             address: None,
+            endpoint: String::new(),
             stream: Some(stream),
             auth_token: None,
         }
@@ -862,6 +876,10 @@ impl LocalClient {
 impl Interface for LocalClient {
     fn mtu() -> usize {
         HW_MTU
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 }
 

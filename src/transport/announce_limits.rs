@@ -1,9 +1,16 @@
 use alloc::collections::BTreeMap;
+use std::collections::VecDeque;
 
 use tokio::time::Duration;
 use tokio::time::Instant;
 
 use crate::hash::AddressHash;
+
+/// Python `Transport.MAX_RATE_TIMESTAMPS`.
+const MAX_RATE_TIMESTAMPS: usize = 16;
+
+/// One rate-table row: destination, violations, block remaining, age, timestamps.
+type RateSnapshot = (AddressHash, u32, Option<Duration>, Duration, Vec<f64>);
 
 pub struct AnnounceRateLimit {
     pub target: Duration,
@@ -26,15 +33,34 @@ struct AnnounceLimitEntry {
     violations: u32,
     last_announce: Instant,
     blocked_until: Instant,
+    /// Announce unix times, oldest first, capped at [`MAX_RATE_TIMESTAMPS`].
+    timestamps: VecDeque<f64>,
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 impl AnnounceLimitEntry {
     pub fn new(rate_limit: Option<AnnounceRateLimit>) -> Self {
+        let mut timestamps = VecDeque::new();
+        timestamps.push_back(unix_now());
         Self {
             rate_limit,
             violations: 0,
             last_announce: Instant::now(),
             blocked_until: Instant::now(),
+            timestamps,
+        }
+    }
+
+    fn record_announce_time(&mut self) {
+        self.timestamps.push_back(unix_now());
+        while self.timestamps.len() > MAX_RATE_TIMESTAMPS {
+            self.timestamps.pop_front();
         }
     }
 
@@ -65,6 +91,7 @@ impl AnnounceLimitEntry {
         }
 
         self.last_announce = now;
+        self.record_announce_time();
 
         if is_blocked {
             Some(self.blocked_until - now)
@@ -120,9 +147,10 @@ impl AnnounceLimits {
         None
     }
 
-    /// `(destination, violations, blocked_for, since_last)`.
+    /// `(destination, violations, blocked_for, since_last, timestamps)`.
     /// `blocked_for` is set only while the destination is still blocked.
-    pub(super) fn snapshot(&self) -> Vec<(AddressHash, u32, Option<Duration>, Duration)> {
+    /// `timestamps` is the announce window, oldest first, at most 16.
+    pub(super) fn snapshot(&self) -> Vec<RateSnapshot> {
         let now = Instant::now();
         self.limits
             .iter()
@@ -130,7 +158,13 @@ impl AnnounceLimits {
                 let blocked_for = (now < entry.blocked_until)
                     .then(|| entry.blocked_until.saturating_duration_since(now));
                 let since_last = now.saturating_duration_since(entry.last_announce);
-                (*destination, entry.violations, blocked_for, since_last)
+                (
+                    *destination,
+                    entry.violations,
+                    blocked_for,
+                    since_last,
+                    entry.timestamps.iter().copied().collect(),
+                )
             })
             .collect()
     }

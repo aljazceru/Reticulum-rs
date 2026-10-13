@@ -54,6 +54,8 @@ pub struct StatusReport {
     pub paths: Vec<crate::rnpath::PathResult>,
     pub link_counts: reticulum::transport::LinkCounts,
     pub transport_enabled: bool,
+    /// Shared-instance active link count. `None` for a local report.
+    pub active_links: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -136,7 +138,7 @@ impl StatusReport {
                 " Transport Instance {} running\n",
                 self.identity_hash
             ));
-        } else {
+        } else if self.active_links.is_none() {
             out.push_str(&format!(
                 " Standalone instance {} (transport mode disabled)\n",
                 self.identity_hash
@@ -145,10 +147,17 @@ impl StatusReport {
 
         let counts = &self.link_counts;
         let plural = if counts.link_table == 1 { "y" } else { "ies" };
-        out.push_str(&format!(
-            " {} entr{} in link table ({} inbound / {} outbound active links)\n",
-            counts.link_table, plural, counts.inbound, counts.outbound
-        ));
+        if let Some(active) = self.active_links {
+            out.push_str(&format!(
+                " {} entr{} in link table ({} active)\n",
+                counts.link_table, plural, active
+            ));
+        } else {
+            out.push_str(&format!(
+                " {} entr{} in link table ({} inbound / {} outbound active links)\n",
+                counts.link_table, plural, counts.inbound, counts.outbound
+            ));
+        }
 
         out.push('\n');
         out.push_str(&format!(" Path table ({} entries):\n", self.paths.len()));
@@ -229,6 +238,7 @@ pub async fn collect(transport: &Transport, transport_enabled: bool) -> StatusRe
         paths: crate::rnpath::path_table(transport, None, None).await,
         link_counts: transport.link_counts().await,
         transport_enabled,
+        active_links: None,
     }
 }
 
@@ -236,7 +246,7 @@ pub async fn collect(transport: &Transport, transport_enabled: bool) -> StatusRe
 /// instance use this instead of the local transport snapshot.
 pub async fn collect_shared(
     config_dir: &std::path::Path,
-    transport: &Transport,
+    _transport: &Transport,
 ) -> Result<StatusReport, String> {
     let stats = crate::common::shared_rpc(config_dir, get_request("interface_stats", None)).await?;
     let paths = crate::common::shared_rpc(
@@ -258,11 +268,11 @@ pub async fn collect_shared(
     let transport_id = map_field(&stats, "transport_id").and_then(|value| value.as_slice());
     let identity_hash = match transport_id {
         Some(bytes) => crate::common::prettyhexrep(bytes),
-        None => crate::common::prettyhexrep(transport.identity_hash().await.as_slice()),
+        None => String::new(),
     };
 
     Ok(StatusReport {
-        instance_name: transport.instance_name().await,
+        instance_name: String::new(),
         identity_hash,
         queue_pressure: (
             field_usize(&stats, "rxqt"),
@@ -283,10 +293,11 @@ pub async fn collect_shared(
         paths: crate::rnpath::paths_from_rpc(&paths)?,
         link_counts: reticulum::transport::LinkCounts {
             link_table: value_usize(&link_count),
-            inbound: value_usize(&active),
+            inbound: 0,
             outbound: 0,
         },
         transport_enabled: transport_id.is_some(),
+        active_links: Some(value_usize(&active)),
     })
 }
 
@@ -410,6 +421,7 @@ mod tests {
             paths: vec![],
             link_counts: Default::default(),
             transport_enabled: true,
+            active_links: None,
             queue_pressure: (0, [0; 4], [0; 4]),
         };
         let text = report.render();

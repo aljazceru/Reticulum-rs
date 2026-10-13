@@ -19,8 +19,9 @@
 //!
 //! All tools take `--config <dir>` like the Python versions (default
 //! `~/.reticulum`). When a shared instance is reachable they attach to it;
-//! otherwise they keep a direct transport. `require_shared_instance` fails
-//! when that attach cannot happen.
+//! otherwise they keep a direct transport.
+//! [`common::build_tool_transport_requiring_shared`] fails when that attach
+//! cannot happen.
 //!
 //! [`rpc`] speaks the shared-instance control channel: Python's
 //! `multiprocessing.connection` authkey handshake, then one length-prefixed

@@ -771,13 +771,15 @@ impl BackboneServer {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let stats = context.channel.stats.clone();
+        let iface_stop = context.channel.stop.clone();
+        let exited = context.channel.exited.clone();
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let fast_flap = { context.inner.lock().unwrap().fast_flap.clone() };
         let parent = context.channel.address;
 
         loop {
-            if context.cancel.is_cancelled() {
+            if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 stats.set_online(false);
                 break;
             }
@@ -786,8 +788,11 @@ impl BackboneServer {
                 Ok(listener) => listener,
                 Err(_) => {
                     log::warn!("backbone_server: couldn't bind to <{addr}>");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
+                    tokio::select! {
+                        _ = iface_stop.cancelled() => break,
+                        _ = context.cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    }
                 }
             };
 
@@ -796,14 +801,16 @@ impl BackboneServer {
 
             // Periodic fast-flap block expiry
             // (Python server job `blocked_ip_list` maintenance).
-            {
+            let flap_task = {
                 let fast_flap = fast_flap.clone();
                 let cancel = context.cancel.clone();
+                let iface_stop = iface_stop.clone();
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(Duration::from_secs(60));
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
+                            _ = iface_stop.cancelled() => break,
                             _ = tick.tick() => {
                                 let removed = fast_flap
                                     .lock()
@@ -815,16 +822,17 @@ impl BackboneServer {
                             }
                         }
                     }
-                });
-            }
+                })
+            };
 
             loop {
-                if context.cancel.is_cancelled() {
+                if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                     break;
                 }
 
                 let accepted = tokio::select! {
                     _ = context.cancel.cancelled() => break,
+                    _ = iface_stop.cancelled() => break,
                     accepted = listener.accept() => accepted,
                 };
 
@@ -874,11 +882,19 @@ impl BackboneServer {
                 }
                 let address = peer_context.channel.address;
                 manager.copy_spawned_control(&parent, &address);
+                manager.note_spawned(&parent, &address);
                 manager.launch(peer_context, BackboneClient::spawn);
             }
 
+            drop(listener);
+            flap_task.abort();
+            let _ = flap_task.await;
             stats.set_online(false);
+            if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
+                break;
+            }
         }
+        let _ = exited.send(true);
     }
 }
 
@@ -889,6 +905,10 @@ impl Interface for BackboneServer {
 
     fn constructor_bitrate(&self) -> Option<u64> {
         Some(BITRATE_GUESS)
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.addr
     }
 }
 

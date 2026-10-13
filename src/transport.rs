@@ -293,6 +293,52 @@ const REVERSE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
 const MAX_RECEIPTS: usize = 1024;
 /// Python `Packet.TIMEOUT_PER_HOP` / `DEFAULT_PER_HOP_TIMEOUT`.
 const TIMEOUT_PER_HOP: Duration = Duration::from_secs(6);
+/// Python `Transport.LOCAL_CLIENT_CACHE_MAXSIZE`.
+const PHY_CACHE_MAX: usize = 512;
+
+/// Per-packet radio stats for the local-client RPC cache.
+struct PhyCache {
+    rssi: std::collections::VecDeque<(Hash, f64)>,
+    snr: std::collections::VecDeque<(Hash, f64)>,
+    q: std::collections::VecDeque<(Hash, f64)>,
+}
+
+impl PhyCache {
+    fn new() -> Self {
+        Self {
+            rssi: std::collections::VecDeque::new(),
+            snr: std::collections::VecDeque::new(),
+            q: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, hash: Hash, rssi: Option<i16>, snr: Option<f32>, quality: Option<f32>) {
+        if let Some(rssi) = rssi {
+            push_phy(&mut self.rssi, hash, f64::from(rssi));
+        }
+        if let Some(snr) = snr {
+            push_phy(&mut self.snr, hash, f64::from(snr));
+        }
+        if let Some(quality) = quality {
+            push_phy(&mut self.q, hash, f64::from(quality));
+        }
+    }
+
+    fn lookup(cache: &std::collections::VecDeque<(Hash, f64)>, hash: &Hash) -> Option<f64> {
+        cache
+            .iter()
+            .rev()
+            .find(|(key, _)| key == hash)
+            .map(|(_, value)| *value)
+    }
+}
+
+fn push_phy(cache: &mut std::collections::VecDeque<(Hash, f64)>, hash: Hash, value: f64) {
+    cache.push_back((hash, value));
+    while cache.len() > PHY_CACHE_MAX {
+        cache.pop_front();
+    }
+}
 
 pub(crate) struct TransportHandler {
     config: TransportConfig,
@@ -311,6 +357,7 @@ pub(crate) struct TransportHandler {
     group_in_destinations: HashMap<AddressHash, Arc<Mutex<GroupInputDestination>>>,
 
     announce_limits: AnnounceLimits,
+    phy: PhyCache,
 
     out_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
@@ -587,6 +634,7 @@ impl Transport {
             plain_in_destinations: HashMap::new(),
             group_in_destinations: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
+            phy: PhyCache::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
             in_link_ifaces: HashMap::new(),
@@ -853,6 +901,16 @@ impl Transport {
     /// Forget the path to a destination (Python `Transport.drop_path`).
     pub async fn drop_path(&self, destination: &AddressHash) -> bool {
         self.handler.lock().await.path_table.drop_path(destination)
+    }
+
+    /// Backdate a path so the next cull removes it
+    /// (Python `Transport.expire_path`). The row stays until that cull.
+    pub async fn expire_path(&self, destination: &AddressHash) -> bool {
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .expire_path(destination)
     }
 
     /// Forget all paths learned over an interface (Python `drop_all_via`).
@@ -5572,6 +5630,13 @@ async fn restore_persisted_path(
     let age_ns = (age_secs as u128)
         .saturating_mul(1_000_000_000)
         .min(i64::MAX as u128) as i64;
+    let mode = InterfaceMode::from_u8(path.mode).unwrap_or(InterfaceMode::Full);
+    let lifetime = path_table::path_lifetime(mode).as_secs_f64();
+    let expires_unix = if path.stored_unix == 0 {
+        unix_now as f64 + lifetime
+    } else {
+        path.stored_unix as f64 + lifetime
+    };
     handler.path_table.restore(
         path.destination,
         path_table::PathEntry {
@@ -5581,7 +5646,8 @@ async fn restore_persisted_path(
             timestamp: now_ns.saturating_sub(age_ns),
             unresponsive: path.unresponsive,
             packet_hash: path.packet_hash,
-            mode: InterfaceMode::from_u8(path.mode).unwrap_or(InterfaceMode::Full),
+            mode,
+            expires_unix,
             random_blobs: path.blobs.clone(),
             gravity: path.gravity,
         },
@@ -5804,6 +5870,23 @@ async fn manage_transport(
 
                         if PACKET_TRACE {
                             log::debug!("tp: << rx({}) = {} {}", message.address, packet, packet.hash());
+                        }
+
+                        {
+                            let manager = handler.iface_manager.lock().await;
+                            if let Some(stat) = manager
+                                .stats()
+                                .into_iter()
+                                .find(|stat| stat.address == message.address)
+                            {
+                                let rssi = stat.rssi;
+                                let snr = stat.snr;
+                                let quality = stat.quality;
+                                drop(manager);
+                                if rssi.is_some() || snr.is_some() || quality.is_some() {
+                                    handler.phy.record(packet.hash(), rssi, snr, quality);
+                                }
+                            }
                         }
 
                         // Early packet filter with protocol-violation
@@ -6705,7 +6788,7 @@ pub struct TunnelTableSnapshotEntry {
     pub paths: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PathTableSnapshotEntry {
     /// Destination hash the path leads to.
     pub destination: AddressHash,
@@ -6724,17 +6807,20 @@ pub struct PathTableSnapshotEntry {
     pub age_secs: u64,
     /// Hash of the announce packet that created/refreshed the path.
     pub announce_hash: crate::hash::Hash,
+    /// Unix expiry recorded when the path was inserted.
+    pub expires_unix: f64,
 }
 
 /// One announce-rate entry (Python `Reticulum.get_rate_table`).
-/// Times are durations from now, not unix timestamps: the limiter stores
-/// [`Instant`](std::time::Instant) values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `blocked_for` and `since_last` are durations from now. `timestamps` is
+/// the announce window as unix times, oldest first, at most 16.
+#[derive(Debug, Clone, PartialEq)]
 pub struct RateTableEntry {
     pub destination: AddressHash,
     pub violations: u32,
     pub blocked_for: Option<std::time::Duration>,
     pub since_last: std::time::Duration,
+    pub timestamps: Vec<f64>,
 }
 
 /// Link table counters (Python `get_link_count` and the separate count of
@@ -6789,6 +6875,7 @@ impl Transport {
                 unresponsive: entry.unresponsive,
                 age_secs: path_table::path_age(now, entry.timestamp).as_secs(),
                 announce_hash: entry.packet_hash,
+                expires_unix: entry.expires_unix,
             })
             .collect()
     }
@@ -6802,14 +6889,39 @@ impl Transport {
             .snapshot()
             .into_iter()
             .map(
-                |(destination, violations, blocked_for, since_last)| RateTableEntry {
+                |(destination, violations, blocked_for, since_last, timestamps)| RateTableEntry {
                     destination,
                     violations,
                     blocked_for,
                     since_last,
+                    timestamps,
                 },
             )
             .collect()
+    }
+
+    /// Validated rows in the transport link table
+    /// (Python `Transport.active_link_count`).
+    pub async fn active_link_count(&self) -> usize {
+        self.handler.lock().await.link_table.validated_len()
+    }
+
+    /// Cached radio RSSI for `hash`, or `None` on a miss.
+    pub async fn packet_rssi(&self, hash: &Hash) -> Option<f64> {
+        let handler = self.handler.lock().await;
+        PhyCache::lookup(&handler.phy.rssi, hash)
+    }
+
+    /// Cached radio SNR for `hash`, or `None` on a miss.
+    pub async fn packet_snr(&self, hash: &Hash) -> Option<f64> {
+        let handler = self.handler.lock().await;
+        PhyCache::lookup(&handler.phy.snr, hash)
+    }
+
+    /// Cached radio quality for `hash`, or `None` on a miss.
+    pub async fn packet_q(&self, hash: &Hash) -> Option<f64> {
+        let handler = self.handler.lock().await;
+        PhyCache::lookup(&handler.phy.q, hash)
     }
 
     /// Link table / link counters (Python `get_link_count` plus
@@ -6984,6 +7096,7 @@ impl Transport {
                         age_secs: path_table::path_age(crate::time::now(), entry.timestamp)
                             .as_secs(),
                         announce_hash: entry.packet_hash,
+                        expires_unix: entry.expires_unix,
                     })
                     .collect();
                 let blackholes = handler.blackholes.read().await.pack_table();

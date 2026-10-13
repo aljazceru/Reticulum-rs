@@ -381,6 +381,12 @@ impl LinkTable {
         self.0.len()
     }
 
+    /// Link-table rows whose proof has been validated
+    /// (Python `Transport.active_link_count`).
+    pub fn validated_len(&self) -> usize {
+        self.0.values().filter(|entry| entry.validated).count()
+    }
+
     /// Whether the link table is empty.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
