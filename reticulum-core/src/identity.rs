@@ -1234,6 +1234,7 @@ mod tests {
     use super::PrivateIdentity;
 
     #[test]
+    #[cfg(feature = "std")]
     fn private_identity_hex_string() {
         let original_id = PrivateIdentity::new_from_rand(OsRng);
         let original_hex = original_id.to_hex_string();
@@ -1283,6 +1284,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn enforced_ratchets_reject_static_key_and_report_id() {
         use super::{RATCHET_ID_LENGTH, generate_ratchet, ratchet_id, ratchet_public_from_private};
 

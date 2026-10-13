@@ -300,7 +300,7 @@ where
         .map_err(|_| RnsError::CryptoError)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use crate::crypt::fernet::Fernet;
     use core::str;

@@ -174,7 +174,7 @@ impl fmt::Display for Hash {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
 
     use rand_core::OsRng;
