@@ -1349,11 +1349,11 @@ enum RsgCheck {
     Invalid,
 }
 
-struct SignedView {
-    hash: Vec<u8>,
-    pubkey: Vec<u8>,
-    message: Option<Vec<u8>>,
-    meta: rmpv::Value,
+pub(crate) struct SignedView {
+    pub(crate) hash: Vec<u8>,
+    pub(crate) pubkey: Vec<u8>,
+    pub(crate) message: Option<Vec<u8>>,
+    pub(crate) meta: rmpv::Value,
 }
 
 fn verify_envelope(identity: &Identity, rsg: &[u8]) -> bool {
@@ -1367,36 +1367,54 @@ fn verify_envelope(identity: &Identity, rsg: &[u8]) -> bool {
 /// `-N` leaves no loaded key. `-V` and embedded-message checks still require
 /// the unresolved `-i` hash to match the embedded public key.
 fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> RsgCheck {
-    let Some(view) = unpack_rsg(rsg) else {
-        return RsgCheck::Invalid;
-    };
-    if view.hash.as_slice() != sha256(message).as_slice() {
-        return RsgCheck::Invalid;
-    }
-    let loaded = Identity::new_from_slices(
-        &view.pubkey[..reticulum::identity::PUBLIC_KEY_LENGTH],
-        &view.pubkey[reticulum::identity::PUBLIC_KEY_LENGTH..],
-    );
     // A supplied identity is the verifier. A hash only has to match the
     // embedded public key. With neither, the embedded key is enough.
     if let Some(key) = resolved.key.as_ref() {
+        let Some(view) = unpack_rsg(rsg) else {
+            return RsgCheck::Invalid;
+        };
+        if view.hash.as_slice() != sha256(message).as_slice() {
+            return RsgCheck::Invalid;
+        }
         if !verify_envelope(key.public_identity(), rsg) {
             return RsgCheck::Invalid;
         }
         return RsgCheck::Valid(key.label());
     }
-    if let Some(hash) = resolved.requested_hash {
-        if loaded.address_hash != hash {
-            return RsgCheck::Invalid;
+    match verify_rsg(rsg, message, resolved.requested_hash.as_ref()) {
+        Some((_, identity)) => RsgCheck::Valid(prettyhexrep(identity.address_hash.as_slice())),
+        None => RsgCheck::Invalid,
+    }
+}
+
+/// Verify an RSG envelope: the embedded hash matches `sha256(message)`, the
+/// signature verifies under the embedded public key, and `required_signer`
+/// (when given) is that signer's identity hash.
+pub(crate) fn verify_rsg(
+    rsg: &[u8],
+    message: &[u8],
+    required_signer: Option<&AddressHash>,
+) -> Option<(SignedView, Identity)> {
+    let view = unpack_rsg(rsg)?;
+    if view.hash.as_slice() != sha256(message).as_slice() {
+        return None;
+    }
+    let loaded = Identity::new_from_slices(
+        &view.pubkey[..reticulum::identity::PUBLIC_KEY_LENGTH],
+        &view.pubkey[reticulum::identity::PUBLIC_KEY_LENGTH..],
+    );
+    if let Some(hash) = required_signer {
+        if loaded.address_hash != *hash {
+            return None;
         }
     }
     if !verify_envelope(&loaded, rsg) {
-        return RsgCheck::Invalid;
+        return None;
     }
-    RsgCheck::Valid(prettyhexrep(loaded.address_hash.as_slice()))
+    Some((view, loaded))
 }
 
-fn unpack_rsg(rsg: &[u8]) -> Option<SignedView> {
+pub(crate) fn unpack_rsg(rsg: &[u8]) -> Option<SignedView> {
     if rsg.len() < SIG_BYTES + 1 {
         return None;
     }
@@ -1614,7 +1632,12 @@ fn sign_message(options: &IdOptions, resolved: &Resolved) -> Result<i32, String>
     } else {
         Vec::new()
     };
-    let rsg = pack_rsg(private, message.as_bytes(), true, &meta);
+    let rsg = pack_rsg(
+        private,
+        message.as_bytes(),
+        true,
+        &meta_pairs_to_rmpv(&meta),
+    );
     if matches!(format, WireFormat::Bin) {
         let Some(write) = options.write.as_deref() else {
             println!("No write path specified");
@@ -1667,39 +1690,44 @@ fn encode_wire(format: &WireFormat, rsg: &[u8]) -> String {
     }
 }
 
-fn pack_rsg(
+/// RSG envelope: `signature ++ packb({hashtype, hash, meta{, message}})`
+/// where `meta` carries signer and pubkey plus the extra `meta` pairs.
+pub(crate) fn pack_rsg(
     signer: &PrivateIdentity,
     message: &[u8],
     embed: bool,
-    meta: &[(String, MetaValue)],
+    meta: &[(rmpv::Value, rmpv::Value)],
 ) -> Vec<u8> {
-    let extras: Vec<_> = meta
-        .iter()
-        .filter(|(key, _)| key != "signer" && key != "pubkey")
-        .collect();
-    let mut envelope = Vec::new();
-    let outer = if embed { 4u32 } else { 3u32 };
-    rmp::encode::write_map_len(&mut envelope, outer).expect("msgpack");
-    rmp::encode::write_str(&mut envelope, "hashtype").expect("msgpack");
-    rmp::encode::write_str(&mut envelope, "sha256").expect("msgpack");
-    rmp::encode::write_str(&mut envelope, "hash").expect("msgpack");
-    let digest = sha256(message);
-    rmp::encode::write_bin(&mut envelope, &digest).expect("msgpack");
-    rmp::encode::write_str(&mut envelope, "meta").expect("msgpack");
-    rmp::encode::write_map_len(&mut envelope, (2 + extras.len()) as u32).expect("msgpack");
-    rmp::encode::write_str(&mut envelope, "signer").expect("msgpack");
-    rmp::encode::write_bin(&mut envelope, signer.address_hash().as_slice()).expect("msgpack");
-    rmp::encode::write_str(&mut envelope, "pubkey").expect("msgpack");
-    let pubkey = signer.as_identity().to_bytes();
-    rmp::encode::write_bin(&mut envelope, &pubkey).expect("msgpack");
-    for (key, value) in extras {
-        rmp::encode::write_str(&mut envelope, key).expect("msgpack");
-        write_meta(&mut envelope, value);
+    let mut meta_pairs = Vec::with_capacity(meta.len() + 2);
+    meta_pairs.push((
+        rmpv::Value::from("signer"),
+        rmpv::Value::Binary(signer.address_hash().as_slice().to_vec()),
+    ));
+    meta_pairs.push((
+        rmpv::Value::from("pubkey"),
+        rmpv::Value::Binary(signer.as_identity().to_bytes().to_vec()),
+    ));
+    for (key, value) in meta {
+        if key.as_str() == Some("signer") || key.as_str() == Some("pubkey") {
+            continue;
+        }
+        meta_pairs.push((key.clone(), value.clone()));
     }
+    let mut pairs = vec![
+        (rmpv::Value::from("hashtype"), rmpv::Value::from("sha256")),
+        (
+            rmpv::Value::from("hash"),
+            rmpv::Value::Binary(sha256(message).to_vec()),
+        ),
+        (rmpv::Value::from("meta"), rmpv::Value::Map(meta_pairs)),
+    ];
     if embed {
-        rmp::encode::write_str(&mut envelope, "message").expect("msgpack");
-        rmp::encode::write_bin(&mut envelope, message).expect("msgpack");
+        pairs.push((
+            rmpv::Value::from("message"),
+            rmpv::Value::Binary(message.to_vec()),
+        ));
     }
+    let envelope = crate::common::rmpv_to_bytes(&rmpv::Value::Map(pairs));
     let signature = signer.sign(&envelope).to_bytes();
     let mut out = Vec::with_capacity(SIG_BYTES + envelope.len());
     out.extend_from_slice(&signature);
@@ -1707,29 +1735,29 @@ fn pack_rsg(
     out
 }
 
-fn write_meta(out: &mut Vec<u8>, value: &MetaValue) {
+fn meta_value_to_rmpv(value: &MetaValue) -> rmpv::Value {
     match value {
-        MetaValue::Null => rmp::encode::write_nil(out).expect("msgpack"),
-        MetaValue::Bool(value) => rmp::encode::write_bool(out, *value).expect("msgpack"),
-        MetaValue::Int(value) => {
-            rmp::encode::write_sint(out, *value).expect("msgpack");
-        }
-        MetaValue::Float(value) => rmp::encode::write_f64(out, *value).expect("msgpack"),
-        MetaValue::Str(value) => rmp::encode::write_str(out, value).expect("msgpack"),
+        MetaValue::Null => rmpv::Value::Nil,
+        MetaValue::Bool(value) => rmpv::Value::Boolean(*value),
+        MetaValue::Int(value) => rmpv::Value::from(*value),
+        MetaValue::Float(value) => rmpv::Value::F64(*value),
+        MetaValue::Str(value) => rmpv::Value::from(value.as_str()),
         MetaValue::List(items) => {
-            rmp::encode::write_array_len(out, items.len() as u32).expect("msgpack");
-            for item in items {
-                write_meta(out, item);
-            }
+            rmpv::Value::Array(items.iter().map(meta_value_to_rmpv).collect())
         }
-        MetaValue::Map(entries) => {
-            rmp::encode::write_map_len(out, entries.len() as u32).expect("msgpack");
-            for (key, value) in entries {
-                rmp::encode::write_str(out, key).expect("msgpack");
-                write_meta(out, value);
-            }
-        }
+        MetaValue::Map(entries) => rmpv::Value::Map(
+            entries
+                .iter()
+                .map(|(key, value)| (rmpv::Value::from(key.as_str()), meta_value_to_rmpv(value)))
+                .collect(),
+        ),
     }
+}
+
+fn meta_pairs_to_rmpv(meta: &[(String, MetaValue)]) -> Vec<(rmpv::Value, rmpv::Value)> {
+    meta.iter()
+        .map(|(key, value)| (rmpv::Value::from(key.as_str()), meta_value_to_rmpv(value)))
+        .collect()
 }
 
 const RSG_HEADER: &str = "#### Start of rsg data ";
@@ -2613,16 +2641,16 @@ fn prettysize(mut num: f64) -> String {
     format!("{num:.2}YB")
 }
 
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = ContentHash::generator().chain_update(data).finalize();
     digest.into()
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn decode_hex(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_hex(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
     if !text.len().is_multiple_of(2) || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -2641,7 +2669,7 @@ fn parse_hex_hash(text: &str) -> Option<AddressHash> {
     AddressHash::new_from_raw_slice(&bytes)
 }
 
-fn expand_user(path: &str) -> PathBuf {
+pub(crate) fn expand_user(path: &str) -> PathBuf {
     if path == "~" {
         if let Ok(home) = std::env::var("HOME") {
             return PathBuf::from(home);

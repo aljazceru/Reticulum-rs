@@ -156,6 +156,13 @@ pub fn parse_hash(input: &str) -> Result<AddressHash, String> {
         .map_err(|_| "Invalid hash entered. Check your input.".to_string())
 }
 
+/// Serialize an `rmpv::Value` tree to msgpack bytes.
+pub(crate) fn rmpv_to_bytes(value: &rmpv::Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    let _ = rmpv::encode::write_value(&mut out, value);
+    out
+}
+
 /// Resolve the configuration directory: explicit argument, else
 /// `$RETICULUM_CONFIG_DIR`, else `~/.reticulum`
 /// (Python: `RNS.Reticulum(configdir=...)` default).

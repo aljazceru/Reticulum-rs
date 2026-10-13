@@ -24,7 +24,8 @@ use reticulum::identity::Identity;
 use reticulum::transport::Transport;
 
 use crate::common::{
-    build_tool_transport, load_or_create_private_identity, resolve_config_dir, ToolTransportOptions,
+    build_tool_transport, load_or_create_private_identity, resolve_config_dir, rmpv_to_bytes,
+    ToolTransportOptions,
 };
 
 pub const APP_NAME: &str = "rnsh";
@@ -90,48 +91,6 @@ pub enum RnshMessage {
 /// Serialize an `rmpv::Value` tree to msgpack bytes.
 pub fn test_pack_value(value: &rmpv::Value) -> Vec<u8> {
     rmpv_to_bytes(value)
-}
-
-fn rmpv_to_bytes(value: &rmpv::Value) -> Vec<u8> {
-    use rmp::encode::*;
-    let mut out = Vec::new();
-    match value {
-        rmpv::Value::Nil => {
-            let _ = write_nil(&mut out);
-        }
-        rmpv::Value::Boolean(b) => {
-            let _ = write_bool(&mut out, *b);
-        }
-        rmpv::Value::Integer(i) => {
-            if let Some(u) = i.as_u64() {
-                // Minimal representation, matching Python umsgpack.
-                let _ = write_uint(&mut out, u);
-            } else {
-                let _ = write_sint(&mut out, i.as_i64().unwrap_or(0));
-            }
-        }
-        rmpv::Value::String(s) => {
-            let _ = write_str(&mut out, s.as_str().unwrap_or(""));
-        }
-        rmpv::Value::Array(items) => {
-            let _ = write_array_len(&mut out, items.len() as u32);
-            for item in items {
-                let mut part = rmpv_to_bytes(item);
-                out.append(&mut part);
-            }
-        }
-        rmpv::Value::Map(pairs) => {
-            let _ = write_map_len(&mut out, pairs.len() as u32);
-            for (key, val) in pairs {
-                let mut part = rmpv_to_bytes(key);
-                out.append(&mut part);
-                let mut part = rmpv_to_bytes(val);
-                out.append(&mut part);
-            }
-        }
-        _ => {}
-    }
-    out
 }
 
 fn pack_opt_u32(value: Option<u32>) -> rmpv::Value {

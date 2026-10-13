@@ -1,16 +1,13 @@
-//! `rngit` — Reticulum git repositories
-//! (Python `RNS/Utilities/rngit`).
-//!
-//! Ports the `rngit` node daemon and the `git-remote-rns` remote helper:
+//! `rngit` — Reticulum git repositories.
 //!
 //! * The node announces a `git.repositories` SINGLE destination and serves
 //!   the request paths `/git/{list,fetch,push,delete,create,fork,sync,mirror}`
 //!   plus `/mgmt/{release,work,perms}` on top of a configured set of
-//!   repository groups. Wire messages match the Python server: request
-//!   payloads are msgpack dicts keyed by the `IDX_*` integers and named
-//!   fields, responses are a status byte (`RES_*`) plus an optional payload,
-//!   and large payloads (git bundles, release artifacts) travel as resource
-//!   responses carrying msgpack metadata.
+//!   repository groups. Wire messages: request payloads are msgpack dicts
+//!   keyed by the `IDX_*` integers and named fields, responses are a status
+//!   byte (`RES_*`) plus an optional payload, and large payloads (git
+//!   bundles, release artifacts) travel as resource responses carrying
+//!   msgpack metadata.
 //! * The client (`rngit create|release|perms|work|fork|sync|mirror`) and the
 //!   `git-remote-rns` helper (git remote-helper protocol over stdin/stdout)
 //!   use the same link + request machinery to talk to a node.
@@ -20,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,13 +28,13 @@ use reticulum::identity::{Identity, PrivateIdentity, Signature};
 use reticulum::resource::manager::{RequestContext, RequestEvent};
 use reticulum::resource::{msgpack_bin, ResourceOptions};
 use reticulum::transport::Transport;
-use sha2::Digest;
 use tokio::sync::Mutex;
 
 use crate::common::{
     build_tool_transport, load_or_create_private_identity, load_private_identity, prettyhexrep,
-    resolve_config_dir, ToolTransportOptions,
+    resolve_config_dir, rmpv_to_bytes, ToolTransportOptions,
 };
+use crate::rnid::{decode_hex, expand_user, hex_encode, pack_rsg, sha256, unpack_rsg, verify_rsg};
 
 pub const APP_NAME: &str = "git";
 pub const DESTINATION_ASPECT: &str = "repositories";
@@ -94,55 +92,16 @@ fn now_f64() -> f64 {
         .as_secs_f64()
 }
 
-/// Encode an `rmpv::Value` to msgpack bytes (minimal ints like umsgpack).
-pub fn pack_value(value: &rmpv::Value) -> Vec<u8> {
-    use rmp::encode::*;
-    let mut out = Vec::new();
-    match value {
-        rmpv::Value::Nil => {
-            let _ = write_nil(&mut out);
-        }
-        rmpv::Value::Boolean(b) => {
-            let _ = write_bool(&mut out, *b);
-        }
-        rmpv::Value::Integer(i) => {
-            if let Some(u) = i.as_u64() {
-                let _ = write_uint(&mut out, u);
-            } else {
-                let _ = write_sint(&mut out, i.as_i64().unwrap_or(0));
-            }
-        }
-        rmpv::Value::F32(f) => {
-            let _ = write_f32(&mut out, *f);
-        }
-        rmpv::Value::F64(f) => {
-            let _ = write_f64(&mut out, *f);
-        }
-        rmpv::Value::String(s) => {
-            let _ = write_str(&mut out, s.as_str().unwrap_or(""));
-        }
-        rmpv::Value::Binary(b) => {
-            let _ = write_bin(&mut out, b);
-        }
-        rmpv::Value::Array(items) => {
-            let _ = write_array_len(&mut out, items.len() as u32);
-            for item in items {
-                let mut part = pack_value(item);
-                out.append(&mut part);
-            }
-        }
-        rmpv::Value::Map(pairs) => {
-            let _ = write_map_len(&mut out, pairs.len() as u32);
-            for (key, val) in pairs {
-                let mut part = pack_value(key);
-                out.append(&mut part);
-                let mut part = pack_value(val);
-                out.append(&mut part);
-            }
-        }
-        rmpv::Value::Ext(_, _) => {}
-    }
-    out
+/// `rngit-{tag}-{pid}-{ms}-{n}{ext}` under the temp dir; `n` keeps
+/// back-to-back paths inside one millisecond distinct.
+fn temp_path(tag: &str, ext: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "rngit-{tag}-{}-{}-{unique}{ext}",
+        std::process::id(),
+        (now_f64() * 1000.0) as u64
+    ))
 }
 
 fn unpack_value(data: &[u8]) -> Option<rmpv::Value> {
@@ -202,41 +161,6 @@ fn value_f64(value: &rmpv::Value) -> Option<f64> {
         .or_else(|| value.as_u64().map(|v| v as f64))
 }
 
-fn hexrep(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push_str(&format!("{byte:0>2x}"));
-    }
-    out
-}
-
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(text.len() / 2);
-    let bytes = text.as_bytes();
-    for pair in bytes.chunks(2) {
-        let hi = (pair[0] as char).to_digit(16)?;
-        let lo = (pair[1] as char).to_digit(16)?;
-        out.push(((hi << 4) | lo) as u8);
-    }
-    Some(out)
-}
-
-fn expand_user(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    } else if path == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
-        }
-    }
-    PathBuf::from(path)
-}
-
 // ---------------------------------------------------------------------------
 // Ref and SHA sanitizers (git-check-ref-format)
 // ---------------------------------------------------------------------------
@@ -281,7 +205,7 @@ fn san_sha(sha: &str) -> Option<&str> {
     if sha.len() < 40 {
         return None;
     }
-    hex_decode(&sha[..sha.len() & !1])?;
+    decode_hex(&sha[..sha.len() & !1])?;
     Some(sha)
 }
 
@@ -378,10 +302,6 @@ fn parse_ini(text: &str) -> IniFile {
     file
 }
 
-fn write_ini_entry(key: &str, value: &str) -> String {
-    format!("{key} = {value}\n")
-}
-
 // ---------------------------------------------------------------------------
 // Permissions (allowed files and [access] config section)
 // ---------------------------------------------------------------------------
@@ -434,31 +354,32 @@ impl PermSet {
 
 type Aliases = HashMap<String, String>;
 
-fn resolve_identity_alias<'a>(aliases: &'a Aliases, alias: &'a str) -> &'a str {
-    if is_target_shorthand(alias) {
+/// Alias lookup. `is_target` keeps the permission shorthands (`all`,
+/// `none`, `everyone`, ...) unresolvable, as permission targets need them
+/// verbatim; destination aliases do not.
+fn resolve_alias<'a>(aliases: &'a Aliases, alias: &'a str, is_target: bool) -> &'a str {
+    if is_target
+        && matches!(
+            alias.to_lowercase().as_str(),
+            "n" | "none" | "nobody" | "a" | "all" | "everyone"
+        )
+    {
         return alias;
     }
-    if alias.len() == 32 && hex_decode(alias).is_some() {
+    if alias.len() == 32 && decode_hex(alias).is_some() {
         return alias;
     }
     aliases.get(alias).map(String::as_str).unwrap_or(alias)
 }
 
-fn is_target_shorthand(alias: &str) -> bool {
-    matches!(
-        alias.to_lowercase().as_str(),
-        "n" | "none" | "nobody" | "a" | "all" | "everyone"
-    )
-}
-
 fn parse_target(target: &str, aliases: &Aliases) -> Option<Target> {
-    let resolved = resolve_identity_alias(aliases, target);
+    let resolved = resolve_alias(aliases, target, true);
     match resolved.to_lowercase().as_str() {
         "n" | "none" | "nobody" => Some(Target::Nobody),
         "a" | "all" | "everyone" => Some(Target::All),
         _ => {
             if resolved.len() == 32 {
-                let bytes = hex_decode(resolved)?;
+                let bytes = decode_hex(resolved)?;
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&bytes[..16]);
                 Some(Target::Identity(hash))
@@ -544,25 +465,17 @@ fn permissions_from_allowed_input(allowed_input: &str, aliases: &Aliases) -> Per
 }
 
 /// Read an `.allowed` file; when it is executable, run it and use its
-/// stdout (Python `load_allowed_permissions`). Returns (perms, dynamic).
+/// stdout. Returns (perms, dynamic).
 fn load_allowed_permissions(allowed_path: &Path, aliases: &Aliases) -> (PermSet, bool) {
     if !allowed_path.is_file() {
         return (PermSet::default(), false);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if allowed_path
-            .metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-        {
-            let output = std::process::Command::new(allowed_path)
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
-            return (permissions_from_allowed_input(&output, aliases), true);
-        }
+    if allowed_path_is_executable(allowed_path) {
+        let output = std::process::Command::new(allowed_path)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        return (permissions_from_allowed_input(&output, aliases), true);
     }
     let input = std::fs::read_to_string(allowed_path).unwrap_or_default();
     (permissions_from_allowed_input(&input, aliases), false)
@@ -884,7 +797,7 @@ impl GitNode {
             || group_admins.contains(&remote)
     }
 
-    fn load_repository_group(&mut self, group_name: &str, group_path: PathBuf) {
+    async fn load_repository_group(&mut self, group_name: &str, group_path: PathBuf) {
         let group = self
             .groups
             .entry(group_name.to_string())
@@ -904,13 +817,11 @@ impl GitNode {
             if let Ok(entries) = std::fs::read_dir(&group_path) {
                 let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
                 paths.sort();
-                let group_name_owned = group_name.to_string();
                 for path in paths {
-                    if load_repository_sync(group, &path, &self.aliases) {
+                    if load_repository(group, path, &self.aliases).await {
                         loaded += 1;
                     }
                 }
-                let _ = group_name_owned;
             }
         }
         log::debug!("Loaded {loaded} repositories for group \"{group_name}\"");
@@ -939,7 +850,7 @@ impl GitNode {
     }
 
     /// Apply `[access]` config-section permissions for a group after the
-    /// `.allowed` file pass (Python `update_group_permissions`).
+    /// `.allowed` file pass.
     fn apply_config_access(&mut self, group_name: &str, config_access: &IniSection) {
         for entry in config_access.entries_for(group_name) {
             if let Some(((perm, is_rw), target)) = parse_permission_full(&entry, &self.aliases) {
@@ -954,13 +865,7 @@ impl GitNode {
         let Some(group) = self.groups.get_mut(group_name) else {
             return false;
         };
-        load_repository_async(group, path, &self.aliases).await
-    }
-
-    /// `handle_create`/`handle_fork`-style bookkeeping once a repository
-    /// dir exists.
-    async fn register_repository(&mut self, group_name: &str, path: PathBuf) -> bool {
-        self.load_repository(group_name, path).await
+        load_repository(group, path, &self.aliases).await
     }
 }
 
@@ -981,43 +886,6 @@ impl IniSection {
     }
 }
 
-/// Synchronous repository scan used at startup (no async runtime needed
-/// inside — git probes run as short subprocesses on the runtime anyway, so
-/// this helper is only for the blocking-free startup path).
-fn load_repository_sync(group: &mut Group, path: &Path, aliases: &Aliases) -> bool {
-    if !(path.is_dir() && !path.ends_with(".work") && !path.ends_with(".releases")) {
-        return false;
-    }
-    let check = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
-        .current_dir(path)
-        .output();
-    let is_repo = check
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == ".")
-        .unwrap_or(false);
-    if !is_repo {
-        log::warn!(
-            "The directory \"{}\" is not a git repository, skipping",
-            path.display()
-        );
-        return false;
-    }
-    let bare = std::process::Command::new("git")
-        .args(["config", "--bool", "core.bare"])
-        .current_dir(path)
-        .output()
-        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
-        .unwrap_or(false);
-    if !bare {
-        log::warn!(
-            "The directory \"{}\" is not a bare git repository, skipping",
-            path.display()
-        );
-        return false;
-    }
-    finish_repository_load(group, path, aliases, None, None)
-}
-
 fn finish_repository_load(
     group: &mut Group,
     path: &Path,
@@ -1030,11 +898,6 @@ fn finish_repository_load(
     };
     let allowed_path = PathBuf::from(format!("{}.allowed", path.display()));
     let (perms, _dynamic) = load_allowed_permissions(&allowed_path, aliases);
-    let (fork, mirror) = if fork.is_none() && mirror.is_none() {
-        probe_repo_type_sync(path)
-    } else {
-        (fork, mirror)
-    };
     group.repositories.insert(
         name.clone(),
         Repository {
@@ -1047,27 +910,7 @@ fn finish_repository_load(
     true
 }
 
-fn probe_repo_type_sync(path: &Path) -> (Option<String>, Option<String>) {
-    let config = |key: &str| -> Option<String> {
-        std::process::Command::new("git")
-            .args(["config", key])
-            .current_dir(path)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-    };
-    let mut fork = None;
-    let mut mirror = None;
-    match config("repository.rngit.type").as_deref() {
-        Some("fork") => fork = config("repository.rngit.upstream.source"),
-        Some("mirror") => mirror = config("repository.rngit.upstream.source"),
-        _ => {}
-    }
-    (fork, mirror)
-}
-
-async fn load_repository_async(group: &mut Group, path: PathBuf, aliases: &Aliases) -> bool {
+async fn load_repository(group: &mut Group, path: PathBuf, aliases: &Aliases) -> bool {
     if !(path.is_dir() && !path.ends_with(".work") && !path.ends_with(".releases")) {
         return false;
     }
@@ -1100,7 +943,7 @@ async fn load_repository_async(group: &mut Group, path: PathBuf, aliases: &Alias
 enum Outcome {
     /// `[request_id, bin(payload)]` packet or plain-resource response.
     Bytes(Vec<u8>),
-    /// Resource response carrying msgpack metadata (Python FILE response).
+    /// Resource response carrying msgpack metadata.
     File {
         data: Vec<u8>,
         metadata: rmpv::Value,
@@ -1125,13 +968,28 @@ fn res_ok_data(payload: &[u8]) -> Outcome {
     Outcome::Bytes(out)
 }
 
-fn res_ok_value(value: rmpv::Value) -> Outcome {
-    res_ok_data(&pack_value(&value))
+/// `group/repository` request path: exactly two components, each at most
+/// 256 bytes.
+fn parse_request_repository_path(path: &str) -> Option<(&str, &str)> {
+    let mut parts = path.split('/');
+    let group = parts.next()?;
+    let repository = parts.next()?;
+    if parts.next().is_some() || group.len() > 256 || repository.len() > 256 {
+        return None;
+    }
+    Some((group, repository))
 }
 
-/// Python handler precondition: link identified + request data is a dict
-/// (Python: `type(data) == dict`). `ctx.data` carries the request
-/// payload's msgpack encoding.
+/// `group` request path: exactly one component, at most 256 bytes.
+fn parse_request_group_path(path: &str) -> Option<&str> {
+    if path.len() > 256 || path.contains('/') {
+        return None;
+    }
+    Some(path)
+}
+
+/// Handler precondition: link identified + request data is a dict.
+/// `ctx.data` carries the request payload's msgpack encoding.
 fn identified_map(ctx: &RequestContext) -> Option<(Identity, rmpv::Value)> {
     let remote = ctx.remote_identity?;
     let data = unpack_value(&ctx.data)?;
@@ -1150,7 +1008,7 @@ async fn handle_list(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let for_push = map_get(data, "for_push").map(value_bool).unwrap_or(false);
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let access = if for_push {
@@ -1220,7 +1078,7 @@ async fn handle_fetch(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
     if refs.is_empty() {
         return res_bytes(RES_INVALID_REQ, "No refs specified");
     }
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     if !node.resolve_permission(remote, group_name, repo_name, Perm::Read) {
@@ -1275,11 +1133,7 @@ async fn handle_fetch(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
         }
     }
 
-    let temp_dir = std::env::temp_dir().join(format!(
-        "rngit-fetch-{}-{}",
-        std::process::id(),
-        (now_f64() * 1000.0) as u64
-    ));
+    let temp_dir = temp_path("fetch", "");
     if std::fs::create_dir_all(&temp_dir).is_err() {
         return res_bytes(RES_REMOTE_FAIL, "Remote failure");
     }
@@ -1325,7 +1179,7 @@ async fn handle_push(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
     let Some(repo_path) = map_get_int(data, IDX_REPOSITORY).and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "No repository specified");
     };
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let read_access = node.resolve_permission(remote, group_name, repo_name, Perm::Read);
@@ -1363,11 +1217,7 @@ async fn handle_push(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
         let (Some(local_ref), Some(remote_ref)) = (local_ref, remote_ref) else {
             return res_bytes(RES_INVALID_REQ, "Missing ref specification");
         };
-        let bundle_path = std::env::temp_dir().join(format!(
-            "rngit-push-{}-{}.bundle",
-            std::process::id(),
-            (now_f64() * 1000.0) as u64
-        ));
+        let bundle_path = temp_path("push", ".bundle");
         if std::fs::write(&bundle_path, &bundle_data).is_err() {
             return res_bytes(RES_REMOTE_FAIL, "Remote error");
         }
@@ -1467,7 +1317,7 @@ async fn handle_delete(node: &mut GitNode, remote: &Identity, data: &rmpv::Value
     let Some(repo_path) = map_get_int(data, IDX_REPOSITORY).and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let write_access = node.resolve_permission(remote, group_name, repo_name, Perm::Write);
@@ -1489,7 +1339,7 @@ async fn handle_delete(node: &mut GitNode, remote: &Identity, data: &rmpv::Value
     let Some(reference) = map_get(data, "ref").and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
-    if san_ref(&reference).is_none() {
+    if san_ref(&reference).is_none() || !reference.starts_with("refs/") {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     }
     let deleted = git(&repository.path, &["update-ref", "-d", &reference])
@@ -1507,7 +1357,7 @@ async fn handle_create(node: &mut GitNode, remote: &Identity, data: &rmpv::Value
     let Some(repo_path) = map_get_int(data, IDX_REPOSITORY).and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let Some(group) = node.groups.get(group_name) else {
@@ -1547,13 +1397,13 @@ async fn handle_create(node: &mut GitNode, remote: &Identity, data: &rmpv::Value
         return res_bytes(RES_REMOTE_FAIL, "Could not initialize repository");
     }
     let allowed_path = PathBuf::from(format!("{}.allowed", repo_dir.display()));
-    let identity_hash = hexrep(remote.address_hash.as_slice());
+    let identity_hash = hex_encode(remote.address_hash.as_slice());
     let allowed = REPO_CREATE_PERMS_TEMPLATE.replace("{IDENTITY_HASH}", &identity_hash);
     if std::fs::write(&allowed_path, format!("{allowed}\n")).is_err() {
         let _ = std::fs::remove_dir_all(&repo_dir);
         return res_bytes(RES_REMOTE_FAIL, "Could not initialize repository");
     }
-    if !node.register_repository(group_name, repo_dir.clone()).await {
+    if !node.load_repository(group_name, repo_dir.clone()).await {
         let _ = std::fs::remove_dir_all(&repo_dir);
         return res_bytes(RES_REMOTE_FAIL, "Failed to register repository");
     }
@@ -1584,7 +1434,7 @@ async fn clone_repository(
     if !CLONE_PROTOS.contains(&proto.as_str()) {
         return res_bytes(RES_DISALLOWED, "Prohibited source URL");
     }
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let Some(group) = node.groups.get(group_name) else {
@@ -1613,11 +1463,7 @@ async fn clone_repository(
         };
     }
 
-    let temp_dir = std::env::temp_dir().join(format!(
-        "rngit-{repo_type}-{}-{}",
-        std::process::id(),
-        (now_f64() * 1000.0) as u64
-    ));
+    let temp_dir = temp_path(repo_type, "");
     let cleanup = |dir: &Path| {
         let _ = std::fs::remove_dir_all(dir);
     };
@@ -1667,7 +1513,7 @@ async fn clone_repository(
         return res_bytes(RES_REMOTE_FAIL, "Remote failure");
     }
     let allowed_path = PathBuf::from(format!("{}.allowed", repo_dir.display()));
-    let identity_hash = hexrep(remote.address_hash.as_slice());
+    let identity_hash = hex_encode(remote.address_hash.as_slice());
     let allowed = REPO_CREATE_PERMS_TEMPLATE.replace("{IDENTITY_HASH}", &identity_hash);
     if std::fs::write(&allowed_path, format!("{allowed}\n")).is_err() {
         cleanup(&temp_dir);
@@ -1677,7 +1523,7 @@ async fn clone_repository(
         cleanup(&temp_dir);
         return res_bytes(RES_REMOTE_FAIL, "Remote failure");
     }
-    if !node.register_repository(group_name, repo_dir).await {
+    if !node.load_repository(group_name, repo_dir).await {
         return res_bytes(RES_REMOTE_FAIL, "Remote failure");
     }
     res_ok()
@@ -1687,7 +1533,7 @@ async fn handle_sync(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
     let Some(repo_path) = map_get_int(data, IDX_REPOSITORY).and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let read = node.resolve_permission(remote, group_name, repo_name, Perm::Read);
@@ -1773,12 +1619,12 @@ fn write_release_meta(releases_dir: &Path, tag: &str, updates: &[(String, String
     }
     let mut text = String::new();
     for (key, value) in &meta.entries {
-        text.push_str(&write_ini_entry(key, value));
+        text.push_str(&format!("{key} = {value}\n"));
     }
     let _ = std::fs::write(release_meta_path(releases_dir, tag), text);
 }
 
-/// `releases_list_data`: list of release info dicts for the wire response.
+/// Release info dicts for the wire response.
 fn releases_list_data(releases_dir: &Path) -> (Vec<rmpv::Value>, Option<String>) {
     let mut releases: Vec<(i64, rmpv::Value)> = Vec::new();
     let mut tags: HashMap<String, bool> = HashMap::new();
@@ -1856,19 +1702,19 @@ fn releases_list_data(releases_dir: &Path) -> (Vec<rmpv::Value>, Option<String>)
     (releases.into_iter().map(|(_, v)| v).collect(), latest)
 }
 
-/// `_release_list`: `\x00 + packb({"releases": [...], "latest": tag|None})`.
+/// `\x00 + packb({"releases": [...], "latest": tag|None})`.
 fn list_releases_payload(releases_dir: &Path) -> Vec<u8> {
     let (releases, latest) = releases_list_data(releases_dir);
     let latest_value = latest.map(|t| vstr(&t)).unwrap_or(rmpv::Value::Nil);
     let mut payload = vec![RES_OK];
-    payload.extend_from_slice(&pack_value(&rmpv::Value::Map(vec![
+    payload.extend_from_slice(&rmpv_to_bytes(&rmpv::Value::Map(vec![
         (vstr("releases"), rmpv::Value::Array(releases)),
         (vstr("latest"), latest_value),
     ])));
     payload
 }
 
-/// `release_data`: full info for one release dir.
+/// Full info for one release dir.
 fn release_data(release_dir: &Path, tag: &str) -> Option<rmpv::Value> {
     let meta = std::fs::read_to_string(release_dir.join("META"))
         .ok()
@@ -1953,7 +1799,7 @@ async fn handle_release(node: &mut GitNode, remote: &Identity, data: &rmpv::Valu
     let Some(operation) = map_get(data, "operation").and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let read_access = node.resolve_permission(remote, group_name, repo_name, Perm::Read);
@@ -1994,7 +1840,7 @@ async fn handle_release(node: &mut GitNode, remote: &Identity, data: &rmpv::Valu
                 return res_bytes(RES_NOT_FOUND, "Release not found");
             }
             match release_data(&release_dir, &tag) {
-                Some(info) => res_ok_value(info),
+                Some(info) => res_ok_data(&rmpv_to_bytes(&info)),
                 None => res_bytes(RES_REMOTE_FAIL, "Error getting release data"),
             }
         }
@@ -2073,7 +1919,7 @@ async fn handle_release(node: &mut GitNode, remote: &Identity, data: &rmpv::Valu
                         ("status".to_string(), "draft".to_string()),
                         (
                             "created_by".to_string(),
-                            hexrep(remote.address_hash.as_slice()),
+                            hex_encode(remote.address_hash.as_slice()),
                         ),
                     ];
                     if let Some(hash) = map_get(data, "hash").and_then(value_str) {
@@ -2096,7 +1942,7 @@ async fn handle_release(node: &mut GitNode, remote: &Identity, data: &rmpv::Valu
                     }
                     let _ = std::fs::write(
                         release_dir.join("THANKS"),
-                        pack_value(&rmpv::Value::Map(vec![(
+                        rmpv_to_bytes(&rmpv::Value::Map(vec![(
                             vstr("count"),
                             rmpv::Value::from(0u64),
                         )])),
@@ -2229,7 +2075,7 @@ fn doc_id_value(data: &rmpv::Value) -> Option<i64> {
 
 /// Response `b"\x00" + packb(map)` helper for the packed-dict replies.
 fn res_ok_map(pairs: Vec<(rmpv::Value, rmpv::Value)>) -> Outcome {
-    res_ok_data(&pack_value(&rmpv::Value::Map(pairs)))
+    res_ok_data(&rmpv_to_bytes(&rmpv::Value::Map(pairs)))
 }
 
 fn work_path(repository: &Repository) -> PathBuf {
@@ -2262,7 +2108,7 @@ fn write_doc(root_path: &Path, content: &str, meta: &rmpv::Value) -> bool {
         (vstr("content"), vstr(content)),
         (vstr("meta"), meta.clone()),
     ]);
-    std::fs::write(root_path, pack_value(&doc)).is_ok()
+    std::fs::write(root_path, rmpv_to_bytes(&doc)).is_ok()
 }
 
 fn list_doc_ids(work_dir: &Path, scope: &str) -> Vec<String> {
@@ -2313,7 +2159,7 @@ fn comments_list(doc_dir: &Path) -> Vec<rmpv::Value> {
             let edited = map_get(meta, "edited").and_then(value_f64).unwrap_or(0.0);
             let author = map_get(meta, "author")
                 .and_then(value_bin)
-                .map(hexrep)
+                .map(hex_encode)
                 .unwrap_or_default();
             let format = map_get(meta, "format")
                 .and_then(value_str)
@@ -2373,7 +2219,7 @@ fn doc_list_data(
                 };
                 let author = map_get(meta, "author")
                     .and_then(value_bin)
-                    .map(hexrep)
+                    .map(hex_encode)
                     .unwrap_or_default();
                 let created = map_get(meta, "created").and_then(value_f64).unwrap_or(0.0);
                 let edited = map_get(meta, "edited").and_then(value_f64).unwrap_or(0.0);
@@ -2420,8 +2266,7 @@ fn doc_list_data(
     rmpv::Value::Map(result)
 }
 
-/// Validate the request's `signature` over `content` (Python
-/// `remote_identity.validate(signature, signed_data)`).
+/// Validate the request's `signature` over `content`.
 fn validate_doc_signature(remote: &Identity, content: &str, signature: &[u8]) -> bool {
     if signature.len() != SIG_BYTES {
         return false;
@@ -2441,7 +2286,7 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
     let Some(operation) = map_get(data, "operation").and_then(value_str) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
-    let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+    let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
         return res_bytes(RES_INVALID_REQ, "Invalid request");
     };
     let Some(repository) = node
@@ -2468,9 +2313,9 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
     let doc_id = doc_id_value(data);
     if let Some(id) = doc_id {
         if ["read", "view", "comment", "edit", "delete", "perms"].contains(&operation.as_str()) {
-            read_access = read_access
-                || node.resolve_doc_permission(remote, group_name, repo_name, id, Perm::Read)
-                || admin_access;
+            read_access =
+                node.resolve_doc_permission(remote, group_name, repo_name, id, Perm::Read)
+                    || admin_access;
             if !read_access {
                 return res_bytes(RES_NOT_FOUND, "Document not found");
             }
@@ -2508,7 +2353,7 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
     let valid_scopes = ["active", "completed", "proposed", "all"];
 
     match operation.as_str() {
-        "list" => res_ok_data(&pack_value(&doc_list_data(
+        "list" => res_ok_data(&rmpv_to_bytes(&doc_list_data(
             node, remote, repository, group_name, repo_name, &scope,
         ))),
         "view" => {
@@ -2547,7 +2392,7 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
                     .unwrap_or(default)
             };
             let author = match map_get(&meta, "author") {
-                Some(rmpv::Value::Binary(b)) => vstr(&hexrep(b)),
+                Some(rmpv::Value::Binary(b)) => vstr(&hex_encode(b)),
                 other => other.cloned().unwrap_or(rmpv::Value::Nil),
             };
             let meta_out = rmpv::Value::Map(vec![
@@ -2628,10 +2473,14 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
         "create" | "propose" => {
             let title = map_get(data, "title")
                 .and_then(value_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let content = map_get(data, "content")
                 .and_then(value_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .trim()
+                .to_string();
             let format_type = map_get(data, "format")
                 .and_then(value_str)
                 .unwrap_or_else(|| "markdown".to_string());
@@ -2648,10 +2497,10 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
             if title.len() + content.len() + format_type.len() > WORK_DOC_LIMIT {
                 return res_bytes(RES_INVALID_REQ, "Content limit exceeded");
             }
-            if title.trim().is_empty() {
+            if title.is_empty() {
                 return res_bytes(RES_INVALID_REQ, "Title is required");
             }
-            if content.trim().is_empty() {
+            if content.is_empty() {
                 return res_bytes(RES_INVALID_REQ, "Content is required");
             }
             let scope_name = if operation == "create" {
@@ -2675,18 +2524,18 @@ async fn handle_work(node: &mut GitNode, remote: &Identity, data: &rmpv::Value) 
                         "markdown"
                     }),
                 ),
-                (vstr("title"), vstr(title.trim())),
+                (vstr("title"), vstr(&title)),
                 (vstr("created"), now.clone()),
                 (vstr("edited"), now),
                 (vstr("author"), vbin(remote.address_hash.as_slice())),
                 (vstr("signature"), vbin(signature)),
                 (vstr("identity"), vbin(&remote.to_bytes())),
             ]);
-            if !write_doc(&doc_dir.join("root"), content.trim(), &meta) {
+            if !write_doc(&doc_dir.join("root"), &content, &meta) {
                 return res_bytes(RES_REMOTE_FAIL, "Error saving document");
             }
             if operation == "propose" {
-                let id_hex = hexrep(remote.address_hash.as_slice());
+                let id_hex = hex_encode(remote.address_hash.as_slice());
                 let owner = format!("i:{id_hex}\nw:{id_hex}\n");
                 let allowed_path = work_dir.join(format!("{doc_id}.allowed"));
                 let tmp_path = allowed_path.with_extension("tmp");
@@ -2980,8 +2829,11 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
             let Some(group_name) = map_get_int(data, IDX_GROUP).and_then(value_str) else {
                 return res_bytes(RES_INVALID_REQ, "No group specified");
             };
-            let read_access = node.resolve_group_permission(remote, &group_name, Perm::Read);
-            let admin_access = node.resolve_group_permission(remote, &group_name, Perm::Admin);
+            let Some(group_name) = parse_request_group_path(&group_name) else {
+                return res_bytes(RES_NOT_FOUND, "Not found");
+            };
+            let read_access = node.resolve_group_permission(remote, group_name, Perm::Read);
+            let admin_access = node.resolve_group_permission(remote, group_name, Perm::Admin);
             if !read_access {
                 return res_bytes(RES_NOT_FOUND, "Not found");
             }
@@ -2991,7 +2843,7 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
             let Some(step) = map_get(data, "step").and_then(value_str) else {
                 return res_bytes(RES_INVALID_REQ, "Invalid request");
             };
-            let group_path = node.groups.get(&group_name).map(|g| g.path.clone());
+            let group_path = node.groups.get(group_name).map(|g| g.path.clone());
             let Some(group_path) = group_path else {
                 return res_bytes(RES_NOT_FOUND, "Not found");
             };
@@ -3032,7 +2884,7 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
                     {
                         return res_bytes(RES_REMOTE_FAIL, "Error setting permissions");
                     }
-                    node.update_group_permissions(&group_name);
+                    node.update_group_permissions(group_name);
                     res_ok()
                 }
                 _ => res_bytes(RES_INVALID_REQ, "Invalid step"),
@@ -3042,7 +2894,7 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
             let Some(repo_path) = map_get_int(data, IDX_REPOSITORY).and_then(value_str) else {
                 return res_bytes(RES_INVALID_REQ, "No repository specified");
             };
-            let Some((group_name, repo_name)) = repo_path.split_once('/') else {
+            let Some((group_name, repo_name)) = parse_request_repository_path(&repo_path) else {
                 return res_bytes(RES_INVALID_REQ, "Invalid request");
             };
             let read_access = node.resolve_permission(remote, group_name, repo_name, Perm::Read);
@@ -3072,6 +2924,15 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
                     res_ok_map(vec![(vstr("content"), vstr(&content))])
                 }
                 "set" => {
+                    let read_access = node.resolve_group_permission(remote, group_name, Perm::Read);
+                    let admin_access =
+                        node.resolve_group_permission(remote, group_name, Perm::Admin);
+                    if !read_access {
+                        return res_bytes(RES_NOT_FOUND, "Not found");
+                    }
+                    if !admin_access {
+                        return res_bytes(RES_DISALLOWED, "Not allowed");
+                    }
                     let content = map_get(data, "content")
                         .and_then(value_str)
                         .unwrap_or_default();
@@ -3116,8 +2977,7 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
 // Node setup and jobs loop
 // ---------------------------------------------------------------------------
 
-/// Resolve the rngit config directory (Python
-/// `Rngit.__init__/GitNode.__init__` configdir resolution).
+/// Resolve the rngit config directory.
 pub fn resolve_rngit_config_dir(explicit: Option<&Path>) -> PathBuf {
     if let Some(dir) = explicit {
         return dir.to_path_buf();
@@ -3136,13 +2996,13 @@ pub fn resolve_rngit_config_dir(explicit: Option<&Path>) -> PathBuf {
     PathBuf::from(&home).join(".rngit")
 }
 
-fn load_node(config_dir: &Path) -> Result<GitNode, String> {
+async fn load_node(config_dir: &Path) -> Result<GitNode, String> {
     let config_path = config_dir.join("config");
     let mut node = GitNode {
         identity: PrivateIdentity::new_from_rand(rand_core::OsRng),
         node_name: String::new(),
-        announce_interval: 360 * 60,
-        mirror_interval: 180 * 60,
+        announce_interval: 0,
+        mirror_interval: 24 * 60 * 60,
         sync_check_interval: 15 * 60,
         blocked: HashSet::new(),
         aliases: Aliases::new(),
@@ -3165,7 +3025,7 @@ fn load_node(config_dir: &Path) -> Result<GitNode, String> {
                 node.mirror_interval = (hours.max(0) as u64) * 60 * 60;
             }
             for hash in rngit.get_list("blocked_identities") {
-                if let Some(bytes) = hex_decode(&hash) {
+                if let Some(bytes) = decode_hex(&hash) {
                     if bytes.len() == 16 {
                         let mut h = [0u8; 16];
                         h.copy_from_slice(&bytes);
@@ -3183,7 +3043,7 @@ fn load_node(config_dir: &Path) -> Result<GitNode, String> {
             let access = config.section("access").cloned().unwrap_or_default();
             for (group_name, group_path) in &repositories.entries {
                 let path = expand_user(group_path);
-                node.load_repository_group(group_name, path);
+                node.load_repository_group(group_name, path).await;
                 node.apply_config_access(group_name, &access);
             }
         }
@@ -3214,8 +3074,8 @@ pub fn node_destination_hash(config_dir: &Path) -> Option<AddressHash> {
     )
 }
 
-/// `node -p`: prints peer identity, node identity and repositories
-/// destination the way Python's `ReticulumGitNode(print_identity)` does.
+/// `node -p`: prints peer identity, node identity and the repositories
+/// destination.
 pub async fn print_node_identities(config_dir: &Path) -> bool {
     let client_path = config_dir.join("client_identity");
     let node_path = config_dir.join("repositories_identity");
@@ -3274,6 +3134,7 @@ pub async fn serve(options: &NodeOptions) -> Result<AddressHash, String> {
         ));
     }
     let node = load_node(&options.config_dir)
+        .await
         .map_err(|e| format!("Could not initialise git node: {e}"))?;
     if node.groups.is_empty() {
         return Err(
@@ -3310,7 +3171,7 @@ pub async fn serve_with_transport(
     config_dir: &Path,
     shutdown: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<AddressHash, String> {
-    let node = load_node(config_dir)?;
+    let node = load_node(config_dir).await?;
     let node = Arc::new(Mutex::new(node));
     let destination = transport
         .add_destination(
@@ -3387,7 +3248,7 @@ async fn dispatch_request(
         Outcome::File { data, metadata } => {
             if let Some(link) = transport.find_in_link(&ctx.link_id).await {
                 let options = ResourceOptions {
-                    metadata: Some(pack_value(&metadata)),
+                    metadata: Some(rmpv_to_bytes(&metadata)),
                     request_id: Some(ctx.request_id),
                     is_response: true,
                     auto_compress: true,
@@ -3412,7 +3273,7 @@ fn invalid_req_bytes() -> Vec<u8> {
 }
 
 /// Periodic node jobs: re-announce, mirror/fork sync checks, dynamic
-/// permission refresh (Python `GitNode.jobs`).
+/// permission refresh.
 async fn node_jobs(
     node: NodeHandle,
     transport: Arc<Transport>,
@@ -3464,16 +3325,15 @@ async fn node_jobs(
             }
             // Mirror sync check
             let mut syncs: Vec<(PathBuf, String)> = Vec::new();
-            for group in node.groups.values() {
-                for repo in group.repositories.values() {
-                    if let Some(source) = repo.mirror.clone() {
-                        let synced = mirror_synced(&repo.path).await;
-                        if (now - synced as f64) > mirror_interval as f64 {
-                            syncs.push((repo.path.clone(), source));
+            if mirror_interval > 0 {
+                for group in node.groups.values() {
+                    for repo in group.repositories.values() {
+                        if let Some(source) = repo.mirror.clone() {
+                            let synced = mirror_synced(&repo.path).await;
+                            if (now - synced as f64) > mirror_interval as f64 {
+                                syncs.push((repo.path.clone(), source));
+                            }
                         }
-                    }
-                    if let Some(source) = repo.fork.clone() {
-                        let _ = source;
                     }
                 }
             }
@@ -3488,7 +3348,7 @@ async fn node_jobs(
 }
 
 // ---------------------------------------------------------------------------
-// Client (`Rngit` in Python server.py, `GitRemote` in client.py)
+// Client (link + request machinery to talk to a node)
 // ---------------------------------------------------------------------------
 
 /// Options controlling how a client attaches to Reticulum.
@@ -3531,7 +3391,7 @@ const CLIENT_CONFIG_TEMPLATE: &str =
      # user-specific configuration file located at:\n\
      # ~/.rngit/client_config\n\
      \n\
-     [rngit]\n\
+     [client]\n\
      # Size of ref batches to request when fetching.\n\
      # ref_batch_size = 25\n\
      \n\
@@ -3550,10 +3410,15 @@ fn load_client_config(config_dir: &Path) -> ClientConfig {
     }
     if let Ok(text) = std::fs::read_to_string(&config_path) {
         let ini = parse_ini(&text);
-        if let Some(rngit) = ini.section("rngit") {
-            if let Some(size) = rngit.get_int("ref_batch_size") {
-                config.ref_batch_size = size as usize;
-            }
+        let size = ini
+            .section("client")
+            .and_then(|s| s.get_int("ref_batch_size"))
+            .or_else(|| {
+                ini.section("rngit")
+                    .and_then(|s| s.get_int("ref_batch_size"))
+            });
+        if let Some(size) = size {
+            config.ref_batch_size = size.clamp(0, 1024) as usize;
         }
         if let Some(aliases) = ini.section("aliases") {
             for (alias, target) in &aliases.entries {
@@ -3564,13 +3429,6 @@ fn load_client_config(config_dir: &Path) -> ClientConfig {
         }
     }
     config
-}
-
-fn resolve_destination_alias<'a>(aliases: &'a Aliases, alias: &'a str) -> &'a str {
-    if alias.len() == 32 && hex_decode(alias).is_some() {
-        return alias;
-    }
-    aliases.get(alias).map(String::as_str).unwrap_or(alias)
 }
 
 fn parse_remote_url(
@@ -3586,11 +3444,11 @@ fn parse_remote_url(
         url = url[PROTO_SPEC.len()..].to_string();
     }
     let components: Vec<&str> = url.split('/').collect();
-    let destination = resolve_destination_alias(aliases, components[0]);
+    let destination = resolve_alias(aliases, components[0], false);
     if destination.len() != 32 {
         return Err("Invalid remote URL".to_string());
     }
-    let Some(hash_bytes) = hex_decode(destination) else {
+    let Some(hash_bytes) = decode_hex(destination) else {
         return Err("Invalid remote URL".to_string());
     };
     let mut hash = [0u8; 16];
@@ -3622,7 +3480,7 @@ pub struct RemoteResponse {
 }
 
 impl RemoteClient {
-    /// `connect_remote`: await path, recall destination, link + identify.
+    /// Await path, recall destination, link + identify.
     pub async fn connect(options: &ClientOptions, remote: &str) -> Result<Self, String> {
         let client_config = load_client_config(&options.rngit_config_dir);
         let (destination_hash, _, _) =
@@ -3715,8 +3573,8 @@ impl RemoteClient {
         let _ = self.transport.link_close(link_id).await;
     }
 
-    /// `send_request`: issue a link request and wait for the matching
-    /// response (packet or resource-carried).
+    /// Issue a link request and wait for the matching response (packet or
+    /// resource-carried).
     pub async fn send_request(
         &self,
         path: &str,
@@ -3724,7 +3582,7 @@ impl RemoteClient {
         timeout: Duration,
     ) -> Result<RemoteResponse, String> {
         let mut events = self.transport.request_events().await;
-        let packed = pack_value(&data);
+        let packed = rmpv_to_bytes(&data);
         let request_id = self
             .transport
             .request(&self.link, path, &packed)
@@ -3759,7 +3617,7 @@ impl RemoteClient {
         }
     }
 
-    /// `handle_git_list`: `{"0": repo_path, "for_push": bool}` → ref text.
+    /// `{"0": repo_path, "for_push": bool}` → ref text.
     pub async fn list_refs(&mut self, repo_path: &str, for_push: bool) -> Result<String, String> {
         let request = rmpv::Value::Map(vec![
             (rmpv::Value::from(IDX_REPOSITORY), vstr(repo_path)),
@@ -3790,8 +3648,8 @@ impl RemoteClient {
         Ok(refs)
     }
 
-    /// `process_fetch_queue`: fetch refs as a bundle and unbundle into
-    /// `work_dir` (a git repository).
+    /// Fetch refs as a bundle and unbundle into `work_dir` (a git
+    /// repository).
     pub async fn fetch_refs(
         &mut self,
         refs: &[(String, String)],
@@ -3869,11 +3727,7 @@ impl RemoteClient {
                     if code != RES_OK as i64 {
                         return Err("Remote error: Unknown error".to_string());
                     }
-                    let bundle_path = std::env::temp_dir().join(format!(
-                        "rngit-fetch-{}-{}.bundle",
-                        std::process::id(),
-                        (now_f64() * 1000.0) as u64
-                    ));
+                    let bundle_path = temp_path("fetch", ".bundle");
                     std::fs::write(&bundle_path, &response.data)
                         .map_err(|e| format!("Could not write bundle: {e}"))?;
                     let bundle_str = bundle_path.to_string_lossy().to_string();
@@ -3907,7 +3761,7 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// `process_push_queue`: push or delete refspecs over the network.
+    /// Push or delete refspecs over the network.
     /// Each entry is `(local_ref, remote_ref, force)`; an empty
     /// `local_ref` deletes the remote ref.
     pub async fn push_refs(
@@ -3952,29 +3806,25 @@ impl RemoteClient {
                 ));
                 continue;
             };
-            let bundle_path = std::env::temp_dir().join(format!(
-                "rngit-push-{}-{}.bundle",
-                std::process::id(),
-                (now_f64() * 1000.0) as u64
-            ));
+            let bundle_path = temp_path("push", ".bundle");
             let mut args = vec![
                 "bundle".to_string(),
                 "create".to_string(),
                 bundle_path.to_string_lossy().to_string(),
                 local_ref.clone(),
             ];
+            // Exclude every remote SHA the local repository already has so
+            // the bundle only carries objects the remote is missing.
             for sha in self.remote_refs.values() {
-                if *sha != local_sha {
-                    let exists = tokio::process::Command::new("git")
-                        .args(["cat-file", "-t", sha])
-                        .current_dir(work_dir)
-                        .output()
-                        .await
-                        .map(|o| o.status.success())
-                        .unwrap_or(false);
-                    if exists {
-                        args.push(format!("^{sha}"));
-                    }
+                let exists = tokio::process::Command::new("git")
+                    .args(["cat-file", "-t", sha])
+                    .current_dir(work_dir)
+                    .output()
+                    .await
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                if exists {
+                    args.push(format!("^{sha}"));
                 }
             }
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -3982,8 +3832,10 @@ impl RemoteClient {
                 .args(&arg_refs)
                 .current_dir(work_dir)
                 .output()
-                .await;
-            let created = created.ok();
+                .await
+                .ok();
+            // All objects reachable from local_ref already exist on the
+            // remote: send a direct update_ref operation, no bundle upload.
             let bundle_empty = created
                 .as_ref()
                 .map(|o| {
@@ -3993,56 +3845,56 @@ impl RemoteClient {
                             .contains("empty bundle")
                 })
                 .unwrap_or(false);
-            let result = match (created, bundle_empty) {
-                (Some(output), false) if output.status.success() && bundle_path.is_file() => {
-                    let bundle = std::fs::read(&bundle_path).unwrap_or_default();
-                    if bundle.is_empty() {
-                        // Empty bundle: direct update-ref operation.
-                        let operations = rmpv::Value::Array(vec![rmpv::Value::Map(vec![
-                            (vstr("action"), vstr("update_ref")),
-                            (vstr("ref"), vstr(remote_ref)),
-                            (vstr("sha"), vstr(&local_sha)),
-                            (vstr("force"), rmpv::Value::Boolean(*force)),
-                        ])]);
-                        let request = rmpv::Value::Map(vec![
-                            (rmpv::Value::from(IDX_REPOSITORY), vstr(repo_path)),
-                            (vstr("operations"), operations),
-                        ]);
-                        match self.send_request(PATH_PUSH, request, timeout).await {
-                            Ok(response)
-                                if !response.data.is_empty() && response.data[0] == RES_OK =>
-                            {
-                                Ok(())
-                            }
-                            Ok(response) => Err(format!(
-                                "Remote error: {}",
-                                String::from_utf8_lossy(&response.data[1..])
-                            )),
-                            Err(err) => Err(err),
+            let bundle_created =
+                matches!(&created, Some(o) if o.status.success()) && bundle_path.is_file();
+            let result = if bundle_empty || bundle_created {
+                let bundle = if bundle_created {
+                    std::fs::read(&bundle_path).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if bundle.is_empty() {
+                    let operations = rmpv::Value::Array(vec![rmpv::Value::Map(vec![
+                        (vstr("action"), vstr("update_ref")),
+                        (vstr("ref"), vstr(remote_ref)),
+                        (vstr("sha"), vstr(&local_sha)),
+                        (vstr("force"), rmpv::Value::Boolean(*force)),
+                    ])]);
+                    let request = rmpv::Value::Map(vec![
+                        (rmpv::Value::from(IDX_REPOSITORY), vstr(repo_path)),
+                        (vstr("operations"), operations),
+                    ]);
+                    match self.send_request(PATH_PUSH, request, timeout).await {
+                        Ok(response) if !response.data.is_empty() && response.data[0] == RES_OK => {
+                            Ok(())
                         }
-                    } else {
-                        let request = rmpv::Value::Map(vec![
-                            (rmpv::Value::from(IDX_REPOSITORY), vstr(repo_path)),
-                            (vstr("local_ref"), vstr(local_ref)),
-                            (vstr("remote_ref"), vstr(remote_ref)),
-                            (vstr("force"), rmpv::Value::Boolean(*force)),
-                            (vstr("bundle"), vbin(&bundle)),
-                        ]);
-                        match self.send_request(PATH_PUSH, request, timeout).await {
-                            Ok(response)
-                                if !response.data.is_empty() && response.data[0] == RES_OK =>
-                            {
-                                Ok(())
-                            }
-                            Ok(response) => Err(format!(
-                                "Remote error: {}",
-                                String::from_utf8_lossy(&response.data[1..])
-                            )),
-                            Err(err) => Err(err),
+                        Ok(response) => Err(format!(
+                            "Remote error: {}",
+                            String::from_utf8_lossy(&response.data[1..])
+                        )),
+                        Err(err) => Err(err),
+                    }
+                } else {
+                    let request = rmpv::Value::Map(vec![
+                        (rmpv::Value::from(IDX_REPOSITORY), vstr(repo_path)),
+                        (vstr("local_ref"), vstr(local_ref)),
+                        (vstr("remote_ref"), vstr(remote_ref)),
+                        (vstr("force"), rmpv::Value::Boolean(*force)),
+                        (vstr("bundle"), vbin(&bundle)),
+                    ]);
+                    match self.send_request(PATH_PUSH, request, timeout).await {
+                        Ok(response) if !response.data.is_empty() && response.data[0] == RES_OK => {
+                            Ok(())
                         }
+                        Ok(response) => Err(format!(
+                            "Remote error: {}",
+                            String::from_utf8_lossy(&response.data[1..])
+                        )),
+                        Err(err) => Err(err),
                     }
                 }
-                _ => Err("Could not create push bundle".to_string()),
+            } else {
+                Err("Could not create push bundle".to_string())
             };
             let _ = std::fs::remove_file(&bundle_path);
             results.push((remote_ref.clone(), result));
@@ -4050,7 +3902,7 @@ impl RemoteClient {
         results
     }
 
-    /// `create_repository`: `{"0": repo_path}` → PATH_CREATE.
+    /// `{"0": repo_path}` → PATH_CREATE.
     pub async fn create_repository(&self, repo_path: &str) -> Result<(), String> {
         let request = rmpv::Value::Map(vec![(rmpv::Value::from(IDX_REPOSITORY), vstr(repo_path))]);
         let response = self
@@ -4070,125 +3922,22 @@ impl RemoteClient {
 }
 
 // ---------------------------------------------------------------------------
-// Signed messages (RSG — Python rnid create_rsg/validate_rsg)
+// Signed messages (RSG — pack/unpack/verify shared with `rnid`)
 // ---------------------------------------------------------------------------
 
-fn sha256_bytes(data: &[u8]) -> [u8; 32] {
-    let digest = sha2::Sha256::digest(data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
-}
-
-/// `create_rsg`: `signature ++ packb({hashtype, hash, meta{, message}})`.
-fn create_rsg(
-    signer: &PrivateIdentity,
-    message: &[u8],
-    embed: bool,
-    extra_meta: Vec<(rmpv::Value, rmpv::Value)>,
-) -> Vec<u8> {
-    let mut meta = vec![
-        (vstr("signer"), vbin(signer.address_hash().as_slice())),
-        (vstr("pubkey"), vbin(&signer.as_identity().to_bytes())),
-    ];
-    for (key, value) in extra_meta {
-        if let Some(key_str) = key.as_str() {
-            if key_str == "signer" || key_str == "pubkey" {
-                continue;
-            }
-        }
-        meta.push((key, value));
-    }
-    let mut pairs = vec![
-        (vstr("hashtype"), vstr("sha256")),
-        (vstr("hash"), vbin(&sha256_bytes(message))),
-        (vstr("meta"), rmpv::Value::Map(meta)),
-    ];
-    if embed {
-        pairs.push((vstr("message"), vbin(message)));
-    }
-    let envelope = pack_value(&rmpv::Value::Map(pairs));
-    let signature = signer.sign(&envelope).to_bytes();
-    let mut out = Vec::with_capacity(SIG_BYTES + envelope.len());
-    out.extend_from_slice(&signature);
-    out.extend_from_slice(&envelope);
-    out
-}
-
-fn extract_signed_rsg_data(rsg: &[u8]) -> Option<rmpv::Value> {
-    if rsg.len() <= SIG_BYTES {
-        return None;
-    }
-    unpack_value(&rsg[SIG_BYTES..])
-}
-
-/// `validate_rsg` -> (valid, signed_data, signing_identity_hash).
+/// `validate_rsg` -> Some((signed view, signing identity hash hex)).
 fn validate_rsg(
     rsg: &[u8],
     message: &[u8],
     required_signer: Option<&[u8; 16]>,
-) -> (bool, Option<rmpv::Value>, Option<String>) {
-    if rsg.len() < SIG_BYTES + 1 {
-        return (false, None, None);
-    }
-    let signature = &rsg[..SIG_BYTES];
-    let envelope = &rsg[SIG_BYTES..];
-    let Some(signed_data) = unpack_value(envelope) else {
-        return (false, None, None);
-    };
-    let Some(hashtype) = map_get(&signed_data, "hashtype").and_then(value_str) else {
-        return (false, None, None);
-    };
-    if hashtype != "sha256" {
-        return (false, None, None);
-    }
-    let Some(meta) = map_get(&signed_data, "meta") else {
-        return (false, None, None);
-    };
-    let (Some(_signer), Some(pubkey)) = (
-        map_get(meta, "signer"),
-        map_get(meta, "pubkey").and_then(value_bin),
-    ) else {
-        return (false, None, None);
-    };
-    if pubkey.len() != KEY_BYTES {
-        return (false, None, None);
-    }
-    let identity = Identity::new_from_slices(&pubkey[..32], &pubkey[32..]);
-    let signer_hash = match required_signer {
-        Some(hash) => *hash,
-        None => remote_hash(&identity),
-    };
-    if remote_hash(&identity) != signer_hash {
-        return (false, None, Some(hexrep(&remote_hash(&identity))));
-    }
-    let embedded = map_get(&signed_data, "hash").and_then(value_bin);
-    if embedded != Some(&sha256_bytes(message)) {
-        return (false, None, Some(hexrep(&remote_hash(&identity))));
-    }
-    let Ok(sig_bytes) = <[u8; SIG_BYTES]>::try_from(signature) else {
-        return (false, None, None);
-    };
-    let sig = Signature::from_bytes(&sig_bytes);
-    if identity.verify(envelope, &sig).is_err() {
-        return (
-            false,
-            Some(signed_data),
-            Some(hexrep(&remote_hash(&identity))),
-        );
-    }
-    (
-        true,
-        Some(signed_data),
-        Some(hexrep(&remote_hash(&identity))),
-    )
+) -> Option<(crate::rnid::SignedView, String)> {
+    let required = required_signer.map(|hash| AddressHash::new(*hash));
+    verify_rsg(rsg, message, required.as_ref())
+        .map(|(view, identity)| (view, hex_encode(identity.address_hash.as_slice())))
 }
 
-/// `check_release_rsm_structure` -> Ok(()) or Err(reason).
-fn check_release_rsm_structure(signed_data: &rmpv::Value) -> Result<(), String> {
-    let Some(meta) = map_get(signed_data, "meta") else {
-        return Err("No release metadata in manifest".to_string());
-    };
+/// -> Ok(()) or Err(reason).
+fn check_release_rsm_structure(meta: &rmpv::Value) -> Result<(), String> {
     let name = map_get(meta, "name").and_then(value_str);
     let version = map_get(meta, "version").and_then(value_str);
     let origin = map_get(meta, "origin").and_then(value_bin);
@@ -4212,7 +3961,7 @@ fn check_release_rsm_structure(signed_data: &rmpv::Value) -> Result<(), String> 
 }
 
 // ---------------------------------------------------------------------------
-// Editor helpers (Python _edit_permissions/_edit_work_content/_edit_release_notes)
+// Editor helpers (permissions, work documents, release notes)
 // ---------------------------------------------------------------------------
 
 fn pick_editor() -> Option<String> {
@@ -4238,12 +3987,7 @@ fn pick_editor() -> Option<String> {
 
 fn edit_with_editor(initial: &str, suffix: &str) -> Option<String> {
     let editor = pick_editor()?;
-    let tmp = std::env::temp_dir().join(format!(
-        "rngit-edit-{}-{}{}",
-        std::process::id(),
-        (now_f64() * 1000.0) as u64,
-        suffix
-    ));
+    let tmp = temp_path("edit", suffix);
     if std::fs::write(&tmp, initial).is_err() {
         return None;
     }
@@ -4310,7 +4054,7 @@ fn edit_work_content(title: &str, content: &str, is_comment: bool) -> Option<Str
 }
 
 // ---------------------------------------------------------------------------
-// Client operations (Python `Rngit` methods in server.py)
+// Client operations
 // ---------------------------------------------------------------------------
 
 struct OperationOutput {
@@ -4345,15 +4089,14 @@ fn res_error(response: &RemoteResponse) -> String {
     )
 }
 
-fn remote_parts(remote: &str, config_dir: &Path) -> Result<(AddressHash, String, String), String> {
-    let aliases = load_client_config(config_dir).destination_aliases;
-    let (hash, group, repo) = parse_remote_url(remote, &aliases, true)?;
-    Ok((hash, group.unwrap_or_default(), repo.unwrap_or_default()))
-}
-
 fn repo_path_of(remote: &str, config_dir: &Path) -> Result<String, String> {
-    let (_, group, repo) = remote_parts(remote, config_dir)?;
-    Ok(format!("{group}/{repo}"))
+    let aliases = load_client_config(config_dir).destination_aliases;
+    let (_, group, repo) = parse_remote_url(remote, &aliases, true)?;
+    Ok(format!(
+        "{}/{}",
+        group.unwrap_or_default(),
+        repo.unwrap_or_default()
+    ))
 }
 
 /// `rngit create <rns://hash/group/repo>`
@@ -4699,7 +4442,7 @@ async fn op_release(
                             "Invalid required signer identity hash length",
                         );
                     }
-                    match hex_decode(s).and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+                    match decode_hex(s).and_then(|b| <[u8; 16]>::try_from(b).ok()) {
                         Some(hash) => Some(hash),
                         None => {
                             return OperationOutput::abort("Invalid required signer identity hash")
@@ -4780,17 +4523,13 @@ async fn release_fetch(
     let Ok(rsg) = std::fs::read(&manifest_path) else {
         return OperationOutput::abort("Could not read release manifest");
     };
-    let Some(signed) = extract_signed_rsg_data(&rsg) else {
+    let Some(view) = unpack_rsg(&rsg) else {
         return OperationOutput::abort("No embedded message in release manifest");
     };
-    let Some(message) = map_get(&signed, "message")
-        .and_then(value_bin)
-        .map(|b| b.to_vec())
-    else {
+    let Some(message) = view.message.clone() else {
         return OperationOutput::abort("No embedded message in release manifest");
     };
-    let (valid, signed_data, signing_identity) = validate_rsg(&rsg, &message, signer);
-    if !valid {
+    let Some((view, signing_identity)) = validate_rsg(&rsg, &message, signer) else {
         return OperationOutput::abort(match signer {
             Some(hash) => format!(
                 "Release manifest not signed by {pretty}",
@@ -4798,20 +4537,14 @@ async fn release_fetch(
             ),
             None => "Could not validate release manifest signature".to_string(),
         });
-    }
-    let mut out = vec![format!(
-        "Release manifest validated, signed by {}",
-        signing_identity.unwrap_or_default()
-    )];
-    let Some(signed_data) = signed_data else {
-        return OperationOutput::abort("Invalid release manifest");
     };
-    if let Err(reason) = check_release_rsm_structure(&signed_data) {
+    let mut out = vec![format!(
+        "Release manifest validated, signed by {signing_identity}"
+    )];
+    let meta = &view.meta;
+    if let Err(reason) = check_release_rsm_structure(meta) {
         return OperationOutput::abort(reason);
     }
-    let Some(meta) = map_get(&signed_data, "meta") else {
-        return OperationOutput::abort("Invalid release manifest");
-    };
     let name = map_get(meta, "name")
         .and_then(value_str)
         .unwrap_or_default();
@@ -4866,8 +4599,7 @@ async fn release_fetch(
         if existing.exists() {
             if let Some(rsg_bytes) = &rsg_data {
                 if let Ok(contents) = std::fs::read(existing) {
-                    let (valid, _, _) = validate_rsg(rsg_bytes, &contents, signer);
-                    if valid {
+                    if validate_rsg(rsg_bytes, &contents, signer).is_some() {
                         out.push(format!(
                             "Existing file {base} validated, not fetching again"
                         ));
@@ -4886,8 +4618,7 @@ async fn release_fetch(
         };
         if let Some(rsg_bytes) = &rsg_data {
             if let Ok(contents) = std::fs::read(&artifact_path) {
-                let (valid, _, _) = validate_rsg(rsg_bytes, &contents, signer);
-                if !valid {
+                if validate_rsg(rsg_bytes, &contents, signer).is_none() {
                     return OperationOutput::abort(format!(
                         "Fetched file {base} does not match manifest, aborting"
                     ));
@@ -4931,7 +4662,7 @@ async fn fetch_release_artifact(
     let path = std::env::temp_dir().join(format!(
         "rngit-fetch-{}-{}",
         std::process::id(),
-        hexrep(&sha256_bytes(format!("{tag}/{artifact_name}").as_bytes())[..8])
+        hex_encode(&sha256(format!("{tag}/{artifact_name}").as_bytes())[..8])
     ));
     std::fs::write(&path, &response.data).map_err(|e| e.to_string())?;
     Ok(path)
@@ -5009,7 +4740,7 @@ async fn release_create(
         return OperationOutput::ok(["Release creation cancelled".to_string()]);
     };
     let release_time = now_f64() as i64;
-    let release_time_iso = iso_time(release_time);
+    let release_time_iso = fmt_time(release_time as f64, "%Y-%m-%dT%H:%M:%SZ");
     let package_name = name.map(str::to_string).unwrap_or_else(|| {
         repo_path
             .split('/')
@@ -5021,7 +4752,7 @@ async fn release_create(
         .trim_start_matches(PROTO_SPEC)
         .split('/')
         .next()
-        .and_then(hex_decode)
+        .and_then(decode_hex)
         .unwrap_or_default();
 
     // Sign artifacts and build the manifest.
@@ -5032,7 +4763,7 @@ async fn release_create(
             return OperationOutput::abort("Release manifest generation failed");
         };
         let artifact_meta = vec![(vstr("timestamp"), rmpv::Value::from(release_time as u64))];
-        let rsg = create_rsg(&signer, &data, false, artifact_meta);
+        let rsg = pack_rsg(&signer, &data, false, &artifact_meta);
         let signature_path = artifact_path.with_extension("rsg");
         let mut sig_path = artifact_path.clone().into_os_string();
         sig_path.push(format!(".{SIG_EXT}"));
@@ -5055,7 +4786,7 @@ async fn release_create(
         (vstr("commit"), vstr(&commit_hash)),
         (vstr("artifacts"), rmpv::Value::Array(manifest_artifacts)),
     ];
-    let manifest = create_rsg(&signer, notes.as_bytes(), true, manifest_meta);
+    let manifest = pack_rsg(&signer, notes.as_bytes(), true, &manifest_meta);
     let manifest_name = format!("manifest.{MSG_EXT}");
     let manifest_path = artifacts_path.join(&manifest_name);
     if std::fs::write(&manifest_path, &manifest).is_err() {
@@ -5206,7 +4937,7 @@ async fn release_create_local(
         .trim_start_matches(PROTO_SPEC)
         .split('/')
         .next()
-        .and_then(hex_decode)
+        .and_then(decode_hex)
         .unwrap_or_default();
     let mut manifest_artifacts: Vec<rmpv::Value> = Vec::new();
     for artifact in &artifacts {
@@ -5215,7 +4946,7 @@ async fn release_create_local(
             return OperationOutput::abort("Release manifest generation failed");
         };
         let artifact_meta = vec![(vstr("timestamp"), rmpv::Value::from(release_time as u64))];
-        let rsg = create_rsg(&signer, &data, false, artifact_meta);
+        let rsg = pack_rsg(&signer, &data, false, &artifact_meta);
         let mut sig_path = artifact_path.clone().into_os_string();
         sig_path.push(format!(".{SIG_EXT}"));
         if std::fs::write(PathBuf::from(sig_path), &rsg).is_err() {
@@ -5229,14 +4960,17 @@ async fn release_create_local(
     let manifest_meta = vec![
         (vstr("name"), vstr(&package_name)),
         (vstr("version"), vstr(tag)),
-        (vstr("released"), vstr(&iso_time(release_time))),
+        (
+            vstr("released"),
+            vstr(&fmt_time(release_time as f64, "%Y-%m-%dT%H:%M:%SZ")),
+        ),
         (vstr("timestamp"), rmpv::Value::from(release_time as u64)),
         (vstr("origin"), vbin(&origin)),
         (vstr("path"), vstr(repo_path)),
         (vstr("commit"), vstr(&commit_hash)),
         (vstr("artifacts"), rmpv::Value::Array(manifest_artifacts)),
     ];
-    let manifest = create_rsg(&signer, notes.as_bytes(), true, manifest_meta);
+    let manifest = pack_rsg(&signer, notes.as_bytes(), true, &manifest_meta);
     let manifest_path = artifacts_path.join(format!("manifest.{MSG_EXT}"));
     if std::fs::write(&manifest_path, &manifest).is_err() {
         return OperationOutput::abort("Release manifest generation failed");
@@ -5244,19 +4978,6 @@ async fn release_create_local(
     OperationOutput::ok([format!(
         "Local release {package_name}:{tag} generated successfully in {target}"
     )])
-}
-
-/// ISO-8601 `YYYY-MM-DDTHH:MM:SSZ` for the manifest `released` field.
-fn iso_time(ts: i64) -> String {
-    let days = ts.div_euclid(86400);
-    let secs = ts.rem_euclid(86400);
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
-        secs / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
 }
 
 /// `rngit perms <rns://hash/group>` or `<rns://hash/group/repo>`
@@ -5791,7 +5512,7 @@ async fn op_work(
 
 fn meta_author_display(meta: &rmpv::Value) -> String {
     match map_get(meta, "author") {
-        Some(rmpv::Value::Binary(b)) => hexrep(b),
+        Some(rmpv::Value::Binary(b)) => hex_encode(b),
         Some(rmpv::Value::String(s)) => s.as_str().unwrap_or("").to_string(),
         _ => "?".to_string(),
     }
@@ -5809,8 +5530,7 @@ fn capitalize(text: &str) -> String {
 // git-remote-rns: git remote-helper protocol over stdin/stdout
 // ---------------------------------------------------------------------------
 
-/// Python `escape_for_stdout`: quote a push error message for the
-/// remote-helper protocol.
+/// Quote a push error message for the remote-helper protocol.
 fn escape_for_stdout(value: &str) -> String {
     let mut escaped = String::from("\"");
     for c in value.chars() {
@@ -5832,9 +5552,8 @@ fn escape_for_stdout(value: &str) -> String {
     escaped
 }
 
-/// Python `_detach_stdout`/BrokenPipeError handling: a write failure
-/// means git closed the helper channel — drop the output instead of
-/// panicking on the default `println!` EPIPE path.
+/// A write failure means git closed the helper channel — drop the output
+/// instead of panicking on the default `println!` EPIPE path.
 fn git_stdout(line: &str) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -5844,7 +5563,11 @@ fn git_stdout(line: &str) {
 }
 
 fn git_stderr(line: &str) {
-    eprintln!("{line}");
+    use std::io::Write;
+    let mut out = std::io::stderr().lock();
+    let _ = out.write_all(line.as_bytes());
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
 }
 
 async fn read_git_line(
@@ -5857,7 +5580,7 @@ async fn read_git_line(
         .flatten()
 }
 
-/// `client.main`: `git-remote-rns <name> <url>`.
+/// `git-remote-rns <name> <url>` entry point.
 pub async fn remote_helper_main(args: &[String]) -> i32 {
     let url = match args.get(2) {
         Some(url) => url.clone(),
@@ -5991,7 +5714,12 @@ pub async fn remote_helper_main(args: &[String]) -> i32 {
             }
             if !push_queue.is_empty() {
                 let results = client
-                    .push_refs(&push_queue, &repo_path, &work_dir, Duration::from_secs(60))
+                    .push_refs(
+                        &push_queue,
+                        &repo_path,
+                        &work_dir,
+                        Duration::from_secs(7200),
+                    )
                     .await;
                 for (remote_ref, result) in results {
                     match result {
@@ -6005,6 +5733,12 @@ pub async fn remote_helper_main(args: &[String]) -> i32 {
             fetch_queue.clear();
             push_queue.clear();
             git_stdout("");
+        } else {
+            git_stderr(&format!(
+                "git-remote-rns failed: Unknown Git command: {line}"
+            ));
+            client.close().await;
+            return 255;
         }
     }
 
@@ -6013,7 +5747,7 @@ pub async fn remote_helper_main(args: &[String]) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// rngit entry point (argv0 "rngit" -> server.main, `rn git`)
+// rngit entry point (argv0 "rngit", `rn git`)
 // ---------------------------------------------------------------------------
 
 fn rngit_usage() -> String {
@@ -6033,8 +5767,7 @@ fn rngit_usage() -> String {
         .to_string()
 }
 
-/// `server.main`-equivalent argument dispatch. `args[0]` is the program
-/// name (ignored), matching Python's `main()`.
+/// Argument dispatch. `args[0]` is the program name (ignored).
 pub async fn rngit_main(args: &[String]) -> i32 {
     const VALID_COMMANDS: [&str; 8] = [
         "node", "create", "release", "perms", "work", "fork", "sync", "mirror",
@@ -6042,11 +5775,13 @@ pub async fn rngit_main(args: &[String]) -> i32 {
     let mut config_dir: Option<PathBuf> = None;
     let mut rns_config_dir: Option<PathBuf> = None;
     let mut identity_path: Option<PathBuf> = None;
+    let mut signer: Option<String> = None;
     let mut print_identity = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 1;
-    // Global options may precede the command.
+    // Options may precede the command; `-i`/`--identity` and `-s`/`--signer`
+    // take values here, `--interactive`/`--service` remain flags.
     while i < args.len() {
         let arg = &args[i];
         match arg.as_str() {
@@ -6058,9 +5793,16 @@ pub async fn rngit_main(args: &[String]) -> i32 {
                 i += 1;
                 rns_config_dir = args.get(i).map(|s| expand_user(s));
             }
-            "-i" | "--identity" | "--interactive" => {}
+            "-i" | "--identity" => {
+                i += 1;
+                identity_path = args.get(i).map(|s| expand_user(s));
+            }
+            "-s" | "--signer" => {
+                i += 1;
+                signer = args.get(i).cloned();
+            }
             "-p" | "--print-identity" => print_identity = true,
-            "-s" | "--service" | "-v" | "--verbose" | "-q" | "--quiet" => {}
+            "--interactive" | "--service" | "-v" | "--verbose" | "-q" | "--quiet" => {}
             "-h" | "--help" => {
                 println!("{}", rngit_usage());
                 return 0;
@@ -6077,11 +5819,10 @@ pub async fn rngit_main(args: &[String]) -> i32 {
             command = candidate.as_str();
             i += 1;
         }
-        // Unknown first arg → node (Python behaviour).
+        // Unknown first arg → node.
     }
 
     // Command-specific argument parsing.
-    let mut signer: Option<String> = None;
     let mut name: Option<String> = None;
     let mut no_upload = false;
     let mut offline = false;
@@ -6225,7 +5966,7 @@ pub async fn rngit_main(args: &[String]) -> i32 {
                 }
                 "work" => {
                     let operation = positional.get(1).cloned().unwrap_or_default();
-                    // Python maps the CLI operation "update" to the "comment" request op.
+                    // The CLI operation "update" maps to the "comment" request op.
                     let operation = if operation == "update" || operation == "comment" {
                         "comment".to_string()
                     } else {
@@ -6254,7 +5995,7 @@ pub async fn rngit_main(args: &[String]) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// git-sign-rns (commitsigs.py): SSHSIG-compatible commit signing for
+// git-sign-rns: SSHSIG-compatible commit signing for
 // `git config gpg.ssh.program`. The signature blob is an RSG signature
 // wrapped in the SSHSIG envelope.
 // ---------------------------------------------------------------------------
@@ -6362,7 +6103,7 @@ fn unarmor_ssh_signature(armored: &str) -> Option<Vec<u8>> {
 }
 
 /// The email-ish `author NAME <FIELD>` / `committer` / `tagger` principal
-/// field inside a commit object (Python extract_commit_*).
+/// field inside a commit object.
 fn extract_commit_field(message: &[u8], target: &[u8]) -> String {
     for line in message.split(|b| *b == b'\n') {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
@@ -6405,8 +6146,8 @@ fn extract_commit_tagger(message: &[u8]) -> (String, bool) {
     (String::new(), is_tag)
 }
 
-/// `commitsigs` main: `-Y sign|find-principals|check-novalidate|verify`.
-/// `args[0]` is the program name.
+/// `-Y sign|find-principals|check-novalidate|verify`. `args[0]` is the
+/// program name.
 pub fn commit_sign_main(args: &[String]) -> i32 {
     let mut op = "";
     let mut keyfile: Option<PathBuf> = None;
@@ -6481,7 +6222,7 @@ pub fn commit_sign_main(args: &[String]) -> i32 {
                     (data, None)
                 }
             };
-            let rsg = create_rsg(&identity, &message, false, vec![]);
+            let rsg = pack_rsg(&identity, &message, false, &[]);
             let blob = create_ssh_signature(&identity, &rsg);
             let armored = armor_ssh_signature(&blob);
             if let Some(sig_path) = sig_path {
@@ -6507,18 +6248,15 @@ pub fn commit_sign_main(args: &[String]) -> i32 {
                 eprintln!("Error: Namespace mismatch");
                 return 1;
             }
-            let Some(data) = extract_signed_rsg_data(&sig.signature_data) else {
+            let Some(data) = unpack_rsg(&sig.signature_data) else {
                 eprintln!("Could not determine signer identity");
                 return 1;
             };
-            let Some(signer) = map_get(&data, "meta")
-                .and_then(|m| map_get(m, "signer"))
-                .and_then(value_bin)
-            else {
+            let Some(signer) = map_get(&data.meta, "signer").and_then(value_bin) else {
                 eprintln!("Could not determine signer identity");
                 return 1;
             };
-            println!("{}", hexrep(signer));
+            println!("{}", hex_encode(signer));
             0
         }
         "check-novalidate" => {
@@ -6531,7 +6269,7 @@ pub fn commit_sign_main(args: &[String]) -> i32 {
             if sig.namespace != SSHSIG_NAMESPACE {
                 return 1;
             }
-            if extract_signed_rsg_data(&sig.signature_data).is_some() {
+            if unpack_rsg(&sig.signature_data).is_some() {
                 0
             } else {
                 1
@@ -6556,13 +6294,12 @@ pub fn commit_sign_main(args: &[String]) -> i32 {
                 eprintln!("Invalid commit signature namespace");
                 return 1;
             }
-            let (valid, _, signing_identity) = validate_rsg(&sig.signature_data, &message, None);
-            if !valid {
+            let Some((_view, signer_hash)) = validate_rsg(&sig.signature_data, &message, None)
+            else {
                 eprintln!("Invalid signature");
                 return 1;
-            }
+            };
             let author = if is_tag { tagger } else { author };
-            let signer_hash = signing_identity.unwrap_or_default();
             if author != signer_hash {
                 eprintln!("Commit not signed by author <{author}>");
                 return 1;
