@@ -1,7 +1,8 @@
 //! RNode interfaces — Python `RNS.Interfaces.RNodeInterface` and
 //! `RNodeMultiInterface` parity (Phase 5.5).
 //!
-//! * [`RnodeInterface`]: one LoRa radio reachable over serial or TCP,
+//! * [`RnodeInterface`]: one LoRa radio reachable over serial, TCP, or
+//!   `ble://` (the btleplug backend is feature `iface-rnode-ble`),
 //!   speaking the RNode KISS command protocol: hardware detection
 //!   (firmware/platform/MCU), radio configuration (frequency, bandwidth,
 //!   TX power, spreading factor, coding rate, airtime locks), radio
@@ -15,7 +16,7 @@
 //! Firmware >= 1.52 is required, validated on connect
 //! (Python `REQUIRED_FW_VER_*`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -68,6 +69,14 @@ pub const CMD_RANDOM: u8 = 0x40;
 pub const CMD_FB_EXT: u8 = 0x41;
 pub const CMD_FB_READ: u8 = 0x42;
 pub const CMD_FB_WRITE: u8 = 0x43;
+/// Bluetooth controller command (Python `CMD_BT_CTRL`).
+pub const CMD_BT_CTRL: u8 = 0x46;
+/// `CMD_BT_CTRL` payload: disable (Python `disable_bluetooth`).
+pub const BT_CTRL_DISABLE: u8 = 0x00;
+/// `CMD_BT_CTRL` payload: enable (Python `enable_bluetooth`).
+pub const BT_CTRL_ENABLE: u8 = 0x01;
+/// `CMD_BT_CTRL` payload: start pairing (Python `bluetooth_pair`).
+pub const BT_CTRL_PAIR: u8 = 0x02;
 pub const CMD_PLATFORM: u8 = 0x48;
 pub const CMD_MCU: u8 = 0x49;
 pub const CMD_FW_VERSION: u8 = 0x50;
@@ -936,8 +945,133 @@ fn vport_transmit_frames(index: u8, data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     )
 }
 
-/// One open link to an RNode device: serial or TCP
-/// (Python serial / `use_tcp` modes).
+/// Nordic UART UUIDs (Python `BLEConnection.UART_*_UUID`).
+pub const BLE_UART_SERVICE_UUID: &str = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+pub const BLE_UART_RX_UUID: &str = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+pub const BLE_UART_TX_UUID: &str = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+
+/// Python `BLEConnection.SCAN_TIMEOUT`.
+pub const BLE_SCAN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Python `BLEConnection.CONNECT_TIMEOUT`.
+pub const BLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Who `ble://` should attach to (Python `BLEConnection` target parse).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BleTarget {
+    /// `ble://` — first device advertising UART whose name starts with `RNode `.
+    Any,
+    /// `ble://<name>` when the remainder is not a 17-character MAC.
+    Name(String),
+    /// `ble://F4:12:73:29:4E:89` (six colon-separated fields, length 17).
+    Address(String),
+}
+
+/// Parse a `ble://` port. `None` when `port` is not that scheme.
+///
+/// The scheme compare is case-insensitive. The remainder keeps its
+/// original spelling, matching Python's slice after `ble://`.
+pub fn parse_ble_target(port: &str) -> Option<BleTarget> {
+    const SCHEME: &str = "ble://";
+    if port.len() < SCHEME.len()
+        || !port.as_bytes()[..SCHEME.len()].eq_ignore_ascii_case(SCHEME.as_bytes())
+    {
+        return None;
+    }
+    let rest = &port[SCHEME.len()..];
+    if rest.is_empty() {
+        return Some(BleTarget::Any);
+    }
+    if rest.len() == 17 && rest.split(':').count() == 6 {
+        Some(BleTarget::Address(rest.to_string()))
+    } else {
+        Some(BleTarget::Name(rest.to_string()))
+    }
+}
+
+/// Android USB serial (`RNS.Interfaces.Android` via `usb4a`) is not
+/// implemented. Those targets are an explicit [`RnsError::Unsupported`],
+/// not a host serial open.
+pub fn android_usb_error(target: &str) -> Result<(), RnsError> {
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("usb://")
+        || lower.starts_with("android-usb://")
+        || lower == "androidrnodeinterface"
+        || lower == "androidserialinterface"
+        || lower == "androidkissinterface"
+    {
+        log::error!("rnode: Android USB interface type '{target}' is not supported");
+        Err(RnsError::Unsupported)
+    } else {
+        Ok(())
+    }
+}
+
+/// Byte pipe to an RNode over BLE (Python `BLEConnection` read/write).
+///
+/// `connected` is true only after a live controller session exists.
+/// [`FakeBleLink`] never reports one.
+pub trait BleLink: Send {
+    fn write(
+        &mut self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), RnsError>> + Send;
+    fn read(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RnsError>> + Send;
+    fn connected(&self) -> bool;
+}
+
+/// In-memory [`BleLink`]. Records host writes and replays queued device
+/// bytes. It does not open an adapter and is never connected.
+#[derive(Debug, Default)]
+pub struct FakeBleLink {
+    written: Vec<u8>,
+    inbound: VecDeque<u8>,
+}
+
+impl FakeBleLink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn written(&self) -> &[u8] {
+        &self.written
+    }
+
+    /// Queue bytes the next [`BleLink::read`] calls will return.
+    pub fn queue_rx(&mut self, bytes: &[u8]) {
+        self.inbound.extend(bytes);
+    }
+}
+
+impl BleLink for FakeBleLink {
+    fn write(
+        &mut self,
+        data: &[u8],
+    ) -> impl std::future::Future<Output = Result<(), RnsError>> + Send {
+        self.written.extend_from_slice(data);
+        async { Ok(()) }
+    }
+
+    fn read(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<usize, RnsError>> + Send {
+        let n = buffer.len().min(self.inbound.len());
+        for slot in &mut buffer[..n] {
+            *slot = self.inbound.pop_front().unwrap_or(0);
+        }
+        async move { Ok(n) }
+    }
+
+    fn connected(&self) -> bool {
+        false
+    }
+}
+
+/// One open link to an RNode device: serial, TCP, or BLE
+/// (Python serial / `use_tcp` / `use_ble`).
 pub struct RnodeLink {
     reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     writer: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
@@ -1015,6 +1149,27 @@ impl RnodeLink {
         })
     }
 
+    /// Open `ble://`. Without `iface-rnode-ble` this is
+    /// [`RnsError::Unsupported`] and does not touch an adapter.
+    pub async fn connect_ble(port: &str) -> Result<Self, RnsError> {
+        let Some(target) = parse_ble_target(port) else {
+            return Err(RnsError::InvalidArgument);
+        };
+        #[cfg(feature = "iface-rnode-ble")]
+        {
+            let link = ble_backend::BtleplugBleLink::connect(&target).await?;
+            Ok(link.into_rnode_link())
+        }
+        #[cfg(not(feature = "iface-rnode-ble"))]
+        {
+            let _ = target;
+            log::error!(
+                "rnode: BLE target '{port}' requires building with --features iface-rnode-ble"
+            );
+            Err(RnsError::Unsupported)
+        }
+    }
+
     pub async fn write(&mut self, data: &[u8]) -> Result<(), RnsError> {
         self.writer
             .write_all(data)
@@ -1031,6 +1186,46 @@ impl RnodeLink {
             .read(buffer)
             .await
             .map_err(|_| RnsError::ConnectionError)
+    }
+}
+
+async fn open_rnode_link(
+    tcp: Option<&str>,
+    port: Option<&str>,
+    baudrate: u32,
+    multi: bool,
+) -> Result<RnodeLink, RnsError> {
+    if let Some(addr) = tcp {
+        return RnodeLink::tcp(addr).await;
+    }
+    let Some(port) = port else {
+        #[cfg(feature = "iface-serial")]
+        {
+            return Err(RnsError::InvalidArgument);
+        }
+        #[cfg(not(feature = "iface-serial"))]
+        {
+            let _ = baudrate;
+            return Err(RnsError::Unsupported);
+        }
+    };
+    android_usb_error(port)?;
+    if parse_ble_target(port).is_some() {
+        if multi {
+            log::error!("rnode_multi: ble:// is not supported");
+            return Err(RnsError::Unsupported);
+        }
+        return RnodeLink::connect_ble(port).await;
+    }
+    #[cfg(feature = "iface-serial")]
+    {
+        RnodeLink::serial(port, baudrate).await
+    }
+    #[cfg(not(feature = "iface-serial"))]
+    {
+        let _ = baudrate;
+        log::error!("rnode: serial port '{port}' requires building with --features iface-serial");
+        Err(RnsError::Unsupported)
     }
 }
 
@@ -1254,6 +1449,30 @@ impl RnodeInterface {
         }
     }
 
+    /// BLE port (Python `port = ble://...`).
+    ///
+    /// A value without the scheme is prefixed with `ble://`. Opening the
+    /// radio still requires feature `iface-rnode-ble`.
+    pub fn ble(port: impl Into<String>, config: RnodeRadioConfig) -> Self {
+        let port = port.into();
+        let port = if parse_ble_target(&port).is_some() {
+            port
+        } else {
+            format!("ble://{port}")
+        };
+        Self {
+            tcp_addr: None,
+            serial_port: Some(port),
+            baudrate: 115200,
+            config,
+            flow_control: false,
+            iface_manager: None,
+            state: Arc::new(std::sync::RwLock::new(RnodeShared::default())),
+            id_interval: None,
+            id_callsign: None,
+        }
+    }
+
     #[cfg(feature = "iface-serial")]
     pub fn serial(port: impl Into<String>, baudrate: u32, config: RnodeRadioConfig) -> Self {
         Self {
@@ -1319,22 +1538,9 @@ impl RnodeInterface {
                     )
                 };
 
-                let result = if let Some(addr) = tcp_addr {
-                    RnodeLink::tcp(&addr).await
-                } else {
-                    let _ = (&serial_port, baudrate);
-                    #[cfg(feature = "iface-serial")]
-                    {
-                        match serial_port.as_deref() {
-                            Some(port) => RnodeLink::serial(port, baudrate).await,
-                            None => Err(RnsError::InvalidArgument),
-                        }
-                    }
-                    #[cfg(not(feature = "iface-serial"))]
-                    {
-                        Err(RnsError::Unsupported)
-                    }
-                };
+                let result =
+                    open_rnode_link(tcp_addr.as_deref(), serial_port.as_deref(), baudrate, false)
+                        .await;
 
                 match result {
                     Ok(link) => link,
@@ -1717,22 +1923,9 @@ impl RnodeMultiInterface {
                     )
                 };
 
-                let result = if let Some(addr) = tcp_addr {
-                    RnodeLink::tcp(&addr).await
-                } else {
-                    let _ = (&serial_port, baudrate);
-                    #[cfg(feature = "iface-serial")]
-                    {
-                        match serial_port.as_deref() {
-                            Some(port) => RnodeLink::serial(port, baudrate).await,
-                            None => Err(RnsError::InvalidArgument),
-                        }
-                    }
-                    #[cfg(not(feature = "iface-serial"))]
-                    {
-                        Err(RnsError::Unsupported)
-                    }
-                };
+                let result =
+                    open_rnode_link(tcp_addr.as_deref(), serial_port.as_deref(), baudrate, true)
+                        .await;
 
                 match result {
                     Ok(link) => link,
@@ -2160,9 +2353,385 @@ impl Interface for RnodeVportPeer {
     }
 }
 
+#[cfg(feature = "iface-rnode-ble")]
+mod ble_backend {
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::time::Duration;
+
+    use btleplug::api::{
+        Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+    };
+    use btleplug::platform::{Manager, Peripheral};
+    use futures_util::stream::StreamExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use uuid::Uuid;
+
+    use super::{BleLink, BleTarget, RnodeLink, BLE_CONNECT_TIMEOUT, BLE_SCAN_TIMEOUT};
+    use crate::error::RnsError;
+
+    const UART_SERVICE_U128: u128 = 0x6E40_0001_B5A3_F393_E0A9_E50E_24DC_CA9E;
+    const UART_RX_U128: u128 = 0x6E40_0002_B5A3_F393_E0A9_E50E_24DC_CA9E;
+    const UART_TX_U128: u128 = 0x6E40_0003_B5A3_F393_E0A9_E50E_24DC_CA9E;
+
+    /// ATT payload before an MTU exchange. btleplug does not report the
+    /// negotiated write-without-response length (Python Android `BASE_MTU`
+    /// is 20). Desktop Python uses the characteristic's negotiated size.
+    const BLE_WRITE_CHUNK: usize = 20;
+
+    pub(super) struct BtleplugBleLink {
+        peripheral: Peripheral,
+        rx: btleplug::api::Characteristic,
+        tx_uuid: Uuid,
+        notes: Pin<Box<dyn futures_util::Stream<Item = ValueNotification> + Send>>,
+        pending: VecDeque<u8>,
+        connected: bool,
+    }
+
+    impl BtleplugBleLink {
+        pub(super) async fn connect(target: &BleTarget) -> Result<Self, RnsError> {
+            let manager = Manager::new().await.map_err(|err| {
+                log::error!("rnode: BLE manager unavailable: {err}");
+                RnsError::ConnectionError
+            })?;
+            let mut adapters = manager.adapters().await.map_err(|err| {
+                log::error!("rnode: BLE adapters unavailable: {err}");
+                RnsError::ConnectionError
+            })?;
+            let Some(adapter) = adapters.drain(..).next() else {
+                log::error!("rnode: no BLE adapter");
+                return Err(RnsError::ConnectionError);
+            };
+            let service = Uuid::from_u128(UART_SERVICE_U128);
+            adapter
+                .start_scan(ScanFilter {
+                    services: vec![service],
+                })
+                .await
+                .map_err(|err| {
+                    log::error!("rnode: BLE scan failed: {err}");
+                    RnsError::ConnectionError
+                })?;
+
+            let deadline = tokio::time::Instant::now() + BLE_SCAN_TIMEOUT;
+            let mut chosen = None;
+            while tokio::time::Instant::now() < deadline && chosen.is_none() {
+                let peripherals = adapter.peripherals().await.unwrap_or_default();
+                for peripheral in peripherals {
+                    let Ok(Some(props)) = peripheral.properties().await else {
+                        continue;
+                    };
+                    // Python requires the UART service UUID in the advertisement.
+                    if !props.services.contains(&service) {
+                        continue;
+                    }
+                    let matches = match target {
+                        BleTarget::Any => props
+                            .local_name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("RNode ")),
+                        BleTarget::Name(name) => props.local_name.as_deref() == Some(name.as_str()),
+                        BleTarget::Address(addr) => {
+                            peripheral.address().to_string().eq_ignore_ascii_case(addr)
+                        }
+                    };
+                    if matches {
+                        chosen = Some(peripheral);
+                        break;
+                    }
+                }
+                if chosen.is_none() {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+            let _ = adapter.stop_scan().await;
+            let Some(peripheral) = chosen else {
+                log::error!("rnode: no BLE RNode matched the target");
+                return Err(RnsError::ConnectionError);
+            };
+
+            // btleplug does not expose the BlueZ Bonded flag Python checks.
+            // A matching advertisement is connected; authentication failure
+            // surfaces as ConnectionError.
+            let connected = tokio::time::timeout(BLE_CONNECT_TIMEOUT, peripheral.connect()).await;
+            if !matches!(connected, Ok(Ok(()))) {
+                log::error!("rnode: BLE connect failed");
+                return Err(RnsError::ConnectionError);
+            }
+            if peripheral.discover_services().await.is_err() {
+                let _ = peripheral.disconnect().await;
+                return Err(RnsError::ConnectionError);
+            }
+            let rx_uuid = Uuid::from_u128(UART_RX_U128);
+            let tx_uuid = Uuid::from_u128(UART_TX_U128);
+            let chars = peripheral.characteristics();
+            let Some(rx) = chars.into_iter().find(|item| item.uuid == rx_uuid) else {
+                let _ = peripheral.disconnect().await;
+                log::error!("rnode: BLE UART RX characteristic missing");
+                return Err(RnsError::ConnectionError);
+            };
+            let tx = peripheral
+                .characteristics()
+                .into_iter()
+                .find(|item| item.uuid == tx_uuid);
+            let Some(tx) = tx else {
+                let _ = peripheral.disconnect().await;
+                log::error!("rnode: BLE UART TX characteristic missing");
+                return Err(RnsError::ConnectionError);
+            };
+            if peripheral.subscribe(&tx).await.is_err() {
+                let _ = peripheral.disconnect().await;
+                return Err(RnsError::ConnectionError);
+            }
+            let notes = peripheral.notifications().await.map_err(|err| {
+                log::error!("rnode: BLE notify failed: {err}");
+                RnsError::ConnectionError
+            })?;
+
+            Ok(Self {
+                peripheral,
+                rx,
+                tx_uuid,
+                notes,
+                pending: VecDeque::new(),
+                connected: true,
+            })
+        }
+
+        pub(super) fn into_rnode_link(self) -> RnodeLink {
+            let Self {
+                peripheral,
+                rx,
+                tx_uuid,
+                mut notes,
+                mut pending,
+                connected: _,
+            } = self;
+            let (reader, mut device_to_host) = tokio::io::simplex(64 * 1024);
+            let (mut host_to_device, writer) = tokio::io::simplex(64 * 1024);
+            tokio::spawn(async move {
+                if !pending.is_empty() {
+                    let queued: Vec<u8> = pending.drain(..).collect();
+                    if device_to_host.write_all(&queued).await.is_err() {
+                        let _ = peripheral.disconnect().await;
+                        return;
+                    }
+                }
+                let mut outbound = [0u8; 512];
+                loop {
+                    tokio::select! {
+                        result = host_to_device.read(&mut outbound) => {
+                            match result {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if write_chunks(&peripheral, &rx, &outbound[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        note = notes.next() => {
+                            match note {
+                                Some(note) if note.uuid == tx_uuid => {
+                                    if device_to_host.write_all(&note.value).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                let _ = peripheral.disconnect().await;
+            });
+            RnodeLink {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+            }
+        }
+    }
+
+    impl BleLink for BtleplugBleLink {
+        fn write(
+            &mut self,
+            data: &[u8],
+        ) -> impl std::future::Future<Output = Result<(), RnsError>> + Send {
+            let peripheral = self.peripheral.clone();
+            let rx = self.rx.clone();
+            let data = data.to_vec();
+            async move { write_chunks(&peripheral, &rx, &data).await }
+        }
+
+        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, RnsError> {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
+            while self.pending.is_empty() {
+                let Some(note) = self.notes.next().await else {
+                    self.connected = false;
+                    return Err(RnsError::ConnectionError);
+                };
+                if note.uuid == self.tx_uuid {
+                    self.pending.extend(note.value);
+                }
+            }
+            let n = buffer.len().min(self.pending.len());
+            for slot in &mut buffer[..n] {
+                *slot = self.pending.pop_front().unwrap_or(0);
+            }
+            Ok(n)
+        }
+
+        fn connected(&self) -> bool {
+            self.connected
+        }
+    }
+
+    async fn write_chunks(
+        peripheral: &Peripheral,
+        rx: &btleplug::api::Characteristic,
+        data: &[u8],
+    ) -> Result<(), RnsError> {
+        for chunk in data.chunks(BLE_WRITE_CHUNK) {
+            peripheral
+                .write(rx, chunk, WriteType::WithoutResponse)
+                .await
+                .map_err(|err| {
+                    log::debug!("rnode: BLE write failed: {err}");
+                    RnsError::ConnectionError
+                })?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ble_target_parse_matches_python_port_forms() {
+        assert_eq!(parse_ble_target("ble://"), Some(BleTarget::Any));
+        assert_eq!(parse_ble_target("BLE://"), Some(BleTarget::Any));
+        assert_eq!(
+            parse_ble_target("ble://F4:12:73:29:4E:89"),
+            Some(BleTarget::Address("F4:12:73:29:4E:89".into()))
+        );
+        assert_eq!(
+            parse_ble_target("ble://RNode 3B87"),
+            Some(BleTarget::Name("RNode 3B87".into()))
+        );
+        // Six colon-separated fields but not 17 characters is a name.
+        assert_eq!(
+            parse_ble_target("ble://A:B:C:D:E:F"),
+            Some(BleTarget::Name("A:B:C:D:E:F".into()))
+        );
+        assert!(parse_ble_target("/dev/ttyUSB0").is_none());
+        assert!(parse_ble_target("tcp://127.0.0.1:7633").is_none());
+    }
+
+    #[test]
+    fn android_usb_interface_types_are_unsupported() {
+        assert_eq!(
+            android_usb_error("AndroidRNodeInterface"),
+            Err(RnsError::Unsupported)
+        );
+        assert_eq!(
+            android_usb_error("AndroidSerialInterface"),
+            Err(RnsError::Unsupported)
+        );
+        assert_eq!(
+            android_usb_error("AndroidKISSInterface"),
+            Err(RnsError::Unsupported)
+        );
+        assert_eq!(android_usb_error("usb://1-1"), Err(RnsError::Unsupported));
+        assert_eq!(android_usb_error("/dev/ttyUSB0"), Ok(()));
+        assert_eq!(android_usb_error("ble://RNode 3B87"), Ok(()));
+    }
+
+    #[test]
+    fn cmd_bt_ctrl_frames_match_python_bytes() {
+        assert_eq!(CMD_BT_CTRL, 0x46);
+        assert_eq!(
+            kiss_frame(CMD_BT_CTRL, &[BT_CTRL_ENABLE]),
+            vec![FEND, CMD_BT_CTRL, 0x01, FEND]
+        );
+        assert_eq!(
+            kiss_frame(CMD_BT_CTRL, &[BT_CTRL_DISABLE]),
+            vec![FEND, CMD_BT_CTRL, 0x00, FEND]
+        );
+        assert_eq!(
+            kiss_frame(CMD_BT_CTRL, &[BT_CTRL_PAIR]),
+            vec![FEND, CMD_BT_CTRL, 0x02, FEND]
+        );
+        assert_eq!(
+            BLE_UART_SERVICE_UUID,
+            "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+        );
+        assert_eq!(BLE_UART_RX_UUID, "6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+        assert_eq!(BLE_UART_TX_UUID, "6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
+        assert_eq!(BLE_SCAN_TIMEOUT, Duration::from_secs(2));
+        assert_eq!(BLE_CONNECT_TIMEOUT, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn ble_framing_uses_the_fake_and_does_not_claim_connected() {
+        let mut link = FakeBleLink::new();
+        assert!(!link.connected());
+
+        // Android `bluetooth_control(..., pairing_mode=True)` writes enable
+        // then the pair command. rnodeconf's `bluetooth_pair` is only 0x02.
+        let enable = kiss_frame(CMD_BT_CTRL, &[BT_CTRL_ENABLE]);
+        let pair = kiss_frame(CMD_BT_CTRL, &[BT_CTRL_PAIR]);
+        link.write(&enable).await.unwrap();
+        link.write(&pair).await.unwrap();
+        assert_eq!(
+            link.written(),
+            [enable.as_slice(), pair.as_slice()].concat()
+        );
+        assert!(!link.connected());
+
+        link.queue_rx(&kiss_frame(CMD_DETECT, &[DETECT_RESP]));
+        let mut buffer = [0u8; 8];
+        let n = link.read(&mut buffer).await.unwrap();
+        assert_eq!(
+            &buffer[..n],
+            kiss_frame(CMD_DETECT, &[DETECT_RESP]).as_slice()
+        );
+        assert_eq!(link.read(&mut buffer).await.unwrap(), 0);
+        assert!(!link.connected());
+
+        let iface = RnodeInterface::ble(
+            "RNode 3B87",
+            RnodeRadioConfig {
+                frequency: 867_500_000,
+                bandwidth: 125_000,
+                txpower: 7,
+                spreadingfactor: 8,
+                codingrate: 5,
+                st_alock: None,
+                lt_alock: None,
+            },
+        );
+        assert_eq!(iface.serial_port.as_deref(), Some("ble://RNode 3B87"));
+        assert!(iface.tcp_addr.is_none());
+    }
+
+    #[cfg(not(feature = "iface-rnode-ble"))]
+    #[tokio::test]
+    async fn ble_without_the_feature_is_unsupported_and_does_not_open_an_adapter() {
+        match RnodeLink::connect_ble("ble://RNode 3B87").await {
+            Err(RnsError::Unsupported) => {}
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("ble open must not succeed without iface-rnode-ble"),
+        }
+        match RnodeLink::connect_ble("not-ble").await {
+            Err(RnsError::InvalidArgument) => {}
+            Err(other) => panic!("expected InvalidArgument, got {other:?}"),
+            Ok(_) => panic!("a non-ble port must not open"),
+        }
+    }
 
     #[test]
     fn radio_state_and_multi_transmit_frames_match_protocol() {

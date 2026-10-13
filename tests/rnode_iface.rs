@@ -869,3 +869,41 @@ async fn rnode_multi_stays_offline_without_interface_probe() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+#[tokio::test]
+async fn ble_cmd_bt_ctrl_frames_go_through_the_fake_link() {
+    let mut link = FakeBleLink::new();
+    assert!(
+        !link.connected(),
+        "the in-memory fake must not claim a radio is connected"
+    );
+
+    let disable = kiss_frame(CMD_BT_CTRL, &[BT_CTRL_DISABLE]);
+    let enable = kiss_frame(CMD_BT_CTRL, &[BT_CTRL_ENABLE]);
+    let pair = kiss_frame(CMD_BT_CTRL, &[BT_CTRL_PAIR]);
+    assert_eq!(disable, [FEND, 0x46, 0x00, FEND]);
+    assert_eq!(enable, [FEND, 0x46, 0x01, FEND]);
+    assert_eq!(pair, [FEND, 0x46, 0x02, FEND]);
+
+    link.write(&disable).await.unwrap();
+    link.write(&enable).await.unwrap();
+    link.write(&pair).await.unwrap();
+    assert_eq!(
+        link.written(),
+        [disable.as_slice(), enable.as_slice(), pair.as_slice()].concat()
+    );
+    assert!(!link.connected());
+
+    link.queue_rx(&enable);
+    let mut buffer = [0u8; 4];
+    let n = link.read(&mut buffer).await.unwrap();
+    assert_eq!(&buffer[..n], enable.as_slice());
+    assert!(!link.connected());
+
+    assert_eq!(
+        android_usb_error("AndroidRNodeInterface"),
+        Err(reticulum::error::RnsError::Unsupported)
+    );
+    assert!(parse_ble_target("ble://").is_some());
+    assert!(parse_ble_target("/dev/ttyUSB0").is_none());
+}

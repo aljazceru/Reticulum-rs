@@ -47,6 +47,11 @@ tokio-serial = { version = "5.4", default-features = false, features = ["rt"], o
 # socket setup for AutoInterface IPv6 multicast
 socket2 = { version = "0.6", optional = true }
 
+# RNode ble:// (Nordic UART). Off unless `iface-rnode-ble` is enabled.
+btleplug = { version = "0.11.8", optional = true }
+uuid = { version = "1", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["std"] }
+
 # Logging
 log = "0.4.27"
 env_logger = "0.10"
@@ -69,6 +74,8 @@ iface-auto = ["dep:socket2"]
 iface-i2p = []
 # RNodeInterface + RNodeMultiInterface (serial mode needs iface-serial)
 iface-rnode = []
+# RNode ble:// via btleplug. Default builds do not link a BLE stack.
+iface-rnode-ble = ["iface-rnode", "dep:btleplug", "dep:uuid", "dep:futures-util"]
 
 [build-dependencies]
 tonic-build = "0.13.0"

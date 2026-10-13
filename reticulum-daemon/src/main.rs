@@ -1037,12 +1037,43 @@ async fn start_configured_interface(
                 };
 
                 let (tcp, port) = rnode_endpoint(tcp, port);
-                if port.is_some_and(|port| port.starts_with("ble://")) {
-                    log::error!(
-                        "Interface '{}' type 'RNodeInterface' BLE is not supported",
-                        iface.name
-                    );
-                    return;
+                if let Some(port) = port {
+                    if reticulum::iface::rnode::parse_ble_target(port).is_some() {
+                        #[cfg(feature = "iface-rnode-ble")]
+                        {
+                            log::info!(
+                                "Enabling interface '{}': RNode over BLE {port} at {frequency} Hz",
+                                iface.name
+                            );
+                            let mut interface =
+                                reticulum::iface::rnode::RnodeInterface::ble(port, radio)
+                                    .with_flow_control(*flow_control)
+                                    .with_manager(iface_manager.clone());
+                            if let (Some(interval), Some(callsign)) =
+                                (iface.id_interval, iface.id_callsign.as_deref())
+                            {
+                                interface = interface.with_beacon(interval, callsign.as_bytes());
+                            }
+                            launch_configured(
+                                iface_manager,
+                                interface,
+                                Some(&iface.name),
+                                reticulum::iface::rnode::RnodeInterface::spawn,
+                                iface,
+                                reticulum,
+                            )
+                            .await;
+                            return;
+                        }
+                        #[cfg(not(feature = "iface-rnode-ble"))]
+                        {
+                            log::error!(
+                                "Interface '{}' type 'RNodeInterface' BLE requires building the daemon with --features iface-rnode-ble",
+                                iface.name
+                            );
+                            return;
+                        }
+                    }
                 }
                 let interface = if let Some(tcp) = tcp {
                     log::info!(
