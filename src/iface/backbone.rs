@@ -1325,11 +1325,6 @@ mod tests {
         }
         assert!(saw_eof, "stuck try_write must drop the stream");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     #[tokio::test]
     async fn accepted_peers_differ_by_port_and_flap_by_ip() {
