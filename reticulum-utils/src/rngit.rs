@@ -980,14 +980,6 @@ fn parse_request_repository_path(path: &str) -> Option<(&str, &str)> {
     Some((group, repository))
 }
 
-/// `group` request path: exactly one component, at most 256 bytes.
-fn parse_request_group_path(path: &str) -> Option<&str> {
-    if path.len() > 256 || path.contains('/') {
-        return None;
-    }
-    Some(path)
-}
-
 /// Handler precondition: link identified + request data is a dict.
 /// `ctx.data` carries the request payload's msgpack encoding.
 fn identified_map(ctx: &RequestContext) -> Option<(Identity, rmpv::Value)> {
@@ -2829,9 +2821,10 @@ async fn handle_perms(node: &mut GitNode, remote: &Identity, data: &rmpv::Value)
             let Some(group_name) = map_get_int(data, IDX_GROUP).and_then(value_str) else {
                 return res_bytes(RES_INVALID_REQ, "No group specified");
             };
-            let Some(group_name) = parse_request_group_path(&group_name) else {
+            if group_name.len() > 256 || group_name.contains('/') {
                 return res_bytes(RES_NOT_FOUND, "Not found");
-            };
+            }
+            let group_name = group_name.as_str();
             let read_access = node.resolve_group_permission(remote, group_name, Perm::Read);
             let admin_access = node.resolve_group_permission(remote, group_name, Perm::Admin);
             if !read_access {

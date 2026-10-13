@@ -1632,12 +1632,11 @@ fn sign_message(options: &IdOptions, resolved: &Resolved) -> Result<i32, String>
     } else {
         Vec::new()
     };
-    let rsg = pack_rsg(
-        private,
-        message.as_bytes(),
-        true,
-        &meta_pairs_to_rmpv(&meta),
-    );
+    let meta: Vec<_> = meta
+        .iter()
+        .map(|(key, value)| (rmpv::Value::from(key.as_str()), meta_value_to_rmpv(value)))
+        .collect();
+    let rsg = pack_rsg(private, message.as_bytes(), true, &meta);
     if matches!(format, WireFormat::Bin) {
         let Some(write) = options.write.as_deref() else {
             println!("No write path specified");
@@ -1752,12 +1751,6 @@ fn meta_value_to_rmpv(value: &MetaValue) -> rmpv::Value {
                 .collect(),
         ),
     }
-}
-
-fn meta_pairs_to_rmpv(meta: &[(String, MetaValue)]) -> Vec<(rmpv::Value, rmpv::Value)> {
-    meta.iter()
-        .map(|(key, value)| (rmpv::Value::from(key.as_str()), meta_value_to_rmpv(value)))
-        .collect()
 }
 
 const RSG_HEADER: &str = "#### Start of rsg data ";
