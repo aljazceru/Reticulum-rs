@@ -69,15 +69,56 @@ struct PathArgs {
     config: Option<PathBuf>,
     /// Destination hash (32 hexadecimal characters)
     destination: Option<String>,
+    /// Filter for a remote blackhole list
+    list_filter: Option<String>,
     /// Show all known paths instead of looking one up
     #[arg(short, long)]
     table: bool,
     /// Maximum hops to filter the path table by
     #[arg(short, long)]
     max: Option<u8>,
+    /// Show announce rate info
+    #[arg(short, long)]
+    rates: bool,
+    /// Remove the path to a destination
+    #[arg(short, long)]
+    drop: bool,
+    /// Drop all queued announces
+    #[arg(short = 'D', long = "drop-announces")]
+    drop_announces: bool,
+    /// Drop all paths via a transport instance
+    #[arg(short = 'x', long = "drop-via")]
+    drop_via: bool,
     /// Timeout in seconds before giving up
     #[arg(short = 'w', long)]
     timeout: Option<f64>,
+    /// Transport identity hash of a remote instance
+    #[arg(short = 'R')]
+    remote: Option<String>,
+    /// Path to the identity used for remote management
+    #[arg(short = 'i')]
+    identity: Option<PathBuf>,
+    /// Timeout in seconds for remote queries
+    #[arg(short = 'W')]
+    remote_timeout: Option<f64>,
+    /// List blackholed identities
+    #[arg(short = 'b', long)]
+    blackholed: bool,
+    /// Blackhole an identity
+    #[arg(short = 'B', long)]
+    blackhole: bool,
+    /// Remove an identity from the blacklist
+    #[arg(short = 'U', long)]
+    unblackhole: bool,
+    /// Blackhole duration in hours
+    #[arg(long)]
+    duration: Option<f64>,
+    /// Reason stored with a blackhole entry
+    #[arg(long)]
+    reason: Option<String>,
+    /// View a remote transport's published blackhole list
+    #[arg(short = 'p', long = "blackholed-list")]
+    blackholed_list: bool,
     /// Output in JSON format
     #[arg(short = 'j', long)]
     json: bool,
@@ -91,12 +132,59 @@ struct StatusArgs {
     /// Path to alternative Reticulum config directory
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Attach an interface by name
+    #[arg(long)]
+    attach: Option<String>,
+    /// Detach an interface by name
+    #[arg(long)]
+    detach: Option<String>,
+    /// Reload an interface by name
+    #[arg(long)]
+    reload: Option<String>,
+    /// Show interfaces that are normally hidden
+    #[arg(short, long)]
+    all: bool,
+    /// Show link table counts
+    #[arg(short = 'l', long = "link-stats")]
+    link_stats: bool,
+    /// Show traffic totals
+    #[arg(short = 't', long)]
+    totals: bool,
+    /// Show packets per second with totals
+    #[arg(short = 'p', long)]
+    pps: bool,
+    /// Show inbound queue pressure
+    #[arg(short = 'q', long)]
+    queues: bool,
+    /// Show profiling results
+    #[arg(short = 'z', long)]
+    profiling: bool,
+    /// List discovered interfaces
+    #[arg(short = 'd', long)]
+    discovered: bool,
+    /// Include stale discovery entries
+    #[arg(long = "show-stale")]
+    show_stale: bool,
+    /// Include discovery entries that have no version
+    #[arg(long = "show-unknown")]
+    show_unknown: bool,
     /// Output in JSON format
     #[arg(short = 'j', long)]
     json: bool,
+    /// Transport identity hash of a remote instance
+    #[arg(short = 'R')]
+    remote: Option<String>,
+    /// Path to the identity used for remote management
+    #[arg(short = 'i')]
+    identity: Option<PathBuf>,
+    /// Timeout in seconds for remote queries
+    #[arg(short = 'w')]
+    timeout: Option<f64>,
     /// Increase verbosity
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
+    /// Only show interfaces whose names contain this text
+    filter: Option<String>,
 }
 
 #[derive(Args)]
@@ -474,86 +562,352 @@ fn exit_code(result: Result<(), String>) -> ExitCode {
 
 async fn run_path(args: PathArgs) -> Result<(), String> {
     init_logging(args.verbose as i32);
-    if !args.table && args.destination.is_none() {
-        return Err(
-            "No destination specified. Use -t/--table to list paths or pass a destination hash."
-                .to_string(),
+    if !args.drop_announces
+        && !args.table
+        && !args.rates
+        && args.destination.is_none()
+        && !args.drop_via
+        && !args.blackholed
+        && !args.blackholed_list
+    {
+        println!(
+            "No destination specified. Use -t/--table, -r/--rates, -b/--blackholed, or pass a destination hash."
         );
+        return Ok(());
     }
     let config_dir = reticulum_utils::common::resolve_config_dir(args.config.as_deref());
     let timeout = duration_arg(args.timeout, reticulum_utils::rnpath::DEFAULT_TIMEOUT);
+    let remote_timeout = duration_arg(
+        args.remote_timeout,
+        reticulum_utils::rnpath::DEFAULT_TIMEOUT,
+    );
 
-    let transport = reticulum_utils::common::build_tool_transport(
-        reticulum_utils::common::ToolTransportOptions {
-            config_dir: &config_dir,
-            instance_name: "rnpath",
-            enable_transport: false,
-            udp_loopback: None,
-        },
-    )
-    .await;
-
-    if args.table {
-        let filter = match &args.destination {
-            Some(destination) => Some(parse_hash(destination)?),
-            None => None,
-        };
-        let attached = transport
-            .iface_manager()
-            .lock()
-            .await
-            .connected_to_shared_instance();
-        let entries = if attached {
-            let max_hops = match args.max {
-                Some(max) => rmpv::Value::from(u64::from(max)),
-                None => rmpv::Value::Nil,
-            };
-            let response = reticulum_utils::common::shared_rpc(
-                &config_dir,
-                rmpv::Value::Map(vec![
-                    (rmpv::Value::from("get"), rmpv::Value::from("path_table")),
-                    (rmpv::Value::from("max_hops"), max_hops),
-                ]),
-            )
-            .await?;
-            let mut entries = reticulum_utils::rnpath::paths_from_rpc(&response)?;
-            if let Some(filter) = filter {
-                entries.retain(|entry| entry.destination == filter);
-            }
-            entries
-        } else {
-            reticulum_utils::rnpath::path_table(&transport, filter.as_ref(), args.max).await
-        };
-        if args.json {
-            #[derive(serde::Serialize)]
-            struct Entry {
-                hash: String,
-                hops: u8,
-                via: String,
-                interface: String,
-            }
-            let json: Vec<Entry> = entries
-                .iter()
-                .map(|entry| Entry {
-                    hash: reticulum_utils::common::prettyhexrep(entry.destination.as_slice()),
-                    hops: entry.hops,
-                    via: reticulum_utils::common::prettyhexrep(entry.via.as_slice()),
-                    interface: entry.on_interface(),
-                })
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-        } else {
-            print!("{}", reticulum_utils::rnpath::render_table(&entries));
-            if entries.is_empty() {
-                println!("No information available");
-            }
-        }
+    if args.blackholed_list && !args.blackholed {
+        let (_, hash) = require_destination(&args.destination)?;
+        let transport = path_transport(&config_dir).await;
+        let text = reticulum_utils::rnpath::remote_blackhole_list(
+            &transport,
+            &hash,
+            remote_timeout,
+            args.list_filter.as_deref(),
+            reticulum_utils::common::unix_now(),
+        )
+        .await?;
+        print!("{text}");
         return Ok(());
     }
 
-    let destination = parse_hash(args.destination.as_deref().expect("checked"))?;
-    let result = reticulum_utils::rnpath::wait_for_path(&transport, &destination, timeout).await;
-    match result {
+    if let Some(remote) = &args.remote {
+        return run_remote_path(&args, &config_dir, remote, remote_timeout).await;
+    }
+
+    let transport = path_transport(&config_dir).await;
+    let attached = transport
+        .iface_manager()
+        .lock()
+        .await
+        .connected_to_shared_instance();
+    if attached {
+        run_shared_path(&args, &config_dir).await
+    } else {
+        run_local_path(&args, &transport, timeout).await
+    }
+}
+
+async fn path_transport(config_dir: &std::path::Path) -> reticulum::transport::Transport {
+    reticulum_utils::common::build_tool_transport(reticulum_utils::common::ToolTransportOptions {
+        config_dir,
+        instance_name: "rnpath",
+        enable_transport: false,
+        udp_loopback: None,
+    })
+    .await
+}
+
+fn require_destination(
+    destination: &Option<String>,
+) -> Result<(String, reticulum::hash::AddressHash), String> {
+    let shown = destination
+        .as_deref()
+        .ok_or_else(|| "No destination specified".to_string())?;
+    Ok((shown.to_string(), parse_hash(shown)?))
+}
+
+fn load_management_identity(
+    path: &Option<PathBuf>,
+) -> Result<reticulum::identity::PrivateIdentity, String> {
+    let Some(path) = path else {
+        return Err("Could not load management identity from None".to_string());
+    };
+    reticulum_utils::common::load_private_identity(path).map_err(|err| {
+        format!(
+            "Could not load management identity from {}: {err}",
+            path.display()
+        )
+    })
+}
+
+async fn run_remote_path(
+    args: &PathArgs,
+    config_dir: &std::path::Path,
+    remote: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let identity_hash = parse_hash(remote)?;
+    if args.blackholed {
+        return Err(
+            "Listing blackholed identities on remote instances not yet implemented".to_string(),
+        );
+    }
+    if args.blackhole || args.unblackhole {
+        return Err("Blackholing identity on remote instances not yet implemented".to_string());
+    }
+    if args.drop_announces {
+        return Err("Dropping announce queues on remote instances not yet implemented".to_string());
+    }
+    if args.drop {
+        return Err("Dropping path on remote instances not yet implemented".to_string());
+    }
+    if args.drop_via {
+        return Err(
+            "Dropping all paths via specific transport instance on remote instances yet not implemented"
+                .to_string(),
+        );
+    }
+    let identity = load_management_identity(&args.identity)?;
+    let transport = path_transport(config_dir).await;
+    let filter = match &args.destination {
+        Some(destination) => Some(parse_hash(destination)?),
+        None => None,
+    };
+    if args.table {
+        let text = reticulum_utils::rnpath::remote_path_table(
+            &transport,
+            &identity_hash,
+            &identity,
+            filter.as_ref(),
+            args.max,
+            timeout,
+        )
+        .await?;
+        print!("{text}");
+        return Ok(());
+    }
+    if args.rates {
+        let text = reticulum_utils::rnpath::remote_rates(
+            &transport,
+            &identity_hash,
+            &identity,
+            filter.as_ref(),
+            reticulum_utils::common::unix_now(),
+            timeout,
+        )
+        .await?;
+        print!("{text}");
+        return Ok(());
+    }
+    Err("Requesting paths on remote instances not implemented".to_string())
+}
+
+async fn run_shared_path(args: &PathArgs, config_dir: &std::path::Path) -> Result<(), String> {
+    let filter = match &args.destination {
+        Some(destination) => Some(parse_hash(destination)?),
+        None => None,
+    };
+    if args.blackholed {
+        let text = reticulum_utils::rnpath::blackholed_text(
+            config_dir,
+            args.destination.as_deref(),
+            reticulum_utils::common::unix_now(),
+            None,
+        )
+        .await?;
+        print!("{text}");
+        return Ok(());
+    }
+    if args.blackhole {
+        let (shown, hash) = require_destination(&args.destination)?;
+        let until = args
+            .duration
+            .map(|hours| reticulum_utils::common::unix_now() + hours * 3_600.0);
+        let text = reticulum_utils::rnpath::blackhole_text(
+            config_dir,
+            &hash,
+            &shown,
+            until,
+            args.reason.as_deref(),
+        )
+        .await?;
+        println!("{text}");
+        return Ok(());
+    }
+    if args.unblackhole {
+        let (shown, hash) = require_destination(&args.destination)?;
+        let text = reticulum_utils::rnpath::unblackhole_text(config_dir, &hash, &shown).await?;
+        println!("{text}");
+        return Ok(());
+    }
+    if args.table {
+        if args.json {
+            let value = reticulum_utils::rnpath::path_table_value(config_dir, args.max).await?;
+            println!("{}", reticulum_utils::common::msgpack_json(&value));
+        } else {
+            print!(
+                "{}",
+                reticulum_utils::rnpath::path_table_text(config_dir, filter.as_ref(), args.max)
+                    .await?
+            );
+        }
+        return Ok(());
+    }
+    if args.rates {
+        let now = reticulum_utils::common::unix_now();
+        if args.json {
+            let value = reticulum_utils::rnpath::rates_value(config_dir).await?;
+            println!("{}", reticulum_utils::common::msgpack_json(&value));
+        } else {
+            print!(
+                "{}",
+                reticulum_utils::rnpath::rates_text(config_dir, filter.as_ref(), now).await?
+            );
+        }
+        return Ok(());
+    }
+    if args.drop_announces {
+        println!(
+            "{}",
+            reticulum_utils::rnpath::drop_announces_text(config_dir).await?
+        );
+        return Ok(());
+    }
+    if args.drop {
+        let (_, hash) = require_destination(&args.destination)?;
+        println!(
+            "{}",
+            reticulum_utils::rnpath::drop_path_text(config_dir, &hash).await?
+        );
+        return Ok(());
+    }
+    if args.drop_via {
+        let (_, hash) = require_destination(&args.destination)?;
+        println!(
+            "{}",
+            reticulum_utils::rnpath::drop_via_text(config_dir, &hash).await?
+        );
+        return Ok(());
+    }
+    let transport = path_transport(config_dir).await;
+    lookup_path(
+        &transport,
+        &args.destination,
+        duration_arg(args.timeout, reticulum_utils::rnpath::DEFAULT_TIMEOUT),
+    )
+    .await
+}
+
+async fn run_local_path(
+    args: &PathArgs,
+    transport: &reticulum::transport::Transport,
+    timeout: Duration,
+) -> Result<(), String> {
+    let filter = match &args.destination {
+        Some(destination) => Some(parse_hash(destination)?),
+        None => None,
+    };
+    let now = reticulum_utils::common::unix_now();
+    if args.blackholed {
+        let text = reticulum_utils::rnpath::local_blackholed_text(
+            transport,
+            args.destination.as_deref(),
+            now,
+        )
+        .await?;
+        print!("{text}");
+        return Ok(());
+    }
+    if args.blackhole {
+        let (shown, hash) = require_destination(&args.destination)?;
+        let until = args.duration.map(|hours| now + hours * 3_600.0);
+        let text = reticulum_utils::rnpath::local_blackhole_text(
+            transport,
+            &hash,
+            &shown,
+            until,
+            args.reason.clone(),
+        )
+        .await?;
+        println!("{text}");
+        return Ok(());
+    }
+    if args.unblackhole {
+        let (shown, hash) = require_destination(&args.destination)?;
+        let text =
+            reticulum_utils::rnpath::local_unblackhole_text(transport, &hash, &shown).await?;
+        println!("{text}");
+        return Ok(());
+    }
+    if args.table {
+        if args.json {
+            let text = reticulum_utils::rnpath::local_path_table_text(
+                transport,
+                filter.as_ref(),
+                args.max,
+            )
+            .await?;
+            println!("{text}");
+        } else {
+            print!(
+                "{}",
+                reticulum_utils::rnpath::local_path_table_text(
+                    transport,
+                    filter.as_ref(),
+                    args.max
+                )
+                .await?
+            );
+        }
+        return Ok(());
+    }
+    if args.rates {
+        print!(
+            "{}",
+            reticulum_utils::rnpath::local_rates_text(transport, filter.as_ref(), now).await?
+        );
+        return Ok(());
+    }
+    if args.drop_announces {
+        println!(
+            "{}",
+            reticulum_utils::rnpath::local_drop_announces_text(transport).await
+        );
+        return Ok(());
+    }
+    if args.drop {
+        let (_, hash) = require_destination(&args.destination)?;
+        println!(
+            "{}",
+            reticulum_utils::rnpath::local_drop_path_text(transport, &hash).await?
+        );
+        return Ok(());
+    }
+    if args.drop_via {
+        let (_, hash) = require_destination(&args.destination)?;
+        println!(
+            "{}",
+            reticulum_utils::rnpath::local_drop_via_text(transport, &hash).await?
+        );
+        return Ok(());
+    }
+    lookup_path(transport, &args.destination, timeout).await
+}
+
+async fn lookup_path(
+    transport: &reticulum::transport::Transport,
+    destination: &Option<String>,
+    timeout: Duration,
+) -> Result<(), String> {
+    let (_, hash) = require_destination(destination)?;
+    match reticulum_utils::rnpath::wait_for_path(transport, &hash, timeout).await {
         Some(result) => {
             println!("{}", result.render());
             Ok(())
@@ -565,6 +919,67 @@ async fn run_path(args: PathArgs) -> Result<(), String> {
 async fn run_status(args: StatusArgs) -> Result<(), String> {
     init_logging(args.verbose as i32);
     let config_dir = reticulum_utils::common::resolve_config_dir(args.config.as_deref());
+    let view = reticulum_utils::rnstatus::StatusView {
+        show_all: args.all,
+        link_stats: args.link_stats,
+        totals: args.totals,
+        pps: args.pps,
+        queues: args.queues,
+        profiling: args.profiling,
+        discovered_only: args.discovered,
+        show_stale: args.show_stale,
+        show_unknown: args.show_unknown,
+        json: args.json,
+        name_filter: args.filter.clone(),
+    };
+
+    if let Some(action) = manage_action(&args) {
+        let transport = reticulum_utils::common::build_tool_transport_requiring_shared(
+            reticulum_utils::common::ToolTransportOptions {
+                config_dir: &config_dir,
+                instance_name: "rnstatus",
+                enable_transport: false,
+                udp_loopback: None,
+            },
+        )
+        .await?;
+        let (verb, name) = action;
+        let message = reticulum_utils::rnstatus::manage_interface(&config_dir, verb, name).await?;
+        println!("{message}");
+        drop(transport);
+        return Ok(());
+    }
+
+    if let Some(remote) = &args.remote {
+        if args.identity.is_none() {
+            return Err(
+                "Remote management requires an identity file. Use -i to specify the path to a management identity."
+                    .to_string(),
+            );
+        }
+        let identity = load_management_identity(&args.identity)?;
+        let hash = parse_hash(remote)?;
+        let transport = reticulum_utils::common::build_tool_transport(
+            reticulum_utils::common::ToolTransportOptions {
+                config_dir: &config_dir,
+                instance_name: "rnstatus",
+                enable_transport: false,
+                udp_loopback: None,
+            },
+        )
+        .await;
+        let text = reticulum_utils::rnstatus::remote_status(
+            &transport,
+            &hash,
+            &identity,
+            &view,
+            duration_arg(args.timeout, reticulum_utils::rnpath::DEFAULT_TIMEOUT),
+        )
+        .await?;
+        print!("{text}");
+        return Ok(());
+    }
+
     let transport = reticulum_utils::common::build_tool_transport_requiring_shared(
         reticulum_utils::common::ToolTransportOptions {
             config_dir: &config_dir,
@@ -574,14 +989,23 @@ async fn run_status(args: StatusArgs) -> Result<(), String> {
         },
     )
     .await?;
-
-    let report = reticulum_utils::rnstatus::collect_shared(&config_dir, &transport).await?;
-    if args.json {
-        println!("{}", report.to_json());
-    } else {
-        print!("{}", report.render());
-    }
+    let text = reticulum_utils::rnstatus::fetch_status(&config_dir, &view).await?;
+    print!("{text}");
+    drop(transport);
     Ok(())
+}
+
+fn manage_action(args: &StatusArgs) -> Option<(&str, &str)> {
+    if let Some(name) = args.attach.as_deref() {
+        return Some(("attach", name));
+    }
+    if let Some(name) = args.detach.as_deref() {
+        return Some(("detach", name));
+    }
+    if let Some(name) = args.reload.as_deref() {
+        return Some(("reload", name));
+    }
+    None
 }
 
 async fn run_cp(args: CpArgs) -> Result<(), String> {

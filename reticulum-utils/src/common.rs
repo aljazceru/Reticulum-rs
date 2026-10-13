@@ -28,6 +28,109 @@ pub fn prettyhexrep(bytes: &[u8]) -> String {
     out
 }
 
+/// Seconds since the unix epoch.
+pub fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Python `RNS.prettytime` (not verbose, not compact).
+pub fn pretty_time(seconds: f64) -> String {
+    let mut time = seconds.max(0.0);
+    let days = (time / 86_400.0) as u64;
+    time %= 86_400.0;
+    let hours = (time / 3_600.0) as u64;
+    time %= 3_600.0;
+    let minutes = (time / 60.0) as u64;
+    time %= 60.0;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if time > 0.0 {
+        parts.push(format!("{}s", trim_number(time)));
+    }
+    match parts.len() {
+        0 => "0s".to_string(),
+        1 => parts.remove(0),
+        _ => {
+            let last = parts.pop().unwrap_or_default();
+            format!("{} and {last}", parts.join(", "))
+        }
+    }
+}
+
+fn trim_number(value: f64) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    if (rounded - rounded.trunc()).abs() < 1e-6 {
+        format!("{}", rounded as u64)
+    } else {
+        let mut text = format!("{rounded:.2}");
+        while text.ends_with('0') {
+            text.pop();
+        }
+        text
+    }
+}
+
+/// Msgpack value as JSON. Byte strings become bare hex, matching
+/// `RNS.hexrep(..., delimit=False)` in the Python utilities' `--json` output.
+pub fn msgpack_json(value: &rmpv::Value) -> String {
+    serde_json::to_string(&msgpack_json_value(value)).unwrap_or_else(|_| "null".to_string())
+}
+
+fn msgpack_json_value(value: &rmpv::Value) -> serde_json::Value {
+    match value {
+        rmpv::Value::Nil => serde_json::Value::Null,
+        rmpv::Value::Boolean(item) => serde_json::Value::Bool(*item),
+        rmpv::Value::Integer(item) => {
+            if let Some(number) = item.as_i64() {
+                serde_json::Value::from(number)
+            } else if let Some(number) = item.as_u64() {
+                serde_json::Value::from(number)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        rmpv::Value::F32(item) => serde_json::json!(*item as f64),
+        rmpv::Value::F64(item) => serde_json::Number::from_f64(*item)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        rmpv::Value::String(item) => {
+            serde_json::Value::String(item.as_str().unwrap_or("").to_string())
+        }
+        rmpv::Value::Binary(item) => serde_json::Value::String(hex_bytes(item)),
+        rmpv::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(msgpack_json_value).collect())
+        }
+        rmpv::Value::Map(entries) => {
+            let mut map = serde_json::Map::new();
+            for (key, item) in entries {
+                let name = match key {
+                    rmpv::Value::String(text) => text.as_str().unwrap_or("").to_string(),
+                    rmpv::Value::Binary(bytes) => hex_bytes(bytes),
+                    other => msgpack_json_value(other).to_string(),
+                };
+                map.insert(name, msgpack_json_value(item));
+            }
+            serde_json::Value::Object(map)
+        }
+        rmpv::Value::Ext(_, data) => serde_json::Value::String(hex_bytes(data)),
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Parse a `<hex>`, bare hex or `/<hex>` string into an address hash.
 pub fn parse_hash(input: &str) -> Result<AddressHash, String> {
     let cleaned: String = input
