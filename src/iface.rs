@@ -1058,23 +1058,43 @@ impl InterfaceManager {
         released
     }
 
-    /// Transmit queued announces whose airtime budget allows it
-    /// (Python `Interface.process_announce_queue`). Returns the direct
-    /// transmit messages for the transport to send.
-    pub fn process_announce_queues(&self) -> Vec<TxMessage> {
+    /// Transmit one queued announce per interface
+    /// (Python `Interface.process_announce_queue`: the selected announce is
+    /// transmitted directly — it does not re-enter `Transport.outbound`, so
+    /// the announce-cap gate must not be applied a second time, which would
+    /// otherwise re-queue it and starve the queue forever).
+    pub async fn process_announce_queues(&self) {
         let now = tokio::time::Instant::now();
-        let mut controls = self.controls.lock().expect("iface control lock");
-        let mut messages = Vec::new();
-        for (address, control) in controls.iter_mut() {
-            while let Some(packet) = control.take_queued_announce(now) {
-                control.sent_announce(now);
-                messages.push(TxMessage {
-                    tx_type: TxMessageType::Direct(*address),
-                    packet,
-                });
+        let drained = {
+            let mut controls = self.controls.lock().expect("iface control lock");
+            let mut drained = Vec::new();
+            for (address, control) in controls.iter_mut() {
+                if let Some(packet) = control.take_queued_announce(now) {
+                    control.sent_announce(now);
+                    drained.push((*address, packet));
+                }
             }
+            drained
+        };
+
+        for (address, packet) in drained {
+            let Some(iface) = self
+                .ifaces
+                .iter()
+                .find(|iface| iface.address == address && !iface.stop.is_cancelled())
+            else {
+                continue;
+            };
+            let size = control::packet_wire_len(&packet);
+            iface.stats.count_announce_tx(size);
+            let _ = iface
+                .tx_send
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(address),
+                    packet,
+                })
+                .await;
         }
-        messages
     }
 
     /// Runtime address to a stable identity (kind, config name, and bind

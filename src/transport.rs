@@ -6101,13 +6101,10 @@ async fn manage_transport(
                             handle_announce(&packet, &mut handler, iface).await;
                         }
 
-                        let messages = {
-                            let manager = handler.iface_manager.lock().await;
-                            manager.process_announce_queues()
-                        };
-                        for message in messages {
-                            handler.send(message).await;
-                        }
+                        // Drained announces transmit directly on their
+                        // interface; they must not re-enter the outbound
+                        // announce-cap gate.
+                        handler.iface_manager.lock().await.process_announce_queues().await;
 
                         // Interfaces that came up (I2P peers, backbone
                         // clients, RNodeMulti transports) request tunnel

@@ -43,13 +43,17 @@ impl AnnounceEntry {
         // the entry waits out a random window (`PATHFINDER_RW`), sends,
         // then retries once more after `PATHFINDER_G + PATHFINDER_RW`,
         // completing once retries exceed `PATHFINDER_R`.
+        // Python's announce-table job completes an entry when
+        // `retries > PATHFINDER_R` before considering the timeout, and a
+        // due entry always transmits: the retry count is incremented
+        // after sending, never before deciding whether to send.
+        if self.retries > PATHFINDER_R {
+            return None;
+        }
         if Instant::now() < self.timeout {
             return None;
         }
         self.retries += 1;
-        if self.retries > PATHFINDER_R {
-            return None;
-        }
         self.timeout = Instant::now() + PATHFINDER_GRACE + PATHFINDER_RANDOM_WINDOW;
         Some(self.always_retransmit(transport_id))
     }
@@ -257,7 +261,10 @@ impl AnnounceTable {
 
             if let Some(message) = entry.retransmit(transport_id) {
                 messages.push(message);
-            } else {
+            } else if entry.retries > PATHFINDER_R {
+                // `retransmit` also returns `None` while an entry is
+                // simply not due yet; only exhausted entries complete
+                // (Python pops the entry when `retries > PATHFINDER_R`).
                 completed.push(*destination);
             }
         }
