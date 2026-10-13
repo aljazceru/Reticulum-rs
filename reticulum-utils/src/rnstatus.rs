@@ -407,6 +407,9 @@ pub struct StatusView {
     pub queues: bool,
     pub profiling: bool,
     pub discovered_only: bool,
+    /// Python `-D` (`config_entries`): the detail view instead of the
+    /// `-d` summary table.
+    pub config_entries: bool,
     pub show_stale: bool,
     pub show_unknown: bool,
     pub json: bool,
@@ -898,13 +901,16 @@ async fn render_discovered(config_dir: &Path, stats: &rmpv::Value, view: &Status
     if view.json {
         return crate::common::msgpack_json(&rmpv::Value::Array(entries));
     }
+    let now = crate::common::unix_now();
+    if view.config_entries {
+        return render_discovery_details(&entries, view, now);
+    }
     let mut out = format!(
         "\n{:<25} {:<10}   {:<10} {:<12} {:<7} {:<16} {:<15}\n",
         "Name", "Type", "Status", "Last Heard", "Value", "Running", "Location"
     );
     out.push_str(&"-".repeat(110));
     out.push('\n');
-    let now = crate::common::unix_now();
     for entry in entries {
         if let Some(line) = discovery_row(&entry, view, now) {
             out.push_str(&line);
@@ -935,7 +941,8 @@ async fn discovery_entries(config_dir: &Path, stats: &rmpv::Value) -> Vec<rmpv::
     // A down shared instance has no blacklist to apply. Treat that as empty
     // rather than failing the disk listing.
     let blackholed = blackholed_hashes(config_dir).await;
-    read_discovery_files(config_dir, crate::common::unix_now(), &blackholed)
+    let sources = crate::common::interface_discovery_sources(config_dir);
+    read_discovery_files(config_dir, crate::common::unix_now(), &blackholed, &sources)
 }
 
 async fn blackholed_hashes(config_dir: &Path) -> HashSet<AddressHash> {
@@ -968,6 +975,7 @@ fn read_discovery_files(
     config_dir: &Path,
     now: f64,
     blackholed: &HashSet<AddressHash>,
+    sources: &HashSet<AddressHash>,
 ) -> Vec<rmpv::Value> {
     let dir = config_dir
         .join("storage")
@@ -996,7 +1004,7 @@ fn read_discovery_files(
                 continue;
             }
         };
-        match classify_discovery(&mut value, now, blackholed) {
+        match classify_discovery(&mut value, now, blackholed, sources) {
             DiskFate::Keep => kept.push(value),
             DiskFate::Remove => {
                 let _ = std::fs::remove_file(&path);
@@ -1033,6 +1041,7 @@ fn classify_discovery(
     value: &mut rmpv::Value,
     now: f64,
     blackholed: &HashSet<AddressHash>,
+    sources: &HashSet<AddressHash>,
 ) -> DiskFate {
     for key in ["ifac_netname", "ifac_netkey"] {
         if map_field(value, key).and_then(|item| item.as_str()) == Some("None") {
@@ -1050,6 +1059,19 @@ fn classify_discovery(
         || !map_field(value, "network_id").is_some_and(truthy)
     {
         return DiskFate::Remove;
+    }
+    if !sources.is_empty() {
+        // Python `list_discovered_interfaces`: with a non-empty
+        // `interface_discovery_sources`, a file whose decoded network
+        // id is not in the set is unlinked. `bytes.fromhex` raising on
+        // a non-hex value keeps the file through the loader's warning
+        // path.
+        match map_field(value, "network_id").and_then(|field| in_discovery_sources(field, sources))
+        {
+            Some(true) => {}
+            Some(false) => return DiskFate::Remove,
+            None => return DiskFate::Skip,
+        }
     }
     let discoverable = map_field(value, "type")
         .and_then(|item| item.as_str())
@@ -1097,7 +1119,7 @@ fn identity_blackholed(
 
 fn identity_bytes(value: &rmpv::Value) -> Result<Vec<u8>, ()> {
     if let Some(text) = value.as_str() {
-        return decode_hex(text);
+        return crate::rpc::decode_hex_key(text).ok_or(());
     }
     if let Some(bytes) = value.as_slice() {
         return Ok(bytes.to_vec());
@@ -1105,21 +1127,21 @@ fn identity_bytes(value: &rmpv::Value) -> Result<Vec<u8>, ()> {
     Err(())
 }
 
-fn decode_hex(text: &str) -> Result<Vec<u8>, ()> {
-    let filtered: String = text
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect();
-    if !filtered.len().is_multiple_of(2) || !filtered.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(());
+/// Whether a stored `network_id` is in `interface_discovery_sources`.
+/// `None` is Python's `bytes.fromhex` raising, which keeps the file.
+/// This stack also persists the id as a raw 32-byte identity hash whose
+/// first 16 bytes are the truncated id Python stores as hex.
+fn in_discovery_sources(field: &rmpv::Value, sources: &HashSet<AddressHash>) -> Option<bool> {
+    let member = |bytes: &[u8]| sources.iter().any(|hash| hash.as_slice() == bytes);
+    match field {
+        rmpv::Value::String(text) => {
+            let bytes = crate::rpc::decode_hex_key(text.as_str()?)?;
+            Some(member(&bytes))
+        }
+        rmpv::Value::Binary(bytes) if bytes.len() == 16 => Some(member(bytes)),
+        rmpv::Value::Binary(bytes) if bytes.len() == 32 => Some(member(&bytes[..16])),
+        _ => None,
     }
-    let mut out = Vec::with_capacity(filtered.len() / 2);
-    let bytes = filtered.as_bytes();
-    for chunk in bytes.chunks(2) {
-        let hex = std::str::from_utf8(chunk).map_err(|_| ())?;
-        out.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
-    }
-    Ok(out)
 }
 
 fn is_ip_address(text: &str) -> bool {
@@ -1231,6 +1253,325 @@ fn discovery_status(entry: &rmpv::Value, now: f64) -> String {
         "unknown".to_string()
     } else {
         "available".to_string()
+    }
+}
+
+/// `-D` detail view (Python `config_entries` branch): one config-entry
+/// block per discovered interface instead of the `-d` summary table.
+fn render_discovery_details(entries: &[rmpv::Value], view: &StatusView, now: f64) -> String {
+    let mut out = String::from("\n");
+    for (index, entry) in entries
+        .iter()
+        .filter(
+            |entry| match (&view.name_filter, field_str(entry, "name")) {
+                (Some(filter), Some(name)) => name.to_lowercase().contains(&filter.to_lowercase()),
+                (Some(_), None) => false,
+                (None, _) => true,
+            },
+        )
+        .enumerate()
+    {
+        let Some(block) = discovery_detail(entry, view, now) else {
+            continue;
+        };
+        if index > 0 {
+            out.push_str(&format!("\n{}\n\n", "=".repeat(47)));
+        }
+        out.push_str(&block);
+    }
+    out
+}
+
+/// One `-D` block. Python wraps the whole entry in `try`/`except`, so a
+/// missing field before the first printed line drops the block silently
+/// and a missing field after it truncates the block.
+fn discovery_detail(entry: &rmpv::Value, view: &StatusView, now: f64) -> Option<String> {
+    let name = field_str(entry, "name")?;
+    let kind = field_str(entry, "type")?;
+    let status = discovery_status(entry, now);
+    let impl_name = field_str(entry, "impl_name").unwrap_or_default();
+    let version = field_str(entry, "version").unwrap_or_default();
+    let has_impl = !impl_name.is_empty() && !version.is_empty();
+    if status == "stale" && !view.show_stale {
+        return None;
+    }
+    if !has_impl && !view.show_unknown {
+        return None;
+    }
+    let impl_str = if has_impl {
+        format!("{impl_name} {version}")
+    } else {
+        "Unknown".to_string()
+    };
+    let status_display = match status.as_str() {
+        "available" => "Available",
+        "unknown" => "Unknown",
+        "stale" => "Stale",
+        other => other,
+    };
+    let discovered = map_field(entry, "discovered").and_then(as_f64)?;
+    let heard = map_field(entry, "last_heard").and_then(as_f64)?;
+    let transport = truthy(map_field(entry, "transport")?);
+    let _ = map_field(entry, "latitude")?;
+
+    let transport_id = map_field(entry, "transport_id").and_then(id_text);
+    let lxmf_addr = map_field(entry, "operator_lxmf_address")
+        .or_else(|| map_field(entry, "operator"))
+        .and_then(id_text);
+    let network = match (
+        transport_id.as_ref(),
+        map_field(entry, "network_id").and_then(id_text),
+    ) {
+        (Some(tid), Some(nid)) if &nid != tid => Some(nid),
+        _ => None,
+    };
+
+    let mut out = String::new();
+    if let Some(network) = network {
+        out.push_str(&format!("Network   ID : {network}\n"));
+    }
+    if let Some(transport_id) = &transport_id {
+        out.push_str(&format!("Transport ID : {transport_id}\n"));
+    }
+    if let Some(lxmf_addr) = lxmf_addr {
+        out.push_str(&format!("LXMF address : {lxmf_addr}\n"));
+    }
+    out.push_str(&format!("Name         : {name}\n"));
+    out.push_str(&format!("Type         : {kind}\n"));
+    out.push_str(&format!("Stack        : {impl_str}\n"));
+    out.push_str(&format!("Status       : {status_display}\n"));
+    out.push_str(&format!(
+        "Transport    : {}\n",
+        if transport { "Enabled" } else { "Disabled" }
+    ));
+    let Some(hops) = map_field(entry, "hops") else {
+        return Some(out);
+    };
+    out.push_str(&format!(
+        "Distance     : {} hop{}\n",
+        display_value(hops),
+        if as_f64(hops) == Some(1.0) { "" } else { "s" }
+    ));
+    out.push_str(&format!(
+        "Discovered   : {} ago\n",
+        pretty_time_compact(now - discovered)
+    ));
+    out.push_str(&format!(
+        "Last Heard   : {} ago\n",
+        pretty_time_compact(now - heard)
+    ));
+    let location = match (
+        map_field(entry, "latitude").and_then(as_f64),
+        map_field(entry, "longitude").and_then(as_f64),
+    ) {
+        (Some(lat), Some(lon)) => {
+            let height = map_field(entry, "height")
+                .and_then(as_f64)
+                .map(|value| format!(", {}m h", py_float_str(value)))
+                .unwrap_or_default();
+            format!("{}, {}{height}", py_round4(lat), py_round4(lon))
+        }
+        _ => "Unknown".to_string(),
+    };
+    out.push_str(&format!("Location     : {location}\n"));
+    if let Some(value) = map_field(entry, "frequency") {
+        out.push_str(&format!("Frequency    : {} Hz\n", comma_grouped(value)));
+    }
+    if let Some(value) = map_field(entry, "bandwidth") {
+        out.push_str(&format!("Bandwidth    : {} Hz\n", comma_grouped(value)));
+    }
+    if let Some(value) = map_field(entry, "sf").or_else(|| map_field(entry, "spreadingfactor")) {
+        out.push_str(&format!("Sprd. Factor : {}\n", display_value(value)));
+    }
+    if let Some(value) = map_field(entry, "cr").or_else(|| map_field(entry, "codingrate")) {
+        out.push_str(&format!("Coding Rate  : {}\n", display_value(value)));
+    }
+    if let Some(value) = map_field(entry, "modulation") {
+        out.push_str(&format!("Modulation   : {}\n", display_value(value)));
+    }
+    if let Some(value) = map_field(entry, "reachable_on") {
+        out.push_str(&format!("Address      : {}\n", display_value(value)));
+    }
+    if let Some(value) = map_field(entry, "port") {
+        out.push_str(&format!("Port         : {}\n", display_value(value)));
+    }
+    let Some(value) = map_field(entry, "value") else {
+        return Some(out);
+    };
+    out.push_str(&format!("Stamp Value  : {}\n", display_value(value)));
+    out.push_str("\nConfiguration Entry:\n");
+    let config = field_str(entry, "config_entry").or_else(|| synthesize_config_entry(entry));
+    let config = config?;
+    for line in config.split('\n') {
+        out.push_str(&format!("  {line}\n"));
+    }
+    Some(out)
+}
+
+/// `str(value)` for the fields the detail view prints verbatim.
+fn display_value(value: &rmpv::Value) -> String {
+    match value {
+        rmpv::Value::String(text) => text.as_str().unwrap_or_default().to_string(),
+        rmpv::Value::Binary(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        rmpv::Value::Boolean(flag) => {
+            if *flag {
+                "True".to_string()
+            } else {
+                "False".to_string()
+            }
+        }
+        rmpv::Value::F32(number) => py_float_str(*number as f64),
+        other => display_num(other),
+    }
+}
+
+/// Python `str(round(value, 4))`.
+fn py_round4(value: f64) -> String {
+    py_float_str((value * 10_000.0).round() / 10_000.0)
+}
+
+/// Python `str(float)`: integral floats keep a `.0` suffix.
+fn py_float_str(value: f64) -> String {
+    let text = format!("{value}");
+    if text.contains('.') || text.contains('e') || !value.is_finite() {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
+/// Python `f"{value:,}"`: thousands separators in the integer part.
+fn comma_grouped(value: &rmpv::Value) -> String {
+    let text = display_value(value);
+    let (int_part, rest) = match text.find(['.', 'e', 'E']) {
+        Some(pos) => text.split_at(pos),
+        None => (text.as_str(), ""),
+    };
+    let digits = int_part.strip_prefix('-').unwrap_or(int_part);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return text;
+    }
+    let mut grouped = String::new();
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    let sign = if int_part.starts_with('-') { "-" } else { "" };
+    format!("{sign}{grouped}{rest}")
+}
+
+/// Python `RNS.prettytime(compact=True)`: whole seconds, at most two
+/// components, the last joined with " and ".
+fn pretty_time_compact(seconds: f64) -> String {
+    let neg = seconds < 0.0;
+    let mut time = seconds.abs();
+    let days = (time / 86_400.0) as u64;
+    time %= 86_400.0;
+    let hours = (time / 3_600.0) as u64;
+    time %= 3_600.0;
+    let minutes = (time / 60.0) as u64;
+    let secs = (time % 60.0) as u64;
+    let mut parts = Vec::new();
+    for (amount, unit) in [(days, "d"), (hours, "h"), (minutes, "m"), (secs, "s")] {
+        if amount > 0 && parts.len() < 2 {
+            parts.push(format!("{amount}{unit}"));
+        }
+    }
+    let text = match parts.len() {
+        0 => "0s".to_string(),
+        1 => parts.remove(0),
+        _ => format!("{} and {}", parts[0], parts[1]),
+    };
+    if neg {
+        format!("-{text}")
+    } else {
+        text
+    }
+}
+
+/// Stored id rendered the way Python prints its hex strings. This
+/// stack persists raw hashes; the truncated first 16 bytes are the
+/// identity hash Python stores as hex.
+fn id_text(value: &rmpv::Value) -> Option<String> {
+    match value {
+        rmpv::Value::String(text) => text.as_str().map(str::to_string),
+        rmpv::Value::Binary(bytes) => Some(
+            bytes[..16.min(bytes.len())]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Rebuild the `config_entry` Python synthesizes at announce time
+/// (`InterfaceAnnounceHandler.received_announce`) for files that do not
+/// carry it, like the ones this stack persists.
+fn synthesize_config_entry(entry: &rmpv::Value) -> Option<String> {
+    let kind = field_str(entry, "type")?;
+    let name = field_str(entry, "name")?;
+    let identity = map_field(entry, "transport_id").and_then(id_text)?;
+    let netname = field_str(entry, "ifac_netname").filter(|text| !text.is_empty());
+    let netkey = field_str(entry, "ifac_netkey").filter(|text| !text.is_empty());
+    let ifac = format!(
+        "{}{}",
+        netname
+            .map(|text| format!("\n  network_name = {text}"))
+            .unwrap_or_default(),
+        netkey
+            .map(|text| format!("\n  passphrase = {text}"))
+            .unwrap_or_default(),
+    );
+    match kind.as_str() {
+        "BackboneInterface" | "TCPServerInterface" => {
+            let host = field_str(entry, "reachable_on")?;
+            let port = map_field(entry, "port").and_then(as_f64)? as u64;
+            let (conn, remote) = if cfg!(any(target_os = "windows", target_os = "macos")) {
+                ("TCPClientInterface", "target_host")
+            } else {
+                ("BackboneInterface", "remote")
+            };
+            Some(format!(
+                "[[{name}]]\n  type = {conn}\n  enabled = yes\n  {remote} = {host}\n  target_port = {port}\n  transport_identity = {identity}{ifac}"
+            ))
+        }
+        "I2PInterface" => {
+            let host = field_str(entry, "reachable_on")?;
+            Some(format!(
+                "[[{name}]]\n  type = I2PInterface\n  enabled = yes\n  peers = {host}.b32.i2p\n  transport_identity = {identity}{ifac}"
+            ))
+        }
+        "RNodeInterface" => {
+            let frequency = map_field(entry, "frequency")?;
+            let bandwidth = map_field(entry, "bandwidth")?;
+            let sf = map_field(entry, "sf").or_else(|| map_field(entry, "spreadingfactor"))?;
+            let cr = map_field(entry, "cr").or_else(|| map_field(entry, "codingrate"))?;
+            Some(format!(
+                "[[{name}]]\n  type = RNodeInterface\n  enabled = yes\n  port = \n  frequency = {}\n  bandwidth = {}\n  spreadingfactor = {}\n  codingrate = {}\n  txpower = {ifac}",
+                display_value(frequency),
+                display_value(bandwidth),
+                display_value(sf),
+                display_value(cr),
+            ))
+        }
+        "WeaveInterface" => Some(format!(
+            "[[{name}]]\n  type = WeaveInterface\n  enabled = yes\n  port = {ifac}"
+        )),
+        "KISSInterface" => {
+            let frequency = map_field(entry, "frequency")?;
+            let bandwidth = map_field(entry, "bandwidth")?;
+            let modulation = map_field(entry, "modulation")?;
+            Some(format!(
+                "[[{name}]]\n  type = KISSInterface\n  enabled = yes\n  port = \n  # Frequency: {}\n  # Bandwidth: {}\n  # Modulation: {}\n  transport_identity = {identity}{ifac}",
+                display_value(frequency),
+                display_value(bandwidth),
+                display_value(modulation),
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -1625,7 +1966,7 @@ mod tests {
             ),
         );
 
-        let rows = read_discovery_files(&dir, now, &blackholed);
+        let rows = read_discovery_files(&dir, now, &blackholed, &HashSet::new());
         let names: Vec<String> = rows
             .iter()
             .filter_map(|row| field_str(row, "name"))
@@ -1644,6 +1985,99 @@ mod tests {
         assert!(!files.join("badhost").exists());
         assert!(!files.join("blocked").exists());
         assert!(files.join("corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovery_sources_allowlist_unlinks_foreign_entries() {
+        let now = 1_700_000_000.0;
+        let dir = std::env::temp_dir().join(format!(
+            "rn-src-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let files = dir.join("storage").join("discovery").join("interfaces");
+        std::fs::create_dir_all(&files).unwrap();
+        let write = |name: &str, value: rmpv::Value| {
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &value).unwrap();
+            std::fs::write(files.join(name), buf).unwrap();
+        };
+        let id = |byte: u8| {
+            let mut text = String::new();
+            for _ in 0..16 {
+                text.push_str(&format!("{byte:02x}"));
+            }
+            text
+        };
+        let source_hex = id(0xaa);
+        let mut sources = HashSet::new();
+        sources.insert(AddressHash::new_from_hex_string(&source_hex).unwrap());
+        write(
+            "allowed",
+            entry(
+                "allowed",
+                "RNodeInterface",
+                &id(1),
+                &source_hex,
+                now - 10.0,
+                "available",
+            ),
+        );
+        write(
+            "foreign",
+            entry(
+                "foreign",
+                "RNodeInterface",
+                &id(2),
+                &id(3),
+                now - 10.0,
+                "available",
+            ),
+        );
+        // This stack persists the raw 32-byte identity hash; its first
+        // 16 bytes are the truncated id the allowlist holds.
+        write("binary", {
+            let mut value = entry(
+                "bin",
+                "WeaveInterface",
+                &id(4),
+                &id(5),
+                now - 10.0,
+                "available",
+            );
+            let mut full = [0u8; 32];
+            full[..16].copy_from_slice(&[0xaau8; 16]);
+            map_set(&mut value, "network_id", rmpv::Value::Binary(full.to_vec()));
+            value
+        });
+        // A non-hex network id keeps the file, like Python's
+        // `bytes.fromhex` raising, but is not listed.
+        write("badhex", {
+            let mut value = entry(
+                "badhex",
+                "KISSInterface",
+                &id(6),
+                &id(7),
+                now - 10.0,
+                "available",
+            );
+            map_set(&mut value, "network_id", rmpv::Value::from("zz-not-hex"));
+            value
+        });
+
+        let rows = read_discovery_files(&dir, now, &HashSet::new(), &sources);
+        let mut names: Vec<String> = rows
+            .iter()
+            .filter_map(|row| field_str(row, "name"))
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["allowed".to_string(), "bin".to_string()]);
+        assert!(!files.join("foreign").exists());
+        assert!(files.join("badhex").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

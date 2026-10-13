@@ -162,6 +162,9 @@ struct StatusArgs {
     /// List discovered interfaces
     #[arg(short = 'd', long)]
     discovered: bool,
+    /// Show details and config entries for discovered interfaces
+    #[arg(short = 'D')]
+    config_entries: bool,
     /// Include stale discovery entries
     #[arg(long = "show-stale")]
     show_stale: bool,
@@ -942,7 +945,8 @@ async fn run_status(args: StatusArgs) -> Result<(), String> {
         pps: args.pps,
         queues: args.queues,
         profiling: args.profiling,
-        discovered_only: args.discovered,
+        discovered_only: args.discovered || args.config_entries,
+        config_entries: args.config_entries,
         show_stale: args.show_stale,
         show_unknown: args.show_unknown,
         json: args.json,

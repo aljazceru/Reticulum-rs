@@ -418,6 +418,42 @@ pub fn read_configured_interfaces(config_dir: &Path) -> Vec<ConfiguredInterface>
     out
 }
 
+/// `[reticulum] interface_discovery_sources` from the config file: the
+/// network-identity hashes interface discovery accepts (Python
+/// `Reticulum.interface_discovery_sources`). A missing, unparseable, or
+/// empty option yields an empty set, which disables filtering.
+pub fn interface_discovery_sources(config_dir: &Path) -> std::collections::HashSet<AddressHash> {
+    let mut sources = std::collections::HashSet::new();
+    let Some(raw) = read_config_file(config_dir)
+        .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("reticulum")?
+                .get("interface_discovery_sources")
+                .cloned()
+        })
+    else {
+        return sources;
+    };
+    let items: Vec<String> = match &raw {
+        toml::Value::Array(list) => list
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        toml::Value::String(text) => text.split(',').map(str::to_string).collect(),
+        _ => Vec::new(),
+    };
+    for item in items {
+        let trimmed = item.trim();
+        if trimmed.len() == 32 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if let Ok(hash) = AddressHash::new_from_hex_string(trimmed) {
+                sources.insert(hash);
+            }
+        }
+    }
+    sources
+}
+
 fn config_config_path(config_dir: &Path) -> PathBuf {
     let toml_path = config_dir.join("config.toml");
     if toml_path.exists() {

@@ -264,7 +264,7 @@ pub fn decode_management_request(data: &[u8]) -> ManagementRequest {
         Some(Value::String(command)) => match command.as_str() {
             Some("table") => ManagementRequest::PathTable {
                 destination: items.get(1).and_then(value_bytes),
-                max_hops: items.get(2).and_then(value_u64),
+                max_hops: items.get(2).and_then(|item| item.as_u64()),
             },
             Some("rates") => ManagementRequest::Rates {
                 destination: items.get(1).and_then(value_bytes),
@@ -285,10 +285,6 @@ fn value_bytes(value: &rmpv::Value) -> Option<Vec<u8>> {
         rmpv::Value::Binary(bytes) => Some(bytes.to_vec()),
         _ => None,
     }
-}
-
-fn value_u64(value: &rmpv::Value) -> Option<u64> {
-    value.as_u64()
 }
 
 /// Encode a blackhole-list response

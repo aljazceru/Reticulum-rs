@@ -33,7 +33,7 @@ use crate::packet::{
 use crate::resource::{
     self,
     manager::{
-        pack_request, pack_request_element, pack_response, packet_response_size,
+        msgpack_bin, pack_request, pack_request_element, pack_response, packet_response_size,
         request_id as make_request_id, PendingRequest, RequestContext as RequestCtx,
         RequestEvent, RequestEventData, RequestHandlerConfig, RequestOptions, RequestResponse,
         ResourceManager, ResourceStrategy,
@@ -1677,8 +1677,8 @@ impl Transport {
         path: &str,
         data: &[u8],
     ) -> Result<AddressHash, RnsError> {
-        self.request_with_options(link, path, data, RequestOptions::default())
-            .await
+        let binned = msgpack_bin(data);
+        self.request_element(link, path, Some(&binned)).await
     }
 
     /// [`Transport::request`] plus Python's per-request `timeout` and
