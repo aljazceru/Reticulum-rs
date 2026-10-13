@@ -8,22 +8,33 @@ listed here.
 
 ## Interfaces and platform support
 
-- **Android USB host interfaces.** Python swaps in
-  `RNS/Interfaces/Android/{RNode,Serial,KISS}Interface.py` on Android.
-  Rust implements none of them: `AndroidRNodeInterface`,
-  `AndroidSerialInterface`, `AndroidKISSInterface`, and `usb://` /
-  `android-usb://` ports return `RnsError::Unsupported`
-  (`src/iface/rnode.rs::android_usb_error`), and an Android daemon build
-  refuses Weave USB serial outright (`reticulum-daemon/src/main.rs`).
+- **No Android USB host stack.** On Android, Python keeps the config
+  types `RNodeInterface`, `SerialInterface`, and `KISSInterface` but
+  swaps in the `RNS/Interfaces/Android/` modules, where USB serial is a
+  device id resolved through `usb4a.usb.get_usb_device(port)`; the
+  Android Weave module takes the same path. Rust has no `usb4a` /
+  `usbserial4a` host stack, so none of those Android USB serial ports
+  can be opened, and `reticulum-daemon/src/main.rs` (commit `01a9d73`)
+  logs and does not start a Weave USB serial interface when
+  `target_os = "android"`.
 - **RNode over `ble://` needs a cargo feature.** The btleplug backend
-  lives behind `iface-rnode-ble` (`Cargo.toml`); default builds reject
-  `ble://` targets (`src/iface/rnode.rs`). Python reaches a BLE radio
-  whenever the platform Bluetooth stack exists.
-- **No interface plugins.** Python `Reticulum` executes
-  `interfaces/<type>.py` for an interface type it does not know
-  (`RNS/Reticulum.py`). Rust loads no external modules; an unknown
-  `type =` is reported as `type 'X' is not supported yet`
-  (`reticulum-daemon/src/config.rs`) and the interface is not started.
+  lives behind `iface-rnode-ble` (`Cargo.toml`, commit `58eb91f`);
+  without it `RnodeLink::connect_ble` returns `RnsError::Unsupported`.
+  Python also fails closed: a desktop `RNodeInterface` opens `ble://`
+  only when `bleak` imports (`setup.py` `install_requires` is just
+  `cryptography` and `pyserial`, so a normal install has no BLE stack,
+  and the device must be bonded), and Android needs the `able` /
+  `BluetoothDispatcher` library.
+- **No `interfaces/` file plugins.** When the config `type` is not a
+  built-in, Python `Reticulum.__create_interface` execs
+  `{configdir}/interfaces/<Type>.py` (`RNS/Reticulum.py`); Rust never
+  loads that file. The daemon can still start an enabled unknown type
+  in-process through `register_interface_factory`
+  (`reticulum-daemon/src/config.rs`, commit `01a9d73`) and errors with
+  `type '{name}' is not supported` only when no factory is registered.
+  `warn_about_unknown_keys` still logs `type '{iface_type}' which is
+  not supported yet` for any type outside `SUPPORTED_INTERFACE_TYPES`,
+  including one a factory will then start.
 - **AutoInterface enumeration is per-OS.** `platform_addresses()` in
   `src/iface/auto.rs` covers Linux, Android, macOS, the BSDs, and
   Windows; any other target (for example Solaris, which Python's
@@ -35,12 +46,19 @@ listed here.
 - **`rnodeconf` is framing-only.** `reticulum-utils/src/rnodeconf.rs`
   covers probing, EEPROM read/write, firmware info, TNC mode, display,
   WiFi, and BLE control frames. Not ported from
-  `RNS/Utilities/rnodeconf.py`: the firmware database and autoinstall
-  flow, MD5 image hashing and RSA signing/key handling, the bundled
-  recovery esptool, most inter-command timing sleeps, and the
-  interactive "Press enter to exit" Bluetooth-pairing wait. `--flash`
-  only builds an argv for an external `rnodeconf` or `esptool` found on
-  `PATH` (`flash_command`); the Rust tool never flashes itself.
+  `RNS/Utilities/rnodeconf.py` (major items, not every missing
+  command): the `models` firmware map and autoinstall/update/extract
+  flow, MD5 image hashing and RSA signing/key files, the bundled
+  `recovery_esptool.py`, the NeoPixel intensity (`--np` /
+  `set_neopixel_intensity`) and interference-avoidance (`--ia-enable` /
+  `--ia-disable` / `set_disable_interference_avoidance`) control
+  frames, the extra RAK4631 `sleep(10)` after the EEPROM wipe (the 13s
+  wipe wait itself is ported) and most other inter-command timing
+  sleeps, and the `input()` "Press enter to exit" Bluetooth-pairing
+  wait. `--flash` builds an argv for an external `rnodeconf` or
+  `esptool` on `PATH` (`flash_command`) that `run_nodeconf` then spawns
+  with `std::process::Command` (`55a3d5c`); the Rust binary does not
+  flash in-process.
 - **`rngit` has no web output.** `reticulum-utils/src/rngit.rs`
   implements the node, client, and `git-remote-rns` wire operations.
   The Python tool's HTML repository pages (`rngit/pages.py`), syntax
