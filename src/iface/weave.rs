@@ -259,6 +259,7 @@ struct Host {
     manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     rx: InterfaceRxSender,
     reassembler: WdclReassembler,
+    peer_job_at: tokio::time::Instant,
 }
 
 impl Host {
@@ -293,6 +294,7 @@ impl Host {
             manager,
             rx,
             reassembler: WdclReassembler::default(),
+            peer_job_at: tokio::time::Instant::now() + PEER_JOB_INTERVAL,
         }
     }
 
@@ -307,13 +309,18 @@ impl Host {
         self.online = online;
         self.link_up.store(online, Ordering::Relaxed);
         self.parent_stats.set_online(online);
+        let now = tokio::time::Instant::now();
         for peer in self.peers.values() {
+            if online && now > peer.last_heard + PEERING_TIMEOUT {
+                continue;
+            }
             peer.stats.set_online(online);
         }
     }
 }
 
 async fn timeout_peers(host: &mut Host) {
+    host.peer_job_at = tokio::time::Instant::now() + PEER_JOB_INTERVAL;
     let now = tokio::time::Instant::now();
     let expired: Vec<([u8; ENDPOINT_ID_LEN], AddressHash)> = host
         .peers
@@ -501,7 +508,6 @@ where
     let (mut read, mut write) = tokio::io::split(stream);
     host.begin_link();
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut peer_job_at = tokio::time::Instant::now() + PEER_JOB_INTERVAL;
     let mut buf = [0u8; 1500];
 
     if write_payload(&mut write, &discover_payload(&host.local_switch_id))
@@ -530,7 +536,7 @@ where
                 None => LinkEvent::Stop,
             },
             egress = host.egress_rx.recv() => LinkEvent::Egress(egress),
-            _ = tokio::time::sleep_until(peer_job_at) => LinkEvent::PeerJob,
+            _ = tokio::time::sleep_until(host.peer_job_at) => LinkEvent::PeerJob,
         };
 
         match event {
@@ -544,10 +550,7 @@ where
                 return true;
             }
             LinkEvent::ParentTx => {}
-            LinkEvent::PeerJob => {
-                peer_job_at = tokio::time::Instant::now() + PEER_JOB_INTERVAL;
-                timeout_peers(host).await;
-            }
+            LinkEvent::PeerJob => timeout_peers(host).await,
             LinkEvent::Egress(None) => {}
             LinkEvent::Egress(Some(egress)) => {
                 if !write_egress(host, &mut write, egress).await {
@@ -571,6 +574,27 @@ where
                     }
                 }
             }
+        }
+    }
+}
+
+/// Sleep for `duration` while the link is down, still running the
+/// peer-ageing job at its scheduled time so peers keep expiring
+/// during reconnect waits and failed opens.
+#[cfg(all(feature = "iface-serial", not(target_os = "android")))]
+async fn link_down_sleep(
+    host: &mut Host,
+    duration: Duration,
+    cancel: &tokio_util::sync::CancellationToken,
+    iface_stop: &tokio_util::sync::CancellationToken,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = iface_stop.cancelled() => break,
+            _ = tokio::time::sleep_until(deadline) => break,
+            _ = tokio::time::sleep_until(host.peer_job_at) => timeout_peers(host).await,
         }
     }
 }
@@ -664,11 +688,13 @@ impl WeaveInterface {
                                 break;
                             }
                             log::warn!("weave: will attempt to reconnect port <{port}>");
-                            tokio::time::sleep(RECONNECT_INTERVAL).await;
+                            link_down_sleep(&mut host, RECONNECT_INTERVAL, &cancel, &iface_stop)
+                                .await;
                         }
                         Err(_) => {
                             log::warn!("weave: couldn't open serial port <{port}>, retrying");
-                            tokio::time::sleep(RECONNECT_INTERVAL).await;
+                            link_down_sleep(&mut host, RECONNECT_INTERVAL, &cancel, &iface_stop)
+                                .await;
                         }
                     }
                 }
