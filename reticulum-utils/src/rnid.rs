@@ -1210,9 +1210,6 @@ fn validate_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<
             return Ok(R_READ_ERROR);
         }
     };
-    if let Err(code) = require_unresolved_signer(resolved) {
-        return Ok(code);
-    }
     if signature.len() == SIG_BYTES {
         let Some(identity) = resolved.key.as_ref().map(KeyMaterial::public_identity) else {
             println!("Cannot validate legacy rsg signatures without an explicit required identity");
@@ -1237,15 +1234,14 @@ fn validate_one(options: &IdOptions, resolved: &Resolved, path: &str) -> Result<
         return Ok(R_INVALID_SIGNATURE);
     }
     match check_rsg(&signature, &message, resolved) {
-        Ok(RsgCheck::Valid(label)) => {
+        RsgCheck::Valid(label) => {
             println!(
                 "Signature is valid, the file {} was signed by {label}",
                 file_path.display()
             );
             Ok(R_OK)
         }
-        Err(code) => Ok(code),
-        Ok(RsgCheck::Invalid) => {
+        RsgCheck::Invalid => {
             let extra = signer_suffix(resolved);
             println!(
                 "Invalid signature {} for file {}{extra}",
@@ -1287,9 +1283,6 @@ fn validate_message(options: &IdOptions, resolved: &Resolved, path: &Path) -> Re
         println!("The signature file \"{}\" does not exist", path.display());
         return Ok(R_NO_FILE);
     }
-    if let Err(code) = require_unresolved_signer(resolved) {
-        return Ok(code);
-    }
     let signature = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -1306,8 +1299,7 @@ fn validate_message(options: &IdOptions, resolved: &Resolved, path: &Path) -> Re
         return Ok(R_INVALID_SIGNATURE);
     };
     match check_rsg(&signature, &message, resolved) {
-        Err(code) => Ok(code),
-        Ok(RsgCheck::Valid(label)) => {
+        RsgCheck::Valid(label) => {
             if options.meta {
                 println!("RSM Metadata\n============\n");
                 print_meta(&view.meta, 1);
@@ -1328,7 +1320,7 @@ fn validate_message(options: &IdOptions, resolved: &Resolved, path: &Path) -> Re
             }
             Ok(R_OK)
         }
-        Ok(RsgCheck::Invalid) => {
+        RsgCheck::Invalid => {
             let extra = if resolved.key.is_some() || resolved.requested_hash.is_some() {
                 let label = resolved
                     .key
@@ -1374,32 +1366,12 @@ fn verify_envelope(identity: &Identity, rsg: &[u8]) -> bool {
 
 /// `-N` leaves no loaded key. `-V` and embedded-message checks still require
 /// the unresolved `-i` hash to match the embedded public key.
-fn require_unresolved_signer(resolved: &Resolved) -> Result<(), i32> {
-    if resolved.key.is_some() || resolved.requested_hash.is_some() {
-        return Ok(());
-    }
-    let Some(text) = resolved.identity_arg.as_deref() else {
-        return Ok(());
-    };
-    unresolved_hash(text)?;
-    Ok(())
-}
-
-fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> Result<RsgCheck, i32> {
-    let required = if resolved.key.is_some() {
-        None
-    } else if let Some(hash) = resolved.requested_hash {
-        Some(hash)
-    } else if let Some(text) = resolved.identity_arg.as_deref() {
-        Some(unresolved_hash(text)?)
-    } else {
-        None
-    };
+fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> RsgCheck {
     let Some(view) = unpack_rsg(rsg) else {
-        return Ok(RsgCheck::Invalid);
+        return RsgCheck::Invalid;
     };
     if view.hash.as_slice() != sha256(message).as_slice() {
-        return Ok(RsgCheck::Invalid);
+        return RsgCheck::Invalid;
     }
     let loaded = Identity::new_from_slices(
         &view.pubkey[..reticulum::identity::PUBLIC_KEY_LENGTH],
@@ -1409,21 +1381,19 @@ fn check_rsg(rsg: &[u8], message: &[u8], resolved: &Resolved) -> Result<RsgCheck
     // embedded public key. With neither, the embedded key is enough.
     if let Some(key) = resolved.key.as_ref() {
         if !verify_envelope(key.public_identity(), rsg) {
-            return Ok(RsgCheck::Invalid);
+            return RsgCheck::Invalid;
         }
-        return Ok(RsgCheck::Valid(key.label()));
+        return RsgCheck::Valid(key.label());
     }
-    if let Some(hash) = required {
+    if let Some(hash) = resolved.requested_hash {
         if loaded.address_hash != hash {
-            return Ok(RsgCheck::Invalid);
+            return RsgCheck::Invalid;
         }
     }
     if !verify_envelope(&loaded, rsg) {
-        return Ok(RsgCheck::Invalid);
+        return RsgCheck::Invalid;
     }
-    Ok(RsgCheck::Valid(prettyhexrep(
-        loaded.address_hash.as_slice(),
-    )))
+    RsgCheck::Valid(prettyhexrep(loaded.address_hash.as_slice()))
 }
 
 fn unpack_rsg(rsg: &[u8]) -> Option<SignedView> {
