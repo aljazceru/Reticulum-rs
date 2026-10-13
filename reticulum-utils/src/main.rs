@@ -606,7 +606,7 @@ fn duration_arg(seconds: Option<f64>, default: Duration) -> Duration {
 fn argv0_dispatch(argv0_name: &str, args: &[String]) -> Option<ExitCode> {
     match argv0_name {
         "git-remote-rns" | "rngit" => {
-            init_logging(args.iter().filter(|a| a.as_str() == "-v").count() as u8);
+            init_logging(args.iter().filter(|a| a.as_str() == "-v").count() as i32);
             let args = args.to_vec();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
