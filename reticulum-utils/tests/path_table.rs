@@ -181,7 +181,7 @@ async fn fixture_rpc_renders_status_and_path_table() {
     assert!(status.contains("8 pps"));
     assert!(status.contains("50.0% total, 3 pkts, 1 dropped"));
     assert!(status.contains("Transport Instance <abababababababababababababababab> running"));
-    assert!(status.contains("Uptime is 1h, 1m and 1s, 2 entries in link table (1 active)"));
+    assert!(status.contains("Uptime is 1h, 1m and 1.0s, 2 entries in link table (1 active)"));
     assert!(status.contains("inbound"));
     assert!(status.contains("Samples  : 4 from 1 thread"));
 

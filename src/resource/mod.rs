@@ -14,9 +14,9 @@ pub mod outbound;
 pub use advertisement::ResourceAdvertisement;
 pub use inbound::IncomingResource;
 pub use manager::{
-    msgpack_bin, pack_request, pack_response, request_id, unpack_request, unpack_response,
-    RequestAllow, RequestContext, RequestHandlerConfig, RequestOptions, RequestResponse,
-    ResourceAcceptCallback, ResourceStartedCallback, ResourceStrategy,
+    msgpack_bin, pack_request, pack_request_element, pack_response, request_id, unpack_request,
+    unpack_response, RequestAllow, RequestContext, RequestHandlerConfig, RequestOptions,
+    RequestResponse, ResourceAcceptCallback, ResourceStartedCallback, ResourceStrategy,
 };
 pub use outbound::OutgoingResource;
 

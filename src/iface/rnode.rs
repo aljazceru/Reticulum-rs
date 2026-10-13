@@ -1643,8 +1643,18 @@ impl RnodeInterface {
                                             RnodeEvent::Status(status) => {
                                                 let mut shared = state.write().unwrap_or_else(|e| e.into_inner());
                                                 let (rssi, snr, quality) = shared.note_status(status);
+                                                let airtime_short = shared.status.airtime_short;
+                                                let airtime_long = shared.status.airtime_long;
+                                                let channel_load_short = shared.status.channel_load_short;
+                                                let channel_load_long = shared.status.channel_load_long;
                                                 drop(shared);
                                                 stats.set_radio_quality(rssi, snr, quality);
+                                                stats.set_radio_channel(
+                                                    airtime_short,
+                                                    airtime_long,
+                                                    channel_load_short,
+                                                    channel_load_long,
+                                                );
                                             }
                                             RnodeEvent::Echo(echo) => {
                                                 if let Some((_, bps)) = state.write().unwrap_or_else(|e| e.into_inner()).note_echo(echo) {
@@ -2197,8 +2207,18 @@ impl RnodeMultiInterface {
                                             RnodeEvent::Status(status) => {
                                                 let mut shared = state.write().unwrap_or_else(|e| e.into_inner());
                                                 let (rssi, snr, quality) = shared.note_status(status);
+                                                let airtime_short = shared.status.airtime_short;
+                                                let airtime_long = shared.status.airtime_long;
+                                                let channel_load_short = shared.status.channel_load_short;
+                                                let channel_load_long = shared.status.channel_load_long;
                                                 drop(shared);
                                                 rx_stats.set_radio_quality(rssi, snr, quality);
+                                                rx_stats.set_radio_channel(
+                                                    airtime_short,
+                                                    airtime_long,
+                                                    channel_load_short,
+                                                    channel_load_long,
+                                                );
                                             }
                                             RnodeEvent::Echo(echo) => {
                                                 if let Some(update) = state.write().unwrap_or_else(|e| e.into_inner()).note_echo(echo) {

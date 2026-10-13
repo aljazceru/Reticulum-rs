@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reticulum::hash::{AddressHash, Hash};
-use reticulum::iface::{IfaceControlState, InterfaceStats};
+use reticulum::iface::{IfaceControlState, InterfaceStats, RadioTelemetry};
 use reticulum::packet::PROTOCOL_MTU;
 use reticulum::transport::{RateTableEntry, Transport};
 use rmpv::Value;
@@ -216,6 +216,7 @@ async fn get_op(state: &RpcState, call: &Value) -> Result<Option<Value>, String>
                 .packet_q(&required_packet_hash(call, "packet_hash")?)
                 .await,
         ),
+        // No profiler is attached, so there is no report to return.
         "profiling_results" => Value::Nil,
         "blackholed_identities" => blackholed_identities(state).await,
         "is_blackholed" => Value::Boolean(
@@ -441,13 +442,14 @@ async fn interface_stats(state: &RpcState) -> Value {
         let mtu = manager.iface_hw_mtu(&stat.address);
         let display = interface_display_name(&manager, &stat.kind, &stat.name, &stat.address);
         let clients = manager.local_server_clients(&stat.address);
+        let radio = manager.radio_telemetry(&stat.address);
         let entry = manager
             .with_control(&stat.address, |control| {
-                interface_entry(stat, control, mtu, &display, clients)
+                interface_entry(stat, control, mtu, &display, clients, &radio)
             })
             .unwrap_or_else(|| {
                 let mut control = IfaceControlState::new(tokio::time::Instant::now());
-                interface_entry(stat, &mut control, mtu, &display, clients)
+                interface_entry(stat, &mut control, mtu, &display, clients, &radio)
             });
         interfaces.push(entry);
     }
@@ -456,26 +458,10 @@ async fn interface_stats(state: &RpcState) -> Value {
     let (total, heights, drops) = state.transport.inbound_queue_snapshot().await;
     let lengths = state.transport.inbound_queue_lengths().await;
     let tql = lengths.iter().sum::<usize>();
+    // Transport-wide byte rates and PPS are not counted. Omit them
+    // instead of reporting zero.
     let mut map = vec![
         (Value::from("interfaces"), Value::Array(interfaces)),
-        (Value::from("rxb"), Value::from(0u64)),
-        (Value::from("txb"), Value::from(0u64)),
-        (Value::from("rxs"), Value::from(0u64)),
-        (Value::from("txs"), Value::from(0u64)),
-        (Value::from("arxb"), Value::from(0u64)),
-        (Value::from("atxb"), Value::from(0u64)),
-        (Value::from("arxs"), Value::from(0u64)),
-        (Value::from("atxs"), Value::from(0u64)),
-        (Value::from("arxf"), Value::from(0u64)),
-        (Value::from("atxf"), Value::from(0u64)),
-        (Value::from("prxb"), Value::from(0u64)),
-        (Value::from("ptxb"), Value::from(0u64)),
-        (Value::from("prxs"), Value::from(0u64)),
-        (Value::from("ptxs"), Value::from(0u64)),
-        (Value::from("prxf"), Value::from(0u64)),
-        (Value::from("ptxf"), Value::from(0u64)),
-        (Value::from("rxpps"), Value::from(0u64)),
-        (Value::from("txpps"), Value::from(0u64)),
         (Value::from("rxqt"), Value::from(total as u64)),
         (Value::from("rxqd"), Value::from(heights[0] as u64)),
         (Value::from("rxqa"), Value::from(heights[1] as u64)),
@@ -539,8 +525,11 @@ fn interface_entry(
     mtu: Option<usize>,
     display_name: &str,
     clients: Option<u64>,
+    radio: &RadioTelemetry,
 ) -> Value {
     let now = tokio::time::Instant::now();
+    // Instantaneous speeds, TX drops, stall, and the transmit buffer are
+    // not counted. Omit those keys rather than reporting zero.
     let mut map = vec![
         (Value::from("name"), Value::from(display_name.to_string())),
         (Value::from("short_name"), Value::from(stat.name.clone())),
@@ -560,17 +549,7 @@ fn interface_entry(
         ),
         (Value::from("rxb"), Value::from(stat.rx_bytes)),
         (Value::from("txb"), Value::from(stat.tx_bytes)),
-        (Value::from("rxs"), Value::from(0u64)),
-        (Value::from("txs"), Value::from(0u64)),
         (Value::from("bitrate"), Value::from(control.bitrate)),
-        (
-            Value::from("mtu"),
-            mtu.map(|mtu| Value::from(mtu as u64)).unwrap_or(Value::Nil),
-        ),
-        (Value::from("txdrp"), Value::from(0u64)),
-        (Value::from("txdrb"), Value::from(0u64)),
-        (Value::from("txstalled"), Value::Boolean(false)),
-        (Value::from("txbuffered"), Value::from(0u64)),
         (
             Value::from("arxb"),
             Value::from(stat.announce_bytes_received),
@@ -578,17 +557,11 @@ fn interface_entry(
         (Value::from("atxb"), Value::from(stat.announce_bytes_sent)),
         (Value::from("arxc"), Value::from(stat.announces_received)),
         (Value::from("atxc"), Value::from(stat.announces_sent)),
-        (Value::from("arxs"), Value::from(0u64)),
-        (Value::from("atxs"), Value::from(0u64)),
-        (Value::from("prxb"), Value::from(0u64)),
-        (Value::from("ptxb"), Value::from(0u64)),
         (
             Value::from("prxc"),
             Value::from(stat.path_requests_received),
         ),
         (Value::from("ptxc"), Value::from(stat.path_requests_sent)),
-        (Value::from("prxs"), Value::from(0u64)),
-        (Value::from("ptxs"), Value::from(0u64)),
         (
             Value::from("incoming_announce_frequency"),
             Value::from(control.incoming_announce_frequency(now)),
@@ -653,7 +626,20 @@ fn interface_entry(
             Value::from(u64::from(grace)),
         ));
     }
+    if let Some(mtu) = mtu {
+        map.push((Value::from("mtu"), Value::from(mtu as u64)));
+    }
+    push_opt_f32(&mut map, "airtime_short", radio.airtime_short);
+    push_opt_f32(&mut map, "airtime_long", radio.airtime_long);
+    push_opt_f32(&mut map, "channel_load_short", radio.channel_load_short);
+    push_opt_f32(&mut map, "channel_load_long", radio.channel_load_long);
     Value::Map(map)
+}
+
+fn push_opt_f32(map: &mut Vec<(Value, Value)>, key: &str, value: Option<f32>) {
+    if let Some(value) = value {
+        map.push((Value::from(key), Value::from(f64::from(value))));
+    }
 }
 
 fn push_opt_secs(map: &mut Vec<(Value, Value)>, key: &str, value: Option<Duration>) {

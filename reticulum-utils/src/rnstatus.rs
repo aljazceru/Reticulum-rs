@@ -5,6 +5,7 @@
 //! daemon comes from [`fetch_status`] over the shared-instance RPC, and
 //! from [`remote_status`] over a management link.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,6 +13,8 @@ use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::Transport;
 use serde::Serialize;
+
+use crate::common::as_f64;
 
 /// Human-readable byte size (Python `RNS.prettysize`).
 pub fn pretty_size(num: u64) -> String {
@@ -417,7 +420,7 @@ pub async fn fetch_status(config_dir: &Path, view: &StatusView) -> Result<String
         return Err("Could not get RNS status".to_string());
     }
     if view.discovered_only {
-        return Ok(render_discovered(config_dir, &stats, view));
+        return Ok(render_discovered(config_dir, &stats, view).await);
     }
     let (link_count, active) = if view.link_stats {
         let links = crate::common::shared_rpc(config_dir, get_request("link_count", None)).await?;
@@ -488,17 +491,25 @@ pub async fn remote_status(
 ) -> Result<String, String> {
     let destination =
         crate::rnpath::named_destination("rnstransport", "remote.management", identity_hash);
-    let payload = pack_value(&rmpv::Value::Array(vec![
-        rmpv::Value::Boolean(view.link_stats),
-        rmpv::Value::Boolean(view.profiling),
-    ]))?;
-    let bytes = crate::rnpath::remote_request(
+    let mut payload = Vec::new();
+    rmpv::encode::write_value(
+        &mut payload,
+        &rmpv::Value::Array(vec![
+            rmpv::Value::Boolean(view.link_stats),
+            rmpv::Value::Boolean(view.profiling),
+        ]),
+    )
+    .map_err(|err| err.to_string())?;
+    // JSON is Python `no_output`: the document must not be prefixed by
+    // path and link progress lines.
+    let bytes = crate::rnpath::remote_exchange(
         transport,
         &destination,
         Some(identity),
         "/status",
         &payload,
         timeout,
+        !view.json,
     )
     .await?;
     let mut cursor = bytes.as_slice();
@@ -536,12 +547,6 @@ fn split_remote_status(
     let link_count = items.get(1).and_then(value_u64).map(|count| count as usize);
     let profiling = items.get(2).cloned().filter(|item| !item.is_nil());
     Some((stats, link_count, profiling))
-}
-
-fn pack_value(value: &rmpv::Value) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    rmpv::encode::write_value(&mut buf, value).map_err(|err| err.to_string())?;
-    Ok(buf)
 }
 
 fn render_report(
@@ -882,8 +887,14 @@ fn queue_line(stats: &rmpv::Value, pressure: &str, label: &str, pkts: &str, drop
     )
 }
 
-fn render_discovered(config_dir: &Path, stats: &rmpv::Value, view: &StatusView) -> String {
-    let entries = discovery_entries(config_dir, stats);
+/// Local discovery list. Used when `-d` is set together with `-R`: Python
+/// prints discovery and returns without opening a management link.
+pub async fn local_discovery(config_dir: &Path, view: &StatusView) -> String {
+    render_discovered(config_dir, &rmpv::Value::Map(Vec::new()), view).await
+}
+
+async fn render_discovered(config_dir: &Path, stats: &rmpv::Value, view: &StatusView) -> String {
+    let entries = discovery_entries(config_dir, stats).await;
     if view.json {
         return crate::common::msgpack_json(&rmpv::Value::Array(entries));
     }
@@ -903,31 +914,258 @@ fn render_discovered(config_dir: &Path, stats: &rmpv::Value, view: &StatusView) 
     out
 }
 
-fn discovery_entries(config_dir: &Path, stats: &rmpv::Value) -> Vec<rmpv::Value> {
+const DISCOVERABLE_TYPES: &[&str] = &[
+    "BackboneInterface",
+    "TCPServerInterface",
+    "I2PInterface",
+    "RNodeInterface",
+    "WeaveInterface",
+    "KISSInterface",
+];
+const DISCOVERY_UNKNOWN_SECS: f64 = 24.0 * 60.0 * 60.0;
+const DISCOVERY_STALE_SECS: f64 = 3.0 * 24.0 * 60.0 * 60.0;
+const DISCOVERY_REMOVE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
+
+async fn discovery_entries(config_dir: &Path, stats: &rmpv::Value) -> Vec<rmpv::Value> {
     if let Some(rows) = map_field(stats, "discovered").and_then(|value| value.as_array()) {
         if !rows.is_empty() {
             return rows.clone();
         }
     }
+    // A down shared instance has no blacklist to apply. Treat that as empty
+    // rather than failing the disk listing.
+    let blackholed = blackholed_hashes(config_dir).await;
+    read_discovery_files(config_dir, crate::common::unix_now(), &blackholed)
+}
+
+async fn blackholed_hashes(config_dir: &Path) -> HashSet<AddressHash> {
+    let Ok(value) = crate::common::shared_rpc(
+        config_dir,
+        rmpv::Value::Map(vec![(
+            rmpv::Value::from("get"),
+            rmpv::Value::from("blackholed_identities"),
+        )]),
+    )
+    .await
+    else {
+        return HashSet::new();
+    };
+    let Some(rows) = value.as_map() else {
+        return HashSet::new();
+    };
+    rows.iter()
+        .filter_map(|(key, _)| key.as_slice().and_then(AddressHash::new_from_raw_slice))
+        .collect()
+}
+
+enum DiskFate {
+    Keep,
+    Remove,
+    Skip,
+}
+
+fn read_discovery_files(
+    config_dir: &Path,
+    now: f64,
+    blackholed: &HashSet<AddressHash>,
+) -> Vec<rmpv::Value> {
     let dir = config_dir
         .join("storage")
         .join("discovery")
         .join("interfaces");
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut out = Vec::new();
+    let mut kept = Vec::new();
     for entry in entries.flatten() {
-        let Ok(bytes) = std::fs::read(entry.path()) else {
-            continue;
+        let path = entry.path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::warn!(
+                    "Error while loading discovered interface data from {}: {err}",
+                    path.display()
+                );
+                continue;
+            }
         };
-        if let Ok(value) = rmpv::decode::read_value(&mut bytes.as_slice()) {
-            if value.is_map() {
-                out.push(value);
+        let mut value = match rmpv::decode::read_value(&mut bytes.as_slice()) {
+            Ok(value) if value.is_map() => value,
+            _ => {
+                log::warn!("The interface data file {} may be corrupt", path.display());
+                continue;
+            }
+        };
+        match classify_discovery(&mut value, now, blackholed) {
+            DiskFate::Keep => kept.push(value),
+            DiskFate::Remove => {
+                let _ = std::fs::remove_file(&path);
+            }
+            DiskFate::Skip => {
+                log::warn!(
+                    "Error while loading discovered interface data from {}",
+                    path.display()
+                );
             }
         }
     }
-    out
+    kept.sort_by(|left, right| {
+        let code = |row: &rmpv::Value| -> i64 {
+            match map_field(row, "status").and_then(|value| value.as_str()) {
+                Some("available") => 1000,
+                Some("unknown") => 100,
+                _ => 0,
+            }
+        };
+        let number =
+            |row: &rmpv::Value, key: &str| map_field(row, key).and_then(as_f64).unwrap_or(0.0);
+        code(right)
+            .cmp(&code(left))
+            .then(number(right, "value").total_cmp(&number(left, "value")))
+            .then(number(right, "last_heard").total_cmp(&number(left, "last_heard")))
+    });
+    kept
+}
+
+/// Apply the discovery monitor's removal rules and recompute `status`
+/// from `last_heard`. A stored status string is not trusted.
+fn classify_discovery(
+    value: &mut rmpv::Value,
+    now: f64,
+    blackholed: &HashSet<AddressHash>,
+) -> DiskFate {
+    for key in ["ifac_netname", "ifac_netkey"] {
+        if map_field(value, key).and_then(|item| item.as_str()) == Some("None") {
+            map_remove(value, key);
+        }
+    }
+    let Some(heard) = map_field(value, "last_heard").and_then(as_f64) else {
+        return DiskFate::Skip;
+    };
+    let age = now - heard;
+    if age > DISCOVERY_REMOVE_SECS {
+        return DiskFate::Remove;
+    }
+    if !map_field(value, "transport_id").is_some_and(truthy)
+        || !map_field(value, "network_id").is_some_and(truthy)
+    {
+        return DiskFate::Remove;
+    }
+    let discoverable = map_field(value, "type")
+        .and_then(|item| item.as_str())
+        .is_some_and(|kind| DISCOVERABLE_TYPES.contains(&kind));
+    if !discoverable {
+        return DiskFate::Remove;
+    }
+    for key in ["network_id", "transport_id"] {
+        match identity_blackholed(value, key, blackholed) {
+            Ok(true) => return DiskFate::Remove,
+            Ok(false) => {}
+            Err(()) => return DiskFate::Skip,
+        }
+    }
+    if let Some(reachable) = map_field(value, "reachable_on") {
+        match reachable.as_str() {
+            Some("") => return DiskFate::Skip,
+            Some(text) if is_ip_address(text) || is_hostname(text) => {}
+            Some(_) => return DiskFate::Remove,
+            None => return DiskFate::Skip,
+        }
+    }
+    let (status, code) = if age > DISCOVERY_STALE_SECS {
+        ("stale", 0u64)
+    } else if age > DISCOVERY_UNKNOWN_SECS {
+        ("unknown", 100)
+    } else {
+        ("available", 1000)
+    };
+    map_set(value, "status", rmpv::Value::from(status));
+    map_set(value, "status_code", rmpv::Value::from(code));
+    DiskFate::Keep
+}
+
+/// Python persists these ids as hex. This stack persists the raw hash.
+fn identity_blackholed(
+    value: &rmpv::Value,
+    key: &str,
+    blackholed: &HashSet<AddressHash>,
+) -> Result<bool, ()> {
+    let field = map_field(value, key).ok_or(())?;
+    let bytes = identity_bytes(field)?;
+    Ok(AddressHash::new_from_raw_slice(&bytes).is_some_and(|hash| blackholed.contains(&hash)))
+}
+
+fn identity_bytes(value: &rmpv::Value) -> Result<Vec<u8>, ()> {
+    if let Some(text) = value.as_str() {
+        return decode_hex(text);
+    }
+    if let Some(bytes) = value.as_slice() {
+        return Ok(bytes.to_vec());
+    }
+    Err(())
+}
+
+fn decode_hex(text: &str) -> Result<Vec<u8>, ()> {
+    let filtered: String = text
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect();
+    if !filtered.len().is_multiple_of(2) || !filtered.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(());
+    }
+    let mut out = Vec::with_capacity(filtered.len() / 2);
+    let bytes = filtered.as_bytes();
+    for chunk in bytes.chunks(2) {
+        let hex = std::str::from_utf8(chunk).map_err(|_| ())?;
+        out.push(u8::from_str_radix(hex, 16).map_err(|_| ())?);
+    }
+    Ok(out)
+}
+
+fn is_ip_address(text: &str) -> bool {
+    text.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn is_hostname(hostname: &str) -> bool {
+    let hostname = hostname.strip_suffix('.').unwrap_or(hostname);
+    if hostname.is_empty() || hostname.len() > 253 {
+        return false;
+    }
+    let labels: Vec<&str> = hostname.split('.').collect();
+    let Some(last) = labels.last() else {
+        return false;
+    };
+    if !last.is_empty() && last.chars().all(|ch| ch.is_ascii_digit()) {
+        return false;
+    }
+    labels.iter().all(|label| {
+        let bytes = label.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 63
+            && bytes[0] != b'-'
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|ch| ch.is_ascii_alphanumeric() || *ch == b'-')
+    })
+}
+
+fn map_set(value: &mut rmpv::Value, key: &str, field: rmpv::Value) {
+    let rmpv::Value::Map(map) = value else {
+        return;
+    };
+    if let Some(slot) = map.iter_mut().find(|(item, _)| item.as_str() == Some(key)) {
+        slot.1 = field;
+    } else {
+        map.push((rmpv::Value::from(key), field));
+    }
+}
+
+fn map_remove(value: &mut rmpv::Value, key: &str) {
+    let rmpv::Value::Map(map) = value else {
+        return;
+    };
+    map.retain(|(item, _)| item.as_str() != Some(key));
 }
 
 fn discovery_row(entry: &rmpv::Value, view: &StatusView, now: f64) -> Option<String> {
@@ -1094,12 +1332,12 @@ fn profile_tag(tag: &rmpv::Value, level: usize) -> String {
         " {ind}              {:^15} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15}\n",
         "Mean", "Median", "Min", "Max", "St. dev", "Total"
     ));
-    out.push_str(&profile_window(&ind, "Stats    ", stats_all));
+    out.push_str(&profile_window(&ind, "  Stats    ", stats_all));
     for (key, label) in [
-        ("stats_1m", " 0-1m    "),
-        ("stats_5m", " 1-5m    "),
-        ("stats_30m", " 5-30m    "),
-        ("stats_60m", "30-60m    "),
+        ("stats_1m", "   0-1m    "),
+        ("stats_5m", "   1-5m    "),
+        ("stats_30m", "  5-30m    "),
+        ("stats_60m", " 30-60m    "),
     ] {
         if let Some(window) = map_field(tag, key).filter(|value| value.is_map()) {
             out.push_str(&profile_window(&ind, label, window));
@@ -1110,7 +1348,7 @@ fn profile_tag(tag: &rmpv::Value, level: usize) -> String {
 
 fn profile_window(ind: &str, label: &str, window: &rmpv::Value) -> String {
     format!(
-        " {ind}  {label}: ({:^15} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15})\n",
+        " {ind}{label}: ({:^15} | {:^15} | {:^15} | {:^15} | {:^15} | {:^15})\n",
         short_time(map_field(window, "mean")),
         short_time(map_field(window, "median")),
         short_time(map_field(window, "min")),
@@ -1184,11 +1422,10 @@ fn speed_str(num: f64) -> String {
 }
 
 fn pretty_speed(num: f64) -> String {
-    format!("{}ps", pretty_unit(num / 8.0, "b"))
+    format!("{}ps", pretty_unit(num, "b"))
 }
 
-fn pretty_unit(num: f64, suffix: &str) -> String {
-    let mut num = if suffix == "b" { num * 8.0 } else { num };
+fn pretty_unit(mut num: f64, suffix: &str) -> String {
     let units = ["", "K", "M", "G", "T", "P", "E", "Z"];
     for unit in units {
         if num.abs() < 1_000.0 {
@@ -1221,15 +1458,6 @@ fn display_num(value: &rmpv::Value) -> String {
     "None".to_string()
 }
 
-fn as_f64(value: &rmpv::Value) -> Option<f64> {
-    value.as_f64().or_else(|| {
-        value
-            .as_i64()
-            .map(|item| item as f64)
-            .or_else(|| value.as_u64().map(|item| item as f64))
-    })
-}
-
 fn truthy(value: &rmpv::Value) -> bool {
     match value {
         rmpv::Value::Nil => false,
@@ -1248,6 +1476,7 @@ fn truthy(value: &rmpv::Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn pretty_sizes() {
@@ -1255,6 +1484,192 @@ mod tests {
         assert_eq!(pretty_size(999), "999 B");
         assert_eq!(pretty_size(1500), "1.50 KB");
         assert_eq!(pretty_size(5_000_000), "5.00 MB");
+    }
+
+    #[test]
+    fn pretty_speed_keeps_the_original_number() {
+        assert_eq!(pretty_speed(500.0), "500 bps");
+        assert_eq!(pretty_speed(8_000.0), "8.00 Kbps");
+        assert_eq!(pretty_unit(4.0, "pps"), "4 pps");
+    }
+
+    #[test]
+    fn profile_window_labels_match_python_widths() {
+        let window = rmpv::Value::Map(vec![(
+            rmpv::Value::from("mean"),
+            rmpv::Value::from(0.001f64),
+        )]);
+        assert!(profile_window("", "   0-1m    ", &window).starts_with("    0-1m    :"));
+        assert!(profile_window("", "   1-5m    ", &window).starts_with("    1-5m    :"));
+        assert!(profile_window("", "  5-30m    ", &window).starts_with("   5-30m    :"));
+        assert!(profile_window("", " 30-60m    ", &window).starts_with("  30-60m    :"));
+        assert!(profile_window("", "  Stats    ", &window).starts_with("   Stats    :"));
+    }
+
+    #[test]
+    fn disk_discovery_recomputes_status_and_unlinks() {
+        let now = 1_700_000_000.0;
+        let dir = std::env::temp_dir().join(format!(
+            "rn-disc-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let files = dir.join("storage").join("discovery").join("interfaces");
+        std::fs::create_dir_all(&files).unwrap();
+        let write = |name: &str, value: rmpv::Value| {
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &value).unwrap();
+            std::fs::write(files.join(name), buf).unwrap();
+        };
+        let id = |byte: u8| {
+            let mut text = String::new();
+            for _ in 0..16 {
+                text.push_str(&format!("{byte:02x}"));
+            }
+            text
+        };
+        write(
+            "fresh",
+            entry(
+                "radio",
+                "RNodeInterface",
+                &id(1),
+                &id(2),
+                now - 10.0,
+                "stale",
+            ),
+        );
+        write(
+            "old",
+            entry(
+                "gone",
+                "RNodeInterface",
+                &id(3),
+                &id(4),
+                now - 8.0 * 86_400.0,
+                "available",
+            ),
+        );
+        write(
+            "notype",
+            entry(
+                "udp",
+                "UdpInterface",
+                &id(5),
+                &id(6),
+                now - 10.0,
+                "available",
+            ),
+        );
+        write(
+            "noid",
+            rmpv::Value::Map(vec![
+                (rmpv::Value::from("name"), rmpv::Value::from("missing")),
+                (
+                    rmpv::Value::from("type"),
+                    rmpv::Value::from("RNodeInterface"),
+                ),
+                (rmpv::Value::from("last_heard"), rmpv::Value::from(now)),
+            ]),
+        );
+        write("badhost", {
+            let mut value = entry(
+                "host",
+                "TCPServerInterface",
+                &id(7),
+                &id(8),
+                now,
+                "available",
+            );
+            map_set(&mut value, "reachable_on", rmpv::Value::from("not a host"));
+            value
+        });
+        write(
+            "binary",
+            rmpv::Value::Map(vec![
+                (rmpv::Value::from("name"), rmpv::Value::from("bin")),
+                (
+                    rmpv::Value::from("type"),
+                    rmpv::Value::from("KISSInterface"),
+                ),
+                (
+                    rmpv::Value::from("last_heard"),
+                    rmpv::Value::from(now - 30.0),
+                ),
+                (rmpv::Value::from("value"), rmpv::Value::from(4u64)),
+                (
+                    rmpv::Value::from("transport_id"),
+                    rmpv::Value::Binary(vec![9u8; 16]),
+                ),
+                (
+                    rmpv::Value::from("network_id"),
+                    rmpv::Value::Binary(vec![10u8; 16]),
+                ),
+            ]),
+        );
+        std::fs::write(files.join("corrupt"), b"not msgpack").unwrap();
+        let mut blackholed = HashSet::new();
+        blackholed.insert(AddressHash::new_from_raw_slice(&[0xbb; 16]).unwrap());
+        write(
+            "blocked",
+            entry(
+                "blocked",
+                "WeaveInterface",
+                &id(0xbb),
+                &id(0xcc),
+                now,
+                "available",
+            ),
+        );
+
+        let rows = read_discovery_files(&dir, now, &blackholed);
+        let names: Vec<String> = rows
+            .iter()
+            .filter_map(|row| field_str(row, "name"))
+            .collect();
+        assert_eq!(names, vec!["bin".to_string(), "radio".to_string()]);
+        assert_eq!(
+            rows.iter()
+                .find(|row| field_str(row, "name").as_deref() == Some("radio"))
+                .and_then(|row| field_str(row, "status"))
+                .as_deref(),
+            Some("available")
+        );
+        assert!(!files.join("old").exists());
+        assert!(!files.join("notype").exists());
+        assert!(!files.join("noid").exists());
+        assert!(!files.join("badhost").exists());
+        assert!(!files.join("blocked").exists());
+        assert!(files.join("corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn entry(
+        name: &str,
+        kind: &str,
+        transport_id: &str,
+        network_id: &str,
+        heard: f64,
+        status: &str,
+    ) -> rmpv::Value {
+        rmpv::Value::Map(vec![
+            (rmpv::Value::from("name"), rmpv::Value::from(name)),
+            (rmpv::Value::from("type"), rmpv::Value::from(kind)),
+            (
+                rmpv::Value::from("transport_id"),
+                rmpv::Value::from(transport_id),
+            ),
+            (
+                rmpv::Value::from("network_id"),
+                rmpv::Value::from(network_id),
+            ),
+            (rmpv::Value::from("last_heard"), rmpv::Value::from(heard)),
+            (rmpv::Value::from("value"), rmpv::Value::from(2u64)),
+            (rmpv::Value::from("status"), rmpv::Value::from(status)),
+        ])
     }
 
     #[test]

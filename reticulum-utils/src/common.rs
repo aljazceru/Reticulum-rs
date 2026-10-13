@@ -56,7 +56,8 @@ pub fn pretty_time(seconds: f64) -> String {
         parts.push(format!("{minutes}m"));
     }
     if time > 0.0 {
-        parts.push(format!("{}s", trim_number(time)));
+        // Python `str(round(seconds, 2))`, so a whole second is `1.0`.
+        parts.push(format!("{}s", round_seconds(time)));
     }
     match parts.len() {
         0 => "0s".to_string(),
@@ -68,17 +69,23 @@ pub fn pretty_time(seconds: f64) -> String {
     }
 }
 
-fn trim_number(value: f64) -> String {
+fn round_seconds(value: f64) -> String {
     let rounded = (value * 100.0).round() / 100.0;
-    if (rounded - rounded.trunc()).abs() < 1e-6 {
-        format!("{}", rounded as u64)
-    } else {
-        let mut text = format!("{rounded:.2}");
-        while text.ends_with('0') {
-            text.pop();
-        }
-        text
+    let mut text = format!("{rounded:.2}");
+    if text.ends_with('0') && !text.ends_with(".0") {
+        text.pop();
     }
+    text
+}
+
+/// Numeric msgpack value as `f64` (int, uint, or float).
+pub(crate) fn as_f64(value: &rmpv::Value) -> Option<f64> {
+    value.as_f64().or_else(|| {
+        value
+            .as_i64()
+            .map(|item| item as f64)
+            .or_else(|| value.as_u64().map(|item| item as f64))
+    })
 }
 
 /// Msgpack value as JSON. Byte strings become bare hex, matching

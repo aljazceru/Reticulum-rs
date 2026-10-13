@@ -1424,14 +1424,28 @@ pub fn msgpack_bin(data: &[u8]) -> Vec<u8> {
 }
 
 /// Pack a request payload `[time, path_hash, data]` like Python
-/// `Link.request`.
+/// `Link.request`. `data` is opaque bytes and is msgpack-binned.
 pub fn pack_request(path: &str, data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + data.len());
+    let mut element = Vec::new();
+    rmp::encode::write_bin(&mut element, data).unwrap();
+    pack_request_element(path, Some(&element))
+}
+
+/// Pack `[time, path_hash, element]` where `element` is already one
+/// msgpack value (a management list). `None` is Python `data=None`.
+pub fn pack_request_element(path: &str, element: Option<&[u8]>) -> Vec<u8> {
+    let extra = element.map(|bytes| bytes.len()).unwrap_or(1);
+    let mut out = Vec::with_capacity(64 + extra);
     rmp::encode::write_array_len(&mut out, 3).unwrap();
     rmp::encode::write_f64(&mut out, super::unix_time()).unwrap();
     let path_hash = crate::hash::Hash::new_from_slice(path.as_bytes());
     rmp::encode::write_bin(&mut out, &path_hash.as_slice()[..16]).unwrap();
-    rmp::encode::write_bin(&mut out, data).unwrap();
+    match element {
+        Some(bytes) => out.extend_from_slice(bytes),
+        None => {
+            rmp::encode::write_nil(&mut out).unwrap();
+        }
+    }
     out
 }
 
@@ -1459,10 +1473,16 @@ pub fn unpack_request(data: &[u8]) -> Option<(f64, AddressHash, Vec<u8>)> {
         return None;
     }
     let path_hash = AddressHash::new(path_bytes.try_into().ok()?);
-    let payload = match rmpv::decode::read_value(&mut cursor).ok()? {
+    // Binary payloads stay unwrapped (opaque request bytes). Any other
+    // element, including a Python management list, is kept as msgpack so
+    // the handler can decode it. Nil is an empty payload.
+    let payload_start = cursor;
+    let value = rmpv::decode::read_value(&mut cursor).ok()?;
+    let raw_len = payload_start.len() - cursor.len();
+    let payload = match value {
         rmpv::Value::Nil => Vec::new(),
         rmpv::Value::Binary(bytes) => bytes.to_vec(),
-        _ => return None,
+        _ => payload_start[..raw_len].to_vec(),
     };
     Some((time, path_hash, payload))
 }
@@ -1585,5 +1605,21 @@ mod split_validation_tests {
         assert!((time - 12345.678).abs() < 0.001);
         assert_eq!(path.as_slice(), &[0x11u8; 16][..]);
         assert!(data.is_empty());
+    }
+
+    #[test]
+    fn request_unpack_keeps_a_list_and_unwraps_a_binned_list() {
+        let mut list = Vec::new();
+        rmp::encode::write_array_len(&mut list, 2).unwrap();
+        rmp::encode::write_bool(&mut list, true).unwrap();
+        rmp::encode::write_bool(&mut list, false).unwrap();
+
+        let python = pack_request_element("/status", Some(&list));
+        let (_, _, data) = unpack_request(&python).expect("python list");
+        assert_eq!(data, list);
+
+        let binned = pack_request("/status", &list);
+        let (_, _, data) = unpack_request(&binned).expect("binned list");
+        assert_eq!(data, list);
     }
 }

@@ -100,6 +100,20 @@ pub struct InterfaceCounters {
     /// Last reported derived link-quality percentage as f32 bits
     /// (`u32::MAX` = not reported; Python `r_stat_q`).
     quality_bits: AtomicU32,
+    /// Radio channel readings (`u32::MAX` = not reported).
+    airtime_short_bits: AtomicU32,
+    airtime_long_bits: AtomicU32,
+    channel_load_short_bits: AtomicU32,
+    channel_load_long_bits: AtomicU32,
+}
+
+/// Radio channel readings an interface has actually reported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RadioTelemetry {
+    pub airtime_short: Option<f32>,
+    pub airtime_long: Option<f32>,
+    pub channel_load_short: Option<f32>,
+    pub channel_load_long: Option<f32>,
 }
 
 impl InterfaceCounters {
@@ -258,8 +272,41 @@ impl InterfaceCounters {
 
     /// Last reported derived link-quality percentage (Python `r_stat_q`).
     pub fn quality(&self) -> Option<f32> {
-        let bits = self.quality_bits.load(Ordering::Relaxed);
-        (bits != u32::MAX).then(|| f32::from_bits(bits))
+        optional_f32(&self.quality_bits)
+    }
+
+    /// Store radio channel readings. `None` keeps the previous value.
+    pub fn set_radio_channel(
+        &self,
+        airtime_short: Option<f32>,
+        airtime_long: Option<f32>,
+        channel_load_short: Option<f32>,
+        channel_load_long: Option<f32>,
+    ) {
+        store_opt_f32(&self.airtime_short_bits, airtime_short);
+        store_opt_f32(&self.airtime_long_bits, airtime_long);
+        store_opt_f32(&self.channel_load_short_bits, channel_load_short);
+        store_opt_f32(&self.channel_load_long_bits, channel_load_long);
+    }
+
+    pub fn radio_telemetry(&self) -> RadioTelemetry {
+        RadioTelemetry {
+            airtime_short: optional_f32(&self.airtime_short_bits),
+            airtime_long: optional_f32(&self.airtime_long_bits),
+            channel_load_short: optional_f32(&self.channel_load_short_bits),
+            channel_load_long: optional_f32(&self.channel_load_long_bits),
+        }
+    }
+}
+
+fn optional_f32(bits: &AtomicU32) -> Option<f32> {
+    let bits = bits.load(Ordering::Relaxed);
+    (bits != u32::MAX).then(|| f32::from_bits(bits))
+}
+
+fn store_opt_f32(slot: &AtomicU32, value: Option<f32>) {
+    if let Some(value) = value {
+        slot.store(value.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -286,6 +333,10 @@ impl Default for InterfaceCounters {
             rssi: AtomicI32::new(i32::MIN),
             snr_bits: AtomicU32::new(u32::MAX),
             quality_bits: AtomicU32::new(u32::MAX),
+            airtime_short_bits: AtomicU32::new(u32::MAX),
+            airtime_long_bits: AtomicU32::new(u32::MAX),
+            channel_load_short_bits: AtomicU32::new(u32::MAX),
+            channel_load_long_bits: AtomicU32::new(u32::MAX),
         }
     }
 }
@@ -1115,6 +1166,15 @@ impl InterfaceManager {
             .first()
             .filter(|iface| !iface.stop.is_cancelled())
             .and_then(|iface| self.iface_hw_mtu(&iface.address))
+    }
+
+    /// Latest radio channel readings for `address`.
+    pub fn radio_telemetry(&self, address: &AddressHash) -> RadioTelemetry {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address)
+            .map(|iface| iface.stats.radio_telemetry())
+            .unwrap_or_default()
     }
 
     /// Path-signalling hardware MTU.

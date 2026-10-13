@@ -24,12 +24,28 @@ use crate::destination::{DestinationName, SingleInputDestination};
 #[derive(Debug, Default)]
 pub struct ManagementSnapshot {
     pub stats: Vec<crate::iface::InterfaceStats>,
+    /// Parallel to `stats`. Mode, bitrate, MTU and radio channel readings
+    /// that are not on [`crate::iface::InterfaceStats`].
+    pub iface_extra: Vec<IfaceStatusExtra>,
     pub paths: Vec<crate::transport::PathTableSnapshotEntry>,
     /// (link_table, inbound, outbound) link counts
     pub link_counts: (usize, usize, usize),
     /// Packed blackhole table in the Python wire format
     /// (msgpack dict `{hash: {source, until, reason}}`).
     pub blackholes: Vec<u8>,
+}
+
+/// Per-interface fields the status snapshot can report when the manager
+/// already has them. Absent options are omitted from the map.
+#[derive(Debug, Clone, Default)]
+pub struct IfaceStatusExtra {
+    pub mode: u8,
+    pub bitrate: u64,
+    pub mtu: Option<u64>,
+    pub airtime_short: Option<f32>,
+    pub airtime_long: Option<f32>,
+    pub channel_load_short: Option<f32>,
+    pub channel_load_long: Option<f32>,
 }
 
 /// Whether a request from `remote_identity` is allowed
@@ -48,7 +64,7 @@ pub fn identity_allowed(
 /// (Python `remote_status_handler`: `[interface_stats]` plus
 /// `[link_count]` when requested).
 pub fn status_response(snapshot: &ManagementSnapshot, include_links: bool) -> Vec<u8> {
-    let stats = encode_interface_stats(&snapshot.stats);
+    let stats = encode_interface_stats(&snapshot.stats, &snapshot.iface_extra);
 
     let mut out = Vec::new();
     if include_links {
@@ -111,32 +127,74 @@ pub fn blackhole_info_name() -> DestinationName {
 
 /// Encode a msgpack list of interface stat maps for `/status` responses
 /// (Python `Reticulum.get_interface_stats` list-of-dicts shape).
-pub fn encode_interface_stats(stats: &[crate::iface::InterfaceStats]) -> Vec<u8> {
+/// `extra` is parallel to `stats`. Keys that are not tracked (TX drops,
+/// PPS) are omitted rather than written as zero.
+pub fn encode_interface_stats(
+    stats: &[crate::iface::InterfaceStats],
+    extra: &[IfaceStatusExtra],
+) -> Vec<u8> {
     let mut out = Vec::new();
     mp::write_array_len(&mut out, stats.len() as u32).ok();
 
-    for stat in stats {
-        mp::write_map_len(&mut out, 7).ok();
+    for (index, stat) in stats.iter().enumerate() {
+        let extra = extra.get(index);
+        let mut fields = 6u32;
+        if extra.is_some() {
+            fields += 2;
+            if extra.is_some_and(|item| item.mtu.is_some()) {
+                fields += 1;
+            }
+            if extra.is_some_and(|item| item.airtime_short.is_some()) {
+                fields += 1;
+            }
+            if extra.is_some_and(|item| item.airtime_long.is_some()) {
+                fields += 1;
+            }
+            if extra.is_some_and(|item| item.channel_load_short.is_some()) {
+                fields += 1;
+            }
+            if extra.is_some_and(|item| item.channel_load_long.is_some()) {
+                fields += 1;
+            }
+        }
+        mp::write_map_len(&mut out, fields).ok();
         mp::write_str(&mut out, "name").ok();
         mp::write_str(&mut out, &stat.name).ok();
         mp::write_str(&mut out, "type").ok();
         mp::write_str(&mut out, &stat.kind).ok();
         mp::write_str(&mut out, "status").ok();
         mp::write_str(&mut out, if stat.online { "online" } else { "offline" }).ok();
-        mp::write_str(&mut out, "bitrate").ok();
-        // `InterfaceStats` does not carry a per-interface bitrate. Report
-        // Python's default (`Interface.bitrate`) rather than deriving a
-        // rate from the announce-cap fraction.
-        mp::write_u64(&mut out, crate::iface::control::DEFAULT_BITRATE).ok();
         mp::write_str(&mut out, "sent").ok();
         mp::write_u64(&mut out, stat.sent).ok();
         mp::write_str(&mut out, "received").ok();
         mp::write_u64(&mut out, stat.received).ok();
         mp::write_str(&mut out, "txb").ok();
         mp::write_u64(&mut out, stat.tx_bytes).ok();
+        if let Some(extra) = extra {
+            mp::write_str(&mut out, "bitrate").ok();
+            mp::write_u64(&mut out, extra.bitrate).ok();
+            mp::write_str(&mut out, "mode").ok();
+            mp::write_u8(&mut out, extra.mode).ok();
+            if let Some(mtu) = extra.mtu {
+                mp::write_str(&mut out, "mtu").ok();
+                mp::write_u64(&mut out, mtu).ok();
+            }
+            write_opt_f32(&mut out, "airtime_short", extra.airtime_short);
+            write_opt_f32(&mut out, "airtime_long", extra.airtime_long);
+            write_opt_f32(&mut out, "channel_load_short", extra.channel_load_short);
+            write_opt_f32(&mut out, "channel_load_long", extra.channel_load_long);
+        }
     }
 
     out
+}
+
+fn write_opt_f32(out: &mut Vec<u8>, key: &str, value: Option<f32>) {
+    let Some(value) = value else {
+        return;
+    };
+    mp::write_str(out, key).ok();
+    mp::write_f32(out, value).ok();
 }
 
 /// Encode a msgpack `/path` "table" response from path table snapshot
@@ -184,6 +242,18 @@ pub fn decode_management_request(data: &[u8]) -> ManagementRequest {
     let value = match read_value(&mut cursor) {
         Ok(value) => value,
         Err(_) => return ManagementRequest::Unknown,
+    };
+    // `Transport::request` bins the caller's bytes. Python sends the list
+    // itself. Both arrive here as the handler payload.
+    let value = match value {
+        Value::Binary(bytes) => {
+            let mut inner = bytes.as_slice();
+            match read_value(&mut inner) {
+                Ok(decoded) => decoded,
+                Err(_) => return ManagementRequest::Unknown,
+            }
+        }
+        other => other,
     };
 
     let Value::Array(items) = value else {

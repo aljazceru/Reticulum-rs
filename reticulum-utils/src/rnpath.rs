@@ -13,12 +13,12 @@ use std::path::Path;
 use std::time::Duration;
 
 use reticulum::destination::link::{LinkEvent, LinkEventData};
-use reticulum::destination::DestinationDesc;
-use reticulum::hash::{AddressHash, Hash};
+use reticulum::destination::{DestinationDesc, DestinationName};
+use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::transport::Transport;
 
-use crate::common::prettyhexrep;
+use crate::common::{as_f64, prettyhexrep};
 
 /// Default timeout for path requests (Python `Transport.PATH_REQUEST_TIMEOUT`
 /// is 15 s; rnpath uses it as the default `-w` value).
@@ -271,24 +271,32 @@ pub fn pretty_date(then: i64, now: i64) -> String {
     format!("{} years", day_diff / 365)
 }
 
+struct NamedIdentity<'a>(&'a AddressHash);
+
+impl reticulum::identity::HashIdentity for NamedIdentity<'_> {
+    fn as_address_hash_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 /// Destination address for `app.aspects` announced by `identity`
 /// (Python `Destination.hash_from_name_and_identity`).
 pub fn named_destination(app: &str, aspects: &str, identity: &AddressHash) -> AddressHash {
-    let mut name_input = Vec::with_capacity(app.len() + 1 + aspects.len());
-    name_input.extend_from_slice(app.as_bytes());
-    name_input.push(b'.');
-    name_input.extend_from_slice(aspects.as_bytes());
-    let name = Hash::new_from_slice(&name_input);
-    let mut full_input = Vec::with_capacity(10 + identity.len());
-    full_input.extend_from_slice(&name.as_slice()[..10]);
-    full_input.extend_from_slice(identity.as_slice());
-    AddressHash::new_from_hash(&Hash::new_from_slice(&full_input))
+    DestinationName::new(app, aspects).address_hash_for(&NamedIdentity(identity))
 }
 
 /// Path table text from a shared-instance `path_table` response.
 pub fn format_path_table(
     value: &rmpv::Value,
     filter: Option<&AddressHash>,
+) -> Result<String, String> {
+    format_path_rows(value, filter, true)
+}
+
+fn format_path_rows(
+    value: &rmpv::Value,
+    filter: Option<&AddressHash>,
+    sort: bool,
 ) -> Result<String, String> {
     let rows = value
         .as_array()
@@ -311,7 +319,9 @@ pub fn format_path_table(
     if filter.is_some() && entries.is_empty() {
         return Err("No path known".to_string());
     }
-    entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    if sort {
+        entries.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+    }
     let mut out = String::new();
     for (interface, hops, destination, via, expires) in entries {
         let hop = if hops == 1 { " hop " } else { " hops" };
@@ -532,7 +542,12 @@ pub async fn drop_via_text(config_dir: &Path, via: &AddressHash) -> Result<Strin
         ]),
     )
     .await?;
-    drop_via_message(via, as_u64(&value).unwrap_or(0))
+    let count = value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|item| u64::try_from(item).ok()))
+        .or_else(|| value.as_f64().map(|item| item as u64))
+        .unwrap_or(0);
+    drop_via_message(via, count)
 }
 
 pub fn drop_via_message(via: &AddressHash, count: u64) -> Result<String, String> {
@@ -732,12 +747,33 @@ pub async fn local_path_table_text(
     filter: Option<&AddressHash>,
     max_hops: Option<u8>,
 ) -> Result<String, String> {
+    format_path_table(&local_path_rows(transport, max_hops).await, filter)
+}
+
+/// Local path table as one JSON document. Sorted like the text table.
+/// The destination filter is not applied; Python dumps the whole table.
+pub async fn local_path_table_value(
+    transport: &Transport,
+    max_hops: Option<u8>,
+) -> Result<rmpv::Value, String> {
+    let mut rows = match local_path_rows(transport, max_hops).await {
+        rmpv::Value::Array(rows) => rows,
+        other => return Ok(other),
+    };
+    rows.sort_by(|left, right| {
+        let iface = |row: &rmpv::Value| rpc_str(row, "interface").unwrap_or_default();
+        let hops = |row: &rmpv::Value| rpc_u64(row, "hops").unwrap_or(0);
+        iface(left)
+            .cmp(&iface(right))
+            .then(hops(left).cmp(&hops(right)))
+    });
+    Ok(rmpv::Value::Array(rows))
+}
+
+async fn local_path_rows(transport: &Transport, max_hops: Option<u8>) -> rmpv::Value {
     let labels = iface_labels(transport).await;
     let mut rows = Vec::new();
     for entry in transport.path_table_snapshot().await {
-        if filter.is_some_and(|hash| entry.destination != *hash) {
-            continue;
-        }
         if max_hops.is_some_and(|max| entry.hops > max) {
             continue;
         }
@@ -766,7 +802,7 @@ pub async fn local_path_table_text(
             (rmpv::Value::from("interface"), rmpv::Value::from(interface)),
         ]));
     }
-    format_path_table(&rmpv::Value::Array(rows), filter)
+    rmpv::Value::Array(rows)
 }
 
 /// Announce rates of a local transport.
@@ -775,6 +811,15 @@ pub async fn local_rates_text(
     filter: Option<&AddressHash>,
     now: f64,
 ) -> Result<String, String> {
+    format_rate_table(&local_rate_rows(transport, now).await, filter, now)
+}
+
+/// Local rate table as one JSON document, sorted by `last`.
+pub async fn local_rates_value(transport: &Transport, now: f64) -> rmpv::Value {
+    sort_rate_rows(&local_rate_rows(transport, now).await)
+}
+
+async fn local_rate_rows(transport: &Transport, now: f64) -> rmpv::Value {
     let rows = transport
         .rate_table_snapshot()
         .await
@@ -812,7 +857,7 @@ pub async fn local_rates_text(
             ])
         })
         .collect();
-    format_rate_table(&rmpv::Value::Array(rows), filter, now)
+    rmpv::Value::Array(rows)
 }
 
 /// Expire one local path (Python `Reticulum.drop_path` calls `expire_path`).
@@ -910,6 +955,8 @@ async fn iface_labels(transport: &Transport) -> Vec<(AddressHash, String)> {
 
 /// Open a link and perform one request. `identity` is `None` for
 /// destinations that do not authenticate (blackhole `/list`).
+/// `data` is one msgpack element spliced as the request payload, or
+/// empty for Python `None`.
 pub async fn remote_request(
     transport: &Transport,
     destination: &AddressHash,
@@ -918,33 +965,41 @@ pub async fn remote_request(
     data: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let timeout = timeout.max(transport.medium_path_timeout().await);
-    if !transport.has_path(destination).await {
-        println!("Path to {} requested", prettyhexrep(destination.as_slice()));
+    remote_exchange(transport, destination, identity, path, data, timeout, true).await
+}
+
+/// Establish the management link and identify, then close it.
+/// Used for remote commands Python refuses after the link is up.
+pub async fn connect_remote(
+    transport: &Transport,
+    destination: &AddressHash,
+    identity: Option<&PrivateIdentity>,
+    timeout: Duration,
+    progress: bool,
+) -> Result<(), String> {
+    let (link_id, _link) =
+        open_remote_link(transport, destination, identity, timeout, progress).await?;
+    let _ = transport.link_close(link_id).await;
+    Ok(())
+}
+
+pub(crate) async fn remote_exchange(
+    transport: &Transport,
+    destination: &AddressHash,
+    identity: Option<&PrivateIdentity>,
+    path: &str,
+    data: &[u8],
+    timeout: Duration,
+    progress: bool,
+) -> Result<Vec<u8>, String> {
+    let (link_id, link) =
+        open_remote_link(transport, destination, identity, timeout, progress).await?;
+    if progress {
+        println!("Sending request...");
     }
-    let desc = wait_for_destination(transport, destination, timeout)
-        .await
-        .ok_or_else(|| "Path request timed out".to_string())?;
-    println!("Establishing link with remote transport instance...");
-    let mut events = transport.out_link_events();
-    let link = transport.link(desc).await;
-    let link_id = *link.lock().await.id();
-    let established = wait_link_active(&mut events, &link_id, timeout).await;
-    if let Err(err) = established {
-        let _ = transport.link_close(link_id).await;
-        return Err(err);
-    }
-    if let Some(identity) = identity {
-        let packet = link
-            .lock()
-            .await
-            .identify(identity)
-            .map_err(|err| format!("could not identify: {err:?}"))?;
-        transport.send_packet(packet).await;
-    }
-    println!("Sending request...");
+    let element = if data.is_empty() { None } else { Some(data) };
     let request_id = transport
-        .request(&link, path, data)
+        .request_element(&link, path, element)
         .await
         .map_err(|_| "The remote request failed. Likely authentication failure.".to_string());
     let request_id = match request_id {
@@ -957,6 +1012,47 @@ pub async fn remote_request(
     let response = transport.await_request_response(request_id, timeout).await;
     let _ = transport.link_close(link_id).await;
     response.ok_or_else(|| "The remote request failed. Likely authentication failure.".to_string())
+}
+
+async fn open_remote_link(
+    transport: &Transport,
+    destination: &AddressHash,
+    identity: Option<&PrivateIdentity>,
+    timeout: Duration,
+    progress: bool,
+) -> Result<
+    (
+        AddressHash,
+        std::sync::Arc<tokio::sync::Mutex<reticulum::destination::link::Link>>,
+    ),
+    String,
+> {
+    let timeout = timeout.max(transport.medium_path_timeout().await);
+    if !transport.has_path(destination).await && progress {
+        println!("Path to {} requested", prettyhexrep(destination.as_slice()));
+    }
+    let desc = wait_for_destination(transport, destination, timeout)
+        .await
+        .ok_or_else(|| "Path request timed out".to_string())?;
+    if progress {
+        println!("Establishing link with remote transport instance...");
+    }
+    let mut events = transport.out_link_events();
+    let link = transport.link(desc).await;
+    let link_id = *link.lock().await.id();
+    if let Err(err) = wait_link_active(&mut events, &link_id, timeout).await {
+        let _ = transport.link_close(link_id).await;
+        return Err(err);
+    }
+    if let Some(identity) = identity {
+        let packet = link
+            .lock()
+            .await
+            .identify(identity)
+            .map_err(|err| format!("could not identify: {err:?}"))?;
+        transport.send_packet(packet).await;
+    }
+    Ok((link_id, link))
 }
 
 async fn wait_link_active(
@@ -992,32 +1088,79 @@ pub async fn remote_path_table(
     max_hops: Option<u8>,
     timeout: Duration,
 ) -> Result<String, String> {
+    let value = fetch_remote_path(
+        transport,
+        transport_identity,
+        identity,
+        filter,
+        max_hops,
+        timeout,
+        true,
+    )
+    .await?;
+    format_path_rows(&value, filter, false)
+}
+
+/// Remote path table as one JSON document. Byte fields are bare hex.
+/// The table is left in the order the remote sent it.
+pub async fn remote_path_json(
+    transport: &Transport,
+    transport_identity: &AddressHash,
+    identity: &PrivateIdentity,
+    filter: Option<&AddressHash>,
+    max_hops: Option<u8>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let value = fetch_remote_path(
+        transport,
+        transport_identity,
+        identity,
+        filter,
+        max_hops,
+        timeout,
+        false,
+    )
+    .await?;
+    Ok(crate::common::msgpack_json(&value))
+}
+
+async fn fetch_remote_path(
+    transport: &Transport,
+    transport_identity: &AddressHash,
+    identity: &PrivateIdentity,
+    filter: Option<&AddressHash>,
+    max_hops: Option<u8>,
+    timeout: Duration,
+    progress: bool,
+) -> Result<rmpv::Value, String> {
     let destination = named_destination("rnstransport", "remote.management", transport_identity);
-    let payload = pack_value(&rmpv::Value::Array(vec![
-        rmpv::Value::from("table"),
+    let payload = encode_value(&path_query("table", filter, max_hops))?;
+    remote_path_response(
+        transport,
+        &destination,
+        identity,
+        &payload,
+        timeout,
+        progress,
+    )
+    .await
+}
+
+fn path_query(command: &str, filter: Option<&AddressHash>, max_hops: Option<u8>) -> rmpv::Value {
+    let mut items = vec![
+        rmpv::Value::from(command),
         match filter {
             Some(hash) => rmpv::Value::Binary(hash.as_slice().to_vec()),
             None => rmpv::Value::Nil,
         },
-        match max_hops {
+    ];
+    if command == "table" {
+        items.push(match max_hops {
             Some(max) => rmpv::Value::from(u64::from(max)),
             None => rmpv::Value::Nil,
-        },
-    ]))?;
-    let bytes = remote_request(
-        transport,
-        &destination,
-        Some(identity),
-        "/path",
-        &payload,
-        timeout,
-    )
-    .await?;
-    let value = decode_msgpack(&bytes)?;
-    if value.is_nil() || value.as_array().is_some_and(|rows| rows.is_empty()) {
-        return Err("The remote request failed. Likely authentication failure.".to_string());
+        });
     }
-    format_path_table(&value, filter)
+    rmpv::Value::Array(items)
 }
 
 pub async fn remote_rates(
@@ -1028,28 +1171,57 @@ pub async fn remote_rates(
     now: f64,
     timeout: Duration,
 ) -> Result<String, String> {
-    let destination = named_destination("rnstransport", "remote.management", transport_identity);
-    let payload = pack_value(&rmpv::Value::Array(vec![
-        rmpv::Value::from("rates"),
-        match filter {
-            Some(hash) => rmpv::Value::Binary(hash.as_slice().to_vec()),
-            None => rmpv::Value::Nil,
-        },
-    ]))?;
-    let bytes = remote_request(
+    let value = fetch_remote_rates(
         transport,
-        &destination,
-        Some(identity),
-        "/path",
-        &payload,
+        transport_identity,
+        identity,
+        filter,
         timeout,
+        true,
     )
     .await?;
-    let value = decode_msgpack(&bytes)?;
-    if value.is_nil() || value.as_array().is_some_and(|rows| rows.is_empty()) {
-        return Err("The remote request failed. Likely authentication failure.".to_string());
-    }
     format_rate_table(&value, filter, now)
+}
+
+/// Remote rate table as one JSON document, sorted by `last` like Python.
+pub async fn remote_rates_json(
+    transport: &Transport,
+    transport_identity: &AddressHash,
+    identity: &PrivateIdentity,
+    filter: Option<&AddressHash>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let value = fetch_remote_rates(
+        transport,
+        transport_identity,
+        identity,
+        filter,
+        timeout,
+        false,
+    )
+    .await?;
+    Ok(crate::common::msgpack_json(&sort_rate_rows(&value)))
+}
+
+async fn fetch_remote_rates(
+    transport: &Transport,
+    transport_identity: &AddressHash,
+    identity: &PrivateIdentity,
+    filter: Option<&AddressHash>,
+    timeout: Duration,
+    progress: bool,
+) -> Result<rmpv::Value, String> {
+    let destination = named_destination("rnstransport", "remote.management", transport_identity);
+    let payload = encode_value(&path_query("rates", filter, None))?;
+    remote_path_response(
+        transport,
+        &destination,
+        identity,
+        &payload,
+        timeout,
+        progress,
+    )
+    .await
 }
 
 /// Published blacklist of a transport identity (`rnstransport.info.blackhole`).
@@ -1069,7 +1241,7 @@ pub async fn remote_blackhole_list(
     format_blackholes(&value, filter, now, None)
 }
 
-fn pack_value(value: &rmpv::Value) -> Result<Vec<u8>, String> {
+fn encode_value(value: &rmpv::Value) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
     rmpv::encode::write_value(&mut buf, value).map_err(|err| err.to_string())?;
     Ok(buf)
@@ -1080,20 +1252,42 @@ fn decode_msgpack(bytes: &[u8]) -> Result<rmpv::Value, String> {
     rmpv::decode::read_value(&mut cursor).map_err(|err| err.to_string())
 }
 
-fn as_f64(value: &rmpv::Value) -> Option<f64> {
-    value.as_f64().or_else(|| {
-        value
-            .as_i64()
-            .map(|item| item as f64)
-            .or_else(|| value.as_u64().map(|item| item as f64))
-    })
+fn sort_rate_rows(value: &rmpv::Value) -> rmpv::Value {
+    let Some(rows) = value.as_array() else {
+        return value.clone();
+    };
+    let mut rows = rows.clone();
+    rows.sort_by(|left, right| {
+        let left = rpc_field(left, "last").and_then(as_f64).unwrap_or(0.0);
+        let right = rpc_field(right, "last").and_then(as_f64).unwrap_or(0.0);
+        left.total_cmp(&right)
+    });
+    rmpv::Value::Array(rows)
 }
 
-fn as_u64(value: &rmpv::Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|item| u64::try_from(item).ok()))
-        .or_else(|| value.as_f64().map(|item| item as u64))
+async fn remote_path_response(
+    transport: &Transport,
+    destination: &AddressHash,
+    identity: &PrivateIdentity,
+    payload: &[u8],
+    timeout: Duration,
+    progress: bool,
+) -> Result<rmpv::Value, String> {
+    let bytes = remote_exchange(
+        transport,
+        destination,
+        Some(identity),
+        "/path",
+        payload,
+        timeout,
+        progress,
+    )
+    .await?;
+    let value = decode_msgpack(&bytes)?;
+    if value.is_nil() || value.as_array().is_some_and(|rows| rows.is_empty()) {
+        return Err("The remote request failed. Likely authentication failure.".to_string());
+    }
+    Ok(value)
 }
 
 /// Wait for an announce for `destination` and return the destination

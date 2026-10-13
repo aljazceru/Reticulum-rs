@@ -33,9 +33,10 @@ use crate::packet::{
 use crate::resource::{
     self,
     manager::{
-        pack_request, pack_response, packet_response_size, request_id as make_request_id,
-        PendingRequest, RequestContext as RequestCtx, RequestEvent, RequestEventData,
-        RequestHandlerConfig, RequestOptions, RequestResponse, ResourceManager, ResourceStrategy,
+        pack_request, pack_request_element, pack_response, packet_response_size,
+        request_id as make_request_id, PendingRequest, RequestContext as RequestCtx,
+        RequestEvent, RequestEventData, RequestHandlerConfig, RequestOptions, RequestResponse,
+        ResourceManager, ResourceStrategy,
     },
     ResourceEvent, ResourceOptions, ResourceTx,
 };
@@ -1691,7 +1692,32 @@ impl Transport {
         data: &[u8],
         options: RequestOptions,
     ) -> Result<AddressHash, RnsError> {
-        let packed = pack_request(path, data);
+        self.dispatch_packed_request(link, pack_request(path, data), options)
+            .await
+    }
+
+    /// [`request`](Self::request), but `element` is spliced as the third
+    /// msgpack value instead of being wrapped in a bin. `None` is nil.
+    pub async fn request_element(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &str,
+        element: Option<&[u8]>,
+    ) -> Result<AddressHash, RnsError> {
+        self.dispatch_packed_request(
+            link,
+            pack_request_element(path, element),
+            RequestOptions::default(),
+        )
+        .await
+    }
+
+    async fn dispatch_packed_request(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        packed: Vec<u8>,
+        options: RequestOptions,
+    ) -> Result<AddressHash, RnsError> {
         let now = crate::resource::unix_time();
 
         // Build the request before taking the handler lock. A resource
@@ -7158,7 +7184,31 @@ impl Transport {
         tokio::spawn(async move {
             loop {
                 let handler = handler.lock().await;
-                let stats = handler.iface_manager.lock().await.stats();
+                let (stats, iface_extra) = {
+                    let manager = handler.iface_manager.lock().await;
+                    let stats = manager.stats();
+                    let iface_extra = stats
+                        .iter()
+                        .map(|stat| {
+                            let (mode, bitrate) = manager
+                                .with_control(&stat.address, |control| {
+                                    (control.mode as u8, control.bitrate)
+                                })
+                                .unwrap_or((0x01, 62_500));
+                            let radio = manager.radio_telemetry(&stat.address);
+                            management::IfaceStatusExtra {
+                                mode,
+                                bitrate,
+                                mtu: manager.iface_hw_mtu(&stat.address).map(|mtu| mtu as u64),
+                                airtime_short: radio.airtime_short,
+                                airtime_long: radio.airtime_long,
+                                channel_load_short: radio.channel_load_short,
+                                channel_load_long: radio.channel_load_long,
+                            }
+                        })
+                        .collect();
+                    (stats, iface_extra)
+                };
                 let paths = handler
                     .path_table
                     .iter()
@@ -7178,6 +7228,7 @@ impl Transport {
 
                 *snapshot.write().unwrap() = management::ManagementSnapshot {
                     stats,
+                    iface_extra,
                     paths,
                     link_counts: (
                         handler.link_table.len(),
