@@ -202,7 +202,7 @@ pub struct RnodeSubinterface {
     pub outgoing: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct NamedInterface {
     pub name: String,
     #[serde(flatten)]
@@ -334,64 +334,7 @@ impl NamedInterface {
     }
 }
 
-impl Default for NamedInterface {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            config: InterfaceConfig::Unsupported,
-            mode: None,
-            bitrate: None,
-            ifac_size: None,
-            networkname: None,
-            passphrase: None,
-            discoverable: false,
-            discovery_announce_interval_minutes: None,
-            discovery_stamp_value: None,
-            discovery_lxmf_address: None,
-            discovery_name: None,
-            reachable_on: None,
-            announce_cap: None,
-            announce_rate_target: None,
-            announce_rate_grace: None,
-            announce_rate_penalty: None,
-            ingress_control: None,
-            egress_control: None,
-            ic_max_held_announces: None,
-            ic_burst_hold: None,
-            ic_burst_freq_new: None,
-            ic_burst_freq: None,
-            ic_pr_burst_freq_new: None,
-            ic_pr_burst_freq: None,
-            ec_pr_freq: None,
-            ic_new_time: None,
-            ic_burst_penalty: None,
-            ic_held_release_interval: None,
-            gravity: None,
-            kiss_framing: false,
-            prefer_ipv6: false,
-            device: None,
-            fixed_mtu: None,
-            max_reconnect_tries: None,
-            connect_timeout: None,
-            id_interval: None,
-            id_callsign: None,
-            discovery_frequency: None,
-            discovery_bandwidth: None,
-            discovery_modulation: None,
-            publish_ifac: false,
-            discovery_encrypt: false,
-            latitude: None,
-            longitude: None,
-            height: None,
-            recursive_prs: false,
-            announces_from_internal: None,
-            announces_to_internal: None,
-            ignore_config_warnings: false,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 #[serde(tag = "type")]
 pub enum InterfaceConfig {
     TCPServerInterface {
@@ -613,6 +556,7 @@ pub enum InterfaceConfig {
         listen_port: u16,
     },
     #[serde(other)]
+    #[default]
     Unsupported,
 }
 
@@ -1181,7 +1125,6 @@ pub const KNOWN_RETICULUM_KEYS: &[&str] = &[
 /// `enable_stranded_announce_rebroadcast` are absent: Python
 /// `__apply_config` does not read them either.
 pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] = &[
-    "instance_control_port",
     "rpc_key",
     "enable_interface_management",
     "panic_on_interface_error",

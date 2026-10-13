@@ -838,6 +838,9 @@ pub struct I2pServer {
     /// Established session once created; the destination is needed by
     /// embedders to publish (discovery data / manual peers).
     pub session: Arc<tokio::sync::RwLock<Option<Arc<SamSession>>>>,
+    /// Live base32 destination hash (no `.b32.i2p` suffix). `None` until
+    /// the SAM session exists, and cleared when the session drops.
+    pub b32_slot: Arc<std::sync::RwLock<Option<String>>>,
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     /// Persisted destination private key. `None` keeps
     /// `DESTINATION=TRANSIENT` so [`I2pServer::new`] stays source-compatible.
@@ -854,6 +857,7 @@ impl I2pServer {
             sam_addr: sam_addr.into(),
             session_id: session_id.into(),
             session: Arc::new(tokio::sync::RwLock::new(None)),
+            b32_slot: Arc::new(std::sync::RwLock::new(None)),
             iface_manager,
             destination_key: None,
         }
@@ -909,6 +913,8 @@ impl I2pServer {
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let session_slot = { context.inner.lock().unwrap().session.clone() };
         let destination_key = { context.inner.lock().unwrap().destination_key.clone() };
+        let b32_slot = { context.inner.lock().unwrap().b32_slot.clone() };
+        let parent = context.channel.address;
 
         loop {
             if context.cancel.is_cancelled() {
@@ -940,6 +946,7 @@ impl I2pServer {
             );
 
             *session_slot.write().await = Some(session.clone());
+            *b32_slot.write().expect("b32 slot") = Some(session.b32());
             stats.set_online(true);
 
             // Accept loop: each accepted stream becomes a spawned peer.
@@ -957,18 +964,18 @@ impl I2pServer {
                         let inherited = context.channel.ifac.read().expect("ifac lock").clone();
 
                         let mut manager = iface_manager.lock().await;
-                        let address = manager.spawn(
-                            I2pPeer::new_from_stream(format!("{session_id}-peer"), stream),
-                            I2pPeer::spawn,
-                        );
-
+                        let peer_context = manager.open(I2pPeer::new_from_stream(
+                            format!("{session_id}-peer"),
+                            stream,
+                        ));
                         // Spawned peers inherit the server's access code
                         // (Python I2PInterfacePeer ifac inheritance).
-                        if inherited.is_some() {
-                            manager.with_iface_ifac(&address, |slot| {
-                                *slot.write().expect("ifac lock") = inherited.clone();
-                            });
+                        if let Some(key) = inherited {
+                            *peer_context.channel.ifac.write().expect("ifac lock") = Some(key);
                         }
+                        let address = peer_context.channel.address;
+                        manager.copy_spawned_control(&parent, &address);
+                        manager.launch(peer_context, I2pPeer::spawn);
                     }
                     Err(_) => {
                         log::warn!("i2p_server: stream accept failed, recreating session");
@@ -979,6 +986,7 @@ impl I2pServer {
 
             stats.set_online(false);
             *session_slot.write().await = None;
+            *b32_slot.write().expect("b32 slot") = None;
             tokio::time::sleep(RECONNECT_WAIT).await;
         }
     }

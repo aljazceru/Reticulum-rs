@@ -1074,6 +1074,12 @@ impl Transport {
     /// Inbound queue pressure snapshot: total queued items, per-class
     /// heights and per-class drop counters
     /// (Python `Transport.inbound_queues.snapshot()`).
+    /// Configured inbound queue lengths per traffic class. A length of 0
+    /// in config is left as the class default ([`INBOUND_QUEUE_LENGTHS`]).
+    pub async fn inbound_queue_lengths(&self) -> [usize; 4] {
+        self.handler.lock().await.config.inbound_queue_lengths
+    }
+
     pub async fn inbound_queue_snapshot(&self) -> (usize, [usize; 4], [u64; 4]) {
         self.handler
             .lock()
@@ -3781,14 +3787,15 @@ async fn handle_announce<'a>(
             .check_limited(&packet.destination, limit),
         None => handler.announce_limits.check(&packet.destination),
     };
+    // A rate hit suppresses rebroadcast only. The path is still installed.
+    let rate_blocked = blocked_until.is_some();
     if let Some(blocked_until) = blocked_until {
         log::info!(
-            "tp({}): too many announces from {}, blocked for {} seconds",
+            "tp({}): blocking rebroadcast of announce from {} for {} seconds",
             handler.config.name,
             packet.destination,
             blocked_until.as_secs(),
         );
-        return;
     }
 
     // Blackhole check uses the announced identity hash and runs before
@@ -3884,9 +3891,11 @@ async fn handle_announce<'a>(
         // (Python `Transport.cache(force_cache=True, packet_type="announce")`).
         handler.packet_cache.lock().await.cache_announce(packet);
 
-        handler
-            .announce_table
-            .add(packet, packet.destination, dest_hash);
+        if !rate_blocked {
+            handler
+                .announce_table
+                .add(packet, packet.destination, dest_hash);
+        }
 
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
@@ -3954,7 +3963,7 @@ async fn handle_announce<'a>(
             );
         }
 
-        let retransmit = handler.config.retransmit;
+        let retransmit = handler.config.retransmit && !rate_blocked;
         if retransmit {
             let transport_id = *handler.config.identity.address_hash();
             // Keyed by the announced destination hash (identity hash is

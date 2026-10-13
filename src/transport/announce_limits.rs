@@ -53,7 +53,9 @@ impl AnnounceLimitEntry {
                 let next_allowed = self.last_announce + rate_limit.target;
                 if now < next_allowed {
                     self.violations += 1;
-                    if self.violations >= rate_limit.grace {
+                    // Python blocks when violations exceed grace (`>`), so a
+                    // grace of N still allows the Nth fast announce.
+                    if self.violations > rate_limit.grace {
                         self.violations = 0;
                         self.blocked_until = now + rate_limit.target;
                         is_blocked = true;
@@ -84,31 +86,36 @@ impl AnnounceLimits {
     }
 
     pub fn check(&mut self, destination: &AddressHash) -> Option<Duration> {
-        if let Some(entry) = self.limits.get_mut(destination) {
-            return entry.handle_announce();
-        }
-
-        self.limits
-            .insert(*destination, AnnounceLimitEntry::new(Default::default()));
-
-        None
+        self.apply(destination, None)
     }
 
-    /// Like [`Self::check`], but the first limit for `destination` is the
-    /// interface's configured rate. Later announces from another interface
-    /// replace that rate so the receiving interface's settings apply.
+    /// Like [`Self::check`], storing `limit` as this destination's rate
+    /// before the check. Callers pass the receiving interface's rate.
     pub fn check_limited(
         &mut self,
         destination: &AddressHash,
         limit: AnnounceRateLimit,
     ) -> Option<Duration> {
+        self.apply(destination, Some(limit))
+    }
+
+    /// `Some` stores that rate and then checks. `None` drops any rate
+    /// another interface stored for `destination` before the check, so an
+    /// interface with no target does not keep or consult it. A missing
+    /// entry is inserted with `limit` (`None` is not
+    /// [`AnnounceRateLimit::default`]).
+    fn apply(
+        &mut self,
+        destination: &AddressHash,
+        limit: Option<AnnounceRateLimit>,
+    ) -> Option<Duration> {
         if let Some(entry) = self.limits.get_mut(destination) {
-            entry.rate_limit = Some(limit);
+            entry.rate_limit = limit;
             return entry.handle_announce();
         }
 
         self.limits
-            .insert(*destination, AnnounceLimitEntry::new(Some(limit)));
+            .insert(*destination, AnnounceLimitEntry::new(limit));
 
         None
     }

@@ -239,8 +239,9 @@ pub struct IfaceControlState {
     pub wants_tunnel: bool,
     /// Path-selection weight (Python `Interface.gravity`, default 0).
     pub gravity: i64,
-    /// Per-interface announce rate. `None` leaves the transport on its
-    /// existing global limiter (callers that never set these).
+    /// Per-interface announce rate. `None` means this interface has no
+    /// target, so transport does not keep or consult a rate another
+    /// interface stored for the same destination.
     pub announce_rate_target: Option<Duration>,
     pub announce_rate_grace: Option<u32>,
     pub announce_rate_penalty: Option<Duration>,

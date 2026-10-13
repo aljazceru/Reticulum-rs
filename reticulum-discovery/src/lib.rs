@@ -1117,6 +1117,9 @@ fn remove_entry_file(storage: &Path, info: &InterfaceInfo) {
 struct QueuedAnnounce {
     entry: AnnouncedInterface,
     encrypt_to: Option<PrivateIdentity>,
+    /// Live `reachable_on` read at announce time. `None` keeps the
+    /// address stored on [`InterfaceInfo`].
+    reachable: Option<Arc<std::sync::RwLock<Option<String>>>>,
 }
 
 /// The interface announcer: periodically announces one due discoverable
@@ -1216,7 +1219,18 @@ impl InterfaceAnnouncer {
                 stamp_value,
             },
             encrypt_to,
+            reachable: None,
         });
+    }
+
+    /// Attach a live `reachable_on` source to the interface most recently
+    /// queued. Empty or missing values leave `reachable_on` unset, so a
+    /// dropped session does not keep a stale address.
+    pub async fn attach_live_reachable(&self, slot: Arc<std::sync::RwLock<Option<String>>>) {
+        let mut interfaces = self.interfaces.write().await;
+        if let Some(queued) = interfaces.last_mut() {
+            queued.reachable = Some(slot);
+        }
     }
 
     async fn job(self: Arc<Self>) {
@@ -1250,8 +1264,17 @@ impl InterfaceAnnouncer {
 
                 selected.map(|index| {
                     interfaces[index].entry.last_announced = Some(now);
+                    let mut info = interfaces[index].entry.info.clone();
+                    if let Some(slot) = &interfaces[index].reachable {
+                        let host = slot
+                            .read()
+                            .ok()
+                            .and_then(|guard| guard.clone())
+                            .filter(|host| !host.is_empty());
+                        info.reachable_on = host;
+                    }
                     (
-                        interfaces[index].entry.info.clone(),
+                        info,
                         interfaces[index].encrypt_to.clone(),
                         interfaces[index]
                             .entry
@@ -1657,8 +1680,8 @@ impl InterfaceDiscovery {
     }
 
     /// [`Self::connect_discovered`] plus settings Python applies inside
-    /// `autoconnect()` (mode, gravity, bitrate, announce rate). Fields
-    /// left `None` are not written.
+    /// `autoconnect()` (mode, gravity, bitrate, announce rate,
+    /// `announces_to_internal`). Fields left `None` are not written.
     pub async fn connect_discovered_with(&self, attach: &AutoconnectAttach) -> usize {
         if !*self.autoconnect.read().await {
             return 0;

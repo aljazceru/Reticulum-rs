@@ -1021,6 +1021,7 @@ impl AutoInterface {
         // configured networkname/passphrase protection silently applies to
         // nothing (Python AutoPeer copies the parent's ifac_* attributes).
         let parent_ifac = context.channel.ifac.read().expect("ifac lock").clone();
+        let parent = context.channel.address;
 
         // The AutoInterface itself never carries data (Python
         // `process_outgoing` is a pass); drain manager tx messages, peers
@@ -1249,6 +1250,7 @@ impl AutoInterface {
                                             &mut peers,
                                             src_addr,
                                             &ifname,
+                                            parent,
                                             &parent_ifac,
                                         )
                                         .await
@@ -1331,6 +1333,7 @@ impl AutoInterface {
         peers: &mut HashMap<Ipv6Addr, PeerEntry>,
         addr: Ipv6Addr,
         ifname: &str,
+        parent: crate::hash::AddressHash,
         parent_ifac: &Option<Arc<crate::iface::ifac::IfacKey>>,
     ) -> bool {
         let Some((_, ifindex, socket)) = beacon_sockets.iter().find(|(name, _, _)| name == ifname)
@@ -1346,12 +1349,13 @@ impl AutoInterface {
 
         let name = format!("AutoPeer[{ifname}/{addr}]");
         let mut manager = iface_manager.lock().await;
-        let address = manager.spawn_named(name, peer, AutoPeer::spawn);
+        let peer_context = manager.open_named(name, peer);
         if let Some(key) = parent_ifac.clone() {
-            manager.with_iface_ifac(&address, |slot| {
-                *slot.write().expect("ifac lock") = Some(key);
-            });
+            *peer_context.channel.ifac.write().expect("ifac lock") = Some(key);
         }
+        let address = peer_context.channel.address;
+        manager.copy_spawned_control(&parent, &address);
+        manager.launch(peer_context, AutoPeer::spawn);
         drop(manager);
 
         peers.insert(addr, PeerEntry { address, data_tx });

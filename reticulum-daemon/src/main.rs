@@ -5,6 +5,9 @@ use rand_core::OsRng;
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::IfaceControlParams;
+use reticulum::iface::Interface;
+use reticulum::iface::InterfaceContext;
+use reticulum::iface::InterfaceManager;
 use reticulum::iface::InterfaceMode;
 use reticulum::iface::local::LocalServer;
 use reticulum::iface::local::SharedInstanceAddress;
@@ -61,16 +64,7 @@ fn parse_identity_hashes(values: &[String], what: &str) -> Result<Vec<AddressHas
 }
 
 fn parse_management_allowed(values: &[String]) -> Result<Vec<AddressHash>, String> {
-    values
-        .iter()
-        .map(|value| {
-            if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                return Err(format!("invalid remote management identity hash: {value}"));
-            }
-            AddressHash::new_from_hex_string(value)
-                .map_err(|_| format!("invalid remote management identity hash: {value}"))
-        })
-        .collect()
+    parse_identity_hashes(values, "remote management")
 }
 
 /// Resolve Python and native RNode endpoints consistently: an explicit TCP
@@ -132,6 +126,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     logger.init();
 
+    // Register before interface startup. A SIGTERM during bind would
+    // otherwise terminate the process before the handler exists.
+    #[cfg(unix)]
+    let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+        Ok(term) => Some(term),
+        Err(err) => {
+            log::warn!("could not listen for SIGTERM: {err}");
+            None
+        }
+    };
+
     log::info!("Configuration loaded from: {}", config_path.display());
     log::info!("Reticulum daemon starting");
 
@@ -174,37 +179,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "rns-daemon".to_string());
     log::info!("Instance name: {instance_name}");
 
+    let blackhole_sources =
+        parse_identity_hashes(&config.reticulum.blackhole_sources, "blackhole source")?;
     let transport = std::sync::Arc::new(
-        TransportConfig::new(&instance_name, &identity)
-            .set_retransmit(config.reticulum.enable_transport)
-            .set_implicit_proof(config.reticulum.use_implicit_proof)
-            .set_local_hops_delta(config.reticulum.local_hops_delta)
-            .set_link_mtu_discovery(config.reticulum.link_mtu_discovery.unwrap_or(true))
-            .set_inbound_queue_length(
-                reticulum::transport::TrafficClass::Data,
-                config.reticulum.qlen_in_data.unwrap_or(0),
-            )
-            .set_inbound_queue_length(
-                reticulum::transport::TrafficClass::Announce,
-                config.reticulum.qlen_in_announce.unwrap_or(0),
-            )
-            .set_inbound_queue_length(
-                reticulum::transport::TrafficClass::PathRequest,
-                config.reticulum.qlen_in_pr.unwrap_or(0),
-            )
-            .set_inbound_queue_length(
-                reticulum::transport::TrafficClass::IngressLimited,
-                config.reticulum.qlen_in_il.unwrap_or(0),
-            )
-            .set_blackhole_publish(config.reticulum.publish_blackhole)
-            .set_blackhole_sources(parse_identity_hashes(
-                &config.reticulum.blackhole_sources,
-                "blackhole source",
-            )?)
-            .set_storage(std::sync::Arc::new(FsStorage::new(
-                config_path.join("storage").to_string_lossy().into_owned(),
-            )))
-            .build(),
+        apply_daemon_transport(
+            TransportConfig::new(&instance_name, &identity),
+            &config.reticulum,
+            blackhole_sources,
+            config_path.join("storage").to_string_lossy().into_owned(),
+        )
+        .build(),
     );
     transport
         .load_known_destinations()
@@ -231,23 +215,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             SharedInstanceAddress::tcp(config.reticulum.shared_instance_port)
         } else if cfg!(unix) {
-            SharedInstanceAddress::unix_abstract(instance_name)
+            SharedInstanceAddress::unix_abstract(instance_name.clone())
         } else {
             SharedInstanceAddress::tcp(config.reticulum.shared_instance_port)
         };
 
         log::info!("Starting shared instance interface: LocalServer on {address:?}");
-        let address = iface_manager.lock().await.spawn(
-            LocalServer::new(address, iface_manager.clone()),
-            LocalServer::spawn,
-        );
+        let server = LocalServer::new(address, iface_manager.clone());
+        let mut manager = iface_manager.lock().await;
+        let context = manager.open(server);
+        let server_address = context.channel.address;
         if let Some(bitrate) = config.reticulum.force_shared_instance_bitrate {
-            iface_manager
-                .lock()
-                .await
-                .set_iface_bitrate(&address, bitrate);
+            manager.set_iface_bitrate(&server_address, bitrate);
+        }
+        manager.launch(context, LocalServer::spawn);
+        drop(manager);
+
+        // Control listener only. The RPC protocol is a later PR.
+        // Python binds `("127.0.0.1", local_control_port)` or
+        // `\0rns/<instance_name>/rpc` when the shared instance uses
+        // domain sockets.
+        let control_port = config.reticulum.instance_control_port;
+        let domain = !config
+            .reticulum
+            .shared_instance_type
+            .eq_ignore_ascii_case("tcp")
+            && cfg!(unix);
+        if domain {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::linux::net::SocketAddrExt;
+                use std::os::unix::net::SocketAddr as UnixSocketAddr;
+                let bound = (|| -> std::io::Result<tokio::net::UnixListener> {
+                    let socket_address = UnixSocketAddr::from_abstract_name(
+                        format!("rns/{instance_name}/rpc").as_bytes(),
+                    )?;
+                    let listener = std::os::unix::net::UnixListener::bind_addr(&socket_address)?;
+                    listener.set_nonblocking(true)?;
+                    tokio::net::UnixListener::from_std(listener)
+                })();
+                match bound {
+                    Ok(listener) => {
+                        log::info!(
+                            "Shared instance control listening on \\0rns/{instance_name}/rpc"
+                        );
+                        tokio::spawn(async move {
+                            let _listener = listener;
+                            std::future::pending::<()>().await;
+                        });
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "could not bind shared instance control \\0rns/{instance_name}/rpc: {error}"
+                        );
+                    }
+                }
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                log::error!(
+                    "could not bind shared instance control \\0rns/{instance_name}/rpc: abstract sockets require Linux"
+                );
+            }
+        } else {
+            match tokio::net::TcpListener::bind(("127.0.0.1", control_port)).await {
+                Ok(listener) => {
+                    log::info!("Shared instance control listening on 127.0.0.1:{control_port}");
+                    tokio::spawn(async move {
+                        let _listener = listener;
+                        std::future::pending::<()>().await;
+                    });
+                }
+                Err(error) => {
+                    log::error!(
+                        "could not bind shared instance control 127.0.0.1:{control_port}: {error}"
+                    );
+                }
+            }
         }
     }
+
+    #[cfg(feature = "iface-i2p")]
+    let mut live_i2p_reachable: Vec<(
+        String,
+        std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    )> = Vec::new();
 
     for iface in &config.interfaces {
         let enabled = match &iface.config {
@@ -291,8 +343,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tcp_options(iface, false),
                 ) {
                     Ok(server) => {
-                        let address = iface_manager.lock().await.spawn(server, TcpServer::spawn);
-                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        launch_configured(
+                            &iface_manager,
+                            server,
+                            None,
+                            TcpServer::spawn,
+                            iface,
+                            &config.reticulum,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         log::error!(
@@ -315,8 +374,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 match TcpClient::with_options(addr, tcp_options(iface, true)) {
                     Ok(client) => {
-                        let address = iface_manager.lock().await.spawn(client, TcpClient::spawn);
-                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        launch_configured(
+                            &iface_manager,
+                            client,
+                            None,
+                            TcpClient::spawn,
+                            iface,
+                            &config.reticulum,
+                        )
+                        .await;
                     }
                     Err(error) => {
                         log::error!(
@@ -351,11 +417,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bind_addr,
                         forward_addr
                     );
-                    let address = iface_manager.lock().await.spawn(
+                    launch_configured(
+                        &iface_manager,
                         UdpInterface::new(bind_addr, Some(forward_addr), false),
+                        None,
                         UdpInterface::spawn,
-                    );
-                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        iface,
+                        &config.reticulum,
+                    )
+                    .await;
                 } else {
                     log::error!(
                         "Interface '{}' (UDP) needs listen_port and forward_port, or port",
@@ -412,12 +482,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         auto_config.group_id,
                         auto_config.discovery_port
                     );
-                    let address = iface_manager.lock().await.spawn_named(
-                        &iface.name,
+                    launch_configured(
+                        &iface_manager,
                         AutoInterface::new(auto_config, iface_manager.clone()),
+                        Some(&iface.name),
                         AutoInterface::spawn,
-                    );
-                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        iface,
+                        &config.reticulum,
+                    )
+                    .await;
                 }
 
                 #[cfg(not(feature = "iface-auto"))]
@@ -456,18 +529,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sam_addr
                         );
                         let session_id = format!("{}-{}", iface.name, std::process::id());
-                        let address = iface_manager.lock().await.spawn_named(
-                            &iface.name,
-                            reticulum::iface::i2p::I2pServer::new(
-                                sam_addr.clone(),
-                                session_id,
-                                iface_manager.clone(),
-                            ),
-                            reticulum::iface::i2p::I2pServer::spawn,
+                        let server = reticulum::iface::i2p::I2pServer::new(
+                            sam_addr.clone(),
+                            session_id,
+                            iface_manager.clone(),
                         );
-                        // Apply mode/bitrate/IFAC to the connectable server
-                        // so spawned inbound peers inherit the protection.
-                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        // Read at announce time, after the SAM session exists.
+                        let b32_slot = server.b32_slot.clone();
+                        launch_configured(
+                            &iface_manager,
+                            server,
+                            Some(&iface.name),
+                            reticulum::iface::i2p::I2pServer::spawn,
+                            iface,
+                            &config.reticulum,
+                        )
+                        .await;
+                        if iface.discoverable {
+                            live_i2p_reachable.push((iface.name.clone(), b32_slot));
+                        }
                     }
 
                     for (index, peer) in peers.iter().enumerate() {
@@ -477,17 +557,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             sam_addr
                         );
                         let session_id = format!("{}-{}-{index}", iface.name, std::process::id());
-                        let address = iface_manager.lock().await.spawn_named(
-                            format!("{}-peer-{index}", iface.name),
+                        let peer_name = format!("{}-peer-{index}", iface.name);
+                        launch_configured(
+                            &iface_manager,
                             reticulum::iface::i2p::I2pPeer::new_initiator(
                                 &sam_addr,
                                 &session_id,
                                 peer,
                             )
                             .with_manager(iface_manager.clone()),
+                            Some(&peer_name),
                             reticulum::iface::i2p::I2pPeer::spawn,
-                        );
-                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                            iface,
+                            &config.reticulum,
+                        )
+                        .await;
                     }
 
                     if !*connectable && peers.is_empty() {
@@ -534,16 +618,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     iface.name,
                     addr
                 );
-                let address = iface_manager.lock().await.spawn_named(
-                    &iface.name,
+                launch_configured(
+                    &iface_manager,
                     reticulum::iface::backbone::BackboneServer::new(
                         addr,
                         iface_manager.clone(),
                         std::sync::Arc::new(tokio::sync::Mutex::new(table)),
                     ),
+                    Some(&iface.name),
                     reticulum::iface::backbone::BackboneServer::spawn,
-                );
-                configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                    iface,
+                    &config.reticulum,
+                )
+                .await;
             }
             InterfaceConfig::BackboneClientInterface {
                 target_ip,
@@ -556,13 +643,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     iface.name,
                     addr
                 );
-                let address = iface_manager.lock().await.spawn_named(
-                    &iface.name,
+                launch_configured(
+                    &iface_manager,
                     reticulum::iface::backbone::BackboneClient::new(addr)
                         .with_manager(iface_manager.clone()),
+                    Some(&iface.name),
                     reticulum::iface::backbone::BackboneClient::spawn,
-                );
-                configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                    iface,
+                    &config.reticulum,
+                )
+                .await;
             }
             InterfaceConfig::RNodeInterface {
                 port,
@@ -640,12 +730,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         {
                             interface = interface.with_beacon(interval, callsign.as_bytes());
                         }
-                        let address = iface_manager.lock().await.spawn_named(
-                            &iface.name,
+                        launch_configured(
+                            &iface_manager,
                             interface,
+                            Some(&iface.name),
                             reticulum::iface::rnode::RnodeInterface::spawn,
-                        );
-                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                            iface,
+                            &config.reticulum,
+                        )
+                        .await;
                     }
                 }
 
@@ -754,12 +847,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 interface = interface.with_receive_only(sub.vport);
                             }
                         }
-                        let address = iface_manager.lock().await.spawn_named(
-                            &iface.name,
+                        launch_configured(
+                            &iface_manager,
                             interface,
+                            Some(&iface.name),
                             RnodeMultiInterface::spawn,
-                        );
-                        configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                            iface,
+                            &config.reticulum,
+                        )
+                        .await;
                     }
                 }
 
@@ -810,12 +906,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         kiss = kiss.with_beacon(interval, callsign.as_bytes());
                     }
-                    let address = iface_manager.lock().await.spawn_named(
-                        &iface.name,
+                    launch_configured(
+                        &iface_manager,
                         kiss,
+                        Some(&iface.name),
                         KissInterface::spawn,
-                    );
-                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        iface,
+                        &config.reticulum,
+                    )
+                    .await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -857,12 +956,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Enabling interface '{}': Serial (HDLC) on {port} at {speed} baud",
                         iface.name
                     );
-                    let address = iface_manager.lock().await.spawn_named(
-                        &iface.name,
+                    launch_configured(
+                        &iface_manager,
                         SerialInterface::new(serial),
+                        Some(&iface.name),
                         SerialInterface::spawn,
-                    );
-                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        iface,
+                        &config.reticulum,
+                    )
+                    .await;
                 }
 
                 #[cfg(not(feature = "iface-serial"))]
@@ -888,12 +990,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Enabling interface '{}': Pipe command '{command}' (respawn delay {respawn_delay:?})",
                         iface.name
                     );
-                    let address = iface_manager.lock().await.spawn_named(
-                        &iface.name,
+                    launch_configured(
+                        &iface_manager,
                         PipeInterface::new(command).with_respawn_delay(respawn_delay),
+                        Some(&iface.name),
                         PipeInterface::spawn,
-                    );
-                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        iface,
+                        &config.reticulum,
+                    )
+                    .await;
                 }
 
                 #[cfg(not(feature = "iface-pipe"))]
@@ -918,15 +1023,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Enabling interface '{}': Local shared instance on 127.0.0.1:{listen_port}",
                         iface.name
                     );
-                    let address = iface_manager.lock().await.spawn_named(
-                        &iface.name,
+                    launch_configured(
+                        &iface_manager,
                         LocalServer::new(
                             SharedInstanceAddress::tcp(*listen_port),
                             iface_manager.clone(),
                         ),
+                        Some(&iface.name),
                         LocalServer::spawn,
-                    );
-                    configure_iface(&iface_manager, &address, iface, &config.reticulum).await;
+                        iface,
+                        &config.reticulum,
+                    )
+                    .await;
                 } else {
                     log::warn!(
                         "Interface '{}' type 'LocalInterface': shared instances always listen on 127.0.0.1 (got {listen_ip})",
@@ -970,13 +1078,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "Enabling interface '{}': AX.25 KISS {callsign}-{ssid} on {port} at {speed} baud",
                                 iface.name
                             );
-                            let address = iface_manager.lock().await.spawn_named(
-                                &iface.name,
+                            launch_configured(
+                                &iface_manager,
                                 interface,
+                                Some(&iface.name),
                                 KissInterface::spawn,
-                            );
-                            configure_iface(&iface_manager, &address, iface, &config.reticulum)
-                                .await;
+                                iface,
+                                &config.reticulum,
+                            )
+                            .await;
                         }
                         Err(_) => {
                             log::error!(
@@ -1063,6 +1173,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 announcer
                     .announce_interface_configured(info, interval, stamp, encrypt_to)
                     .await;
+                #[cfg(feature = "iface-i2p")]
+                if let Some((_, slot)) = live_i2p_reachable
+                    .iter()
+                    .find(|(name, _)| name == &iface.name)
+                {
+                    announcer.attach_live_reachable(slot.clone()).await;
+                }
             } else {
                 log::warn!(
                     "Interface '{}' is discoverable but its type has no discovery mapping yet",
@@ -1165,12 +1282,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(unix)]
     {
         let sigterm = async {
-            match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-                Ok(mut term) => term.recv().await,
-                Err(err) => {
-                    log::warn!("could not listen for SIGTERM: {err}");
-                    std::future::pending::<Option<()>>().await
-                }
+            match sigterm.as_mut() {
+                Some(term) => term.recv().await,
+                None => std::future::pending().await,
             }
         };
         tokio::select! {
@@ -1188,7 +1302,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Apply per-interface common options after spawning
+fn apply_daemon_transport(
+    builder: TransportConfig,
+    config: &reticulum_daemon::config::ReticulumConfig,
+    blackhole_sources: Vec<AddressHash>,
+    storage_path: String,
+) -> TransportConfig {
+    builder
+        .set_retransmit(config.enable_transport)
+        .set_implicit_proof(config.use_implicit_proof)
+        .set_local_hops_delta(config.local_hops_delta)
+        .set_link_mtu_discovery(config.link_mtu_discovery.unwrap_or(true))
+        .set_inbound_queue_length(
+            reticulum::transport::TrafficClass::Data,
+            config.qlen_in_data.unwrap_or(0),
+        )
+        .set_inbound_queue_length(
+            reticulum::transport::TrafficClass::Announce,
+            config.qlen_in_announce.unwrap_or(0),
+        )
+        .set_inbound_queue_length(
+            reticulum::transport::TrafficClass::PathRequest,
+            config.qlen_in_pr.unwrap_or(0),
+        )
+        .set_inbound_queue_length(
+            reticulum::transport::TrafficClass::IngressLimited,
+            config.qlen_in_il.unwrap_or(0),
+        )
+        .set_blackhole_publish(config.publish_blackhole)
+        .set_blackhole_sources(blackhole_sources)
+        .set_storage(std::sync::Arc::new(FsStorage::new(storage_path)))
+}
+
+/// Open an interface, publish its control state, then start the worker.
+async fn launch_configured<T, F, R>(
+    iface_manager: &std::sync::Arc<tokio::sync::Mutex<InterfaceManager>>,
+    inner: T,
+    name: Option<&str>,
+    worker: F,
+    iface: &reticulum_daemon::config::NamedInterface,
+    config: &reticulum_daemon::config::ReticulumConfig,
+) -> AddressHash
+where
+    T: Interface,
+    F: FnOnce(InterfaceContext<T>) -> R,
+    R: std::future::Future<Output = ()> + Send + 'static,
+    R::Output: Send + 'static,
+{
+    let context = {
+        let mut manager = iface_manager.lock().await;
+        let context = manager.open(inner);
+        let address = context.channel.address;
+        if let Some(name) = name {
+            manager.set_iface_name(&address, name);
+        }
+        context
+    };
+    let address = context.channel.address;
+    configure_iface(iface_manager, &address, iface, config).await;
+    iface_manager.lock().await.launch(context, worker)
+}
+
+/// Apply per-interface common options before the worker can accept
 /// (Python `Reticulum._add_interface` / `interface_post_init`).
 async fn configure_iface(
     iface_manager: &std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
@@ -1371,7 +1546,7 @@ fn discovery_info_for(
             "RNodeInterface"
         }
         InterfaceConfig::I2PInterface { .. } => {
-            reachable_on = iface.reachable_on.clone();
+            // `reachable_on` is the live SAM b32, filled at announce time.
             "I2PInterface"
         }
         InterfaceConfig::KISSInterface { .. } => "KISSInterface",
@@ -1702,5 +1877,154 @@ mod tests {
 
         let serial = Some("/dev/ttyACM0".to_string());
         assert_eq!(rnode_endpoint(&tcp, &serial), (None, Some("/dev/ttyACM0")));
+    }
+
+    #[tokio::test]
+    async fn configure_path_publishes_control_on_the_receiving_peer() {
+        use std::time::Duration;
+
+        use super::apply_daemon_transport;
+        use super::launch_configured;
+        use super::tcp_options;
+        use rand_core::OsRng;
+        use reticulum::identity::PrivateIdentity;
+        use reticulum::iface::InterfaceMode;
+        use reticulum::iface::control::ANNOUNCE_CAP;
+        use reticulum::iface::tcp_server::TcpServer;
+        use reticulum::iface::udp::UdpInterface;
+        use reticulum::transport::TransportConfig;
+        use reticulum_daemon::config::InterfaceConfig;
+        use reticulum_daemon::config::NamedInterface;
+        use reticulum_daemon::config::ReticulumConfig;
+
+        let config = ReticulumConfig {
+            qlen_in_data: Some(0),
+            qlen_in_announce: Some(32),
+            default_gravity: Some(7),
+            ..ReticulumConfig::default()
+        };
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let transport = apply_daemon_transport(
+            TransportConfig::new("configure-path", &identity),
+            &config,
+            Vec::new(),
+            std::env::temp_dir()
+                .join("rns-configure-path")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .build();
+        let lengths = transport.inbound_queue_lengths().await;
+        assert_eq!(
+            lengths[reticulum::transport::TrafficClass::Data as usize],
+            reticulum::transport::INBOUND_QUEUE_LENGTHS[0],
+            "qlen 0 leaves the data queue at the class default"
+        );
+        assert_eq!(
+            lengths[reticulum::transport::TrafficClass::Announce as usize],
+            32
+        );
+
+        let manager = transport.iface_manager();
+        let fresh_cap = {
+            let mut manager = manager.lock().await;
+            let fresh = manager.open(UdpInterface::new("127.0.0.1:9", None, false));
+            let address = fresh.channel.address;
+            drop(fresh);
+            manager.with_control(&address, |control| control.announce_cap)
+        };
+        assert_eq!(fresh_cap, Some(ANNOUNCE_CAP / 100.0));
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let iface = NamedInterface {
+            name: "uplink".to_string(),
+            mode: Some("gw".to_string()),
+            bitrate: Some(50_000),
+            announce_cap: Some(25.0),
+            gravity: Some(3),
+            announce_rate_target: Some(120),
+            announce_rate_grace: Some(2),
+            announce_rate_penalty: Some(30),
+            ingress_control: Some(false),
+            egress_control: Some(true),
+            recursive_prs: true,
+            announces_from_internal: Some(false),
+            announces_to_internal: Some(true),
+            ic_max_held_announces: Some(9),
+            config: InterfaceConfig::TCPServerInterface {
+                enabled: true,
+                bind_host: "127.0.0.1".to_string(),
+                bind_port: port,
+            },
+            ..NamedInterface::default()
+        };
+
+        let server = TcpServer::with_options(
+            format!("127.0.0.1:{port}"),
+            manager.clone(),
+            tcp_options(&iface, false),
+        )
+        .expect("tcp options");
+        launch_configured(&manager, server, None, TcpServer::spawn, &iface, &config).await;
+
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(connected) = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await
+            {
+                stream = Some(connected);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stream = stream.expect("connect");
+        let mut peer = None;
+        for _ in 0..50 {
+            let stats = manager.lock().await.stats();
+            if let Some(stat) = stats.iter().find(|stat| stat.kind == "TcpClient") {
+                peer = Some(stat.address);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let peer = peer.expect("spawned tcp peer");
+        let control = manager
+            .lock()
+            .await
+            .with_control(&peer, |control| {
+                (
+                    control.mode,
+                    control.gravity,
+                    control.bitrate,
+                    control.announce_cap,
+                    control.announce_rate_target,
+                    control.announce_rate_grace,
+                    control.announce_rate_penalty,
+                    control.ingress_control,
+                    control.egress_control,
+                    control.recursive_prs,
+                    control.announces_from_internal,
+                    control.announces_to_internal,
+                    control.params().ic_max_held_announces,
+                )
+            })
+            .expect("peer control");
+        assert_eq!(control.0, InterfaceMode::Gateway);
+        assert_eq!(control.1, 3);
+        assert_eq!(control.2, 50_000);
+        assert_eq!(control.3, 0.25);
+        assert_eq!(control.4, Some(Duration::from_secs(120)));
+        assert_eq!(control.5, Some(2));
+        assert_eq!(control.6, Some(Duration::from_secs(30)));
+        assert!(!control.7);
+        assert!(control.8);
+        assert!(control.9);
+        assert!(!control.10);
+        assert_eq!(control.11, Some(true));
+        assert_eq!(control.12, 9);
+        drop(stream);
     }
 }

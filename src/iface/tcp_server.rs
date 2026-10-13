@@ -56,6 +56,7 @@ impl TcpServer {
 
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let server_ifac = context.channel.ifac.clone();
+        let parent = context.channel.address;
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -157,15 +158,14 @@ impl TcpServer {
                                 options.for_accepted_client(),
                             );
 
-                            let _address = if let Some(key) = inherited {
-                                iface_manager.spawn_with_ifac(peer, TcpClient::spawn, key)
+                            let peer_context = if let Some(key) = inherited {
+                                iface_manager.open_with_ifac(peer, key)
                             } else {
-                                iface_manager.spawn_named(
-                                    &peer_endpoint,
-                                    peer,
-                                    TcpClient::spawn,
-                                )
+                                iface_manager.open_named(&peer_endpoint, peer)
                             };
+                            let address = peer_context.channel.address;
+                            iface_manager.copy_spawned_control(&parent, &address);
+                            iface_manager.launch(peer_context, TcpClient::spawn);
                         }
                     }
                 }

@@ -372,6 +372,7 @@ impl LocalServer {
         let iface_manager = context.inner.lock().unwrap().iface_manager.clone();
         let access = context.inner.lock().unwrap().access.clone();
         let stats = context.channel.stats.clone();
+        let parent = context.channel.address;
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -444,8 +445,11 @@ impl LocalServer {
                         if let Some(client) = client {
                             let mut iface_manager = iface_manager.lock().await;
                             let name = client.name().to_string();
-                            let address =
-                                iface_manager.spawn(client, LocalClient::spawn);
+                            let peer_context = iface_manager.open(client);
+                            let address = peer_context.channel.address;
+                            // Parent control, including a forced shared-instance
+                            // bitrate, is copied before the client worker runs.
+                            iface_manager.copy_spawned_control(&parent, &address);
                             // Surface the client's declared (or peer) name
                             // in interface statistics.
                             iface_manager.set_iface_name(&address, &name);
@@ -453,6 +457,7 @@ impl LocalServer {
                             // local client interfaces
                             // (Python `is_local_shared_instance`).
                             iface_manager.set_iface_local_client(&address);
+                            iface_manager.launch(peer_context, LocalClient::spawn);
                         }
                     }
                 }

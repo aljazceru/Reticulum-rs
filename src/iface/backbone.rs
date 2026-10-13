@@ -775,6 +775,7 @@ impl BackboneServer {
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let fast_flap = { context.inner.lock().unwrap().fast_flap.clone() };
+        let parent = context.channel.address;
 
         loop {
             if context.cancel.is_cancelled() {
@@ -853,28 +854,28 @@ impl BackboneServer {
 
                 let inherited = context.channel.ifac.read().expect("ifac lock").clone();
 
-                // Register under ip:port before the worker can learn a
-                // path and before this lock is released. Fast-flap above
-                // stays keyed by IP only.
+                // Register under ip:port, with the parent's control state
+                // and access code, before the worker can learn a path.
+                // Fast-flap above stays keyed by IP only.
                 let mut manager = iface_manager.lock().await;
                 // Python `spawned_interface.bitrate = self.bitrate`.
+                // `with_bitrate` makes `launch` publish that rate before the
+                // worker starts; `copy_spawned_control` carries the rest.
                 let parent_bitrate = manager
-                    .with_control(&server_address, |c| c.bitrate)
+                    .with_control(&parent, |c| c.bitrate)
                     .unwrap_or(BITRATE_GUESS);
-                let address = manager.spawn_named(
+                let peer_context = manager.open_named(
                     &peer_endpoint,
                     BackboneClient::new_from_stream(socket, peer_endpoint.clone())
                         .with_fast_flap(fast_flap.clone())
                         .with_bitrate(parent_bitrate),
-                    BackboneClient::spawn,
                 );
-                manager.set_iface_bitrate(&address, parent_bitrate);
-
-                if inherited.is_some() {
-                    manager.with_iface_ifac(&address, |slot| {
-                        *slot.write().expect("ifac lock") = inherited.clone();
-                    });
+                if let Some(key) = inherited {
+                    *peer_context.channel.ifac.write().expect("ifac lock") = Some(key);
                 }
+                let address = peer_context.channel.address;
+                manager.copy_spawned_control(&parent, &address);
+                manager.launch(peer_context, BackboneClient::spawn);
             }
 
             stats.set_online(false);

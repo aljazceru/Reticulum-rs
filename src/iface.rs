@@ -662,25 +662,31 @@ impl InterfaceManager {
             .is_some())
     }
 
-    /// Spawn an interface worker with its IFAC slot already populated,
-    /// so the worker never observes an unauthenticated frame before the
-    /// key is installed (needed on multithreaded runtimes where `spawn`
-    /// may begin polling immediately).
-    ///
-    /// When `endpoint()` is non-empty, that string becomes the statistics
-    /// name before the worker starts. A later `set_iface_name` can still
-    /// replace it with a config name.
-    pub fn spawn_with_ifac<T, F, R>(
+    /// Register an interface without starting its worker, so the caller
+    /// can publish control state before the worker accepts.
+    pub fn open<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
+        self.new_context(inner)
+    }
+
+    /// [`Self::open`] registered under `name`.
+    pub fn open_named<T: Interface>(
+        &mut self,
+        name: impl AsRef<str>,
+        inner: T,
+    ) -> InterfaceContext<T> {
+        let context = self.new_context(inner);
+        let address = context.channel.address;
+        self.set_iface_name(&address, name.as_ref());
+        context
+    }
+
+    /// [`Self::open`] with the IFAC slot already populated and, when
+    /// `endpoint()` is non-empty, that string as the statistics name.
+    pub fn open_with_ifac<T: Interface>(
         &mut self,
         inner: T,
-        worker: F,
         ifac: Arc<ifac::IfacKey>,
-    ) -> AddressHash
-    where
-        T: Interface,
-        F: FnOnce(InterfaceContext<T>) -> R,
-        R: std::future::Future<Output = ()> + Send + 'static,
-    {
+    ) -> InterfaceContext<T> {
         let kind = interface_kind_name::<T>();
         let endpoint = inner.endpoint().to_string();
         let channel = self.new_channel_named(1, &kind, &kind);
@@ -701,14 +707,89 @@ impl InterfaceManager {
             iface.endpoint = endpoint;
         }
 
-        let context = InterfaceContext::<T> {
+        InterfaceContext::<T> {
             inner: Arc::new(Mutex::new(inner)),
             channel,
             cancel: self.cancel.clone(),
-        };
+        }
+    }
 
+    /// Start a worker for an interface registered with [`Self::open`].
+    pub fn launch<T, F, R>(&self, context: InterfaceContext<T>, worker: F) -> AddressHash
+    where
+        T: Interface,
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        self.publish_constructor_bitrate(&context);
+        let address = context.channel.address;
         task::spawn(worker(context));
         address
+    }
+
+    /// Copy the parent control fields Python copies onto a spawned peer:
+    /// mode, gravity, bitrate, announce cap and rate, ingress/egress,
+    /// `ic_*` / `ec_*`, and the recursive path-request and
+    /// internal-announce flags.
+    pub fn copy_spawned_control(&self, parent: &AddressHash, child: &AddressHash) {
+        let mut controls = self.controls.lock().expect("iface control lock");
+        let Some(source) = controls.get(parent) else {
+            return;
+        };
+        let mode = source.mode;
+        let gravity = source.gravity;
+        let bitrate = source.bitrate;
+        let announce_cap = source.announce_cap;
+        let announce_rate_target = source.announce_rate_target;
+        let announce_rate_grace = source.announce_rate_grace;
+        let announce_rate_penalty = source.announce_rate_penalty;
+        let ingress_control = source.ingress_control;
+        let egress_control = source.egress_control;
+        let recursive_prs = source.recursive_prs;
+        let announces_from_internal = source.announces_from_internal;
+        let announces_to_internal = source.announces_to_internal;
+        let params = *source.params();
+        let Some(dest) = controls.get_mut(child) else {
+            return;
+        };
+        dest.mode = mode;
+        dest.gravity = gravity;
+        dest.bitrate = bitrate;
+        dest.announce_cap = announce_cap;
+        dest.announce_rate_target = announce_rate_target;
+        dest.announce_rate_grace = announce_rate_grace;
+        dest.announce_rate_penalty = announce_rate_penalty;
+        dest.ingress_control = ingress_control;
+        dest.egress_control = egress_control;
+        dest.recursive_prs = recursive_prs;
+        dest.announces_from_internal = announces_from_internal;
+        dest.announces_to_internal = announces_to_internal;
+        dest.set_params(params);
+    }
+
+    /// Spawn an interface worker with its IFAC slot already populated,
+    /// so the worker never observes an unauthenticated frame before the
+    /// key is installed (needed on multithreaded runtimes where `spawn`
+    /// may begin polling immediately).
+    ///
+    /// When `endpoint()` is non-empty, that string becomes the statistics
+    /// name before the worker starts. A later `set_iface_name` can still
+    /// replace it with a config name.
+    pub fn spawn_with_ifac<T, F, R>(
+        &mut self,
+        inner: T,
+        worker: F,
+        ifac: Arc<ifac::IfacKey>,
+    ) -> AddressHash
+    where
+        T: Interface,
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        let context = self.open_with_ifac(inner, ifac);
+        self.launch(context, worker)
     }
 
     /// Access the IFAC configuration slot of an interface.
@@ -1043,13 +1124,8 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context(inner);
-        let address = *context.channel.address();
-        self.publish_constructor_bitrate(&context);
-
-        task::spawn(worker(context));
-
-        address
+        let context = self.open(inner);
+        self.launch(context, worker)
     }
 
     /// Spawn an interface worker registered under a human-readable `name`
@@ -1065,15 +1141,8 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context(inner);
-        let address = *context.channel.address();
-        self.publish_constructor_bitrate(&context);
-
-        self.set_iface_name(&address, name.as_ref());
-
-        task::spawn(worker(context));
-
-        address
+        let context = self.open_named(name, inner);
+        self.launch(context, worker)
     }
 
     pub fn receiver(&self) -> Arc<tokio::sync::Mutex<InterfaceRxReceiver>> {
