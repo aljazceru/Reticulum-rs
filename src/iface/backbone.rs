@@ -771,7 +771,6 @@ impl BackboneServer {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let stats = context.channel.stats.clone();
-        let server_address = context.channel.address;
         let addr = { context.inner.lock().unwrap().addr.clone() };
         let iface_manager = { context.inner.lock().unwrap().iface_manager.clone() };
         let fast_flap = { context.inner.lock().unwrap().fast_flap.clone() };
