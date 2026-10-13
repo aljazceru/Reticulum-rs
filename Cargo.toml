@@ -59,6 +59,10 @@ env_logger = "0.10"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 
+# BlueZ `Bonded`. btleplug's PeripheralProperties drops it. Linux only.
+[target.'cfg(target_os = "linux")'.dependencies]
+bluez-async = { version = "0.8.2", optional = true }
+
 [features]
 default = ["bz2"]
 fernet-aes128 = ["reticulum-core/fernet-aes128"]
@@ -75,7 +79,7 @@ iface-i2p = []
 # RNodeInterface + RNodeMultiInterface (serial mode needs iface-serial)
 iface-rnode = []
 # RNode ble:// via btleplug. Default builds do not link a BLE stack.
-iface-rnode-ble = ["iface-rnode", "dep:btleplug", "dep:uuid", "dep:futures-util"]
+iface-rnode-ble = ["iface-rnode", "dep:btleplug", "dep:uuid", "dep:futures-util", "dep:bluez-async"]
 
 [build-dependencies]
 tonic-build = "0.13.0"

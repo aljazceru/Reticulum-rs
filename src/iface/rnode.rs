@@ -958,7 +958,8 @@ pub const BLE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Who `ble://` should attach to (Python `BLEConnection` target parse).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BleTarget {
-    /// `ble://` — first device advertising UART whose name starts with `RNode `.
+    /// `ble://` — first bonded device advertising the Nordic UART service.
+    /// Python does not require the name to start with `RNode `.
     Any,
     /// `ble://<name>` when the remainder is not a 17-character MAC.
     Name(String),
@@ -985,6 +986,29 @@ pub fn parse_ble_target(port: &str) -> Option<BleTarget> {
         Some(BleTarget::Address(rest.to_string()))
     } else {
         Some(BleTarget::Name(rest.to_string()))
+    }
+}
+
+/// Python `BLEConnection.device_filter` after bond status is known.
+///
+/// `address` is `None` when the controller has no public MAC. An unbonded
+/// device never matches. `BleTarget::Any` does not look at the local name.
+/// The btleplug caller is behind `iface-rnode-ble`; unit tests cover the
+/// rule without that feature.
+#[cfg_attr(not(feature = "iface-rnode-ble"), allow(dead_code))]
+fn ble_candidate_matches(
+    target: &BleTarget,
+    local_name: Option<&str>,
+    address: Option<&str>,
+    bonded: bool,
+) -> bool {
+    if !bonded {
+        return false;
+    }
+    match target {
+        BleTarget::Any => true,
+        BleTarget::Name(name) => local_name == Some(name.as_str()),
+        BleTarget::Address(want) => address.is_some_and(|addr| addr.eq_ignore_ascii_case(want)),
     }
 }
 
@@ -2355,19 +2379,22 @@ impl Interface for RnodeVportPeer {
 
 #[cfg(feature = "iface-rnode-ble")]
 mod ble_backend {
-    use std::collections::VecDeque;
     use std::pin::Pin;
     use std::time::Duration;
 
     use btleplug::api::{
-        Central, Manager as _, Peripheral as _, ScanFilter, ValueNotification, WriteType,
+        BDAddr, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter,
+        ValueNotification, WriteType,
     };
-    use btleplug::platform::{Manager, Peripheral};
+    use btleplug::platform::{Adapter, Manager, Peripheral};
+    use futures_util::future::FutureExt;
     use futures_util::stream::StreamExt;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use uuid::Uuid;
 
-    use super::{BleLink, BleTarget, RnodeLink, BLE_CONNECT_TIMEOUT, BLE_SCAN_TIMEOUT};
+    use super::{
+        ble_candidate_matches, BleTarget, RnodeLink, BLE_CONNECT_TIMEOUT, BLE_SCAN_TIMEOUT,
+    };
     use crate::error::RnsError;
 
     const UART_SERVICE_U128: u128 = 0x6E40_0001_B5A3_F393_E0A9_E50E_24DC_CA9E;
@@ -2380,12 +2407,11 @@ mod ble_backend {
     const BLE_WRITE_CHUNK: usize = 20;
 
     pub(super) struct BtleplugBleLink {
+        adapter: Adapter,
         peripheral: Peripheral,
         rx: btleplug::api::Characteristic,
         tx_uuid: Uuid,
         notes: Pin<Box<dyn futures_util::Stream<Item = ValueNotification> + Send>>,
-        pending: VecDeque<u8>,
-        connected: bool,
     }
 
     impl BtleplugBleLink {
@@ -2394,15 +2420,25 @@ mod ble_backend {
                 log::error!("rnode: BLE manager unavailable: {err}");
                 RnsError::ConnectionError
             })?;
-            let mut adapters = manager.adapters().await.map_err(|err| {
+            let adapters = manager.adapters().await.map_err(|err| {
                 log::error!("rnode: BLE adapters unavailable: {err}");
                 RnsError::ConnectionError
             })?;
-            let Some(adapter) = adapters.drain(..).next() else {
+            let Some(adapter) = adapters.into_iter().next() else {
                 log::error!("rnode: no BLE adapter");
                 return Err(RnsError::ConnectionError);
             };
+            let bonded_macs = bonded_addresses().await;
             let service = Uuid::from_u128(UART_SERVICE_U128);
+            // Subscribe before scanning so a report is not lost, then discard
+            // the cached DeviceDiscovered replay. `peripherals()` is every
+            // remembered device, and its service list can be GATT state from
+            // an earlier connection rather than this advertisement.
+            let mut events = adapter.events().await.map_err(|err| {
+                log::error!("rnode: BLE scan events unavailable: {err}");
+                RnsError::ConnectionError
+            })?;
+            while let Some(Some(_)) = events.next().now_or_never() {}
             adapter
                 .start_scan(ScanFilter {
                     services: vec![service],
@@ -2415,47 +2451,85 @@ mod ble_backend {
 
             let deadline = tokio::time::Instant::now() + BLE_SCAN_TIMEOUT;
             let mut chosen = None;
+            let mut logged_unpaired: Vec<String> = Vec::new();
             while tokio::time::Instant::now() < deadline && chosen.is_none() {
-                let peripherals = adapter.peripherals().await.unwrap_or_default();
-                for peripheral in peripherals {
-                    let Ok(Some(props)) = peripheral.properties().await else {
-                        continue;
-                    };
-                    // Python requires the UART service UUID in the advertisement.
-                    if !props.services.contains(&service) {
-                        continue;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let event = match tokio::time::timeout(remaining, events.next()).await {
+                    Ok(Some(event)) => event,
+                    _ => break,
+                };
+                // DeviceDiscovered carries no UUID list. ServicesAdvertisement
+                // is the live service list. A DeviceDiscovered after the cache
+                // replay is a device added during this scan.
+                let (id, uart_on_advertisement) = match event {
+                    CentralEvent::ServicesAdvertisement { id, services } => {
+                        (id, services.contains(&service))
                     }
-                    let matches = match target {
-                        BleTarget::Any => props
-                            .local_name
-                            .as_deref()
-                            .is_some_and(|name| name.starts_with("RNode ")),
-                        BleTarget::Name(name) => props.local_name.as_deref() == Some(name.as_str()),
-                        BleTarget::Address(addr) => {
-                            peripheral.address().to_string().eq_ignore_ascii_case(addr)
-                        }
-                    };
-                    if matches {
-                        chosen = Some(peripheral);
-                        break;
-                    }
+                    CentralEvent::DeviceDiscovered(id) => (id, false),
+                    _ => continue,
+                };
+                let Ok(peripheral) = adapter.peripheral(&id).await else {
+                    continue;
+                };
+                let Ok(Some(props)) = peripheral.properties().await else {
+                    continue;
+                };
+                if !uart_on_advertisement && !props.services.contains(&service) {
+                    continue;
                 }
-                if chosen.is_none() {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                let mac = populated_mac(&props.address);
+                let bonded = mac.as_deref().is_some_and(|addr| {
+                    bonded_macs
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(addr))
+                });
+                if ble_candidate_matches(
+                    target,
+                    props.local_name.as_deref(),
+                    mac.as_deref(),
+                    bonded,
+                ) {
+                    chosen = Some(peripheral);
+                    break;
+                }
+                if !bonded {
+                    let label = match target {
+                        BleTarget::Name(name)
+                            if props.local_name.as_deref() == Some(name.as_str()) =>
+                        {
+                            Some(name.clone())
+                        }
+                        BleTarget::Address(addr)
+                            if mac
+                                .as_deref()
+                                .is_some_and(|mac| mac.eq_ignore_ascii_case(addr)) =>
+                        {
+                            Some(addr.clone())
+                        }
+                        _ => None,
+                    };
+                    if let Some(label) = label {
+                        if !logged_unpaired.iter().any(|seen| seen == &label) {
+                            log::error!(
+                                "rnode: can't connect to target device {label} over BLE, device is not bonded"
+                            );
+                            logged_unpaired.push(label);
+                        }
+                    }
                 }
             }
             let _ = adapter.stop_scan().await;
             let Some(peripheral) = chosen else {
-                log::error!("rnode: no BLE RNode matched the target");
+                log::error!("rnode: no bonded BLE RNode matched the target");
                 return Err(RnsError::ConnectionError);
             };
 
-            // btleplug does not expose the BlueZ Bonded flag Python checks.
-            // A matching advertisement is connected; authentication failure
-            // surfaces as ConnectionError.
-            let connected = tokio::time::timeout(BLE_CONNECT_TIMEOUT, peripheral.connect()).await;
-            if !matches!(connected, Ok(Ok(()))) {
+            let connect_result =
+                tokio::time::timeout(BLE_CONNECT_TIMEOUT, peripheral.connect()).await;
+            if !matches!(connect_result, Ok(Ok(()))) {
                 log::error!("rnode: BLE connect failed");
+                // Dropping the connect future does not send Disconnect.
+                let _ = peripheral.disconnect().await;
                 return Err(RnsError::ConnectionError);
             }
             if peripheral.discover_services().await.is_err() {
@@ -2483,57 +2557,96 @@ mod ble_backend {
                 let _ = peripheral.disconnect().await;
                 return Err(RnsError::ConnectionError);
             }
-            let notes = peripheral.notifications().await.map_err(|err| {
-                log::error!("rnode: BLE notify failed: {err}");
-                RnsError::ConnectionError
-            })?;
+            let notes = match peripheral.notifications().await {
+                Ok(notes) => notes,
+                Err(err) => {
+                    log::error!("rnode: BLE notify failed: {err}");
+                    let _ = peripheral.disconnect().await;
+                    return Err(RnsError::ConnectionError);
+                }
+            };
 
             Ok(Self {
+                adapter,
                 peripheral,
                 rx,
                 tx_uuid,
                 notes,
-                pending: VecDeque::new(),
-                connected: true,
             })
         }
 
         pub(super) fn into_rnode_link(self) -> RnodeLink {
             let Self {
+                adapter,
                 peripheral,
                 rx,
                 tx_uuid,
-                mut notes,
-                mut pending,
-                connected: _,
+                notes,
             } = self;
-            let (reader, mut device_to_host) = tokio::io::simplex(64 * 1024);
-            let (mut host_to_device, writer) = tokio::io::simplex(64 * 1024);
-            tokio::spawn(async move {
-                if !pending.is_empty() {
-                    let queued: Vec<u8> = pending.drain(..).collect();
-                    if device_to_host.write_all(&queued).await.is_err() {
-                        let _ = peripheral.disconnect().await;
-                        return;
+            let (reader, device_to_host) = tokio::io::simplex(64 * 1024);
+            let (host_to_device, writer) = tokio::io::simplex(64 * 1024);
+            // Unbounded on purpose: macOS/Windows btleplug delivers notifications
+            // through broadcast::channel(16) and drops the lagging receiver.
+            let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+            let stop = tokio_util::sync::CancellationToken::new();
+
+            tokio::spawn({
+                let stop = stop.clone();
+                async move {
+                    let mut device_to_host = device_to_host;
+                    loop {
+                        let bytes = tokio::select! {
+                            _ = stop.cancelled() => break,
+                            bytes = inbound_rx.recv() => bytes,
+                        };
+                        let Some(bytes) = bytes else { break };
+                        if device_to_host.write_all(&bytes).await.is_err() {
+                            break;
+                        }
                     }
+                    // Dropping the writer is the read-side EOF the reconnect loop uses.
                 }
-                let mut outbound = [0u8; 512];
-                loop {
-                    tokio::select! {
-                        result = host_to_device.read(&mut outbound) => {
-                            match result {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if write_chunks(&peripheral, &rx, &outbound[..n]).await.is_err() {
+            });
+
+            let watch_peripheral = peripheral.clone();
+            let peripheral_id = peripheral.id();
+            let watch_stop = stop.clone();
+            tokio::spawn(async move {
+                let mut notes = notes;
+                let mut events = adapter.events().await.ok();
+                // `is_connected` is a separate task so a BlueZ round-trip does
+                // not stop the notification drain. Linux notifications() does
+                // not end when Connected becomes false.
+                let (down_tx, mut down_rx) = tokio::sync::mpsc::channel::<()>(1);
+                let poll_peripheral = watch_peripheral.clone();
+                let poll_stop = watch_stop.clone();
+                tokio::spawn(async move {
+                    let mut link_check = tokio::time::interval(Duration::from_secs(1));
+                    link_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    link_check.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = poll_stop.cancelled() => break,
+                            _ = link_check.tick() => {
+                                match poll_peripheral.is_connected().await {
+                                    Ok(true) => {}
+                                    _ => {
+                                        let _ = down_tx.send(()).await;
                                         break;
                                     }
                                 }
                             }
                         }
+                    }
+                });
+                loop {
+                    tokio::select! {
+                        _ = watch_stop.cancelled() => break,
+                        _ = down_rx.recv() => break,
                         note = notes.next() => {
                             match note {
                                 Some(note) if note.uuid == tx_uuid => {
-                                    if device_to_host.write_all(&note.value).await.is_err() {
+                                    if inbound_tx.send(note.value).is_err() {
                                         break;
                                     }
                                 }
@@ -2541,10 +2654,47 @@ mod ble_backend {
                                 None => break,
                             }
                         }
+                        event = async {
+                            match events.as_mut() {
+                                Some(stream) => stream.next().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            match event {
+                                Some(CentralEvent::DeviceDisconnected(id)) if id == peripheral_id => {
+                                    break;
+                                }
+                                Some(_) => {}
+                                None => break,
+                            }
+                        }
+                    }
+                }
+                drop(inbound_tx);
+                watch_stop.cancel();
+                let _ = watch_peripheral.disconnect().await;
+            });
+
+            tokio::spawn(async move {
+                let mut host_to_device = host_to_device;
+                let mut outbound = [0u8; 512];
+                loop {
+                    match host_to_device.read(&mut outbound).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if write_chunks(&peripheral, &rx, &outbound[..n])
+                                .await
+                                .is_err()
+                            {
+                                stop.cancel();
+                                break;
+                            }
+                        }
                     }
                 }
                 let _ = peripheral.disconnect().await;
             });
+
             RnodeLink {
                 reader: Box::new(reader),
                 writer: Box::new(writer),
@@ -2552,39 +2702,45 @@ mod ble_backend {
         }
     }
 
-    impl BleLink for BtleplugBleLink {
-        fn write(
-            &mut self,
-            data: &[u8],
-        ) -> impl std::future::Future<Output = Result<(), RnsError>> + Send {
-            let peripheral = self.peripheral.clone();
-            let rx = self.rx.clone();
-            let data = data.to_vec();
-            async move { write_chunks(&peripheral, &rx, &data).await }
+    /// CoreBluetooth has no public MAC. btleplug reports `00:00:00:00:00:00`
+    /// there; that value is not a matchable address. Use `properties().address`
+    /// when it is populated, not `Peripheral::address()`.
+    fn populated_mac(address: &BDAddr) -> Option<String> {
+        if address.as_ref().iter().all(|byte| *byte == 0) {
+            None
+        } else {
+            Some(address.to_string())
         }
+    }
 
-        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, RnsError> {
-            if buffer.is_empty() {
-                return Ok(0);
-            }
-            while self.pending.is_empty() {
-                let Some(note) = self.notes.next().await else {
-                    self.connected = false;
-                    return Err(RnsError::ConnectionError);
-                };
-                if note.uuid == self.tx_uuid {
-                    self.pending.extend(note.value);
+    /// Snapshot of BlueZ `Bonded` addresses. btleplug does not keep the flag.
+    async fn bonded_addresses() -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        {
+            let session = match bluez_async::BluetoothSession::new().await {
+                Ok((_, session)) => session,
+                Err(err) => {
+                    log::error!("rnode: BlueZ bond lookup unavailable: {err}");
+                    return Vec::new();
+                }
+            };
+            match session.get_devices().await {
+                Ok(devices) => devices
+                    .into_iter()
+                    .filter(|device| device.bonded)
+                    .map(|device| device.mac_address.to_string())
+                    .collect(),
+                Err(err) => {
+                    log::error!("rnode: BlueZ bond lookup failed: {err}");
+                    Vec::new()
                 }
             }
-            let n = buffer.len().min(self.pending.len());
-            for slot in &mut buffer[..n] {
-                *slot = self.pending.pop_front().unwrap_or(0);
-            }
-            Ok(n)
         }
-
-        fn connected(&self) -> bool {
-            self.connected
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Python treats a missing Bonded property as not bonded. WinRT's
+            // paired-address list is not on btleplug's property struct.
+            Vec::new()
         }
     }
 
@@ -2605,7 +2761,6 @@ mod ble_backend {
         Ok(())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,6 +2784,59 @@ mod tests {
         );
         assert!(parse_ble_target("/dev/ttyUSB0").is_none());
         assert!(parse_ble_target("tcp://127.0.0.1:7633").is_none());
+    }
+
+    #[test]
+    fn ble_candidate_requires_bond_and_any_ignores_name_prefix() {
+        assert!(ble_candidate_matches(
+            &BleTarget::Any,
+            Some("Other Radio"),
+            Some("F4:12:73:29:4E:89"),
+            true
+        ));
+        assert!(ble_candidate_matches(
+            &BleTarget::Any,
+            None,
+            Some("F4:12:73:29:4E:89"),
+            true
+        ));
+        assert!(!ble_candidate_matches(
+            &BleTarget::Any,
+            Some("RNode 3B87"),
+            Some("F4:12:73:29:4E:89"),
+            false
+        ));
+        assert!(ble_candidate_matches(
+            &BleTarget::Name("RNode 3B87".into()),
+            Some("RNode 3B87"),
+            Some("F4:12:73:29:4E:89"),
+            true
+        ));
+        assert!(!ble_candidate_matches(
+            &BleTarget::Name("RNode 3B87".into()),
+            Some("RNode 3B87"),
+            Some("F4:12:73:29:4E:89"),
+            false
+        ));
+        assert!(!ble_candidate_matches(
+            &BleTarget::Name("RNode 3B87".into()),
+            Some("Other"),
+            Some("F4:12:73:29:4E:89"),
+            true
+        ));
+        assert!(ble_candidate_matches(
+            &BleTarget::Address("f4:12:73:29:4e:89".into()),
+            None,
+            Some("F4:12:73:29:4E:89"),
+            true
+        ));
+        // No public MAC (CoreBluetooth reports zeros) cannot match ble://<mac>.
+        assert!(!ble_candidate_matches(
+            &BleTarget::Address("F4:12:73:29:4E:89".into()),
+            Some("RNode 3B87"),
+            None,
+            true
+        ));
     }
 
     #[test]

@@ -334,8 +334,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             false,
             &mut live_i2p_reachable,
         )
-        .await;
-    }
+        .await;    }
 
     // Network interface discovery (Python RNS/Discovery.py).
     let discoverable: Vec<_> = config
@@ -1178,7 +1177,9 @@ async fn start_configured_interface(
                     .collect();
 
                 let (tcp, port) = rnode_endpoint(tcp, port);
-                if port.is_some_and(|port| port.starts_with("ble://")) {
+                if port.is_some_and(|port| {
+                    reticulum::iface::rnode::parse_ble_target(port).is_some()
+                }) {
                     log::error!(
                         "Interface '{}' type 'RNodeMultiInterface' BLE is not supported",
                         iface.name
