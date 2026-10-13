@@ -2383,8 +2383,8 @@ mod ble_backend {
     use std::time::Duration;
 
     use btleplug::api::{
-        BDAddr, Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter,
-        ValueNotification, WriteType,
+        Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter, ValueNotification,
+        WriteType,
     };
     use btleplug::platform::{Adapter, Manager, Peripheral};
     use futures_util::future::FutureExt;
@@ -2458,14 +2458,20 @@ mod ble_backend {
                     Ok(Some(event)) => event,
                     _ => break,
                 };
-                // DeviceDiscovered carries no UUID list. ServicesAdvertisement
-                // is the live service list. A DeviceDiscovered after the cache
-                // replay is a device added during this scan.
-                let (id, uart_on_advertisement) = match event {
+                // An already-paired radio often only updates RSSI or
+                // manufacturer/service data. Those events mean it is
+                // advertising now; BlueZ does not emit InterfacesAdded again.
+                // ServicesAdvertisement carries the live UUID list. The other
+                // events do not, so the UART check uses the device properties.
+                let (id, advertised_uart) = match event {
                     CentralEvent::ServicesAdvertisement { id, services } => {
-                        (id, services.contains(&service))
+                        (id, Some(services.contains(&service)))
                     }
-                    CentralEvent::DeviceDiscovered(id) => (id, false),
+                    CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) => {
+                        (id, None)
+                    }
+                    CentralEvent::ManufacturerDataAdvertisement { id, .. }
+                    | CentralEvent::ServiceDataAdvertisement { id, .. } => (id, None),
                     _ => continue,
                 };
                 let Ok(peripheral) = adapter.peripheral(&id).await else {
@@ -2474,10 +2480,20 @@ mod ble_backend {
                 let Ok(Some(props)) = peripheral.properties().await else {
                     continue;
                 };
-                if !uart_on_advertisement && !props.services.contains(&service) {
+                let uart_present =
+                    advertised_uart.unwrap_or_else(|| props.services.contains(&service));
+                if !uart_present {
                     continue;
                 }
-                let mac = populated_mac(&props.address);
+                // CoreBluetooth has no public MAC. btleplug reports
+                // 00:00:00:00:00:00 there; that is not a matchable address.
+                // Use properties().address when it is populated, not
+                // Peripheral::address().
+                let mac = if props.address.as_ref().iter().all(|byte| *byte == 0) {
+                    None
+                } else {
+                    Some(props.address.to_string())
+                };
                 let bonded = mac.as_deref().is_some_and(|addr| {
                     bonded_macs
                         .iter()
@@ -2702,45 +2718,126 @@ mod ble_backend {
         }
     }
 
-    /// CoreBluetooth has no public MAC. btleplug reports `00:00:00:00:00:00`
-    /// there; that value is not a matchable address. Use `properties().address`
-    /// when it is populated, not `Peripheral::address()`.
-    fn populated_mac(address: &BDAddr) -> Option<String> {
-        if address.as_ref().iter().all(|byte| *byte == 0) {
-            None
-        } else {
-            Some(address.to_string())
-        }
-    }
-
-    /// Snapshot of BlueZ `Bonded` addresses. btleplug does not keep the flag.
+    /// Addresses Python treats as bonded. btleplug does not keep the flag.
     async fn bonded_addresses() -> Vec<String> {
         #[cfg(target_os = "linux")]
         {
-            let session = match bluez_async::BluetoothSession::new().await {
-                Ok((_, session)) => session,
+            linux_bonded_addresses().await
+        }
+        #[cfg(target_os = "windows")]
+        {
+            windows_paired_addresses().await
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            // CoreBluetooth exposes no MAC and no bond flag. Python's Bonded
+            // property is absent there, so the device stays unbonded.
+            Vec::new()
+        }
+    }
+
+    /// BlueZ `Device1.Bonded`. The system bus is opened on a blocking thread.
+    /// `BluetoothSession::new` both blocks on the caller and detaches a dbus
+    /// task the returned future cannot abort, so this drives `IOResource`
+    /// itself and aborts that task before returning.
+    #[cfg(target_os = "linux")]
+    async fn linux_bonded_addresses() -> Vec<String> {
+        use dbus::nonblock::stdintf::org_freedesktop_dbus::ObjectManager;
+
+        let opened = tokio::task::spawn_blocking(dbus_tokio::connection::new_system_sync).await;
+        let (resource, connection) = match opened {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(err)) => {
+                log::error!("rnode: BlueZ bond lookup unavailable: {err}");
+                return Vec::new();
+            }
+            Err(err) => {
+                log::error!("rnode: BlueZ bond lookup unavailable: {err}");
+                return Vec::new();
+            }
+        };
+        let driver = tokio::spawn(async move {
+            let _ = resource.await;
+        });
+        let proxy = dbus::nonblock::Proxy::new(
+            "org.bluez",
+            "/",
+            std::time::Duration::from_secs(5),
+            connection,
+        );
+        let objects = match proxy.get_managed_objects().await {
+            Ok(objects) => objects,
+            Err(err) => {
+                log::error!("rnode: BlueZ bond lookup failed: {err}");
+                driver.abort();
+                return Vec::new();
+            }
+        };
+        driver.abort();
+        let mut macs = Vec::new();
+        for (_path, interfaces) in objects {
+            let Some(props) = interfaces.get("org.bluez.Device1") else {
+                continue;
+            };
+            if dbus::arg::prop_cast::<bool>(props, "Bonded") != Some(&true) {
+                continue;
+            }
+            if let Some(address) = dbus::arg::prop_cast::<String>(props, "Address") {
+                macs.push(address.clone());
+            }
+        }
+        macs
+    }
+
+    /// Python `_get_windows_paired_ble_addresses`: WinRT devices paired with
+    /// the system, last `-` segment of the device id.
+    #[cfg(target_os = "windows")]
+    async fn windows_paired_addresses() -> Vec<String> {
+        let joined = tokio::task::spawn_blocking(|| {
+            let selector = match windows::Devices::Bluetooth::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true)
+            {
+                Ok(selector) => selector,
                 Err(err) => {
-                    log::error!("rnode: BlueZ bond lookup unavailable: {err}");
+                    log::error!("rnode: Windows paired-device selector failed: {err}");
                     return Vec::new();
                 }
             };
-            match session.get_devices().await {
-                Ok(devices) => devices
-                    .into_iter()
-                    .filter(|device| device.bonded)
-                    .map(|device| device.mac_address.to_string())
-                    .collect(),
+            let operation = match windows::Devices::Enumeration::DeviceInformation::FindAllAsyncAqsFilter(&selector)
+            {
+                Ok(operation) => operation,
                 Err(err) => {
-                    log::error!("rnode: BlueZ bond lookup failed: {err}");
-                    Vec::new()
+                    log::error!("rnode: Windows paired-device query failed: {err}");
+                    return Vec::new();
+                }
+            };
+            let infos = match operation.get() {
+                Ok(infos) => infos,
+                Err(err) => {
+                    log::error!("rnode: Windows paired-device query failed: {err}");
+                    return Vec::new();
+                }
+            };
+            let mut macs = Vec::new();
+            for info in infos {
+                let Ok(id) = info.Id() else {
+                    continue;
+                };
+                let id = id.to_string();
+                if let Some(suffix) = id.rsplit('-').next() {
+                    if !suffix.is_empty() {
+                        macs.push(suffix.to_lowercase());
+                    }
                 }
             }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Python treats a missing Bonded property as not bonded. WinRT's
-            // paired-address list is not on btleplug's property struct.
-            Vec::new()
+            macs
+        })
+        .await;
+        match joined {
+            Ok(macs) => macs,
+            Err(err) => {
+                log::error!("rnode: Windows paired-device lookup failed: {err}");
+                Vec::new()
+            }
         }
     }
 

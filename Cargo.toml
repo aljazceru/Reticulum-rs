@@ -58,10 +58,18 @@ env_logger = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+# Python's WinRT paired-address list. Not part of btleplug's properties.
+windows = { version = "0.61", optional = true, features = [
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+] }
 
 # BlueZ `Bonded`. btleplug's PeripheralProperties drops it. Linux only.
+# The bus connection is opened off the runtime and its driver task is aborted
+# when the lookup returns.
 [target.'cfg(target_os = "linux")'.dependencies]
-bluez-async = { version = "0.8.2", optional = true }
+dbus = { version = "0.9.12", optional = true, features = ["futures"] }
+dbus-tokio = { version = "0.7.6", optional = true }
 
 [features]
 default = ["bz2"]
@@ -79,7 +87,7 @@ iface-i2p = []
 # RNodeInterface + RNodeMultiInterface (serial mode needs iface-serial)
 iface-rnode = []
 # RNode ble:// via btleplug. Default builds do not link a BLE stack.
-iface-rnode-ble = ["iface-rnode", "dep:btleplug", "dep:uuid", "dep:futures-util", "dep:bluez-async"]
+iface-rnode-ble = ["iface-rnode", "dep:btleplug", "dep:uuid", "dep:futures-util", "dep:dbus", "dep:dbus-tokio", "dep:windows"]
 
 [build-dependencies]
 tonic-build = "0.13.0"
