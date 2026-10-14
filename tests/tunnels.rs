@@ -9,6 +9,7 @@ use reticulum::destination::{DestinationName, SingleInputDestination};
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
+use reticulum::storage::{MemoryStorage, Storage, TUNNELS_FILE};
 use reticulum::transport::{Transport, TransportConfig};
 
 async fn udp_pair(name: &str, port_a: u16, port_b: u16) -> (Transport, Transport, AddressHash) {
@@ -130,4 +131,50 @@ async fn tunnel_synthesize_associate_and_restore() {
     }
     .await;
     assert!(restored, "tunnel paths must be restored on re-appearance");
+}
+
+#[tokio::test]
+async fn tunnel_table_persists_to_storage() {
+    let storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    let a = TransportConfig::new("tunnel-persist-a", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .build();
+    let b = TransportConfig::new("tunnel-persist-b", &PrivateIdentity::new_from_rand(OsRng))
+        .set_retransmit(true)
+        .set_storage(storage.clone())
+        .build();
+
+    let iface_a = {
+        let manager = a.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47016", Some("127.0.0.1:47017"), true),
+            UdpInterface::spawn,
+        )
+    };
+    {
+        let manager = b.iface_manager();
+        let mut manager = manager.lock().await;
+        manager.spawn(
+            UdpInterface::new("127.0.0.1:47017", Some("127.0.0.1:47016"), true),
+            UdpInterface::spawn,
+        );
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    a.synthesize_tunnel(iface_a).await.expect("synthesize");
+    for _ in 0..100 {
+        if !b.tunnel_table_snapshot().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !b.tunnel_table_snapshot().await.is_empty(),
+        "tunnel must be established before it can be persisted"
+    );
+
+    b.persist_data().await;
+    let saved = storage.read(TUNNELS_FILE).expect("tunnel table written");
+    assert!(saved.len() > 16, "tunnel table file must hold the entry");
 }

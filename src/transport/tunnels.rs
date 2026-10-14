@@ -215,6 +215,19 @@ impl Tunnels {
         self.map.retain(|_, entry| now < entry.expires);
         before - self.map.len()
     }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+    }
+
+    pub fn insert(&mut self, tunnel_id: AddressHash, entry: TunnelEntry) {
+        self.map.insert(tunnel_id, entry);
+    }
+
+    /// Drop tunnels bound to `iface`.
+    pub fn drop_iface(&mut self, iface: &AddressHash) {
+        self.map.retain(|_, entry| entry.iface != Some(*iface));
+    }
 }
 
 /// A decoded and signature-validated tunnel synthesize packet.

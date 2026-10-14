@@ -136,3 +136,86 @@ async fn split_resource_transfers_all_segments() {
     assert_eq!(final_data.as_deref(), Some(payload.as_slice()));
     assert_eq!(final_metadata, Some(metadata));
 }
+
+#[tokio::test]
+async fn split_file_transfers_all_segments() {
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .try_init();
+    let (a, b) = udp_pair("split-file", 4544, 4545).await;
+
+    let destination = b
+        .add_destination(
+            PrivateIdentity::new_from_rand(OsRng),
+            DestinationName::new("split", "file"),
+        )
+        .await;
+    let dest_hash = destination.lock().await.desc.address_hash;
+    b.set_accepts_links(&dest_hash, true).await;
+    b.send_announce(&destination, None).await;
+
+    let mut announces = a.recv_announces().await;
+    let announce = tokio::time::timeout(Duration::from_secs(10), announces.recv())
+        .await
+        .expect("announce timeout")
+        .expect("channel");
+    let desc = announce.destination.lock().await.desc;
+
+    let link = a.link(desc).await;
+    let mut out_events = a.out_link_events();
+    let _ = tokio::time::timeout(Duration::from_secs(10), out_events.recv()).await;
+
+    let link_id = *link.lock().await.id();
+    b.set_resource_strategy(link_id, reticulum::resource::ResourceStrategy::All)
+        .await;
+
+    let payload: Vec<u8> = (0..(MAX_EFFICIENT_SIZE + 32 * 1024))
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let path = std::env::temp_dir().join(format!(
+        "reticulum-resource-test-{}-split",
+        std::process::id()
+    ));
+    std::fs::write(&path, &payload).expect("write file");
+
+    let mut events = a.resource_events().await;
+    let mut receiver_events = b.resource_events().await;
+    a.send_resource_from_path(
+        &link,
+        &path,
+        ResourceOptions {
+            auto_compress: false,
+            ..ResourceOptions::default()
+        },
+    )
+    .await
+    .expect("send file");
+
+    let mut segments_completed = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    while segments_completed < 2 && tokio::time::Instant::now() < deadline {
+        let Ok(Ok(event)) = tokio::time::timeout_at(deadline, events.recv()).await else {
+            break;
+        };
+        if matches!(event.status, ResourceStatus::Complete) {
+            segments_completed += 1;
+        }
+    }
+    assert!(
+        segments_completed >= 2,
+        "expected both segments of a file above MAX_EFFICIENT_SIZE, got {segments_completed}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut final_data = None;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Ok(event)) = tokio::time::timeout_at(deadline, receiver_events.recv()).await else {
+            break;
+        };
+        if event.status == ResourceStatus::Complete && event.data.is_some() {
+            final_data = event.data;
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(final_data.as_deref(), Some(payload.as_slice()));
+}

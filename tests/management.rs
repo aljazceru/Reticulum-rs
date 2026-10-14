@@ -7,8 +7,14 @@ use std::time::Duration;
 use rand_core::OsRng;
 use reticulum::destination::DestinationName;
 use reticulum::destination::SingleInputDestination;
+use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
+use reticulum::iface::{TxMessage, TxMessageType};
+use reticulum::packet::{
+    DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext, PacketDataBuffer,
+    PacketType, PropagationType,
+};
 use reticulum::transport::{Transport, TransportConfig};
 
 async fn udp_pair(
@@ -175,6 +181,82 @@ async fn remote_management_status_and_path() {
         .windows(dest_hash.as_slice().len())
         .any(|window| window == dest_hash.as_slice());
     assert!(found, "path table response must contain the announced path");
+}
+
+#[tokio::test]
+async fn drop_announce_queues_clears_queued_announces() {
+    let identity_a = PrivateIdentity::new_from_rand(OsRng);
+    let identity_b = PrivateIdentity::new_from_rand(OsRng);
+    let (a, _) = udp_pair("dropq", 47030, 47031, &identity_a, &identity_b).await;
+    let iface = {
+        let manager = a.iface_manager();
+        let manager = manager.lock().await;
+        manager.stats().first().map(|stat| stat.address).unwrap()
+    };
+    {
+        let manager = a.iface_manager();
+        let manager = manager.lock().await;
+        manager.set_iface_bitrate(&iface, 1200);
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Broadcast(None),
+                packet: forwarded_announce(2),
+            })
+            .await;
+        manager
+            .send(TxMessage {
+                tx_type: TxMessageType::Broadcast(None),
+                packet: forwarded_announce(3),
+            })
+            .await;
+    }
+    let queued = {
+        let manager = a.iface_manager();
+        let manager = manager.lock().await;
+        manager
+            .with_control(&iface, |control| control.queued_announces_len())
+            .unwrap_or(0)
+    };
+    assert!(queued >= 1, "announce cap must queue a forwarded announce");
+
+    a.drop_announce_queues().await;
+    let left = {
+        let manager = a.iface_manager();
+        let manager = manager.lock().await;
+        manager
+            .with_control(&iface, |control| control.queued_announces_len())
+            .unwrap_or(0)
+    };
+    assert_eq!(
+        left, 0,
+        "drop_announce_queues must clear every announce queue"
+    );
+}
+
+fn forwarded_announce(hops: u8) -> Packet {
+    let mut data = PacketDataBuffer::new();
+    data.safe_write(&[1u8; 32]);
+    data.safe_write(&[2u8; 32]);
+    data.safe_write(&[3u8; 10]);
+    data.safe_write(&[0u8; 5]);
+    data.safe_write(&42u64.to_be_bytes()[3..8]);
+    data.safe_write(&[4u8; 64]);
+    Packet {
+        header: Header {
+            ifac_flag: IfacFlag::Open,
+            context_flag: false,
+            header_type: HeaderType::Type2,
+            propagation_type: PropagationType::Broadcast,
+            destination_type: DestinationType::Single,
+            packet_type: PacketType::Announce,
+            hops,
+        },
+        ifac: None,
+        destination: AddressHash::new_from_rand(OsRng),
+        transport: None,
+        context: PacketContext::None,
+        data,
+    }
 }
 
 fn pack_status_request() -> Vec<u8> {

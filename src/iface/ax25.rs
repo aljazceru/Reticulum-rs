@@ -205,4 +205,25 @@ mod tests {
         assert_eq!(src, "N0CALL");
         assert_eq!(src_ssid, 7);
     }
+
+    #[test]
+    fn announce_burst_is_not_held() {
+        use crate::iface::control::{hold_announce_burst, IfaceControlState};
+        use crate::iface::kiss::KissInterface;
+        use crate::iface::Interface;
+
+        // AX.25 KISS is a `KissInterface`; both modes share the override.
+        assert!(!KissInterface::should_ingress_limit());
+
+        let t0 = tokio::time::Instant::now();
+        let mut generic = IfaceControlState::new(t0);
+        assert!(
+            hold_announce_burst(&mut generic, t0) > 0,
+            "burst fixture must trip the generic limiter"
+        );
+
+        let mut state = IfaceControlState::new(t0);
+        state.set_announce_ingress_limit(KissInterface::should_ingress_limit());
+        assert_eq!(hold_announce_burst(&mut state, t0), 0);
+    }
 }

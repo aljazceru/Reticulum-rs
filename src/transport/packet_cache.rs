@@ -95,6 +95,19 @@ impl PacketCache {
     pub fn get_cached_announce(&self, hash: &Hash) -> Option<Packet> {
         self.announces.get(hash).copied()
     }
+
+    /// Hashes currently in the duplicate filter (Python `packet_hashlist`).
+    pub fn hashes(&self) -> Vec<Hash> {
+        self.map.keys().copied().collect()
+    }
+
+    /// Remember a hash loaded from storage without treating it as a fresh arrival.
+    pub fn remember_hash(&mut self, hash: Hash) {
+        self.map.entry(hash).or_insert(PacketTrack {
+            time: Instant::now(),
+            min_hops: 0,
+        });
+    }
 }
 
 #[cfg(test)]

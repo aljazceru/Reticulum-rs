@@ -7,7 +7,7 @@ pub mod tcp_client;
 pub mod tcp_server;
 pub mod udp;
 
-#[cfg(all(feature = "iface-auto", target_os = "linux"))]
+#[cfg(feature = "iface-auto")]
 pub mod auto;
 #[cfg(feature = "iface-serial")]
 pub mod ax25;
@@ -22,12 +22,14 @@ pub mod pipe;
 pub mod rnode;
 #[cfg(feature = "iface-serial")]
 pub mod serial;
+pub mod weave;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 use crate::hash::AddressHash;
 use crate::hash::Hash;
 pub use crate::iface::control::{IfaceControlParams, IfaceControlState, InterfaceMode};
-use crate::packet::{Packet, PacketType};
+use crate::packet::{DestinationType, HeaderType, Packet, PacketType, PropagationType};
 
 pub type InterfaceTxSender = mpsc::Sender<TxMessage>;
 pub type InterfaceTxReceiver = mpsc::Receiver<TxMessage>;
@@ -99,6 +101,20 @@ pub struct InterfaceCounters {
     /// Last reported derived link-quality percentage as f32 bits
     /// (`u32::MAX` = not reported; Python `r_stat_q`).
     quality_bits: AtomicU32,
+    /// Radio channel readings (`u32::MAX` = not reported).
+    airtime_short_bits: AtomicU32,
+    airtime_long_bits: AtomicU32,
+    channel_load_short_bits: AtomicU32,
+    channel_load_long_bits: AtomicU32,
+}
+
+/// Radio channel readings an interface has actually reported.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RadioTelemetry {
+    pub airtime_short: Option<f32>,
+    pub airtime_long: Option<f32>,
+    pub channel_load_short: Option<f32>,
+    pub channel_load_long: Option<f32>,
 }
 
 impl InterfaceCounters {
@@ -257,8 +273,41 @@ impl InterfaceCounters {
 
     /// Last reported derived link-quality percentage (Python `r_stat_q`).
     pub fn quality(&self) -> Option<f32> {
-        let bits = self.quality_bits.load(Ordering::Relaxed);
-        (bits != u32::MAX).then(|| f32::from_bits(bits))
+        optional_f32(&self.quality_bits)
+    }
+
+    /// Store radio channel readings. `None` keeps the previous value.
+    pub fn set_radio_channel(
+        &self,
+        airtime_short: Option<f32>,
+        airtime_long: Option<f32>,
+        channel_load_short: Option<f32>,
+        channel_load_long: Option<f32>,
+    ) {
+        store_opt_f32(&self.airtime_short_bits, airtime_short);
+        store_opt_f32(&self.airtime_long_bits, airtime_long);
+        store_opt_f32(&self.channel_load_short_bits, channel_load_short);
+        store_opt_f32(&self.channel_load_long_bits, channel_load_long);
+    }
+
+    pub fn radio_telemetry(&self) -> RadioTelemetry {
+        RadioTelemetry {
+            airtime_short: optional_f32(&self.airtime_short_bits),
+            airtime_long: optional_f32(&self.airtime_long_bits),
+            channel_load_short: optional_f32(&self.channel_load_short_bits),
+            channel_load_long: optional_f32(&self.channel_load_long_bits),
+        }
+    }
+}
+
+fn optional_f32(bits: &AtomicU32) -> Option<f32> {
+    let bits = bits.load(Ordering::Relaxed);
+    (bits != u32::MAX).then(|| f32::from_bits(bits))
+}
+
+fn store_opt_f32(slot: &AtomicU32, value: Option<f32>) {
+    if let Some(value) = value {
+        slot.store(value.to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -285,6 +334,10 @@ impl Default for InterfaceCounters {
             rssi: AtomicI32::new(i32::MIN),
             snr_bits: AtomicU32::new(u32::MAX),
             quality_bits: AtomicU32::new(u32::MAX),
+            airtime_short_bits: AtomicU32::new(u32::MAX),
+            airtime_long_bits: AtomicU32::new(u32::MAX),
+            channel_load_short_bits: AtomicU32::new(u32::MAX),
+            channel_load_long_bits: AtomicU32::new(u32::MAX),
         }
     }
 }
@@ -339,6 +392,8 @@ pub struct InterfaceChannel {
     pub rx_channel: InterfaceRxSender,
     pub tx_channel: InterfaceTxReceiver,
     pub stop: CancellationToken,
+    /// Set after this worker has dropped its listener sockets.
+    pub exited: tokio::sync::watch::Sender<bool>,
     pub stats: Arc<InterfaceCounters>,
     /// Interface access code configuration for this interface
     /// (Python `interface.ifac_identity`); packets are wrapped/unwrapped
@@ -364,11 +419,13 @@ impl InterfaceChannel {
         address: AddressHash,
         stop: CancellationToken,
     ) -> Self {
+        let (exited, _) = tokio::sync::watch::channel(false);
         Self {
             address,
             rx_channel,
             tx_channel,
             stop,
+            exited,
             stats: Arc::new(InterfaceCounters::default()),
             ifac: Arc::new(std::sync::RwLock::new(None)),
         }
@@ -385,14 +442,45 @@ impl InterfaceChannel {
 
 pub trait Interface {
     fn mtu() -> usize;
+
+    /// Bitrate to store on the control word when this interface is spawned.
+    ///
+    /// `None` leaves the generic default. The worker is not polled until
+    /// after [`InterfaceManager::spawn`] returns, so this is the only
+    /// chance to publish a constructor rate before that return.
+    fn constructor_bitrate(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether this type applies announce ingress limiting.
+    ///
+    /// KISS (including AX.25) and serial return false here, so those
+    /// links forward announce bursts instead of holding them.
+    fn should_ingress_limit() -> bool {
+        true
+    }
+
+    /// Bind or peer endpoint included in the stable interface id.
+    /// Empty when this interface has neither.
+    fn endpoint(&self) -> &str {
+        ""
+    }
 }
 
 struct LocalInterface {
     address: AddressHash,
     name: String,
     kind: String,
+    /// Bind or peer string recorded for the stable id. Separate from
+    /// `name` so a later config-name change does not drop it. Empty when
+    /// the interface recorded neither.
+    endpoint: String,
+    /// Parent listener that spawned this interface, when there is one.
+    parent: Option<AddressHash>,
     tx_send: InterfaceTxSender,
     stop: CancellationToken,
+    /// Becomes true after the worker drops its listener.
+    exited: tokio::sync::watch::Receiver<bool>,
     stats: Arc<InterfaceCounters>,
     ifac: IfacSlot,
 }
@@ -412,6 +500,11 @@ pub struct InterfaceManager {
     /// Per-interface transport control state (Python `Interface` ingress /
     /// egress control attributes).
     controls: Mutex<HashMap<AddressHash, IfaceControlState>>,
+    /// Sampled hops-0 rewrite onto the wider network
+    /// (Python `Transport.local_hops_delta`). Zero disables it.
+    pub(crate) local_hops_delta: AtomicU8,
+    /// Transport identity inserted when an announce header is upgraded.
+    transport_identity: Mutex<Option<AddressHash>>,
 }
 
 impl InterfaceManager {
@@ -426,7 +519,34 @@ impl InterfaceManager {
             cancel: CancellationToken::new(),
             ifaces: Vec::new(),
             controls: Mutex::new(HashMap::new()),
+            local_hops_delta: AtomicU8::new(0),
+            transport_identity: Mutex::new(None),
         }
+    }
+
+    /// Enable the local-client hop rewrite sampled by transport
+    /// (Python `Transport.local_hops_delta`, 2 through 7).
+    pub fn set_local_hops_delta(&self, delta: u8, transport_id: Option<AddressHash>) {
+        self.local_hops_delta.store(delta, Ordering::Relaxed);
+        *self.transport_identity.lock().expect("transport id") = transport_id;
+    }
+
+    /// Drop queued announces on every interface
+    /// (Python `Transport.drop_announce_queues`).
+    pub fn drop_announce_queues(&self) {
+        let mut controls = self.controls.lock().expect("iface control lock");
+        for control in controls.values_mut() {
+            control.clear_announce_queue();
+        }
+    }
+
+    pub fn connected_to_shared_instance(&self) -> bool {
+        self.ifaces.iter().any(|iface| {
+            iface.kind == "LocalClient"
+                && iface.stats.online()
+                && !iface.stop.is_cancelled()
+                && !self.is_local_client_iface(&iface.address)
+        })
     }
 
     pub fn new_channel(&mut self, tx_cap: usize) -> InterfaceChannel {
@@ -451,6 +571,7 @@ impl InterfaceManager {
         let stop = CancellationToken::new();
         let stats = Arc::new(InterfaceCounters::default());
         stats.set_online(false);
+        let (exited_tx, exited_rx) = tokio::sync::watch::channel(false);
 
         let ifac: IfacSlot = Arc::new(std::sync::RwLock::new(None));
 
@@ -458,8 +579,11 @@ impl InterfaceManager {
             address,
             name: name.to_string(),
             kind: kind.to_string(),
+            endpoint: String::new(),
+            parent: None,
             tx_send,
             stop: stop.clone(),
+            exited: exited_rx,
             stats: stats.clone(),
             ifac: ifac.clone(),
         });
@@ -474,6 +598,7 @@ impl InterfaceManager {
             tx_channel: tx_recv,
             address,
             stop,
+            exited: exited_tx,
             stats,
             ifac,
         }
@@ -481,14 +606,37 @@ impl InterfaceManager {
 
     pub fn new_context<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
         let kind = interface_kind_name::<T>();
+        let endpoint = inner.endpoint().to_string();
         let channel = self.new_channel_named(1, &kind, &kind);
+        let address = channel.address;
+        if let Some(iface) = self
+            .ifaces
+            .iter_mut()
+            .find(|iface| iface.address == address)
+        {
+            iface.endpoint = endpoint;
+        }
 
         let inner = Arc::new(Mutex::new(inner));
+        let address = channel.address;
+        self.apply_type_ingress_policy::<T>(&address);
 
         InterfaceContext::<T> {
             inner: inner.clone(),
             channel,
             cancel: self.cancel.clone(),
+        }
+    }
+
+    /// KISS (including AX.25) and serial return false from
+    /// `should_ingress_limit`. Applied when the channel is registered so
+    /// transport (which only sees [`IfaceControlState`]) holds no
+    /// announces for these types.
+    fn apply_type_ingress_policy<T: Interface>(&self, address: &AddressHash) {
+        if !T::should_ingress_limit() {
+            self.with_control(address, |control| {
+                control.set_announce_ingress_limit(false);
+            });
         }
     }
 
@@ -500,19 +648,84 @@ impl InterfaceManager {
         }
     }
 
-    /// Stop a single interface by address. The interface worker observes the
-    /// stop token of its channel and terminates; the entry is removed from
-    /// the manager once it has been cleaned up.
-    pub fn stop_iface(&mut self, address: &AddressHash) {
-        if let Some(index) = self.ifaces.iter().position(|i| &i.address == address) {
-            let iface = self.ifaces.remove(index);
-            iface.stats.set_online(false);
-            iface.stop.cancel();
-            self.controls
-                .lock()
-                .expect("iface control lock")
-                .remove(address);
+    /// Record that `child` was spawned by `parent` so detach can stop both.
+    pub fn note_spawned(&mut self, parent: &AddressHash, child: &AddressHash) {
+        if let Some(iface) = self.ifaces.iter_mut().find(|iface| &iface.address == child) {
+            iface.parent = Some(*parent);
         }
+    }
+
+    /// Config name of the listener that spawned `address`, when that
+    /// listener is still registered.
+    pub fn spawned_parent_name(&self, address: &AddressHash) -> Option<String> {
+        let parent = self
+            .ifaces
+            .iter()
+            .find(|iface| iface.address == *address)?
+            .parent?;
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == parent)
+            .map(|iface| iface.name.clone())
+    }
+
+    /// Bind or peer string recorded for `address`. Empty when none was stored.
+    pub fn iface_endpoint(&self, address: &AddressHash) -> String {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address)
+            .map(|iface| iface.endpoint.clone())
+            .unwrap_or_default()
+    }
+
+    /// Connected clients of a `LocalServer`, or `None` for every other kind.
+    pub fn local_server_clients(&self, address: &AddressHash) -> Option<u64> {
+        let kind = self
+            .ifaces
+            .iter()
+            .find(|iface| iface.address == *address)?
+            .kind
+            .as_str();
+        if kind != "LocalServer" {
+            return None;
+        }
+        let count = self
+            .ifaces
+            .iter()
+            .filter(|iface| iface.parent == Some(*address) && !iface.stop.is_cancelled())
+            .count();
+        Some(count as u64)
+    }
+
+    /// Stop a single interface by address, and any peers it spawned.
+    ///
+    /// The returned watch becomes true after a parent worker drops its
+    /// listener. Callers that ignore it still cancel the worker.
+    pub fn stop_iface(
+        &mut self,
+        address: &AddressHash,
+    ) -> Option<tokio::sync::watch::Receiver<bool>> {
+        let children: Vec<AddressHash> = self
+            .ifaces
+            .iter()
+            .filter(|iface| iface.parent == Some(*address))
+            .map(|iface| iface.address)
+            .collect();
+        for child in children {
+            let _ = self.stop_iface(&child);
+        }
+        let index = self
+            .ifaces
+            .iter()
+            .position(|iface| &iface.address == address)?;
+        let iface = self.ifaces.remove(index);
+        iface.stats.set_online(false);
+        iface.stop.cancel();
+        self.controls
+            .lock()
+            .expect("iface control lock")
+            .remove(address);
+        Some(iface.exited)
     }
 
     /// Run `f` with the control state of one interface
@@ -578,10 +791,120 @@ impl InterfaceManager {
             .is_some())
     }
 
+    /// Register an interface without starting its worker, so the caller
+    /// can publish control state before the worker accepts.
+    pub fn open<T: Interface>(&mut self, inner: T) -> InterfaceContext<T> {
+        self.new_context(inner)
+    }
+
+    /// [`Self::open`] registered under `name`.
+    pub fn open_named<T: Interface>(
+        &mut self,
+        name: impl AsRef<str>,
+        inner: T,
+    ) -> InterfaceContext<T> {
+        let context = self.new_context(inner);
+        let address = context.channel.address;
+        self.set_iface_name(&address, name.as_ref());
+        context
+    }
+
+    /// [`Self::open`] with the IFAC slot already populated and, when
+    /// `endpoint()` is non-empty, that string as the statistics name.
+    pub fn open_with_ifac<T: Interface>(
+        &mut self,
+        inner: T,
+        ifac: Arc<ifac::IfacKey>,
+    ) -> InterfaceContext<T> {
+        let kind = interface_kind_name::<T>();
+        let endpoint = inner.endpoint().to_string();
+        let channel = self.new_channel_named(1, &kind, &kind);
+        *channel.ifac.write().expect("ifac lock") = Some(ifac);
+
+        let address = channel.address;
+        self.apply_type_ingress_policy::<T>(&address);
+        // Name and endpoint are recorded before the worker starts, so an
+        // accepted client cannot learn a path under the shared type name.
+        if let Some(iface) = self
+            .ifaces
+            .iter_mut()
+            .find(|iface| iface.address == address)
+        {
+            if !endpoint.is_empty() {
+                iface.name = endpoint.clone();
+            }
+            iface.endpoint = endpoint;
+        }
+
+        InterfaceContext::<T> {
+            inner: Arc::new(Mutex::new(inner)),
+            channel,
+            cancel: self.cancel.clone(),
+        }
+    }
+
+    /// Start a worker for an interface registered with [`Self::open`].
+    pub fn launch<T, F, R>(&self, context: InterfaceContext<T>, worker: F) -> AddressHash
+    where
+        T: Interface,
+        F: FnOnce(InterfaceContext<T>) -> R,
+        R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
+    {
+        self.publish_constructor_bitrate(&context);
+        let address = context.channel.address;
+        task::spawn(worker(context));
+        address
+    }
+
+    /// Copy the parent control fields Python copies onto a spawned peer:
+    /// mode, gravity, bitrate, announce cap and rate, ingress/egress,
+    /// `ic_*` / `ec_*`, and the recursive path-request and
+    /// internal-announce flags.
+    pub fn copy_spawned_control(&self, parent: &AddressHash, child: &AddressHash) {
+        let mut controls = self.controls.lock().expect("iface control lock");
+        let Some(source) = controls.get(parent) else {
+            return;
+        };
+        let mode = source.mode;
+        let gravity = source.gravity;
+        let bitrate = source.bitrate;
+        let announce_cap = source.announce_cap;
+        let announce_rate_target = source.announce_rate_target;
+        let announce_rate_grace = source.announce_rate_grace;
+        let announce_rate_penalty = source.announce_rate_penalty;
+        let ingress_control = source.ingress_control;
+        let egress_control = source.egress_control;
+        let recursive_prs = source.recursive_prs;
+        let announces_from_internal = source.announces_from_internal;
+        let announces_to_internal = source.announces_to_internal;
+        let params = *source.params();
+        let Some(dest) = controls.get_mut(child) else {
+            return;
+        };
+        dest.mode = mode;
+        dest.gravity = gravity;
+        dest.bitrate = bitrate;
+        dest.announce_cap = announce_cap;
+        dest.announce_rate_target = announce_rate_target;
+        dest.announce_rate_grace = announce_rate_grace;
+        dest.announce_rate_penalty = announce_rate_penalty;
+        dest.ingress_control = ingress_control;
+        dest.egress_control = egress_control;
+        dest.recursive_prs = recursive_prs;
+        dest.announces_from_internal = announces_from_internal;
+        dest.announces_to_internal = announces_to_internal;
+        dest.set_params(params);
+    }
+
     /// Spawn an interface worker with its IFAC slot already populated,
     /// so the worker never observes an unauthenticated frame before the
     /// key is installed (needed on multithreaded runtimes where `spawn`
     /// may begin polling immediately).
+    ///
+    /// When `endpoint()` is non-empty, that string becomes the statistics
+    /// name before the worker starts. A later `set_iface_name` can still
+    /// replace it with a config name.
     pub fn spawn_with_ifac<T, F, R>(
         &mut self,
         inner: T,
@@ -592,20 +915,10 @@ impl InterfaceManager {
         T: Interface,
         F: FnOnce(InterfaceContext<T>) -> R,
         R: std::future::Future<Output = ()> + Send + 'static,
+        R::Output: Send + 'static,
     {
-        let kind = interface_kind_name::<T>();
-        let channel = self.new_channel_named(1, &kind, &kind);
-        *channel.ifac.write().expect("ifac lock") = Some(ifac);
-
-        let context = InterfaceContext::<T> {
-            inner: Arc::new(Mutex::new(inner)),
-            channel,
-            cancel: self.cancel.clone(),
-        };
-
-        let address = context.channel.address;
-        task::spawn(worker(context));
-        address
+        let context = self.open_with_ifac(inner, ifac);
+        self.launch(context, worker)
     }
 
     /// Access the IFAC configuration slot of an interface.
@@ -745,23 +1058,88 @@ impl InterfaceManager {
         released
     }
 
-    /// Transmit queued announces whose airtime budget allows it
-    /// (Python `Interface.process_announce_queue`). Returns the direct
-    /// transmit messages for the transport to send.
-    pub fn process_announce_queues(&self) -> Vec<TxMessage> {
+    /// Transmit one queued announce per interface
+    /// (Python `Interface.process_announce_queue`: the selected announce is
+    /// transmitted directly — it does not re-enter `Transport.outbound`, so
+    /// the announce-cap gate must not be applied a second time, which would
+    /// otherwise re-queue it and starve the queue forever).
+    pub async fn process_announce_queues(&self) {
         let now = tokio::time::Instant::now();
-        let mut controls = self.controls.lock().expect("iface control lock");
-        let mut messages = Vec::new();
-        for (address, control) in controls.iter_mut() {
-            while let Some(packet) = control.take_queued_announce(now) {
-                control.sent_announce(now);
-                messages.push(TxMessage {
-                    tx_type: TxMessageType::Direct(*address),
+        let drained = {
+            let mut controls = self.controls.lock().expect("iface control lock");
+            let mut drained = Vec::new();
+            for (address, control) in controls.iter_mut() {
+                if let Some(packet) = control.take_queued_announce(now) {
+                    control.sent_announce(now);
+                    drained.push((*address, packet));
+                }
+            }
+            drained
+        };
+
+        for (address, packet) in drained {
+            let Some(iface) = self
+                .ifaces
+                .iter()
+                .find(|iface| iface.address == address && !iface.stop.is_cancelled())
+            else {
+                continue;
+            };
+            let size = control::packet_wire_len(&packet);
+            iface.stats.count_announce_tx(size);
+            let _ = iface
+                .tx_send
+                .send(TxMessage {
+                    tx_type: TxMessageType::Direct(address),
                     packet,
-                });
+                })
+                .await;
+        }
+    }
+
+    /// Runtime address to a stable identity (kind, config name, and bind
+    /// or peer endpoint), so a restart can resolve persisted paths onto
+    /// the new `AddressHash`.
+    pub fn stable_iface_map(&self) -> HashMap<AddressHash, AddressHash> {
+        let mut map = HashMap::new();
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() {
+                continue;
+            }
+            map.insert(iface.address, iface_stable_id(iface));
+        }
+        map
+    }
+
+    /// Classify live interfaces once.
+    ///
+    /// The map is stable id to the single runtime address that owns it.
+    /// The set is every stable id shared by more than one live interface.
+    /// Load skips those ids instead of attaching every saved path to the
+    /// last interface.
+    pub fn classify_stable_ids(&self) -> (HashMap<AddressHash, AddressHash>, HashSet<AddressHash>) {
+        let mut counts: HashMap<AddressHash, usize> = HashMap::new();
+        let mut first: HashMap<AddressHash, AddressHash> = HashMap::new();
+        for iface in &self.ifaces {
+            if iface.stop.is_cancelled() {
+                continue;
+            }
+            let id = iface_stable_id(iface);
+            *counts.entry(id).or_insert(0) += 1;
+            first.entry(id).or_insert(iface.address);
+        }
+        let mut unique = HashMap::new();
+        let mut ambiguous = HashSet::new();
+        for (id, count) in counts {
+            if count == 1 {
+                if let Some(address) = first.remove(&id) {
+                    unique.insert(id, address);
+                }
+            } else {
+                ambiguous.insert(id);
             }
         }
-        messages
+        (unique, ambiguous)
     }
 
     /// Addresses of all live interfaces with their online status,
@@ -783,10 +1161,6 @@ impl InterfaceManager {
             .map(|iface| iface.kind.clone())
     }
 
-    /// The hardware MTU of an interface (Python
-    /// `Transport.next_hop_interface_hw_mtu`): `None` for interface
-    /// types that cannot negotiate a path MTU, otherwise the type's
-    /// fixed/auto-configured MTU.
     /// The lowest bitrate of all online interfaces with a configured
     /// bitrate (Python `Transport.lowest_interface_bitrate`, recomputed
     /// on the jobs loop there; `None` when no online interface has one).
@@ -815,17 +1189,55 @@ impl InterfaceManager {
             .and_then(|iface| self.iface_hw_mtu(&iface.address))
     }
 
+    /// Latest radio channel readings for `address`.
+    pub fn radio_telemetry(&self, address: &AddressHash) -> RadioTelemetry {
+        self.ifaces
+            .iter()
+            .find(|iface| iface.address == *address)
+            .map(|iface| iface.stats.radio_telemetry())
+            .unwrap_or_default()
+    }
+
+    /// Path-signalling hardware MTU.
+    ///
+    /// Bitrate tiers match `Interface.optimise_mtu`, including `None`
+    /// below 62_500 bps. The `min` with 524288, `TCPInterface.HW_MTU`
+    /// (262144), or 1048576 is this function's ceiling, not a step
+    /// `optimise_mtu` takes. Auto keeps its fixed hardware MTU of 1196.
+    /// Weave keeps its fixed hardware MTU of 1024.
     pub fn iface_hw_mtu(&self, address: &AddressHash) -> Option<usize> {
         let kind = self.iface_kind(address)?;
-        match kind.as_str() {
-            // Python `AUTOCONFIGURE_MTU`/`FIXED_MTU` interfaces
-            // (LocalInterface 262144, TCP 262144, Backbone 1048576,
-            // AutoInterface 1196).
-            "LocalServer" | "LocalClient" | "TcpClient" | "TcpServer" => Some(262_144),
-            "BackboneClient" | "BackboneServer" => Some(1_048_576),
-            "AutoInterface" => Some(1_196),
-            _ => None,
+        // Fixed hardware MTU, not a bitrate tier.
+        if kind == "AutoInterface" || kind == "AutoPeer" {
+            return Some(1_196);
         }
+        if kind == "WeaveInterface" || kind == "WeaveInterfacePeer" {
+            return Some(weave::HW_MTU);
+        }
+        // Ceilings applied by this function only. `optimise_mtu` does
+        // not take `min` with these values. TCP uses `TCPInterface.HW_MTU`.
+        // 1048576 is above every tier and is not used when the tier is `None`.
+        let ceiling = match kind.as_str() {
+            "LocalServer" | "LocalClient" => 524_288,
+            "TcpClient" | "TcpServer" => 262_144,
+            "BackboneClient" | "BackboneServer" => 1_048_576,
+            _ => return None,
+        };
+        let bitrate = self.with_control(address, |control| control.bitrate)?;
+        let tier = match bitrate {
+            1_000_000_000.. => 524_288,
+            750_000_000.. => 262_144,
+            400_000_000.. => 131_072,
+            200_000_000.. => 65_536,
+            100_000_000.. => 32_768,
+            10_000_000.. => 16_384,
+            5_000_000.. => 8_192,
+            2_000_000.. => 4_096,
+            1_000_000.. => 2_048,
+            62_500.. => 1_024,
+            _ => return None,
+        };
+        Some(tier.min(ceiling))
     }
 
     /// Snapshot of the statistics of all live interfaces.
@@ -858,18 +1270,24 @@ impl InterfaceManager {
             .collect()
     }
 
+    /// Store a constructor bitrate after `new_context` has inserted the
+    /// generic default and before the worker is scheduled. An `async fn`
+    /// body does not run until the task is polled, which is after `spawn`
+    /// has returned.
+    fn publish_constructor_bitrate<T: Interface>(&self, context: &InterfaceContext<T>) {
+        if let Some(rate) = context.inner.lock().unwrap().constructor_bitrate() {
+            self.set_iface_bitrate(&context.channel.address, rate);
+        }
+    }
+
     pub fn spawn<T: Interface, F, R>(&mut self, inner: T, worker: F) -> AddressHash
     where
         F: FnOnce(InterfaceContext<T>) -> R,
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context(inner);
-        let address = *context.channel.address();
-
-        task::spawn(worker(context));
-
-        address
+        let context = self.open(inner);
+        self.launch(context, worker)
     }
 
     /// Spawn an interface worker registered under a human-readable `name`
@@ -885,14 +1303,8 @@ impl InterfaceManager {
         R: std::future::Future<Output = ()> + Send + 'static,
         R::Output: Send + 'static,
     {
-        let context = self.new_context(inner);
-        let address = *context.channel.address();
-
-        self.set_iface_name(&address, name.as_ref());
-
-        task::spawn(worker(context));
-
-        address
+        let context = self.open_named(name, inner);
+        self.launch(context, worker)
     }
 
     pub fn receiver(&self) -> Arc<tokio::sync::Mutex<InterfaceRxReceiver>> {
@@ -905,6 +1317,13 @@ impl InterfaceManager {
 
     pub async fn send(&self, message: TxMessage) {
         let is_announce = message.packet.header.packet_type == PacketType::Announce;
+        let hops_delta = self.local_hops_delta.load(Ordering::Relaxed);
+        let rewrite_hops = hops_delta != 0 && !self.connected_to_shared_instance();
+        let transport_id = if rewrite_hops {
+            *self.transport_identity.lock().expect("transport id")
+        } else {
+            None
+        };
 
         for iface in &self.ifaces {
             let should_send = match message.tx_type {
@@ -958,7 +1377,28 @@ impl InterfaceManager {
                     iface.stats.count_announce_tx(size);
                 }
 
-                let _ = iface.tx_send.send(message).await;
+                let mut outbound = message;
+                let local_client = self.is_local_client_iface(&iface.address);
+                if rewrite_hops
+                    && outbound.packet.header.hops == 0
+                    && outbound.packet.header.destination_type != DestinationType::Plain
+                    && outbound.packet.header.destination_type != DestinationType::Group
+                    && !local_client
+                    && iface.kind != "LocalServer"
+                {
+                    let upgrade = outbound.packet.header.packet_type == PacketType::Announce
+                        && outbound.packet.header.header_type == HeaderType::Type1;
+                    outbound.packet.header.hops = hops_delta;
+                    if upgrade {
+                        if let Some(transport_id) = transport_id {
+                            outbound.packet.header.header_type = HeaderType::Type2;
+                            outbound.packet.header.propagation_type = PropagationType::Transport;
+                            outbound.packet.transport = Some(transport_id);
+                        }
+                    }
+                }
+
+                let _ = iface.tx_send.send(outbound).await;
             }
         }
     }
@@ -1010,6 +1450,29 @@ impl Drop for InterfaceManager {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+/// Stable identity of an interface across process restarts.
+/// The runtime `AddressHash` from `new_channel_named` is a fresh random
+/// seed and is not persisted.
+///
+/// The id is the interface kind, the statistics name, and the bind or
+/// peer string when one was recorded. Types which record neither a
+/// distinct name nor a bind or peer string still share an id.
+fn stable_interface_id(kind: &str, name: &str, endpoint: &str) -> AddressHash {
+    let mut label = String::with_capacity(kind.len() + name.len() + endpoint.len() + 2);
+    label.push_str(kind);
+    label.push('\0');
+    label.push_str(name);
+    if !endpoint.is_empty() {
+        label.push('\0');
+        label.push_str(endpoint);
+    }
+    AddressHash::new_from_slice(label.as_bytes())
+}
+
+fn iface_stable_id(iface: &LocalInterface) -> AddressHash {
+    stable_interface_id(&iface.kind, &iface.name, &iface.endpoint)
 }
 
 /// Short type name of an interface, used as statistics `kind`.
@@ -1185,5 +1648,205 @@ mod tests {
         assert_eq!(counters.rssi(), Some(-100));
         assert_eq!(counters.snr(), Some(-7.5));
         assert_eq!(counters.quality(), Some(0.0));
+    }
+
+    #[test]
+    fn hardware_mtu_follows_bitrate_tiers() {
+        // Python `Interface.optimise_mtu`, including the step just below
+        // each threshold. Backbone's class MTU is above every tier, so
+        // the reported value is the tier (never 1048576).
+        let tiers = [
+            (1_000_000_000, Some(524_288usize)),
+            (999_999_999, Some(262_144)),
+            (750_000_000, Some(262_144)),
+            (749_999_999, Some(131_072)),
+            (400_000_000, Some(131_072)),
+            (399_999_999, Some(65_536)),
+            (200_000_000, Some(65_536)),
+            (199_999_999, Some(32_768)),
+            (100_000_000, Some(32_768)),
+            (99_999_999, Some(16_384)),
+            (10_000_000, Some(16_384)),
+            (9_999_999, Some(8_192)),
+            (5_000_000, Some(8_192)),
+            (4_999_999, Some(4_096)),
+            (2_000_000, Some(4_096)),
+            (1_999_999, Some(2_048)),
+            (1_000_000, Some(2_048)),
+            (999_999, Some(1_024)),
+            (62_500, Some(1_024)),
+            (62_499, None),
+            (0, None),
+        ];
+
+        let mut manager = InterfaceManager::new(4);
+        for (bitrate, expected) in tiers {
+            for kind in ["BackboneClient", "BackboneServer"] {
+                let channel = manager.new_channel_named(1, kind, kind);
+                assert!(manager.set_iface_bitrate(&channel.address, bitrate));
+                assert_eq!(
+                    manager.iface_hw_mtu(&channel.address),
+                    expected,
+                    "{kind} at {bitrate}"
+                );
+            }
+        }
+
+        // Unset bitrate is the interface default 62500, which is the
+        // 1024 tier, not the backbone class MTU.
+        let unset = manager.new_channel_named(1, "bb", "BackboneClient");
+        assert_eq!(manager.iface_hw_mtu(&unset.address), Some(1_024));
+
+        for kind in ["TcpClient", "TcpServer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(262_144));
+            assert!(manager.set_iface_bitrate(&channel.address, 750_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(262_144));
+            assert!(manager.set_iface_bitrate(&channel.address, 400_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(131_072));
+            assert!(manager.set_iface_bitrate(&channel.address, 62_499));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), None);
+        }
+
+        for kind in ["LocalClient", "LocalServer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(524_288));
+            assert!(manager.set_iface_bitrate(&channel.address, 100_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(32_768));
+            assert!(manager.set_iface_bitrate(&channel.address, 62_499));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), None);
+        }
+
+        for kind in ["AutoInterface", "AutoPeer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_196));
+            assert!(manager.set_iface_bitrate(&channel.address, 0));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_196));
+        }
+
+        for kind in ["WeaveInterface", "WeaveInterfacePeer"] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_024));
+            assert!(manager.set_iface_bitrate(&channel.address, 62_499));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_024));
+            assert!(manager.set_iface_bitrate(&channel.address, 0));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), Some(1_024));
+        }
+
+        for kind in [
+            "UdpInterface",
+            "SerialInterface",
+            "KissInterface",
+            "TestIface",
+        ] {
+            let channel = manager.new_channel_named(1, kind, kind);
+            assert!(manager.set_iface_bitrate(&channel.address, 1_000_000_000));
+            assert_eq!(manager.iface_hw_mtu(&channel.address), None, "{kind}");
+        }
+
+        assert_eq!(manager.iface_hw_mtu(&AddressHash::new_empty()), None);
+    }
+
+    #[tokio::test]
+    async fn stable_ids_follow_endpoint_and_skip_collisions() {
+        use super::tcp_client::TcpClient;
+        use super::udp::UdpInterface;
+
+        let mut manager = InterfaceManager::new(4);
+
+        let udp_a = manager.new_context(UdpInterface::new("127.0.0.1:1", None, false));
+        let udp_a_addr = udp_a.channel.address;
+        drop(udp_a);
+        let udp_b = manager.new_context(UdpInterface::new("127.0.0.1:2", None, false));
+        let udp_b_addr = udp_b.channel.address;
+        drop(udp_b);
+
+        let (map, ambiguous) = manager.classify_stable_ids();
+        assert!(ambiguous.is_empty());
+        assert_eq!(map.len(), 2, "unnamed UDP interfaces must not share an id");
+        assert!(map.values().any(|address| *address == udp_a_addr));
+        assert!(map.values().any(|address| *address == udp_b_addr));
+
+        drop(manager.new_context(UdpInterface::new("127.0.0.1:1", None, false)));
+        let (map, ambiguous) = manager.classify_stable_ids();
+        assert!(
+            !map.values().any(|address| *address == udp_a_addr),
+            "two live interfaces with one id must not own persisted paths"
+        );
+        assert!(map.values().any(|address| *address == udp_b_addr));
+        assert!(!ambiguous.is_empty());
+
+        let named_a = manager.new_context(UdpInterface::new("127.0.0.1:9", None, false));
+        let named_a_addr = named_a.channel.address;
+        drop(named_a);
+        manager.set_iface_name(&named_a_addr, "west");
+        let named_b = manager.new_context(UdpInterface::new("127.0.0.1:9", None, false));
+        let named_b_addr = named_b.channel.address;
+        drop(named_b);
+        manager.set_iface_name(&named_b_addr, "east");
+        let (map, _) = manager.classify_stable_ids();
+        assert!(map.values().any(|address| *address == named_a_addr));
+        assert!(
+            map.values().any(|address| *address == named_b_addr),
+            "a unique config name plus the bind endpoint stays distinct"
+        );
+
+        let tcp_a = manager.new_context(TcpClient::new("10.0.0.1:80"));
+        let tcp_a_addr = tcp_a.channel.address;
+        drop(tcp_a);
+        let tcp_b = manager.new_context(TcpClient::new("10.0.0.2:80"));
+        let tcp_b_addr = tcp_b.channel.address;
+        drop(tcp_b);
+        let (map, _) = manager.classify_stable_ids();
+        assert!(map.values().any(|address| *address == tcp_a_addr));
+        assert!(map.values().any(|address| *address == tcp_b_addr));
+
+        let same_a = manager.new_context(TcpClient::new("10.1.0.1:80"));
+        let same_a_addr = same_a.channel.address;
+        drop(same_a);
+        manager.set_iface_name(&same_a_addr, "uplink");
+        let same_b = manager.new_context(TcpClient::new("10.1.0.1:80"));
+        let same_b_addr = same_b.channel.address;
+        drop(same_b);
+        manager.set_iface_name(&same_b_addr, "uplink");
+        let (map, _) = manager.classify_stable_ids();
+        assert!(
+            !map.values()
+                .any(|address| *address == same_a_addr || *address == same_b_addr),
+            "interfaces that still share an id are skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_ifac_names_a_nonempty_endpoint() {
+        use super::ifac::IfacKey;
+        use super::tcp_client::TcpClient;
+
+        let mut manager = InterfaceManager::new(4);
+        let key = Arc::new(IfacKey::derive(Some("net"), Some("pass"), 8).expect("ifac"));
+        let addressed = manager.spawn_with_ifac(
+            TcpClient::new("192.0.2.10:4242"),
+            TcpClient::spawn,
+            Arc::clone(&key),
+        );
+        let bare = manager.spawn_with_ifac(TestIface, test_worker, key);
+        let stats = manager.stats();
+        let named = stats
+            .iter()
+            .find(|stat| stat.address == addressed)
+            .expect("named client");
+        assert_eq!(named.name, "192.0.2.10:4242");
+        let unnamed = stats
+            .iter()
+            .find(|stat| stat.address == bare)
+            .expect("unnamed iface");
+        assert_eq!(unnamed.name, "TestIface");
+        let (map, ambiguous) = manager.classify_stable_ids();
+        assert!(ambiguous.is_empty());
+        assert!(map.values().any(|address| *address == addressed));
     }
 }

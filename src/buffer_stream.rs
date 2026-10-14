@@ -25,7 +25,9 @@ pub const STREAM_ID_MAX: u16 = 0x3fff;
 /// (Python `StreamDataMessage.OVERHEAD`).
 pub const OVERHEAD: usize = 2 + 6;
 
-/// Maximum data length of one stream frame.
+/// Maximum data length of one stream frame at the protocol MTU
+/// (Python `StreamDataMessage.MAX_DATA_LEN = Link.MDU - OVERHEAD`).
+/// Writers use the live `channel.mdu - 2` when the link MTU differs.
 pub const MAX_DATA_LEN: usize = crate::packet::LINK_MDU - OVERHEAD;
 
 /// Maximum raw chunk length before compression attempts
@@ -213,77 +215,7 @@ pub struct BufferWriter {
 
 impl BufferWriter {
     pub(crate) fn new(stream_id: u16, channel: Channel<StreamDataMessage>) -> Self {
-        // The user writes into `client`; the pump reads what was written
-        // from the other end (`peer`) and frames it onto the channel.
-        let (client, mut peer) = tokio::io::duplex(DUPLEX_BUFFER);
-        let (_, duplex) = tokio::io::split(client);
-
-        tokio::spawn(async move {
-            use tokio::io::AsyncReadExt;
-            let mut channel = channel;
-
-            // Wait for the channel to become ready before the first frame.
-            let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !channel.is_ready().await {
-                if tokio::time::Instant::now() > ready_deadline {
-                    log::debug!("buffer_stream: channel never became ready");
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-
-            let mut chunk = Vec::with_capacity(MAX_CHUNK_LEN);
-            let mut tmp = [0u8; MAX_CHUNK_LEN];
-            loop {
-                chunk.clear();
-                let n = match peer.read(&mut tmp).await {
-                    Ok(0) => break,
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
-                chunk.extend_from_slice(&tmp[..n]);
-
-                // Send the chunk in as many frames as needed, retrying while
-                // the channel window is full (LinkNotReady), waiting for each
-                // frame's delivery receipt before continuing (backpressure).
-                let mut offset = 0usize;
-                while offset < chunk.len() {
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(120);
-                    loop {
-                        match write_frame(&mut channel, stream_id, &chunk[offset..], false).await {
-                            Ok(processed) => {
-                                offset += processed;
-                                break;
-                            }
-                            Err(RnsError::LinkNotReady) | Err(RnsError::ChannelError) => {
-                                if tokio::time::Instant::now() > deadline {
-                                    log::debug!("buffer_stream: channel window never opened");
-                                    return;
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                            }
-                            Err(err) => {
-                                log::debug!("buffer_stream: write_frame failed: {err:?}");
-                                return;
-                            }
-                        }
-                    }
-                    if let Some(mut receipt_rx) = pending_receipt(&mut channel).await {
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
-                            receipt_rx.recv(),
-                        )
-                        .await;
-                    }
-                }
-            }
-
-            // Reader closed: send EOF.
-            let _ = write_frame(&mut channel, stream_id, &[], true).await;
-        });
-
-        Self { stream_id, duplex }
+        spawn_writer(stream_id, channel)
     }
 
     pub fn stream_id(&self) -> u16 {
@@ -315,15 +247,99 @@ impl AsyncWrite for BufferWriter {
     }
 }
 
+/// Pump user writes onto `channel` as `StreamDataMessage` frames.
+///
+/// The channel's primary message type does not have to be
+/// `StreamDataMessage`; frames are sent through [`Channel::send`], which
+/// accepts any [`Message`].
+fn spawn_writer<M: Message>(stream_id: u16, channel: Channel<M>) -> BufferWriter {
+    // The user writes into `client`; the pump reads what was written
+    // from the other end (`peer`) and frames it onto the channel.
+    let (client, mut peer) = tokio::io::duplex(DUPLEX_BUFFER);
+    let (_, duplex) = tokio::io::split(client);
+
+    tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut channel = channel;
+
+        // Wait for the channel to become ready before the first frame.
+        let ready_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !channel.is_ready().await {
+            if tokio::time::Instant::now() > ready_deadline {
+                log::debug!("buffer_stream: channel never became ready");
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Python `RawChannelWriter._mdu = channel.mdu - HEADER_LEN`.
+        let frame_mdu = channel.mdu().await.saturating_sub(2);
+        if frame_mdu == 0 {
+            log::debug!("buffer_stream: channel mdu leaves no room for a stream frame");
+            return;
+        }
+
+        let mut chunk = Vec::with_capacity(MAX_CHUNK_LEN);
+        let mut tmp = [0u8; MAX_CHUNK_LEN];
+        loop {
+            chunk.clear();
+            let n = match peer.read(&mut tmp).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            chunk.extend_from_slice(&tmp[..n]);
+
+            // Send the chunk in as many frames as needed. Backpressure is
+            // the channel window: retry while send returns LinkNotReady.
+            let mut offset = 0usize;
+            while offset < chunk.len() {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+                loop {
+                    match write_frame(&mut channel, stream_id, &chunk[offset..], false, frame_mdu)
+                        .await
+                    {
+                        Ok(0) => {
+                            log::debug!("buffer_stream: frame made no progress");
+                            return;
+                        }
+                        Ok(processed) => {
+                            offset += processed;
+                            break;
+                        }
+                        Err(RnsError::LinkNotReady) | Err(RnsError::ChannelError) => {
+                            if tokio::time::Instant::now() > deadline {
+                                log::debug!("buffer_stream: channel window never opened");
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        Err(err) => {
+                            log::debug!("buffer_stream: write_frame failed: {err:?}");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reader closed: send EOF.
+        let _ = write_frame(&mut channel, stream_id, &[], true, frame_mdu).await;
+    });
+
+    BufferWriter { stream_id, duplex }
+}
+
 /// Frame and send one chunk, mirroring the Python compression heuristic:
 /// try progressively smaller prefixes, send the first that compresses below
-/// both `MAX_DATA_LEN` and its own size; otherwise send up to `MAX_DATA_LEN`
+/// both the live frame MDU and its own size; otherwise send up to that MDU
 /// uncompressed. Returns the number of bytes consumed.
-async fn write_frame(
-    channel: &mut Channel<StreamDataMessage>,
+async fn write_frame<M: Message>(
+    channel: &mut Channel<M>,
     stream_id: u16,
     data: &[u8],
     eof: bool,
+    frame_mdu: usize,
 ) -> Result<usize, RnsError> {
     if eof {
         let message = StreamDataMessage {
@@ -341,13 +357,17 @@ async fn write_frame(
         chunk = &chunk[..MAX_CHUNK_LEN];
     }
 
+    if frame_mdu == 0 {
+        return Err(RnsError::ChannelMessageTooBig);
+    }
+
     let mut compressed_frame: Option<(Vec<u8>, usize)> = None;
     let mut comp_try = 1usize;
     while chunk.len() > 32 && comp_try < COMPRESSION_TRIES {
         let segment_length = chunk.len() / comp_try;
         let (compressed, _) =
             crate::resource::maybe_compress(&chunk[..segment_length], true, usize::MAX);
-        if compressed.len() < MAX_DATA_LEN && compressed.len() < segment_length {
+        if compressed.len() < frame_mdu && compressed.len() < segment_length {
             compressed_frame = Some((compressed, segment_length));
             break;
         }
@@ -357,7 +377,7 @@ async fn write_frame(
     let (payload, processed, compressed) = match compressed_frame {
         Some((compressed, segment_length)) => (compressed, segment_length, true),
         None => {
-            let take = chunk.len().min(MAX_DATA_LEN);
+            let take = chunk.len().min(frame_mdu);
             (chunk[..take].to_vec(), take, false)
         }
     };
@@ -371,14 +391,6 @@ async fn write_frame(
     channel.send(&message).await?;
     log::debug!("buffer_stream: frame of {processed} bytes queued (compressed={compressed})");
     Ok(processed)
-}
-
-/// Get a delivery-receipt receiver from the channel if one is available
-/// for the most recent message (backpressure for stream pumps).
-async fn pending_receipt(
-    channel: &mut Channel<StreamDataMessage>,
-) -> Option<tokio::sync::broadcast::Receiver<bool>> {
-    channel.last_receipt().await
 }
 
 /// A bidirectional buffer stream pair
@@ -415,6 +427,58 @@ pub fn create_reader(
 /// Create a writer (Python `Buffer.create_writer`).
 pub fn create_writer(stream_id: u16, channel: Channel<StreamDataMessage>) -> BufferWriter {
     BufferWriter::new(stream_id, channel)
+}
+
+/// Receive a buffer stream on a channel whose primary message type is not
+/// `StreamDataMessage`.
+///
+/// Registers system type `0xff00` (Python `RawChannelReader` calls
+/// `_register_message_type(StreamDataMessage, is_system_type=True)`).
+pub fn attach_reader<M: Message>(
+    channel: &Channel<M>,
+    stream_id: u16,
+) -> Result<BufferReader, RnsError> {
+    let mut raw_rx = channel.register_message_type(SMT_STREAM_DATA, true)?;
+    let (tx, rx) = broadcast::channel(64);
+    tokio::spawn(async move {
+        loop {
+            match raw_rx.recv().await {
+                Ok(bytes) => match StreamDataMessage::unpack_bytes(&bytes) {
+                    Ok(message) => {
+                        if tx.send(message).is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        log::debug!("buffer_stream: dropping undecodable frame: {err:?}");
+                    }
+                },
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+    Ok(BufferReader::new(stream_id, rx))
+}
+
+/// Send a buffer stream on any channel (Python `Buffer.create_writer`).
+pub fn attach_writer<M: Message>(stream_id: u16, channel: &Channel<M>) -> BufferWriter {
+    spawn_writer(stream_id, channel.clone_for_stream())
+}
+
+/// Reader/writer pair on a channel that also carries other message types.
+///
+/// `receive_stream_id` is the local stream id the peer writes to;
+/// `send_stream_id` is the remote stream id frames are addressed to.
+pub fn attach_bidirectional_buffer<M: Message>(
+    channel: &Channel<M>,
+    receive_stream_id: u16,
+    send_stream_id: u16,
+) -> Result<BufferStream, RnsError> {
+    Ok(BufferStream {
+        reader: attach_reader(channel, receive_stream_id)?,
+        writer: attach_writer(send_stream_id, channel),
+    })
 }
 
 #[cfg(test)]

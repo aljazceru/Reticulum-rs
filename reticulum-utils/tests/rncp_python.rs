@@ -205,6 +205,8 @@ async fn rust_sender_to_python_listener() {
         silent: true,
         identity_path: None,
         udp_loopback: None,
+        quiet: false,
+        phy_rates: false,
     })
     .await
     .expect("rust → python transfer");

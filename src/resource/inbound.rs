@@ -707,6 +707,15 @@ impl IncomingResource {
         false
     }
 
+    /// Progress of a response resource, for `RequestEvent::Progress`.
+    /// `None` when this transfer is not a response to a request.
+    pub fn request_progress(&self) -> Option<(AddressHash, f64)> {
+        if !self.is_response {
+            return None;
+        }
+        self.request_id.map(|id| (id, self.progress()))
+    }
+
     /// Transfer progress (0.0 - 1.0) including segmentation weighting.
     pub fn progress(&self) -> f64 {
         if self.status == ResourceStatus::Complete && self.segment_index == self.total_segments {

@@ -68,11 +68,11 @@ impl InterfaceMode {
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name.to_lowercase().as_str() {
             "full" | "default" => Self::Full,
-            "pointtopoint" | "point_to_point" | "point-to-point" => Self::PointToPoint,
-            "accesspoint" | "access_point" | "access-point" => Self::AccessPoint,
+            "pointtopoint" | "point_to_point" | "point-to-point" | "ptp" => Self::PointToPoint,
+            "accesspoint" | "access_point" | "access-point" | "ap" => Self::AccessPoint,
             "roaming" => Self::Roaming,
             "boundary" => Self::Boundary,
-            "gateway" => Self::Gateway,
+            "gateway" | "gw" => Self::Gateway,
             "internal" => Self::Internal,
             _ => return None,
         })
@@ -96,18 +96,26 @@ const FREQ_SAMPLES: usize = 48;
 /// Minimum deque samples before frequencies are trusted
 /// (Python `Interface.IC_DEQUE_MIN_SAMPLE`).
 const DEQUE_MIN_SAMPLE: usize = 2;
-/// Minimum samples before egress limiting kicks in
-/// (Python `Interface.IC_BURST_MIN_SAMPLES`).
-const BURST_MIN_SAMPLES: usize = 6;
+/// Minimum samples before egress path-request limiting
+/// (Python `Interface.EC_BURST_MIN_SAMPLES`).
+const EC_BURST_MIN_SAMPLES: usize = 2;
+/// Quiet samples a path-request burst must survive before it clears
+/// (Python hardcodes 3 in `should_ingress_limit_pr`).
+const IC_PR_BURST_COOLDOWN: u8 = 3;
 /// Announce frequency decay, `1 / AR_MINFREQ_HZ` seconds
 /// (Python `Interface.AR_FREQ_DECAY`).
 const AR_FREQ_DECAY: Duration = Duration::from_secs(10);
 /// Path-request frequency decay (Python `Interface.PR_FREQ_DECAY`).
 const PR_FREQ_DECAY: Duration = Duration::from_secs(10);
 
-/// Default announce airtime budget per interface
-/// (Python `RNS.Reticulum.ANNOUNCE_CAP`).
-pub const ANNOUNCE_CAP: f64 = 2.0;
+/// Default announce airtime budget as a fraction of interface airtime.
+/// Python's integer `Reticulum.ANNOUNCE_CAP` is 2 percent; the runtime
+/// field is `ANNOUNCE_CAP / 100.0`.
+pub const ANNOUNCE_CAP: f64 = 0.02;
+/// Default interface bitrate in bits per second
+/// (Python `Interface.bitrate`). Kept separate from [`ANNOUNCE_CAP`]:
+/// the cap is a fraction, not a rate.
+pub const DEFAULT_BITRATE: u64 = 62_500;
 /// Maximum queued announces per interface
 /// (Python `RNS.Reticulum.MAX_QUEUED_ANNOUNCES`).
 pub const MAX_QUEUED_ANNOUNCES: usize = 16384;
@@ -197,13 +205,17 @@ pub struct IfaceControlState {
     /// Interface mode (Python `Interface.mode`).
     pub mode: InterfaceMode,
     /// Nominal interface bitrate in bits per second
-    /// (Python `Interface.bitrate`, default 62500).
+    /// (Python `Interface.bitrate`, default [`DEFAULT_BITRATE`]).
     pub bitrate: u64,
     /// Announce airtime budget fraction (Python `Interface.announce_cap`,
-    /// default `RNS.Reticulum.ANNOUNCE_CAP`).
+    /// default [`ANNOUNCE_CAP`] = `Reticulum.ANNOUNCE_CAP / 100.0`).
     pub announce_cap: f64,
     /// Ingress control enabled (Python `Interface.ingress_control`).
     pub ingress_control: bool,
+    /// When false, `should_ingress_limit` stays false even if
+    /// `ingress_control` is on. KISS (including AX.25) and serial set
+    /// this false. Path-request limiting is unchanged.
+    announce_ingress_limit: bool,
     /// Egress control for path requests (Python `Interface.egress_control`).
     pub egress_control: bool,
     /// Always send recursive path requests out of this interface
@@ -225,6 +237,14 @@ pub struct IfaceControlState {
     /// The interface requested a tunnel synthesis
     /// (Python `Interface.wants_tunnel`).
     pub wants_tunnel: bool,
+    /// Path-selection weight (Python `Interface.gravity`, default 0).
+    pub gravity: i64,
+    /// Per-interface announce rate. `None` means this interface has no
+    /// target, so transport does not keep or consult a rate another
+    /// interface stored for the same destination.
+    pub announce_rate_target: Option<Duration>,
+    pub announce_rate_grace: Option<u32>,
+    pub announce_rate_penalty: Option<Duration>,
 
     params: IfaceControlParams,
 
@@ -237,8 +257,16 @@ pub struct IfaceControlState {
 
     ic_burst_active: bool,
     ic_burst_activated: Instant,
+    /// Last time the announce burst was still at or above the threshold
+    /// (Python `Interface.ic_burst_sustained`). The hold window is measured
+    /// from this stamp, so a sustained burst does not expire early.
+    ic_burst_sustained: Instant,
     ic_pr_burst_active: bool,
     ic_pr_burst_activated: Instant,
+    ic_pr_burst_sustained: Instant,
+    /// Remaining quiet observations before a path-request burst clears
+    /// (Python `Interface.ic_pr_burst_cooldown`).
+    ic_pr_burst_cooldown: u8,
     ic_held_release: Instant,
 
     /// Announces held due to active ingress limiting
@@ -253,9 +281,10 @@ impl IfaceControlState {
         Self {
             created: now,
             mode: InterfaceMode::default(),
-            bitrate: 62500,
+            bitrate: DEFAULT_BITRATE,
             announce_cap: ANNOUNCE_CAP,
             ingress_control: true,
+            announce_ingress_limit: true,
             egress_control: false,
             recursive_prs: false,
             announces_from_internal: true,
@@ -263,6 +292,10 @@ impl IfaceControlState {
             is_local_client: false,
             tunnel_id: None,
             wants_tunnel: false,
+            gravity: 0,
+            announce_rate_target: None,
+            announce_rate_grace: None,
+            announce_rate_penalty: None,
             params: IfaceControlParams::default(),
             announce_allowed_at: now,
             ia_freq_deque: VecDeque::new(),
@@ -271,8 +304,11 @@ impl IfaceControlState {
             op_freq_deque: VecDeque::new(),
             ic_burst_active: false,
             ic_burst_activated: now,
+            ic_burst_sustained: now,
             ic_pr_burst_active: false,
             ic_pr_burst_activated: now,
+            ic_pr_burst_sustained: now,
+            ic_pr_burst_cooldown: 0,
             ic_held_release: now,
             held_announces: BTreeMap::new(),
             announce_queue: Vec::new(),
@@ -282,6 +318,14 @@ impl IfaceControlState {
     /// Override the configurable control parameters.
     pub fn set_params(&mut self, params: IfaceControlParams) {
         self.params = params;
+    }
+
+    /// Enable or disable announce ingress limiting.
+    ///
+    /// KISS (including AX.25) and serial set this false at spawn.
+    /// `ingress_control` still gates path-request bursts.
+    pub fn set_announce_ingress_limit(&mut self, enabled: bool) {
+        self.announce_ingress_limit = enabled;
     }
 
     pub fn params(&self) -> &IfaceControlParams {
@@ -324,11 +368,14 @@ impl IfaceControlState {
         Self::push_sample(&mut self.op_freq_deque, now);
     }
 
+    /// `preemptive` counts a packet that has not been sampled yet.
+    /// Python adds that 1 after the length check (`outgoing_pr_frequency`).
     fn frequency(
         deque: &mut VecDeque<Instant>,
         decay: Duration,
         min_samples: usize,
         now: Instant,
+        preemptive: bool,
     ) -> f64 {
         let n = deque.len();
         if n <= min_samples {
@@ -344,7 +391,7 @@ impl IfaceControlState {
         if span <= 0.0 {
             0.0
         } else {
-            n as f64 / span
+            (n + usize::from(preemptive)) as f64 / span
         }
     }
 
@@ -356,12 +403,13 @@ impl IfaceControlState {
             AR_FREQ_DECAY,
             DEQUE_MIN_SAMPLE,
             now,
+            false,
         )
     }
 
     /// Outgoing announce frequency in Hz.
     pub fn outgoing_announce_frequency(&mut self, now: Instant) -> f64 {
-        Self::frequency(&mut self.oa_freq_deque, AR_FREQ_DECAY, 1, now)
+        Self::frequency(&mut self.oa_freq_deque, AR_FREQ_DECAY, 1, now, false)
     }
 
     /// Incoming path-request frequency in Hz
@@ -372,12 +420,13 @@ impl IfaceControlState {
             PR_FREQ_DECAY,
             DEQUE_MIN_SAMPLE,
             now,
+            false,
         )
     }
 
     /// Outgoing path-request frequency in Hz.
     pub fn outgoing_pr_frequency(&mut self, now: Instant) -> f64 {
-        Self::frequency(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now)
+        Self::frequency(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now, false)
     }
 
     // ------------------------------------------------------------------
@@ -387,7 +436,7 @@ impl IfaceControlState {
 
     /// Whether announces should currently be ingress limited.
     pub fn should_ingress_limit(&mut self, now: Instant) -> bool {
-        if !self.ingress_control {
+        if !self.ingress_control || !self.announce_ingress_limit {
             return false;
         }
 
@@ -399,16 +448,20 @@ impl IfaceControlState {
         let ia_freq = self.incoming_announce_frequency(now);
 
         if self.ic_burst_active {
-            if ia_freq < freq_threshold
-                && now > self.ic_burst_activated + self.params.ic_burst_hold
-                && self.ia_freq_deque.len() >= DEQUE_MIN_SAMPLE
-            {
-                self.ic_burst_active = false;
+            let hold_elapsed = now > self.ic_burst_activated + self.params.ic_burst_hold
+                && now > self.ic_burst_sustained + self.params.ic_burst_hold;
+            if ia_freq < freq_threshold && hold_elapsed {
+                if self.ia_freq_deque.len() >= DEQUE_MIN_SAMPLE {
+                    self.ic_burst_active = false;
+                }
+            } else if ia_freq >= freq_threshold {
+                self.ic_burst_sustained = now;
             }
             true
         } else if ia_freq > freq_threshold {
             self.ic_burst_active = true;
             self.ic_burst_activated = now;
+            self.ic_burst_sustained = now;
             self.ic_held_release = now + self.params.ic_burst_penalty;
             true
         } else {
@@ -431,15 +484,26 @@ impl IfaceControlState {
         let ip_freq = self.incoming_pr_frequency(now);
 
         if self.ic_pr_burst_active {
-            if ip_freq < freq_threshold
-                && now > self.ic_pr_burst_activated + self.params.ic_burst_hold
-            {
-                self.ic_pr_burst_active = false;
+            let hold_elapsed = now > self.ic_pr_burst_activated + self.params.ic_burst_hold
+                && now > self.ic_pr_burst_sustained + self.params.ic_burst_hold;
+            if ip_freq < freq_threshold && hold_elapsed {
+                if self.ic_pr_burst_cooldown == 0 {
+                    self.ic_pr_burst_active = false;
+                } else {
+                    self.ic_pr_burst_cooldown -= 1;
+                }
+            } else {
+                self.ic_pr_burst_cooldown = IC_PR_BURST_COOLDOWN;
+                if ip_freq >= freq_threshold {
+                    self.ic_pr_burst_sustained = now;
+                }
             }
             true
         } else if ip_freq > freq_threshold {
             self.ic_pr_burst_active = true;
             self.ic_pr_burst_activated = now;
+            self.ic_pr_burst_sustained = now;
+            self.ic_pr_burst_cooldown = IC_PR_BURST_COOLDOWN;
             true
         } else {
             false
@@ -453,8 +517,11 @@ impl IfaceControlState {
             return false;
         }
 
-        self.outgoing_pr_frequency(now) > self.params.ec_pr_freq
-            && self.op_freq_deque.len() >= BURST_MIN_SAMPLES
+        // Frequency is sampled first: it may drop a stale deque entry
+        // before the minimum-sample check, matching Python.
+        // `preemptive` counts the path request about to be sent.
+        let op_freq = Self::frequency(&mut self.op_freq_deque, PR_FREQ_DECAY, 1, now, true);
+        op_freq > self.params.ec_pr_freq && self.op_freq_deque.len() >= EC_BURST_MIN_SAMPLES
     }
 
     /// Hold an announce due to active ingress limiting
@@ -613,6 +680,30 @@ impl IfaceControlState {
     pub fn queued_announces_len(&self) -> usize {
         self.announce_queue.len()
     }
+
+    /// Drop every queued announce (Python `Transport.drop_announce_queues`).
+    pub fn clear_announce_queue(&mut self) {
+        self.announce_queue.clear();
+    }
+}
+
+/// Feed a new-interface announce burst and hold the next announce when
+/// `should_ingress_limit` says so. Returns how many announces were held.
+///
+/// Ten samples over half a second, scored one second after the first, is
+/// above `ic_burst_freq_new` (3 Hz) for a generic interface.
+#[cfg(test)]
+pub(crate) fn hold_announce_burst(state: &mut IfaceControlState, t0: Instant) -> usize {
+    for i in 0..10 {
+        state.received_announce(t0 + Duration::from_millis(50 * i));
+    }
+    let now = t0 + Duration::from_secs(1);
+    if state.should_ingress_limit(now) {
+        let mut packet = Packet::default();
+        packet.header.hops = 1;
+        state.hold_announce(&packet, 128);
+    }
+    state.held_announces_len()
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +774,18 @@ mod tests {
     }
 
     #[test]
+    fn disabled_announce_ingress_limit_does_not_hold_burst() {
+        let t0 = Instant::now();
+        let mut state = IfaceControlState::new(t0);
+        state.set_announce_ingress_limit(false);
+        assert_eq!(super::hold_announce_burst(&mut state, t0), 0);
+
+        // The same burst is held when the override is left at the default.
+        let mut generic = IfaceControlState::new(t0);
+        assert!(super::hold_announce_burst(&mut generic, t0) > 0);
+    }
+
+    #[test]
     fn held_announces_release_after_burst() {
         let t0 = Instant::now();
         let mut state = IfaceControlState::new(t0);
@@ -741,6 +844,63 @@ mod tests {
     }
 
     #[test]
+    fn announce_cap_fraction_waits_tx_time_over_point_zero_two() {
+        let t0 = Instant::now();
+        let mut state = IfaceControlState::new(t0);
+        assert_eq!(state.bitrate, 62_500);
+        assert_eq!(state.announce_cap, 0.02);
+
+        let packet = announce_packet(1, [2; 16], 100);
+        let size = packet_wire_len(&packet);
+        assert!(size > 0);
+
+        let tx_time = (size as f64 * 8.0) / 62_500.0;
+        let expected = Duration::from_secs_f64(tx_time / 0.02);
+        // The old integer cap (2.0) made this wait ~100× too short.
+        let integer_cap_wait = Duration::from_secs_f64(tx_time / 2.0);
+        assert!(expected > integer_cap_wait * 50);
+
+        assert!(state.try_transmit_announce(size, t0));
+        let early = expected.saturating_sub(Duration::from_millis(1));
+        assert!(early > Duration::ZERO);
+        assert!(!state.try_transmit_announce(size, t0 + early));
+        assert!(state.try_transmit_announce(size, t0 + expected));
+    }
+
+    #[test]
+    fn ingress_burst_extends_while_sustained() {
+        let t0 = Instant::now();
+        let mut state = IfaceControlState::new(t0);
+        // Past `ic_new_time`, so the steady threshold (10 Hz) applies.
+        let origin = t0 + Duration::from_secs(3 * 60 * 60);
+
+        for i in 0..12 {
+            state.received_announce(origin + Duration::from_millis(50 * i));
+        }
+        let activated = origin + Duration::from_millis(50 * 11);
+        assert!(state.should_ingress_limit(activated));
+
+        // Another burst before the hold expires refreshes `ic_burst_sustained`.
+        let sustain = activated + Duration::from_secs(10);
+        for i in 0..48 {
+            state.received_announce(sustain + Duration::from_millis(10 * i));
+        }
+        let sustained_at = sustain + Duration::from_millis(10 * 47);
+        assert!(state.should_ingress_limit(sustained_at));
+
+        // Original activation hold has elapsed, but the sustained stamp has not.
+        let still = activated + Duration::from_secs(16);
+        assert!(state.should_ingress_limit(still));
+        assert!(state.should_ingress_limit(still + Duration::from_millis(1)));
+
+        // Once the sustained hold elapses and the rate is quiet, the next
+        // call clears the burst (this call still reports limited).
+        let quiet = sustained_at + Duration::from_secs(16);
+        assert!(state.should_ingress_limit(quiet));
+        assert!(!state.should_ingress_limit(quiet + Duration::from_millis(1)));
+    }
+
+    #[test]
     fn queued_announces_dedupe_keeps_newest_emitted() {
         let t0 = Instant::now();
         let mut state = IfaceControlState::new(t0);
@@ -793,6 +953,47 @@ mod tests {
             state.sent_path_request(t0 + Duration::from_secs(2) + Duration::from_millis(10 * i));
         }
         assert!(state.should_egress_limit_pr(t0 + Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn egress_limit_requires_two_samples() {
+        let t0 = Instant::now();
+        let mut state = IfaceControlState::new(t0);
+        state.egress_control = true;
+
+        // One sample is below `EC_BURST_MIN_SAMPLES` (and the frequency floor).
+        state.sent_path_request(t0);
+        assert!(!state.should_egress_limit_pr(t0 + Duration::from_millis(10)));
+
+        // Two closely spaced samples are enough. The previous constant of 6
+        // would still refuse to limit here.
+        state.sent_path_request(t0 + Duration::from_millis(10));
+        assert!(state.should_egress_limit_pr(t0 + Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn path_request_burst_cooldown_counts_down_from_three() {
+        let t0 = Instant::now();
+        let mut state = IfaceControlState::new(t0);
+        let origin = t0 + Duration::from_secs(3 * 60 * 60);
+
+        for i in 0..12 {
+            state.received_path_request(origin + Duration::from_millis(40 * i));
+        }
+        let activated = origin + Duration::from_millis(40 * 11);
+        assert!(state.should_ingress_limit_pr(activated));
+
+        // Hold has elapsed and the rate is quiet. Cooldown starts at 3, so
+        // three quiet calls decrement it and the fourth clears the burst.
+        // Each of those calls still reports limited; the following one does not.
+        let quiet = activated + Duration::from_secs(20);
+        for step in 0..4 {
+            assert!(
+                state.should_ingress_limit_pr(quiet + Duration::from_millis(step)),
+                "quiet call {step} must stay limited while cooldown drains"
+            );
+        }
+        assert!(!state.should_ingress_limit_pr(quiet + Duration::from_millis(4)));
     }
 
     #[test]

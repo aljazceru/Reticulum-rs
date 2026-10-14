@@ -25,7 +25,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio_util::sync::CancellationToken;
 
 use crate::buffer::InputBuffer;
 use crate::buffer::OutputBuffer;
@@ -45,8 +44,37 @@ pub const SHARED_INSTANCE_PORT: u16 = 37428;
 /// `LocalClientInterface.RECONNECT_WAIT` in seconds
 pub const RECONNECT_WAIT: Duration = Duration::from_secs(8);
 
-/// `LocalClientInterface.HW_MTU`
-const HW_MTU: usize = 262144;
+/// Hardware MTU from `AUTOCONFIGURE_MTU` at 1e9 bps (`Interface.optimise_mtu`).
+pub const HW_MTU: usize = 524_288;
+
+/// `Interface.optimise_mtu` tiers. Test-only: the local interface always
+/// uses [`HW_MTU`], and a non-test copy would be dead.
+#[cfg(test)]
+const fn optimise_mtu(bitrate_bps: u64) -> Option<usize> {
+    if bitrate_bps >= 1_000_000_000 {
+        Some(524_288)
+    } else if bitrate_bps >= 750_000_000 {
+        Some(262_144)
+    } else if bitrate_bps >= 400_000_000 {
+        Some(131_072)
+    } else if bitrate_bps >= 200_000_000 {
+        Some(65_536)
+    } else if bitrate_bps >= 100_000_000 {
+        Some(32_768)
+    } else if bitrate_bps >= 10_000_000 {
+        Some(16_384)
+    } else if bitrate_bps >= 5_000_000 {
+        Some(8_192)
+    } else if bitrate_bps >= 2_000_000 {
+        Some(4_096)
+    } else if bitrate_bps >= 1_000_000 {
+        Some(2_048)
+    } else if bitrate_bps >= 62_500 {
+        Some(1_024)
+    } else {
+        None
+    }
+}
 
 /// Python ignores frames of at most `Reticulum.HEADER_MINSIZE` bytes
 /// (2 + 1 + TRUNCATED_HASHLENGTH/8 = 19).
@@ -210,6 +238,7 @@ fn parse_auth_frame(frame: &[u8]) -> Option<(String, Vec<u8>)> {
 /// of the daemon transport.
 pub struct LocalServer {
     address: SharedInstanceAddress,
+    endpoint: String,
     iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
     access: SharedInstanceAccessConfig,
 }
@@ -232,8 +261,10 @@ impl LocalServer {
         iface_manager: Arc<tokio::sync::Mutex<InterfaceManager>>,
         access: SharedInstanceAccessConfig,
     ) -> Self {
+        let endpoint = address.describe();
         Self {
             address,
+            endpoint,
             iface_manager,
             access,
         }
@@ -343,6 +374,7 @@ impl LocalServer {
         let iface_manager = context.inner.lock().unwrap().iface_manager.clone();
         let access = context.inner.lock().unwrap().access.clone();
         let stats = context.channel.stats.clone();
+        let parent = context.channel.address;
 
         let (_, tx_channel) = context.channel.split();
         let tx_channel = Arc::new(tokio::sync::Mutex::new(tx_channel));
@@ -415,8 +447,12 @@ impl LocalServer {
                         if let Some(client) = client {
                             let mut iface_manager = iface_manager.lock().await;
                             let name = client.name().to_string();
-                            let address =
-                                iface_manager.spawn(client, LocalClient::spawn);
+                            let peer_context = iface_manager.open(client);
+                            let address = peer_context.channel.address;
+                            // Parent control, including a forced shared-instance
+                            // bitrate, is copied before the client worker runs.
+                            iface_manager.copy_spawned_control(&parent, &address);
+                            iface_manager.note_spawned(&parent, &address);
                             // Surface the client's declared (or peer) name
                             // in interface statistics.
                             iface_manager.set_iface_name(&address, &name);
@@ -424,6 +460,7 @@ impl LocalServer {
                             // local client interfaces
                             // (Python `is_local_shared_instance`).
                             iface_manager.set_iface_local_client(&address);
+                            iface_manager.launch(peer_context, LocalClient::spawn);
                         }
                     }
                 }
@@ -438,6 +475,10 @@ impl LocalServer {
 impl Interface for LocalServer {
     fn mtu() -> usize {
         HW_MTU
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 }
 
@@ -492,6 +533,7 @@ impl StreamType {
 pub struct LocalClient {
     name: String,
     address: Option<SharedInstanceAddress>,
+    endpoint: String,
     stream: Option<StreamType>,
     /// Access token presented to servers that require authentication.
     auth_token: Option<Vec<u8>>,
@@ -500,9 +542,11 @@ pub struct LocalClient {
 impl LocalClient {
     /// Create a client that connects to a shared instance at `address`.
     pub fn new(name: impl Into<String>, address: SharedInstanceAddress) -> Self {
+        let endpoint = address.describe();
         Self {
             name: name.into(),
             address: Some(address),
+            endpoint,
             stream: None,
             auth_token: None,
         }
@@ -517,9 +561,11 @@ impl LocalClient {
         address: SharedInstanceAddress,
         token: Vec<u8>,
     ) -> Self {
+        let endpoint = address.describe();
         Self {
             name: name.into(),
             address: Some(address),
+            endpoint,
             stream: None,
             auth_token: Some(token),
         }
@@ -541,6 +587,7 @@ impl LocalClient {
         Self {
             name: name.into(),
             address: None,
+            endpoint: String::new(),
             stream: Some(stream),
             auth_token: None,
         }
@@ -572,6 +619,7 @@ impl LocalClient {
 
     pub async fn spawn(context: InterfaceContext<Self>) {
         let iface_stop = context.channel.stop.clone();
+        let exited = context.channel.exited.clone();
         let stats = context.channel.stats.clone();
         let iface_address = context.channel.address;
         let channel_ifac = context.channel.ifac.clone();
@@ -596,7 +644,7 @@ impl LocalClient {
         let server_side = stream.is_some();
 
         'outer: loop {
-            if context.cancel.is_cancelled() {
+            if context.cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
 
@@ -612,6 +660,7 @@ impl LocalClient {
                     tokio::select! {
                         biased;
                         _ = context.cancel.cancelled() => break,
+                        _ = iface_stop.cancelled() => break,
                         Some(_) = tx_channel.recv() => continue,
                         connected = Self::connect(target) => connected,
                     }
@@ -636,6 +685,7 @@ impl LocalClient {
                         tokio::select! {
                             biased;
                             _ = context.cancel.cancelled() => break 'outer,
+                            _ = iface_stop.cancelled() => break 'outer,
                             Some(_) = tx_channel.recv() => {}
                             _ = tokio::time::sleep_until(retry_at) => break,
                         }
@@ -645,7 +695,6 @@ impl LocalClient {
             };
 
             let cancel = context.cancel.clone();
-            let stop = CancellationToken::new();
 
             let (read_half, mut write_half) = match stream {
                 StreamType::Tcp(stream) => {
@@ -666,6 +715,9 @@ impl LocalClient {
                 let frame = encode_auth_frame(&name, token);
                 if stream_write_all(&mut write_half, &frame).await.is_err() {
                     log::debug!("local_client[{}]: authentication write failed", name);
+                    if server_side || cancel.is_cancelled() || iface_stop.is_cancelled() {
+                        break;
+                    }
                     continue;
                 }
             }
@@ -681,9 +733,9 @@ impl LocalClient {
             );
 
             // Start receive task
-            let rx_task = {
+            let mut rx_task = {
                 let cancel = cancel.clone();
-                let stop = stop.clone();
+                let iface_stop = iface_stop.clone();
                 let stats = stats.clone();
                 let rx_channel = rx_channel.clone();
                 let mut stream = read_half;
@@ -697,11 +749,10 @@ impl LocalClient {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => break,
-                            _ = stop.cancelled() => break,
+                            _ = iface_stop.cancelled() => break,
                             result = stream_read(&mut stream, &mut buffer[..]) => match result {
                                 Ok(0) => {
                                     log::debug!("local_client: connection closed");
-                                    stop.cancel();
                                     break;
                                 }
                                 Ok(n) => {
@@ -720,9 +771,10 @@ impl LocalClient {
                                                 .read()
                                                 .expect("ifac lock")
                                                 .clone();
-                                            match crate::iface::ifac::decode(
+                                            match crate::iface::ifac::decode_inbound(
                                                 &frame,
                                                 ifac.as_deref(),
+                                                Some(&stats),
                                             ) {
                                                 Some(plain) => plain,
                                                 None => {
@@ -758,7 +810,6 @@ impl LocalClient {
                                 }
                                 Err(e) => {
                                     log::debug!("local_client: connection error {}", e);
-                                    stop.cancel();
                                     break;
                                 }
                             }
@@ -768,8 +819,9 @@ impl LocalClient {
             };
 
             // Start transmit task
-            let tx_task = {
+            let mut tx_task = {
                 let cancel = cancel.clone();
+                let iface_stop = iface_stop.clone();
                 let tx_channel = tx_channel.clone();
                 let stats = stats.clone();
                 let mut stream = write_half;
@@ -781,7 +833,7 @@ impl LocalClient {
 
                         let message = tokio::select! {
                             _ = cancel.cancelled() => break,
-                            _ = stop.cancelled() => break,
+                            _ = iface_stop.cancelled() => break,
                             Some(message) = tx_channel.recv() => message,
                         };
 
@@ -809,17 +861,27 @@ impl LocalClient {
                 })
             };
 
-            tx_task.await.unwrap();
-            rx_task.await.unwrap();
+            tokio::select! {
+                _ = &mut rx_task => {
+                    tx_task.abort();
+                }
+                _ = &mut tx_task => {
+                    rx_task.abort();
+                }
+            }
+            let _ = rx_task.await;
+            let _ = tx_task.await;
 
             stats.set_online(false);
             log::debug!("local_client[{}]: disconnected", name);
 
-            if server_side {
+            // A channel stop ends the client. Do not open the socket again.
+            if server_side || cancel.is_cancelled() || iface_stop.is_cancelled() {
                 break;
             }
         }
 
+        let _ = exited.send(true);
         iface_stop.cancel();
     }
 }
@@ -827,5 +889,33 @@ impl LocalClient {
 impl Interface for LocalClient {
     fn mtu() -> usize {
         HW_MTU
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autoconfigure_mtu_at_1e9_is_524288() {
+        assert_eq!(HW_MTU, 524_288);
+        assert_eq!(optimise_mtu(1_000_000_000), Some(HW_MTU));
+        assert_eq!(<LocalClient as Interface>::mtu(), 524_288);
+        assert_eq!(<LocalServer as Interface>::mtu(), 524_288);
+
+        assert_eq!(optimise_mtu(750_000_000), Some(262_144));
+        assert_eq!(optimise_mtu(400_000_000), Some(131_072));
+        assert_eq!(optimise_mtu(200_000_000), Some(65_536));
+        assert_eq!(optimise_mtu(100_000_000), Some(32_768));
+        assert_eq!(optimise_mtu(10_000_000), Some(16_384));
+        assert_eq!(optimise_mtu(5_000_000), Some(8_192));
+        assert_eq!(optimise_mtu(2_000_000), Some(4_096));
+        assert_eq!(optimise_mtu(1_000_000), Some(2_048));
+        assert_eq!(optimise_mtu(62_500), Some(1_024));
+        assert_eq!(optimise_mtu(62_499), None);
     }
 }

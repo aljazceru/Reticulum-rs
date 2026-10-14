@@ -101,6 +101,8 @@ async fn send_file_over_udp_loopback() {
         silent: true,
         identity_path: None,
         udp_loopback: None,
+        quiet: false,
+        phy_rates: false,
     })
     .await
     .expect("transfer");
@@ -154,6 +156,8 @@ async fn send_split_file_over_udp_loopback() {
         silent: true,
         identity_path: None,
         udp_loopback: None,
+        quiet: false,
+        phy_rates: false,
     })
     .await
     .expect("split transfer");
@@ -211,6 +215,9 @@ async fn fetch_file_over_udp_loopback() {
         save_dir: Some(save_dir.clone()),
         identity_path: None,
         udp_loopback: None,
+        quiet: false,
+        phy_rates: false,
+        allow_overwrite: false,
     })
     .await
     .expect("fetch");
@@ -266,6 +273,8 @@ async fn unauthenticated_sender_is_rejected() {
         silent: true,
         identity_path: None,
         udp_loopback: None,
+        quiet: false,
+        phy_rates: false,
     })
     .await;
 
@@ -277,4 +286,92 @@ async fn unauthenticated_sender_is_rejected() {
 
     shutdown.cancel();
     let _ = serve_task.await;
+}
+
+#[test]
+fn overwrite_refuses_to_replace_an_existing_file() {
+    let dir = temp_dir("overwrite-refuse");
+    let existing = dir.join("payload.bin");
+    std::fs::write(&existing, b"keep-me").unwrap();
+
+    let refused = rncp::receive_path(&dir, "payload.bin", false);
+    assert_ne!(refused, existing);
+    std::fs::write(&refused, b"new-bytes").unwrap();
+    assert_eq!(std::fs::read(&existing).unwrap(), b"keep-me");
+
+    let replaced = rncp::receive_path(&dir, "payload.bin", true);
+    assert_eq!(replaced, existing);
+    assert!(!existing.exists());
+    std::fs::write(&replaced, b"replaced").unwrap();
+    assert_eq!(std::fs::read(&existing).unwrap(), b"replaced");
+}
+
+#[test]
+fn quiet_suppresses_progress() {
+    let shown = rncp::progress_line(
+        false,
+        false,
+        "Transferring file",
+        40.0,
+        400,
+        1000,
+        8000.0,
+        Some(16000.0),
+    )
+    .expect("progress");
+    assert!(shown.contains("physical layer"), "{shown}");
+    assert!(rncp::progress_line(
+        true,
+        false,
+        "Transferring file",
+        40.0,
+        400,
+        1000,
+        8000.0,
+        Some(16000.0)
+    )
+    .is_none());
+    assert!(rncp::progress_line(
+        false,
+        true,
+        "Transferring file",
+        40.0,
+        400,
+        1000,
+        8000.0,
+        None
+    )
+    .is_none());
+    let plain = rncp::progress_line(
+        false,
+        false,
+        "Transferring file",
+        40.0,
+        400,
+        1000,
+        8000.0,
+        None,
+    )
+    .unwrap();
+    assert!(!plain.contains("physical layer"), "{plain}");
+}
+
+#[test]
+fn allowed_identities_file_is_loaded() {
+    let dir = temp_dir("allowed-file");
+    let first = dir.join("allowed_identities");
+    let skipped = dir.join("later");
+    let hash = "00112233445566778899aabbccddeeff";
+    std::fs::write(&first, format!("# note\n{hash}\nshort\n")).unwrap();
+    std::fs::write(&skipped, "ffffffffffffffffffffffffffffffff\n").unwrap();
+    let loaded = rncp::load_allowed_identities_at(&[first, skipped]).expect("allowed file");
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        loaded[0],
+        reticulum_utils::common::parse_hash(hash).unwrap()
+    );
+    let paths = rncp::default_allowed_identity_paths();
+    assert!(paths
+        .iter()
+        .any(|path| path.ends_with(".rncp/allowed_identities")));
 }

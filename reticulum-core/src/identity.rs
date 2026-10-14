@@ -456,7 +456,7 @@ impl PrivateIdentity {
     /// (Python `Identity.decrypt`).
     ///
     /// The supplied `ratchets` are private ratchet keys of this identity,
-    /// tried newest-first before falling back to the static identity key.
+    /// tried in order before falling back to the static identity key.
     /// The HKDF salt is always the identity hash.
     pub fn decrypt<'a>(
         &self,
@@ -464,6 +464,25 @@ impl PrivateIdentity {
         ratchets: &[[u8; RATCHET_KEY_LENGTH]],
         out_buf: &'a mut [u8],
     ) -> Result<&'a [u8], RnsError> {
+        self.decrypt_ratchet(data, ratchets, false, out_buf)
+            .map(|(plaintext, _ratchet_id)| plaintext)
+    }
+
+    /// Decrypt like [`PrivateIdentity::decrypt`] and report which ratchet
+    /// worked.
+    ///
+    /// The ratchet id is the truncated hash of that ratchet's public key
+    /// (Python `Identity._get_ratchet_id`). It is `None` when the static
+    /// identity key was used. When `enforce_ratchets` is set, a token that
+    /// no supplied ratchet can open is rejected instead of falling through
+    /// to the static key (Python `enforce_ratchets=True`).
+    pub fn decrypt_ratchet<'a>(
+        &self,
+        data: &[u8],
+        ratchets: &[[u8; RATCHET_KEY_LENGTH]],
+        enforce_ratchets: bool,
+        out_buf: &'a mut [u8],
+    ) -> Result<(&'a [u8], Option<[u8; RATCHET_ID_LENGTH]>), RnsError> {
         if data.len() <= RATCHET_KEY_LENGTH {
             return Err(RnsError::InvalidArgument);
         }
@@ -473,31 +492,35 @@ impl PrivateIdentity {
         let peer_public_key = PublicKey::from(peer_bytes);
         let ciphertext = &data[RATCHET_KEY_LENGTH..];
 
-        let mut plain_text = None;
-
         for ratchet in ratchets {
             let ratchet_key = StaticSecret::from(*ratchet);
             let shared_key = ratchet_key.diffie_hellman(&peer_public_key);
             let derived_key =
                 DerivedKey::new(&shared_key, Some(self.identity.address_hash.as_slice()));
 
-            if let Ok(decrypted) = self.decrypt_token(&derived_key, ciphertext, &mut *out_buf) {
-                plain_text = Some(decrypted.len());
-                break;
+            let len = self
+                .decrypt_token(&derived_key, ciphertext, &mut *out_buf)
+                .map(|plain| plain.len())
+                .ok();
+            if let Some(len) = len {
+                let public = ratchet_public_from_private(ratchet);
+                let id_hash = ratchet_id(&public);
+                let mut id = [0u8; RATCHET_ID_LENGTH];
+                id.copy_from_slice(&id_hash.as_slice()[..RATCHET_ID_LENGTH]);
+                return Ok((&out_buf[..len], Some(id)));
             }
         }
 
-        if plain_text.is_none() {
-            let shared_key = self.private_key.diffie_hellman(&peer_public_key);
-            let derived_key =
-                DerivedKey::new(&shared_key, Some(self.identity.address_hash.as_slice()));
-
-            let decrypted = self.decrypt_token(&derived_key, ciphertext, &mut *out_buf)?;
-            plain_text = Some(decrypted.len());
+        if enforce_ratchets {
+            return Err(RnsError::CryptoError);
         }
 
-        let len = plain_text.unwrap_or(0);
-        Ok(&out_buf[..len])
+        let shared_key = self.private_key.diffie_hellman(&peer_public_key);
+        let derived_key = DerivedKey::new(&shared_key, Some(self.identity.address_hash.as_slice()));
+        let len = self
+            .decrypt_token(&derived_key, ciphertext, &mut *out_buf)?
+            .len();
+        Ok((&out_buf[..len], None))
     }
 
     fn decrypt_token<'a>(
@@ -701,6 +724,30 @@ pub struct KnownDestinationData {
     /// Announce app data (`None` when the announce carried none).
     pub app_data: Option<Vec<u8>>,
     pub uses: DestinationUses,
+}
+
+/// Recall a known destination (Python `Identity.recall`).
+///
+/// `target_hash` is a destination hash unless `from_identity_hash` is set,
+/// in which case it is an identity hash (truncated SHA-256 of the raw
+/// `x25519 || ed25519` public key, the same value as
+/// [`Identity::address_hash`]) and the first matching entry in iteration
+/// order is returned.
+pub fn recall<'a>(
+    entries: &'a [(AddressHash, KnownDestinationData)],
+    target_hash: &AddressHash,
+    from_identity_hash: bool,
+) -> Option<(&'a AddressHash, &'a KnownDestinationData)> {
+    if from_identity_hash {
+        return entries.iter().find_map(|(destination_hash, entry)| {
+            (AddressHash::new_from_slice(&entry.public_key) == *target_hash)
+                .then_some((destination_hash, entry))
+        });
+    }
+
+    entries
+        .iter()
+        .find_map(|(hash, entry)| (hash == target_hash).then_some((hash, entry)))
 }
 
 /// Pack a known-destinations map exactly like Python
@@ -1187,6 +1234,7 @@ mod tests {
     use super::PrivateIdentity;
 
     #[test]
+    #[cfg(feature = "std")]
     fn private_identity_hex_string() {
         let original_id = PrivateIdentity::new_from_rand(OsRng);
         let original_hex = original_id.to_hex_string();
@@ -1202,6 +1250,95 @@ mod tests {
         assert_eq!(
             actual_id.sign_key.as_bytes(),
             original_id.sign_key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn recall_from_identity_hash_matches_public_key() {
+        use crate::hash::{AddressHash, HASH_SIZE};
+
+        use super::{DestinationUses, KnownDestinationData, recall};
+
+        let identity = PrivateIdentity::new_from_name("recall-by-identity");
+        let other = PrivateIdentity::new_from_name("recall-other");
+        let destination_hash = AddressHash::new_from_slice(b"destination-not-identity");
+        let entries = [(
+            destination_hash,
+            KnownDestinationData {
+                time: 1.0,
+                packet_hash: [7u8; HASH_SIZE],
+                public_key: identity.as_identity().to_bytes(),
+                app_data: Some(alloc::vec![1, 2, 3]),
+                uses: DestinationUses::Never,
+            },
+        )];
+
+        let (found_hash, found) =
+            recall(&entries, identity.address_hash(), true).expect("identity hash");
+        assert_eq!(found_hash, &destination_hash);
+        assert_eq!(found.public_key, identity.as_identity().to_bytes());
+
+        assert!(recall(&entries, other.address_hash(), true).is_none());
+        assert!(recall(&entries, identity.address_hash(), false).is_none());
+        assert!(recall(&entries, &destination_hash, false).is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "std")]
+    fn enforced_ratchets_reject_static_key_and_report_id() {
+        use super::{RATCHET_ID_LENGTH, generate_ratchet, ratchet_id, ratchet_public_from_private};
+
+        let identity = PrivateIdentity::new_from_name("ratchet-enforce");
+        let public = *identity.as_identity();
+        let ratchet = generate_ratchet(rand_core::OsRng);
+        let ratchet_public = ratchet_public_from_private(&ratchet);
+        let expected_id = {
+            let hash = ratchet_id(&ratchet_public);
+            let mut id = [0u8; RATCHET_ID_LENGTH];
+            id.copy_from_slice(&hash.as_slice()[..RATCHET_ID_LENGTH]);
+            id
+        };
+
+        let plaintext = b"ratchet or static";
+        let mut token_buf = [0u8; 512];
+        let static_token = public
+            .encrypt(rand_core::OsRng, plaintext, None, &mut token_buf)
+            .expect("static encrypt")
+            .to_vec();
+
+        let mut ratchet_buf = [0u8; 512];
+        let ratchet_token = public
+            .encrypt(
+                rand_core::OsRng,
+                plaintext,
+                Some(&super::PublicKey::from(ratchet_public)),
+                &mut ratchet_buf,
+            )
+            .expect("ratchet encrypt")
+            .to_vec();
+
+        let mut out = [0u8; 512];
+        let (plain, id) = identity
+            .decrypt_ratchet(&static_token, &[], false, &mut out)
+            .expect("static key");
+        assert_eq!(plain, plaintext);
+        assert!(id.is_none());
+
+        let (plain, id) = identity
+            .decrypt_ratchet(&ratchet_token, &[ratchet], false, &mut out)
+            .expect("ratchet key");
+        assert_eq!(plain, plaintext);
+        assert_eq!(id, Some(expected_id));
+
+        assert!(
+            identity
+                .decrypt_ratchet(&static_token, &[ratchet], true, &mut out)
+                .is_err()
+        );
+        assert!(
+            identity
+                .decrypt_ratchet(&static_token, &[], true, &mut out)
+                .is_err()
         );
     }
 }

@@ -14,7 +14,7 @@ use tokio::io::AsyncWriteExt;
 use rand_core::OsRng;
 use reticulum::destination::{DestinationName, SingleInputDestination};
 use reticulum::identity::PrivateIdentity;
-use reticulum::iface::ifac::{IfacKey, DEFAULT_IFAC_SIZE};
+use reticulum::iface::ifac::{IfacKey, DEFAULT_IFAC_SIZE, SERIAL_FAMILY_IFAC_SIZE};
 use reticulum::iface::tcp_client::TcpClient;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::TransportConfig;
@@ -22,7 +22,10 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 const PASSPHRASE: &str = "interop-secret";
-const IFAC_BYTES: usize = 8; // python config `ifac_size = 64` bits
+// Python partner `tests/rns-py-configs/tcp-ifac/config` hardcodes
+// `ifac_size = 64` bits. Both sides stay on that explicit size rather
+// than the omitted-size default of 16 bytes.
+const IFAC_BYTES: usize = 8;
 
 fn python_dir() -> String {
     std::env::var("RETICULUM_TEST_PYTHON_DIR")
@@ -99,6 +102,10 @@ async fn ifac_protected_tcp_exchange_with_python() {
     .await
     .expect("python announce example ready");
 
+    // Explicit partner size, not the omitted-size default.
+    assert_eq!(IFAC_BYTES, 64 / 8);
+    assert_ne!(IFAC_BYTES, DEFAULT_IFAC_SIZE);
+
     // Rust TCP client with the same access code.
     let transport =
         TransportConfig::new("ifac-client", &PrivateIdentity::new_from_rand(OsRng)).build();
@@ -163,6 +170,10 @@ async fn ifac_protected_tcp_exchange_with_python() {
 
 #[tokio::test]
 async fn ifac_rejects_packets_without_the_passphrase() {
+    // An omitted `ifac_size` is Python `Interface.DEFAULT_IFAC_SIZE`.
+    assert_eq!(DEFAULT_IFAC_SIZE, 16);
+    assert_eq!(SERIAL_FAMILY_IFAC_SIZE, 8);
+
     // A UDP pair where the receiver expects an access code but the sender
     // does not apply one: the packets must be dropped.
     let receiver =

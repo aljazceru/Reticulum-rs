@@ -1,6 +1,8 @@
 //! Resource transfer tests: unit tests for wire formats (against Python
 //! golden vectors) and end-to-end loopback transfers over a local link.
 
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +17,8 @@ use reticulum::iface::udp::UdpInterface;
 use reticulum::resource::manager::RequestEvent;
 use reticulum::resource::{
     self, advertisement::ResourceAdvertisement, msgpack_bin, pack_response, request_id,
-    unpack_request, unpack_response, ResourceOptions, ResourceStatus, ResourceStrategy,
+    unpack_request, unpack_response, RequestAllow, RequestHandlerConfig, RequestOptions,
+    RequestResponse, ResourceOptions, ResourceStatus, ResourceStrategy,
 };
 use reticulum::transport::{Transport, TransportConfig};
 
@@ -700,4 +703,609 @@ async fn interface_stats_for_link_resolves_the_links_interface() {
         .interface_stats_for_link(AddressHash::new([0x0e; 16]))
         .await
         .is_none());
+}
+
+async fn dest_hash(server: &Transport, link: &Arc<Mutex<Link>>) -> AddressHash {
+    let destination = server
+        .get_in_destination(&link.lock().await.destination().address_hash)
+        .await
+        .expect("destination");
+    let hash = destination.lock().await.desc.address_hash;
+    hash
+}
+
+#[tokio::test]
+async fn request_response_emits_progress() {
+    let (server, client, link) = connected_pair(4811, 4812).await;
+    let dest_hash = dest_hash(&server, &link).await;
+
+    // Incompressible so the response stays a multi-part resource. A
+    // payload that bz2 shrinks under the link MDU would be one packet
+    // and would never report resource progress.
+    let payload = incompressible(48 * 1024, 0x0A1_1CE);
+    let response_payload = payload.clone();
+    server
+        .register_request_handler(&dest_hash, "progress", move |_ctx| {
+            Some(msgpack_bin(&response_payload))
+        })
+        .await;
+
+    let mut request_events = client.request_events().await;
+    let rid = client
+        .request(&link, "progress", b"go")
+        .await
+        .expect("request");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut saw_progress = false;
+    let mut response = None;
+    while tokio::time::Instant::now() < deadline && response.is_none() {
+        match tokio::time::timeout_at(deadline, request_events.recv()).await {
+            Ok(Ok(event)) => match event.event {
+                RequestEvent::Progress {
+                    request_id,
+                    progress,
+                } if request_id == rid && progress > 0.0 => {
+                    saw_progress = true;
+                }
+                RequestEvent::Response {
+                    request_id, data, ..
+                } if request_id == rid => {
+                    response = Some(data);
+                }
+                RequestEvent::Failed { request_id } if request_id == rid => {
+                    panic!("progress request failed");
+                }
+                _ => {}
+            },
+            // The broadcast retains 64 events; a fast transfer overruns it.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(err)) => panic!("request event channel closed: {err}"),
+            Err(_) => break,
+        }
+    }
+    assert!(saw_progress, "expected RequestEvent::Progress above 0");
+    assert_eq!(response.as_deref(), Some(payload.as_slice()));
+}
+
+#[tokio::test]
+async fn request_allow_list_requires_an_identified_peer() {
+    let (server, client, link) = connected_pair(4821, 4822).await;
+    let dest_hash = dest_hash(&server, &link).await;
+    let allowed = PrivateIdentity::new_from_rand(OsRng);
+    let stranger = PrivateIdentity::new_from_rand(OsRng);
+
+    server
+        .register_request_handler_with_config(
+            &dest_hash,
+            "secret",
+            RequestHandlerConfig {
+                allow: RequestAllow::List,
+                allowed_list: vec![*allowed.address_hash()],
+                ..Default::default()
+            },
+            |_ctx| Some(RequestResponse::Element(msgpack_bin(b"ok"))),
+        )
+        .await;
+    server
+        .register_request_handler_with_config(
+            &dest_hash,
+            "other",
+            RequestHandlerConfig {
+                allow: RequestAllow::List,
+                allowed_list: vec![*stranger.address_hash()],
+                ..Default::default()
+            },
+            |_ctx| Some(RequestResponse::Element(msgpack_bin(b"no"))),
+        )
+        .await;
+    server
+        .register_request_handler_with_config(
+            &dest_hash,
+            "closed",
+            RequestHandlerConfig {
+                allow: RequestAllow::None,
+                ..Default::default()
+            },
+            |_ctx| Some(RequestResponse::Element(msgpack_bin(b"no"))),
+        )
+        .await;
+
+    let denied = client
+        .request(&link, "secret", b"x")
+        .await
+        .expect("request");
+    assert!(client
+        .await_request_response(denied, Duration::from_millis(800))
+        .await
+        .is_none());
+
+    let packet = link.lock().await.identify(&allowed).expect("identify");
+    client.send_packet(packet).await;
+
+    let link_id = *link.lock().await.id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peer never identified"
+        );
+        if let Some(inbound) = server.find_in_link(&link_id).await {
+            if inbound.lock().await.remote_identity().is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let rid = client
+        .request(&link, "secret", b"x")
+        .await
+        .expect("request");
+    let response = client
+        .await_request_response(rid, Duration::from_secs(5))
+        .await;
+    assert_eq!(response, Some(b"ok".to_vec()));
+
+    // A hash that is not the identified peer, and ALLOW_NONE, stay silent
+    // after the same identify. A link accepts one identity.
+    for path in ["other", "closed"] {
+        let rid = client.request(&link, path, b"x").await.expect("request");
+        assert!(
+            client
+                .await_request_response(rid, Duration::from_millis(800))
+                .await
+                .is_none(),
+            "{path} responded"
+        );
+    }
+}
+
+#[tokio::test]
+async fn file_backed_resource_roundtrip() {
+    let (server, client, link) = connected_pair(4831, 4832).await;
+    let link_id = *link.lock().await.id();
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
+    let mut resource_events = server.resource_events().await;
+    let mut sender_events = client.resource_events().await;
+
+    let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+    let path = std::env::temp_dir().join(format!(
+        "reticulum-resource-test-{}-file",
+        std::process::id()
+    ));
+    std::fs::write(&path, &payload).expect("write file");
+    let file_hash = client
+        .send_resource_from_path(&link, &path, ResourceOptions::default())
+        .await
+        .expect("send file");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut received = None;
+    while tokio::time::Instant::now() < deadline {
+        let event = tokio::time::timeout_at(deadline, resource_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.status == ResourceStatus::Complete {
+            if let Some(data) = event.data {
+                received = Some(data);
+                break;
+            }
+        }
+    }
+    assert_eq!(received.as_deref(), Some(payload.as_slice()));
+    let _ = std::fs::remove_file(&path);
+
+    // The next transfer is queued until this one is proven. Wait for the
+    // sender so the stream is advertised immediately.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "sender did not finish the file"
+        );
+        let event = tokio::time::timeout_at(deadline, sender_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.hash == file_hash && event.status == ResourceStatus::Complete {
+            break;
+        }
+    }
+
+    let stream_payload = b"streamed-not-seekable".to_vec();
+    let reader = OwnedReader {
+        data: stream_payload.clone(),
+        pos: 0,
+    };
+    client
+        .send_resource_from_read(&link, reader, ResourceOptions::default())
+        .await
+        .expect("send stream");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut received = None;
+    while tokio::time::Instant::now() < deadline {
+        let event = tokio::time::timeout_at(deadline, resource_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.status == ResourceStatus::Complete
+            && event.data.as_deref() == Some(stream_payload.as_slice())
+        {
+            received = event.data;
+            break;
+        }
+    }
+    assert_eq!(received.as_deref(), Some(stream_payload.as_slice()));
+}
+
+#[tokio::test]
+async fn file_response_is_not_msgpack_wrapped() {
+    let (server, client, link) = connected_pair(4833, 4834).await;
+    let dest_hash = dest_hash(&server, &link).await;
+
+    let payload = vec![0x5A; 16 * 1024];
+    let metadata = b"file-meta".to_vec();
+    let path = std::env::temp_dir().join(format!(
+        "reticulum-resource-test-{}-response",
+        std::process::id()
+    ));
+    std::fs::write(&path, &payload).expect("write file");
+    let handler_path = path.clone();
+    let handler_meta = metadata.clone();
+    server
+        .register_request_handler_with_config(
+            &dest_hash,
+            "file",
+            RequestHandlerConfig::default(),
+            move |_ctx| {
+                Some(RequestResponse::File {
+                    path: handler_path.clone(),
+                    metadata: Some(handler_meta.clone()),
+                })
+            },
+        )
+        .await;
+
+    let mut request_events = client.request_events().await;
+    let rid = client
+        .request(&link, "file", b"get")
+        .await
+        .expect("request");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut got = None;
+    while tokio::time::Instant::now() < deadline && got.is_none() {
+        match tokio::time::timeout_at(deadline, request_events.recv()).await {
+            Ok(Ok(event)) => match event.event {
+                RequestEvent::Response {
+                    request_id,
+                    data,
+                    metadata,
+                } if request_id == rid => {
+                    got = Some((data, metadata));
+                }
+                RequestEvent::Failed { request_id } if request_id == rid => {
+                    panic!("file response failed");
+                }
+                _ => {}
+            },
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(err)) => panic!("request event channel closed: {err}"),
+            Err(_) => break,
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    let (data, meta) = got.expect("file response");
+    assert_eq!(data, payload);
+    assert_eq!(meta, Some(metadata));
+    // A wrapped `[request_id, bytes]` element would unpack. The file
+    // bytes are the response itself.
+    assert!(unpack_response(&data).is_none());
+}
+
+/// Reads are counted. Seeks, including the length probe, are not: Python
+/// discovers a file's size with `seek` and only then reads a segment.
+struct CountingReader {
+    len: u64,
+    pos: u64,
+    read_bytes: Arc<AtomicUsize>,
+}
+
+impl Read for CountingReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let n = buf.len().min((self.len - self.pos) as usize);
+        buf[..n].fill(0);
+        self.pos += n as u64;
+        self.read_bytes.fetch_add(n, Ordering::SeqCst);
+        Ok(n)
+    }
+}
+
+impl Seek for CountingReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let next = match pos {
+            SeekFrom::Start(offset) => offset,
+            SeekFrom::End(delta) => {
+                if delta >= 0 {
+                    self.len + delta as u64
+                } else {
+                    self.len.saturating_sub(delta.unsigned_abs())
+                }
+            }
+            SeekFrom::Current(delta) => {
+                if delta >= 0 {
+                    self.pos + delta as u64
+                } else {
+                    self.pos.saturating_sub(delta.unsigned_abs())
+                }
+            }
+        };
+        self.pos = next;
+        Ok(self.pos)
+    }
+}
+
+struct OwnedReader {
+    data: Vec<u8>,
+    pos: usize,
+}
+
+impl Read for OwnedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.data.len() {
+            return Ok(0);
+        }
+        let n = (self.data.len() - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+#[tokio::test]
+async fn file_backed_transfer_reads_one_segment_before_advertise() {
+    let (_server, client, link) = connected_pair(4835, 4836).await;
+    // Default strategy ignores the advertisement, so the sender cannot be
+    // pulled into segment 2 before this assertion runs.
+    let total = resource::MAX_EFFICIENT_SIZE + 4096;
+    let read_bytes = Arc::new(AtomicUsize::new(0));
+    let reader = CountingReader {
+        len: total as u64,
+        pos: 0,
+        read_bytes: read_bytes.clone(),
+    };
+    client
+        .send_resource_from_reader(
+            &link,
+            reader,
+            ResourceOptions {
+                auto_compress: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("send reader");
+
+    let read = read_bytes.load(Ordering::SeqCst);
+    assert_eq!(read, resource::MAX_EFFICIENT_SIZE);
+    assert!(read < total);
+}
+
+#[tokio::test]
+async fn per_request_timeout_ignores_a_late_response() {
+    let (server, client, link) = connected_pair(4841, 4842).await;
+    let dest_hash = dest_hash(&server, &link).await;
+    server
+        .register_async_request_handler(&dest_hash, "slow", |_ctx| async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Some(msgpack_bin(b"late"))
+        })
+        .await;
+
+    let mut request_events = client.request_events().await;
+    let rid = client
+        .request_with_options(
+            &link,
+            "slow",
+            b"x",
+            RequestOptions {
+                timeout: Some(0.4),
+                max_response_size: None,
+            },
+        )
+        .await
+        .expect("request");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_failed = false;
+    let mut saw_response = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, request_events.recv()).await {
+            Ok(Ok(event)) => match event.event {
+                RequestEvent::Failed { request_id } if request_id == rid => {
+                    saw_failed = true;
+                }
+                RequestEvent::Response { request_id, .. } if request_id == rid => {
+                    saw_response = true;
+                    break;
+                }
+                _ => {}
+            },
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(saw_failed, "request did not fail when its timeout elapsed");
+    assert!(!saw_response, "late response was delivered");
+}
+
+#[tokio::test]
+async fn per_request_timeout_ignores_a_late_resource_response() {
+    let (server, client, link) = connected_pair(4871, 4872).await;
+    let dest_hash = dest_hash(&server, &link).await;
+    // Larger than the link MDU and incompressible, so the response is a
+    // resource rather than a single RESPONSE packet.
+    let payload = incompressible(48 * 1024, 0x0A1_1CF);
+    server
+        .register_async_request_handler(&dest_hash, "slowres", move |_ctx| {
+            let payload = payload.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Some(msgpack_bin(&payload))
+            }
+        })
+        .await;
+
+    let mut request_events = client.request_events().await;
+    let rid = client
+        .request_with_options(
+            &link,
+            "slowres",
+            b"x",
+            RequestOptions {
+                timeout: Some(0.4),
+                max_response_size: None,
+            },
+        )
+        .await
+        .expect("request");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_failed = false;
+    let mut saw_response = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, request_events.recv()).await {
+            Ok(Ok(event)) => match event.event {
+                RequestEvent::Failed { request_id } if request_id == rid => {
+                    saw_failed = true;
+                }
+                RequestEvent::Response { request_id, .. } if request_id == rid => {
+                    saw_response = true;
+                    break;
+                }
+                _ => {}
+            },
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        saw_failed,
+        "resource request did not fail when its timeout elapsed"
+    );
+    assert!(!saw_response, "late resource response was delivered");
+}
+
+#[tokio::test]
+async fn per_request_max_response_size_is_enforced() {
+    let (server, client, link) = connected_pair(4851, 4852).await;
+    let dest_hash = dest_hash(&server, &link).await;
+    server
+        .register_request_handler(&dest_hash, "sized", |_ctx| Some(msgpack_bin(b"hello")))
+        .await;
+
+    // bin8 of 5 bytes is reported as 5 (`len(packb(response)) - 2`).
+    let too_big = client
+        .request_with_options(
+            &link,
+            "sized",
+            b"x",
+            RequestOptions {
+                timeout: None,
+                max_response_size: Some(4),
+            },
+        )
+        .await
+        .expect("request");
+    assert!(client
+        .await_request_response(too_big, Duration::from_secs(3))
+        .await
+        .is_none());
+
+    let fits = client
+        .request_with_options(
+            &link,
+            "sized",
+            b"x",
+            RequestOptions {
+                timeout: None,
+                max_response_size: Some(16),
+            },
+        )
+        .await
+        .expect("request");
+    assert_eq!(
+        client
+            .await_request_response(fits, Duration::from_secs(5))
+            .await,
+        Some(b"hello".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn auto_compress_limit_is_the_original_input_size() {
+    let (server, client, link) = connected_pair(4861, 4862).await;
+    let link_id = *link.lock().await.id();
+    server
+        .set_resource_strategy(link_id, ResourceStrategy::All)
+        .await;
+
+    let payload = vec![0xAB; 8 * 1024];
+    let mut client_events = client.resource_events().await;
+    client
+        .send_resource_with_options(
+            &link,
+            payload.clone(),
+            ResourceOptions {
+                auto_compress: true,
+                auto_compress_limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("send");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut limited = None;
+    while tokio::time::Instant::now() < deadline {
+        let event = tokio::time::timeout_at(deadline, client_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.status == ResourceStatus::Complete {
+            if let Some(adv) = event.advertisement {
+                limited = Some(adv.compressed());
+                break;
+            }
+        }
+    }
+    // The segment is 8 KiB, but Python compares the original input to the
+    // integer limit, so this transfer must stay uncompressed.
+    assert_eq!(limited, Some(false));
+
+    client
+        .send_resource_with_options(&link, payload, ResourceOptions::default())
+        .await
+        .expect("send");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut default_compressed = None;
+    while tokio::time::Instant::now() < deadline {
+        let event = tokio::time::timeout_at(deadline, client_events.recv())
+            .await
+            .expect("timeout")
+            .expect("channel");
+        if event.status == ResourceStatus::Complete {
+            if let Some(adv) = event.advertisement {
+                default_compressed = Some(adv.compressed());
+                break;
+            }
+        }
+    }
+    assert_eq!(default_compressed, Some(cfg!(feature = "bz2")));
 }

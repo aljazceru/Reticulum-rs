@@ -43,13 +43,17 @@ impl AnnounceEntry {
         // the entry waits out a random window (`PATHFINDER_RW`), sends,
         // then retries once more after `PATHFINDER_G + PATHFINDER_RW`,
         // completing once retries exceed `PATHFINDER_R`.
+        // Python's announce-table job completes an entry when
+        // `retries > PATHFINDER_R` before considering the timeout, and a
+        // due entry always transmits: the retry count is incremented
+        // after sending, never before deciding whether to send.
+        if self.retries > PATHFINDER_R {
+            return None;
+        }
         if Instant::now() < self.timeout {
             return None;
         }
         self.retries += 1;
-        if self.retries > PATHFINDER_R {
-            return None;
-        }
         self.timeout = Instant::now() + PATHFINDER_GRACE + PATHFINDER_RANDOM_WINDOW;
         Some(self.always_retransmit(transport_id))
     }
@@ -128,7 +132,10 @@ impl AnnounceCache {
 
 pub struct AnnounceTable {
     map: BTreeMap<AddressHash, AnnounceEntry>,
-    responses: BTreeMap<AddressHash, AnnounceEntry>,
+    /// One path response per requesting interface. Keyed by
+    /// `(destination, iface)` so a second requestor does not replace
+    /// the first.
+    responses: BTreeMap<(AddressHash, AddressHash), AnnounceEntry>,
     cache: AnnounceCache,
 }
 
@@ -182,7 +189,24 @@ impl AnnounceTable {
         response.timeout = Instant::now() + grace;
         response.response_to_iface = Some(to_iface);
 
-        self.responses.insert(destination, response);
+        self.responses.insert((destination, to_iface), response);
+    }
+
+    fn response_pending(&self, destination: &AddressHash) -> bool {
+        self.responses.keys().any(|(dest, _)| dest == destination)
+    }
+
+    /// Drop every announce and path response (shared-instance disconnect).
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.responses.clear();
+        self.cache.newer = Some(BTreeMap::new());
+        self.cache.older = None;
+    }
+
+    /// Drop path responses aimed at `iface`.
+    pub fn drop_responses_to(&mut self, iface: &AddressHash) {
+        self.responses.retain(|(_, to), _| to != iface);
     }
 
     pub fn add_response(
@@ -227,15 +251,20 @@ impl AnnounceTable {
     pub fn tx_to_retransmit(&mut self, transport_id: &AddressHash) -> Vec<TxMessage> {
         let mut messages = vec![];
         let mut completed = vec![];
+        // Snapshot first: `map` is borrowed mutably for the retransmit pass.
+        let pending: Vec<AddressHash> = self.responses.keys().map(|(dest, _)| *dest).collect();
 
-        for (destination, ref mut entry) in &mut self.map {
-            if self.responses.contains_key(destination) {
+        for (destination, entry) in &mut self.map {
+            if pending.iter().any(|dest| dest == destination) {
                 continue;
             }
 
             if let Some(message) = entry.retransmit(transport_id) {
                 messages.push(message);
-            } else {
+            } else if entry.retries > PATHFINDER_R {
+                // `retransmit` also returns `None` while an entry is
+                // simply not due yet; only exhausted entries complete
+                // (Python pops the entry when `retries > PATHFINDER_R`).
                 completed.push(*destination);
             }
         }
@@ -246,17 +275,17 @@ impl AnnounceTable {
         // tick actually retransmits them (Python keeps the announce-table
         // entry until `IDX_AT_RTRNS_TMO` passes and it is sent).
         let mut sent = vec![];
-        for (destination, entry) in self.responses.iter_mut() {
+        for (key, entry) in self.responses.iter_mut() {
             if let Some(message) = entry.retransmit(transport_id) {
                 messages.push(message);
-                sent.push(*destination);
+                sent.push(*key);
             }
         }
 
         let n_responses = messages.len() - n_announces;
 
-        for destination in sent {
-            self.responses.remove(&destination); // each response is retransmitted once
+        for key in sent {
+            self.responses.remove(&key); // each response is retransmitted once
         }
 
         if !(messages.is_empty() && completed.is_empty()) {
@@ -282,7 +311,7 @@ impl AnnounceTable {
 
         if let Some(ref cache) = self.cache.newer {
             for (destination, entry) in cache {
-                if self.responses.contains_key(destination) {
+                if self.response_pending(destination) {
                     continue;
                 }
 
@@ -292,7 +321,7 @@ impl AnnounceTable {
 
         if let Some(ref cache) = self.cache.older {
             for (destination, entry) in cache {
-                if self.responses.contains_key(destination) {
+                if self.response_pending(destination) {
                     continue;
                 }
 

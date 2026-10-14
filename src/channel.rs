@@ -4,7 +4,8 @@
 //! reliable delivery of messages. Each message that is sent through a [Channel]
 //! is answered with a receipt, so the sender knows it has been delivered.
 //!
-//! If the receipt does not arrive in time, the message is sent again.
+//! If the receipt does not arrive in time, the message is sent again and the
+//! send window shrinks the way Python `Channel._packet_timeout` does.
 //! If the receipt still does not arrive after a fixed number of tries, the
 //! [Channel] is torn down and the underlying [Link] is closed.
 //!
@@ -15,6 +16,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
+use std::sync::Mutex as StdMutex;
 
 use tokio::sync::{broadcast, mpsc, Mutex, MutexGuard};
 use tokio::time::{sleep, Duration, Instant};
@@ -23,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::destination::link::{LinkEvent, LinkEventData, LinkId, LinkPayload, LinkStatus};
 use crate::error::RnsError;
 use crate::hash::Hash;
-use crate::packet::{PacketContext, PACKET_MDU};
+use crate::packet::PacketContext;
 
 #[cfg(not(test))]
 use crate::{
@@ -35,14 +37,37 @@ use crate::{
 #[cfg(test)]
 use mock::{Link, Packet, Transport, TransportHandler};
 
-/// Maximal payload size of a message sent through a `Channel`.
-pub const CHANNEL_MDU: usize = PACKET_MDU - 6;
+/// Default message payload budget at the protocol MTU.
+///
+/// Python `Channel.mdu` is `link.mdu - 6` (the envelope header). This
+/// constant is that value when the link MTU is [`crate::packet::PROTOCOL_MTU`]
+/// (425). A live link may negotiate a larger MTU; [`Channel::mdu`] also
+/// refuses to advertise a payload whose envelope's Fernet token would not
+/// fit in [`crate::packet::PACKET_MDU`].
+pub const CHANNEL_MDU: usize = crate::packet::LINK_MDU - 6;
+
+/// Largest link plaintext whose Fernet token fits in `PACKET_MDU`.
+///
+/// The token is IV + PKCS7(plaintext) + HMAC (`TOKEN_OVERHEAD` plus at
+/// least one padding byte). A discovered MTU can be far larger than the
+/// packet buffer; channel sends must not aim past what `encrypt` can write.
+fn max_link_plaintext() -> usize {
+    let room = crate::packet::PACKET_MDU.saturating_sub(crate::packet::TOKEN_OVERHEAD);
+    let max_cipher = room / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE;
+    max_cipher.saturating_sub(1)
+}
+
+/// Message types at or above this value are reserved for system messages
+/// (Python `MessageBase`: `MSGTYPE >= 0xf000`). `0xff00` is the buffer
+/// stream type.
+pub const MSGTYPE_SYSTEM_MIN: u16 = 0xf000;
 
 /// Message model for `Channel`.
 ///
-/// Each `Channel` has a type for its messages. The client opening the
+/// Each `Channel` has a primary type for its messages. The client opening the
 /// channel defines it by implementing this trait. A typical implementation
-/// will be an `enum` that has the message types as variants.
+/// will be an `enum` that has the message types as variants. Additional types,
+/// including system type `0xff00`, can be registered on the same channel.
 pub trait Message: Clone + Send + Sized + Sync + 'static {
     /// Reconstruct a message the channel has received.
     fn unpack(packed: &[u8], message_type: u16) -> Result<Self, RnsError>;
@@ -52,10 +77,10 @@ pub trait Message: Clone + Send + Sized + Sync + 'static {
 
     /// The type information that channel will include in the message envelope.
     ///
-    /// The reference implementation reserves the range `0xff00` to `0xffff` for
-    /// "system messages". Although the range is not actually used, we recommend
-    /// keeping the convention and not assigning numbers in that range to user-
-    /// defined message types.
+    /// Types `>= `[`MSGTYPE_SYSTEM_MIN`] are reserved. They can be sent like
+    /// any other message, but receiving them on a channel whose primary type
+    /// does not unpack them requires
+    /// [`Channel::register_message_type`] with `system` set.
     fn message_type(&self) -> u16;
 }
 
@@ -63,15 +88,12 @@ async fn outlet_send(
     link: &Arc<Mutex<Link>>,
     raw: &[u8],
     transport: &Arc<Mutex<TransportHandler>>,
-) -> (Packet, bool) {
-    let mut packet;
-    let active;
-
-    {
+) -> Result<(Packet, bool), RnsError> {
+    let (mut packet, active) = {
         let link = link.lock().await;
-        packet = link.data_packet(raw).unwrap();
-        active = link.status() == LinkStatus::Active;
-    }
+        let packet = link.data_packet(raw)?;
+        (packet, link.status() == LinkStatus::Active)
+    };
 
     packet.context = PacketContext::Channel;
 
@@ -79,7 +101,7 @@ async fn outlet_send(
         transport.lock().await.send_packet(packet).await;
     }
 
-    (packet, active)
+    Ok((packet, active))
 }
 
 async fn outlet_resend(
@@ -116,31 +138,6 @@ pub enum MessageStatus {
     Sent(u16),
     /// We have received proof that the message has been delivered.
     Delivered,
-}
-
-struct Envelope<M: Message> {
-    message: M,
-    sequence: u16,
-}
-
-impl<M: Message> Envelope<M> {
-    fn new(message: M, sequence: u16) -> Self {
-        Self { message, sequence }
-    }
-
-    fn unpack(raw: &[u8]) -> Result<Self, RnsError> {
-        let (message_type, sequence, size) = deenvelope_raw(raw)?;
-
-        if raw.len() as u16 != size + 6 {
-            log::trace!(
-                "channel: ignoring length field in packed message which doesn't match actual message length."
-            );
-        }
-
-        let message = M::unpack(&raw[6..], message_type)?;
-
-        Ok(Self::new(message, sequence))
-    }
 }
 
 fn envelope_raw(data: &[u8], message_type: u16, sequence: Option<u16>) -> Vec<u8> {
@@ -192,22 +189,32 @@ fn packet_timeout_time(rtt: Duration, ring_len: usize, tries: u16) -> Duration {
     Duration::from_secs_f32(total)
 }
 
-static WINDOW: u16 = 2;
+const WINDOW: u16 = 2;
 
-static WINDOW_MIN: u16 = 2;
-static WINDOW_MIN_LIMIT_MEDIUM: u16 = 5;
-static WINDOW_MIN_LIMIT_FAST: u16 = 16;
+const WINDOW_MIN: u16 = 2;
+const WINDOW_MIN_LIMIT_MEDIUM: u16 = 5;
+const WINDOW_MIN_LIMIT_FAST: u16 = 16;
 
-static WINDOW_MAX_SLOW: u16 = 5;
-static WINDOW_MAX_MEDIUM: u16 = 12;
-static WINDOW_MAX_FAST: u16 = 48;
-static WINDOW_MAX: u16 = WINDOW_MAX_FAST;
+const WINDOW_MAX_SLOW: u16 = 5;
+const WINDOW_MAX_MEDIUM: u16 = 12;
+const WINDOW_MAX_FAST: u16 = 48;
+const WINDOW_MAX: u16 = WINDOW_MAX_FAST;
 
-static FAST_RATE_THRESHOLD: u16 = 10;
+const FAST_RATE_THRESHOLD: u16 = 10;
 
-static RTT_FAST: f32 = 0.18;
-static RTT_MEDIUM: f32 = 0.75;
-static RTT_SLOW: f32 = 1.45;
+const RTT_FAST: f32 = 0.18;
+const RTT_MEDIUM: f32 = 0.75;
+const RTT_SLOW: f32 = 1.45;
+
+/// Strict extra gap required before a timeout decrements `window_max`.
+///
+/// `window` itself shrinks by one whenever it is above `window_min`.
+/// `window_max` shrinks by one only while
+/// `window_max > window_min + WINDOW_FLEXIBILITY`. The initial window
+/// (`window_max` 5, `window_min` 2) is already tighter than this gap, so
+/// a timeout there does not move `window_max`. A link with RTT above
+/// `RTT_SLOW` stores flexibility 1, not this constant.
+const WINDOW_FLEXIBILITY: u16 = 4;
 
 struct ChannelParams {
     pub max_tries: u16,
@@ -216,17 +223,32 @@ struct ChannelParams {
     pub window: u16,
     pub window_max: u16,
     pub window_min: u16,
+    pub window_flexibility: u16,
 }
 
 impl ChannelParams {
     pub fn new(slow: bool) -> Self {
-        Self {
-            max_tries: 5,
-            fast_rate_rounds: 0,
-            medium_rate_rounds: 0,
-            window: if slow { 1 } else { WINDOW },
-            window_max: if slow { 1 } else { WINDOW_MAX_SLOW },
-            window_min: if slow { 1 } else { WINDOW_MIN },
+        if slow {
+            // Python uses a fixed window of 1 when RTT is above `RTT_SLOW`.
+            Self {
+                max_tries: 5,
+                fast_rate_rounds: 0,
+                medium_rate_rounds: 0,
+                window: 1,
+                window_max: 1,
+                window_min: 1,
+                window_flexibility: 1,
+            }
+        } else {
+            Self {
+                max_tries: 5,
+                fast_rate_rounds: 0,
+                medium_rate_rounds: 0,
+                window: WINDOW,
+                window_max: WINDOW_MAX_SLOW,
+                window_min: WINDOW_MIN,
+                window_flexibility: WINDOW_FLEXIBILITY,
+            }
         }
     }
 }
@@ -308,18 +330,32 @@ struct SentMessage {
     pub tries: u16,
 }
 
+/// One ordered inbound envelope. Registered types share the sequence
+/// space with the channel's primary message type.
+enum Held<M: Message> {
+    Primary(M),
+    Registered {
+        tx: broadcast::Sender<Vec<u8>>,
+        payload: Vec<u8>,
+    },
+}
+
+type TypeRegistry = BTreeMap<u16, broadcast::Sender<Vec<u8>>>;
+
 struct Inbound<M: Message> {
-    on_hold: BTreeMap<u16, M>,
+    on_hold: BTreeMap<u16, Held<M>>,
     incoming: broadcast::Sender<M>,
+    registry: Arc<StdMutex<TypeRegistry>>,
     sequence: u16,
     link_id: LinkId,
 }
 
 impl<M: Message> Inbound<M> {
-    fn new(link_id: LinkId) -> Self {
+    fn new(link_id: LinkId, registry: Arc<StdMutex<TypeRegistry>>) -> Self {
         Self {
             on_hold: BTreeMap::new(),
             incoming: broadcast::Sender::new(16),
+            registry,
             sequence: 0u16,
             link_id,
         }
@@ -332,15 +368,21 @@ impl<M: Message> Inbound<M> {
     pub async fn receive(&mut self, raw: &[u8]) {
         log::trace!("channel({}) received {}B", self.link_id, raw.len());
 
-        let envelope = match Envelope::<M>::unpack(raw) {
-            Ok(env) => env,
+        let (message_type, sequence, size) = match deenvelope_raw(raw) {
+            Ok(parts) => parts,
             Err(_) => {
                 log::error!("channel({}): error unpacking message", self.link_id);
                 return;
             }
         };
 
-        let sequence = envelope.sequence;
+        if raw.len() as u16 != size + 6 {
+            log::trace!(
+                "channel: ignoring length field in packed message which doesn't match actual message length."
+            );
+        }
+
+        let payload = raw[6..].to_vec();
 
         if sequence < self.sequence {
             let overflow = sequence.saturating_add(WINDOW_MAX);
@@ -354,20 +396,47 @@ impl<M: Message> Inbound<M> {
             }
         }
 
-        let replaced = self.on_hold.insert(sequence, envelope.message);
+        let registered_tx = self
+            .registry
+            .lock()
+            .ok()
+            .and_then(|registry| registry.get(&message_type).cloned());
+        let held = if let Some(tx) = registered_tx {
+            Held::Registered { tx, payload }
+        } else {
+            match M::unpack(&payload, message_type) {
+                Ok(message) => Held::Primary(message),
+                Err(_) => {
+                    log::error!("channel({}): error unpacking message", self.link_id);
+                    return;
+                }
+            }
+        };
+
+        let replaced = self.on_hold.insert(sequence, held);
 
         if replaced.is_some() {
             log::trace!("channel({}): duplicate message received", self.link_id);
         }
 
-        while let Some(message) = self.on_hold.remove(&self.sequence) {
-            let result = self.incoming.send(message);
-
-            if result.is_err() {
-                log::warn!(
-                    "channel({}): received a message that will not be processed (no subscribers)",
-                    self.link_id,
-                );
+        while let Some(held) = self.on_hold.remove(&self.sequence) {
+            match held {
+                Held::Primary(message) => {
+                    if self.incoming.send(message).is_err() {
+                        log::warn!(
+                            "channel({}): received a message that will not be processed (no subscribers)",
+                            self.link_id,
+                        );
+                    }
+                }
+                Held::Registered { tx, payload } => {
+                    if tx.send(payload).is_err() {
+                        log::warn!(
+                            "channel({}): received a registered message that will not be processed (no subscribers)",
+                            self.link_id,
+                        );
+                    }
+                }
             }
 
             self.sequence = self.sequence.wrapping_add(1);
@@ -501,6 +570,19 @@ impl Outbound {
             return;
         }
 
+        // Python `Channel._packet_timeout`: shrink `window` whenever it is
+        // above `window_min`. Shrink `window_max` only while it exceeds
+        // `window_min + window_flexibility`.
+        {
+            let mut params = self.params.lock().await;
+            if params.window > params.window_min {
+                params.window -= 1;
+                if params.window_max > params.window_min.saturating_add(params.window_flexibility) {
+                    params.window_max -= 1;
+                }
+            }
+        }
+
         let sent = outlet_resend(&self.outlet, packet, self.transport.clone()).await;
 
         if !sent {
@@ -511,11 +593,12 @@ impl Outbound {
             );
         }
 
+        // Python increments `envelope.tries` before computing the next
+        // timeout, so the backoff uses the post-increment count.
         tries += 1;
+        self.sent_messages.get_mut(&packet_hash).unwrap().tries = tries;
 
         self.schedule_timeout(packet_hash).await;
-
-        self.sent_messages.get_mut(&packet_hash).unwrap().tries = tries;
     }
 
     async fn schedule_timeout(&self, packet_hash: Hash) {
@@ -566,36 +649,53 @@ impl Outbound {
 
         let sequence = self.next_sequence;
 
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-
         let packet_hash;
         {
             let raw = message_raw(message, Some(sequence));
-
-            if raw.len() > PACKET_MDU {
+            let link_mdu = self.outlet.lock().await.mdu();
+            let payload_len = raw.len().saturating_sub(6);
+            // Python rejects `len(envelope.raw) > outlet.mdu`. The length
+            // field is a u16, and the Fernet token must fit in PACKET_MDU
+            // even when link MTU discovery reports a larger hardware MTU.
+            let envelope_limit = link_mdu.min(max_link_plaintext()).min(0xFFFF + 6);
+            if payload_len > 0xFFFF || raw.len() > envelope_limit {
+                log::debug!(
+                    "channel({}): message too big for link mdu ({} > {})",
+                    self.link_id,
+                    raw.len(),
+                    envelope_limit
+                );
                 return Err(RnsError::ChannelMessageTooBig);
             }
 
-            let (packet, sent) = outlet_send(&self.outlet, &raw, &transport).await;
+            let (packet, sent) = match outlet_send(&self.outlet, &raw, &transport).await {
+                Ok(sent) => sent,
+                Err(_) => return Err(RnsError::ChannelMessageTooBig),
+            };
+            // Do not consume a sequence number unless the packet is tracked.
+            // `data_packet` failing (token does not fit) and a link that
+            // did not accept the packet both leave the sequence unchanged.
+            if !sent {
+                return Err(RnsError::LinkNotReady);
+            }
+
             packet_hash = packet.hash();
 
             let (delivery_tx, delivery_rx) = broadcast::channel(1);
 
-            if sent {
-                let sent_message = SentMessage {
-                    packet,
-                    delivered: delivery_tx,
-                    tries: 1,
-                };
+            let sent_message = SentMessage {
+                packet,
+                delivered: delivery_tx,
+                tries: 1,
+            };
 
-                self.sent_messages.insert(packet_hash, sent_message);
-            }
+            self.sent_messages.insert(packet_hash, sent_message);
+            self.next_sequence = self.next_sequence.wrapping_add(1);
 
-            let tries = if sent { 1 } else { 0 };
             let rtt = *self.outlet.lock().await.rtt();
 
             let ring_len = self.sent_messages.len();
-            let timeout = packet_timeout_time(rtt, ring_len, tries);
+            let timeout = packet_timeout_time(rtt, ring_len, 1);
 
             watch_message_try(
                 self.timeouts_tx.clone(),
@@ -685,8 +785,9 @@ async fn spawn_receiver<M: Message>(
     mut rx: broadcast::Receiver<LinkPayload>,
     our_link_id: LinkId,
     cancel: CancellationToken,
+    registry: Arc<StdMutex<TypeRegistry>>,
 ) -> broadcast::Sender<M> {
-    let mut inbound = Inbound::new(our_link_id);
+    let mut inbound = Inbound::new(our_link_id, registry);
     let incoming = inbound.get_incoming();
 
     tokio::spawn(async move {
@@ -739,6 +840,7 @@ pub struct Channel<M: Message> {
     pub link: Arc<Mutex<Link>>,
     outbound: Arc<Mutex<Outbound>>,
     incoming: broadcast::Sender<M>,
+    registry: Arc<StdMutex<TypeRegistry>>,
 }
 
 impl<M: Message> Clone for Channel<M> {
@@ -747,6 +849,7 @@ impl<M: Message> Clone for Channel<M> {
             link: Arc::clone(&self.link),
             outbound: Arc::clone(&self.outbound),
             incoming: self.incoming.clone(),
+            registry: Arc::clone(&self.registry),
         }
     }
 }
@@ -777,23 +880,86 @@ impl<M: Message> Channel<M> {
 
         let rx = transport.bind_link_to_channel(link_id).await?;
 
-        let incoming = spawn_receiver(rx, link_id, cancel).await;
+        let registry = Arc::new(StdMutex::new(TypeRegistry::new()));
+        let incoming = spawn_receiver(rx, link_id, cancel, Arc::clone(&registry)).await;
         let incoming_rx = incoming.subscribe();
 
         let channel = Self {
             link,
             outbound,
             incoming,
+            registry,
         };
 
         Ok((channel, incoming_rx))
     }
 
+    /// Register an additional message type on this channel.
+    ///
+    /// Python `Channel.register_message_type` accepts several classes on one
+    /// channel. Types `>= `[`MSGTYPE_SYSTEM_MIN`] (including buffer stream
+    /// type `0xff00`) are rejected unless `system` is set, matching
+    /// `_register_message_type(..., is_system_type=True)`.
+    ///
+    /// The receiver yields the packed message payload (the bytes after the
+    /// 6-byte envelope header). A second registration of the same type
+    /// subscribes to the existing stream. Registered types are delivered
+    /// instead of the channel's primary [`Message`] when the type numbers
+    /// match, and they share that primary type's sequence space.
+    pub fn register_message_type(
+        &self,
+        message_type: u16,
+        system: bool,
+    ) -> Result<broadcast::Receiver<Vec<u8>>, RnsError> {
+        if message_type >= MSGTYPE_SYSTEM_MIN && !system {
+            return Err(RnsError::ChannelError);
+        }
+
+        let mut registry = self.registry.lock().map_err(|_| RnsError::ChannelError)?;
+        if let Some(tx) = registry.get(&message_type) {
+            return Ok(tx.subscribe());
+        }
+
+        let (tx, rx) = broadcast::channel(64);
+        registry.insert(message_type, tx);
+        Ok(rx)
+    }
+
+    /// Bytes available for one message payload (Python `Channel.mdu`).
+    ///
+    /// This is the link MDU minus the 6-byte envelope header, and at most
+    /// the largest payload whose envelope's Fernet token fits in
+    /// `PACKET_MDU`. At the protocol MTU that is still `link.mdu - 6`.
+    pub async fn mdu(&self) -> usize {
+        let link_mdu = self.link.lock().await.mdu();
+        link_mdu
+            .saturating_sub(6)
+            .min(max_link_plaintext().saturating_sub(6))
+    }
+
+    /// Current send window (Python `Channel.window`).
+    pub async fn window(&self) -> u16 {
+        self.outbound.lock().await.params.lock().await.window
+    }
+
+    /// Current maximum send window (Python `Channel.window_max`).
+    pub async fn window_max(&self) -> u16 {
+        self.outbound.lock().await.params.lock().await.window_max
+    }
+
+    /// Current minimum send window (Python `Channel.window_min`).
+    pub async fn window_min(&self) -> u16 {
+        self.outbound.lock().await.params.lock().await.window_min
+    }
+
     /// Send a message over the channel.
     ///
-    /// Fails if the channel is not ready to send. If successful, it returns
-    /// the `Hash` with which the message can be identified.
-    pub async fn send(&self, message: &M) -> Result<Hash, RnsError> {
+    /// `message` does not have to be the channel's primary type: any
+    /// [`Message`] can be sent, including a system type such as `0xff00`.
+    /// Fails if the channel is not ready to send, or if the packed envelope
+    /// is larger than the link MDU. If successful, it returns the `Hash`
+    /// with which the message can be identified.
+    pub async fn send<T: Message>(&self, message: &T) -> Result<Hash, RnsError> {
         self.outbound.lock().await.send(message).await
     }
 
@@ -886,6 +1052,7 @@ mod mock {
         pub id: LinkId,
         pub rtt: Duration,
         pub status: LinkStatus,
+        pub mtu: usize,
         pub tx: broadcast::Sender<LinkPayload>,
     }
 
@@ -898,6 +1065,7 @@ mod mock {
                 id,
                 rtt,
                 status,
+                mtu: crate::packet::PROTOCOL_MTU,
                 tx,
             }
         }
@@ -912,6 +1080,16 @@ mod mock {
 
         pub fn status(&self) -> LinkStatus {
             self.status
+        }
+
+        /// Same formula as `RNS.Link.mdu` / `Link::mdu`.
+        pub fn mdu(&self) -> usize {
+            let overhead = crate::packet::IFAC_MIN_SIZE
+                + crate::packet::HEADER_MINSIZE
+                + crate::packet::TOKEN_OVERHEAD;
+            let mdu = self.mtu.saturating_sub(overhead);
+            (mdu / crate::packet::AES128_BLOCKSIZE * crate::packet::AES128_BLOCKSIZE)
+                .saturating_sub(1)
         }
 
         pub fn data_packet(&self, raw: &[u8]) -> Result<Packet, RnsError> {
@@ -1330,5 +1508,302 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         assert!(incoming_b.is_empty());
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Blob {
+        message_type: u16,
+        data: Vec<u8>,
+    }
+
+    impl Message for Blob {
+        fn unpack(packed: &[u8], message_type: u16) -> Result<Self, RnsError> {
+            Ok(Self {
+                message_type,
+                data: packed.to_vec(),
+            })
+        }
+
+        fn pack(&self) -> Vec<u8> {
+            self.data.clone()
+        }
+
+        fn message_type(&self) -> u16 {
+            self.message_type
+        }
+    }
+
+    async fn prove_one(fixture: &Fixture, channel: &Channel<TestMessage>) -> Hash {
+        let before = fixture.transport_a.packets().await.len();
+        let hash = channel.send(&TestMessage::Short(1)).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let packets = fixture.transport_a.packets().await;
+            if packets.len() > before {
+                fixture
+                    .transport_a
+                    .out_tx
+                    .send(packets[before].prove())
+                    .unwrap();
+                break;
+            }
+            assert!(Instant::now() < deadline, "packet was not sent");
+            sleep(Duration::from_millis(10)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if channel.message_status(&hash).await == MessageStatus::Delivered {
+                return hash;
+            }
+            assert!(Instant::now() < deadline, "proof was not applied");
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mdu_is_link_mdu_minus_header() {
+        let fixture = Fixture::new().await;
+        let (channel, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
+
+        let link_mdu = fixture.link_a.lock().await.mdu();
+        assert_eq!(channel.mdu().await, link_mdu - 6);
+        assert_eq!(channel.mdu().await, CHANNEL_MDU);
+        const { assert!(CHANNEL_MDU < crate::packet::PACKET_MDU) };
+
+        let too_big = Blob {
+            message_type: 7,
+            data: vec![0u8; channel.mdu().await + 1],
+        };
+        assert_eq!(
+            channel.send(&too_big).await,
+            Err(RnsError::ChannelMessageTooBig)
+        );
+        assert!(fixture.transport_a.packets().await.is_empty());
+
+        let fits = Blob {
+            message_type: 7,
+            data: vec![0u8; channel.mdu().await],
+        };
+        channel.send(&fits).await.unwrap();
+        let packets = fixture.transport_a.packets().await;
+        assert_eq!(packets.len(), 1);
+        // Sequence was not consumed by the rejected message.
+        assert_eq!(&packets[0].data.as_slice()[2..4], &[0, 0]);
+        assert_eq!(packets[0].data.as_slice().len(), link_mdu);
+    }
+
+    #[tokio::test]
+    async fn test_packet_buffer_caps_envelope() {
+        let fixture = Fixture::new().await;
+        // TCP, local, and backbone report a hardware MTU far above the
+        // packet buffer. Channel::mdu must not advertise 65535 there.
+        fixture.link_a.lock().await.mtu = 1_048_576;
+        let (channel, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
+
+        let link_mdu = fixture.link_a.lock().await.mdu();
+        let cap = max_link_plaintext() - 6;
+        assert!(link_mdu - 6 > 0xFFFF);
+        assert_eq!(cap, 1993);
+        assert_eq!(channel.mdu().await, cap);
+        assert!(channel.mdu().await < link_mdu - 6);
+
+        let too_big = Blob {
+            message_type: 7,
+            data: vec![0u8; cap + 1],
+        };
+        assert_eq!(
+            channel.send(&too_big).await,
+            Err(RnsError::ChannelMessageTooBig)
+        );
+        assert!(fixture.transport_a.packets().await.is_empty());
+
+        channel.send(&TestMessage::Short(1)).await.unwrap();
+        let packets = fixture.transport_a.packets().await;
+        assert_eq!(packets.len(), 1);
+        // The rejected envelope did not consume a sequence number.
+        assert_eq!(&packets[0].data.as_slice()[2..4], &[0, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_registered_types_including_system() {
+        let fixture = Fixture::new().await;
+        let (channel_a, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
+        let (_channel_b, mut incoming_b) =
+            Channel::<TestMessage>::new(&fixture.transport_b, fixture.link_b.clone())
+                .await
+                .unwrap();
+
+        assert_eq!(
+            _channel_b.register_message_type(0xff00, false).unwrap_err(),
+            RnsError::ChannelError
+        );
+        let mut system_rx = _channel_b.register_message_type(0xff00, true).unwrap();
+        let mut user_rx = _channel_b.register_message_type(0x0007, false).unwrap();
+
+        let first = channel_a.send(&TestMessage::Short(9)).await.unwrap();
+        channel_a
+            .send(&Blob {
+                message_type: 0xff00,
+                data: b"stream".to_vec(),
+            })
+            .await
+            .unwrap();
+        // The initial window is 2. Prove the first message so the third
+        // type can be sent without waiting out a timeout.
+        {
+            let packets = fixture.transport_a.packets().await;
+            fixture.transport_a.out_tx.send(packets[0].prove()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if channel_a.message_status(&first).await == MessageStatus::Delivered {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "proof was not applied");
+                sleep(Duration::from_millis(10)).await;
+            }
+        }
+        channel_a
+            .send(&Blob {
+                message_type: 0x0007,
+                data: b"extra".to_vec(),
+            })
+            .await
+            .unwrap();
+
+        let packets = fixture.transport_a.packets().await;
+        assert_eq!(packets.len(), 3);
+
+        // Deliver the system frame before the primary message. It shares the
+        // sequence space, so it stays on hold until sequence 0 arrives.
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[1].payload())
+            .unwrap();
+        sleep(Duration::from_millis(30)).await;
+        assert!(system_rx.is_empty());
+        assert!(incoming_b.is_empty());
+
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[0].payload())
+            .unwrap();
+        fixture
+            .link_b
+            .lock()
+            .await
+            .tx
+            .send(packets[2].payload())
+            .unwrap();
+
+        assert_eq!(incoming_b.recv().await.unwrap(), TestMessage::Short(9));
+        assert_eq!(system_rx.recv().await.unwrap(), b"stream");
+        assert_eq!(user_rx.recv().await.unwrap(), b"extra");
+    }
+
+    #[tokio::test]
+    async fn test_timeout_does_not_shrink_window_at_minimum() {
+        let fixture = Fixture::new().await;
+        let (channel, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
+        assert_eq!(channel.window().await, WINDOW);
+        assert_eq!(channel.window_min().await, WINDOW_MIN);
+
+        channel.send(&TestMessage::Short(1)).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if fixture.transport_a.packets().await.len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "message was not resent");
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(channel.window().await, WINDOW);
+        assert_eq!(channel.window_max().await, WINDOW_MAX_SLOW);
+        assert_eq!(fixture.link_a.lock().await.status(), LinkStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_shrinks_window_but_not_max_inside_flexibility() {
+        let fixture = Fixture::new().await;
+        // Medium RTT: the window may grow to WINDOW_MAX_SLOW, but ten
+        // medium rounds are required before window_max itself rises, so
+        // one timeout can shrink `window` without touching `window_max`
+        // (5 is not greater than window_min + WINDOW_FLEXIBILITY).
+        fixture.link_a.lock().await.rtt = Duration::from_millis(200);
+        let (channel, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
+
+        for _ in 0..3 {
+            prove_one(&fixture, &channel).await;
+        }
+        assert_eq!(channel.window().await, WINDOW_MAX_SLOW);
+        assert_eq!(channel.window_max().await, WINDOW_MAX_SLOW);
+
+        channel.send(&TestMessage::Short(2)).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            if channel.window().await == WINDOW_MAX_SLOW - 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "window did not shrink");
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(channel.window_max().await, WINDOW_MAX_SLOW);
+        assert_eq!(fixture.transport_a.packets().await.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_timeout_shrinks_window_max_by_one_past_flexibility() {
+        let fixture = Fixture::new().await;
+        let (channel, _) =
+            Channel::<TestMessage>::new(&fixture.transport_a, fixture.link_a.clone())
+                .await
+                .unwrap();
+
+        // Fast RTT (the mock default). After FAST_RATE_THRESHOLD proofs,
+        // window_max jumps to the fast limit and the window can grow past
+        // window_min. The next timeout then decrements window_max by one
+        // because it is more than WINDOW_FLEXIBILITY above window_min.
+        for _ in 0..22 {
+            prove_one(&fixture, &channel).await;
+        }
+        assert_eq!(channel.window().await, 17);
+        assert_eq!(channel.window_max().await, WINDOW_MAX_FAST);
+        assert_eq!(channel.window_min().await, WINDOW_MIN_LIMIT_FAST);
+
+        channel.send(&TestMessage::Short(3)).await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if channel.window_max().await == WINDOW_MAX_FAST - 1 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "window_max did not shrink");
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(channel.window().await, 16);
+        assert_eq!(channel.window_max().await, WINDOW_MAX_FAST - 1);
+        assert_ne!(
+            channel.window_max().await,
+            WINDOW_MAX_FAST - WINDOW_FLEXIBILITY
+        );
     }
 }

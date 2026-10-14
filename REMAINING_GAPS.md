@@ -1,150 +1,74 @@
-# Remaining Implementation Gaps — Status
+# Remaining gaps vs Python Reticulum 1.5.5
 
-All gaps listed below are implemented and covered by tests. This file is
-kept as the record of what was closed and where each piece lives.
+Comparison target: `/home/user/g/reticulum/Reticulum` (`RNS/_version.py` =
+1.5.5). The items below are the differences that remain after the parity
+series landed. LXMF, LXST, `reticulum-actor`, `reticulum-ffi`, and
+`firmware/` are Rust-side extras, not Python parity items, and are not
+listed here.
 
-## 1. Resource cancellation ✅
+## Interfaces and platform support
 
-- `src/resource/outbound.rs`
-  - `OutgoingResource::cancel(&mut self, link) -> ResourceTx` builds the
-    `RESOURCE_ICL` packet and stops advertising/transferring.
-- `src/resource/manager.rs`
-  - `cancel_outbound(&mut self, link, hash)` marks outgoing transfers
-    `Failed`, sends `RESOURCE_ICL`, and emits a `ResourceEvent`.
-  - `cancel_inbound(&mut self, link, hash)` does the receiver-side cancel
-    with `RESOURCE_RCL`.
-  - Bug fixed on the way: receiver-built cancel/reject packets were sent
-    unencrypted (`raw_packet`); peers decrypt them, so they now use
-    `context_packet` (Python `Packet.pack` only leaves resource parts and
-    proofs unencrypted).
-- `src/transport.rs`
-  - `cancel_resource(&self, link_id, hash)` sends the cancel and falls
-    back to the receiver-side cancel when nothing is outbound.
-  - `send_resource*` now returns the full 32-byte resource hash (the same
-    hash used in resource events and accepted by `cancel_resource`). This
-    also fixes the LXMF router's completion tracking, which compared event
-    hashes against a truncated hash.
-- `reticulum-actor`
-  - `Action::CancelResource` calls the real `transport().cancel_resource`.
-  - `Action::SetResourceStrategy` with an empty link id configures the
-    transport-level default strategy (`set_default_resource_strategy`) so
-    inbound resources can be accepted without knowing the link id.
-- Tests: `tests/resource_transfer.rs`
-  (`sender_cancel_fails_both_ends_of_a_transfer`,
-  `receiver_cancel_fails_sender_transfer`),
-  `reticulum-actor/tests/integration.rs`
-  (`resource_offer_accept_and_cancel`).
+- **No Android USB host stack.** On Android, Python keeps the config
+  types `RNodeInterface`, `SerialInterface`, and `KISSInterface` but
+  swaps in the `RNS/Interfaces/Android/` modules, where USB serial is a
+  device id resolved through `usb4a.usb.get_usb_device(port)`; the
+  Android Weave module takes the same path. Rust has no `usb4a` /
+  `usbserial4a` host stack, so none of those Android USB serial ports
+  can be opened, and `reticulum-daemon/src/main.rs` (commit `01a9d73`)
+  logs and does not start a Weave USB serial interface when
+  `target_os = "android"`.
+- **RNode over `ble://` needs a cargo feature.** The btleplug backend
+  lives behind `iface-rnode-ble` (`Cargo.toml`, commit `58eb91f`);
+  without it `RnodeLink::connect_ble` returns `RnsError::Unsupported`.
+  Python also fails closed: a desktop `RNodeInterface` opens `ble://`
+  only when `bleak` imports (`setup.py` `install_requires` is just
+  `cryptography` and `pyserial`, so a normal install has no BLE stack,
+  and the device must be bonded), and Android needs the `able` /
+  `BluetoothDispatcher` library.
+- **No `interfaces/` file plugins.** When the config `type` is not a
+  built-in, Python `Reticulum._synthesize_interface` execs
+  `{configdir}/interfaces/<Type>.py` (`RNS/Reticulum.py`); Rust never
+  loads that file. The daemon can still start an enabled unknown type
+  in-process through `register_interface_factory`
+  (`reticulum-daemon/src/config.rs`, commit `01a9d73`) and errors with
+  `type '{name}' is not supported` only when no factory is registered.
+  `warn_about_unknown_keys` still logs `type '{iface_type}' which is
+  not supported yet` for any type outside `SUPPORTED_INTERFACE_TYPES`,
+  including one a factory will then start.
+- **AutoInterface enumeration is per-OS.** `platform_addresses()` in
+  `src/iface/auto.rs` covers Linux, Android, macOS, the BSDs, and
+  Windows; any other target (for example Solaris, which Python's
+  vendored `netinfo` handles via `getifaddrs`) gets an empty list, so
+  AutoInterface finds no subinterfaces there.
 
-## 2. LXMF transport-encryption selection ✅
+## Utilities
 
-- `lxmf/src/message.rs`
-  - `LXMessage::destination_type` (Python `__destination.type`, defaults
-    to `Single`) drives `determine_transport_encryption()`:
-    `GROUP → Aes128`, `SINGLE → Curve25519`, `PLAIN`/other → unencrypted,
-    `DIRECT` always Curve25519 — exactly the Python table.
-  - `set_transport_encryption()` / `clear_transport_encryption_override()`
-    for explicit overrides that survive re-determination.
-- `reticulum-actor`: `Action::SendLxmfMessage` gained
-  `transport_encryption: Option<String>` (`LxmfTransportEncryption` names).
-- `reticulum-ffi`: mirrored in `AppAction::SendLxmfMessage`; bindings
-  regenerated.
-- Tests: `lxmf/src/message.rs::transport_encryption_tests` (9 tests),
-  `reticulum-actor/tests/integration.rs` sends with the field set.
+- **`rnodeconf` is framing-only.** `reticulum-utils/src/rnodeconf.rs`
+  covers probing, EEPROM read/write, firmware info, TNC mode, display,
+  WiFi, and BLE control frames. Not ported from
+  `RNS/Utilities/rnodeconf.py` (major items, not every missing
+  command): the `models` firmware map and autoinstall/update/extract
+  flow, MD5 image hashing and RSA signing/key files, the bundled
+  `recovery_esptool.py`, the NeoPixel intensity (`--np` /
+  `set_neopixel_intensity`) and interference-avoidance (`--ia-enable` /
+  `--ia-disable` / `set_disable_interference_avoidance`) control
+  frames, the extra RAK4631 `sleep(10)` after the EEPROM wipe (the 13s
+  wipe wait itself is ported) and most other inter-command timing
+  sleeps, and the `input()` "Press enter to exit" Bluetooth-pairing
+  wait. `--flash` builds an argv for an external `rnodeconf` or
+  `esptool` on `PATH` (`flash_command`) that `run_nodeconf` then spawns
+  with `std::process::Command` (`55a3d5c`); the Rust binary does not
+  flash in-process.
+- **`rngit` has no web output.** `reticulum-utils/src/rngit.rs`
+  implements the node, client, and `git-remote-rns` wire operations.
+  The Python tool's HTML repository pages (`rngit/pages.py`), syntax
+  highlighting (`rngit/highlight.py`), and media transcoding to WebP
+  (`rngit/media.py`) are not ported.
 
-## 3. RNode link-quality telemetry ✅
+## Stubs on both sides — not gaps
 
-- `src/iface.rs`
-  - `InterfaceCounters::set_radio_quality(rssi, snr, quality)` plus
-    `rssi()/snr()/quality()` getters; `InterfaceStats` carries
-    `rssi: Option<i16>`, `snr: Option<f32>`, `quality: Option<f32>`.
-- `src/iface/rnode.rs` — the KISS status parser publishes telemetry into
-  the interface counters (single-radio and multi-radio workers).
-- `src/transport.rs` — `interface_stats_for_link(link_id)` resolves the
-  link's interface (inbound receiving interface via `in_link_ifaces`,
-  intermediary link table, or the outbound path's next hop).
-- `reticulum-actor` — `InterfaceSummary` and `CallSummary` expose
-  `rssi`/`snr`/`quality`; `CallSummary::quality` blends audio-bridge
-  delivery with radio `q` when both exist.
-- Tests: `src/iface.rs` counter tests,
-  `tests/resource_transfer.rs::interface_stats_for_link_resolves_the_links_interface`.
-
-## 4. Shared-instance access configuration ✅
-
-- `src/iface/local.rs`
-  - `SharedInstanceAccessConfig { allow, required_token, max_clients }`
-    with an HDLC-framed authentication handshake
-    (`RNSLIA1 || name || token`, constant-time token compare).
-  - `LocalServer::new_with_access`, `LocalClient::new_authenticated`,
-    accepted clients keep their declared name in interface stats.
-- `reticulum-actor`: `SharedInstanceAccessConfig` +
-  `Action::StartSharedInstance { access }` and
-  `Action::ConnectSharedInstance { access_token }`.
-- `reticulum-ffi`: `AppSharedInstanceAccessConfig` + conversions; bindings
-  regenerated.
-- Tests: `tests/local_iface.rs` (token accepted/rejected, allow list,
-  client cap), `reticulum-actor/tests/integration.rs`
-  (`shared_instance_hosting_and_connecting`).
-
-## 5. Audio pump performance / fallback ✅
-
-- `reticulum-actor`
-  - `AudioPolicy { warning_latency_ms, max_consecutive_failures,
-    min_quality, quality_grace_ticks }` via `Action::SetAudioPolicy`.
-  - The pump measures per-call `read_frames` latency, emits
-    `Update::AudioWarning` on threshold breaches, and degrades to a
-    null-codec fallback (the platform bridge is no longer called) after
-    sustained failures.
-  - `min_quality` auto-closes calls that stay below the floor for
-    `quality_grace_ticks` network ticks.
-- `reticulum-ffi`: `AppAudioPolicy`, `AppUpdate::AudioWarning`; bindings
-  regenerated.
-- Tests: `reticulum-actor/tests/integration.rs`
-  (`audio_pump_warns_on_slow_bridge_callbacks_and_degrades`,
-  `audio_policy_rejects_invalid_bounds`,
-  `lxst_call_setup_and_teardown`).
-
-## 6. Actor acceptance tests ✅
-
-`reticulum-actor/tests/integration.rs` covers: TCP request/response
-loopback, `TransportBridge` with a mock bridge, LXMF send/receipt between
-two actors, propagation-node sync set/request/cancel, LXST call
-setup/teardown with a mock `AudioBridge`, resource offer/accept/cancel,
-discovery announce/listen/connect, shared-instance hosting with access
-control, `LogBridge` fan-out verification, and the audio policy paths.
-
-Fixed on the way (all now under test):
-
-- Async request handlers no longer hold the transport handler lock while
-  awaiting user code (this deadlocked the actor's state snapshots);
-  `tests/async_request.rs` pins both immediate and deferred handlers.
-- Actor `SendResponse` responses are msgpack-wrapped (Python parity).
-- `AdvertiseResource` resolves outbound links by id through the tracked
-  link table.
-- Identities can be imported/created before the node starts.
-- Propagation nodes announce when enabled
-  (`Action::AnnounceLxmfPropagationNode`); call endpoints re-announce via
-  `Action::AnnounceCallEndpoint`.
-- Discovery announces fire on the first poll after registration instead
-  of after the full poll interval.
-
-## 7. FFI / mobile coverage ✅
-
-- `reticulum-ffi/tests/ffi_callbacks.rs`: an `AppReconciler` implemented
-  in Rust receives updates through `listen_for_updates`;
-  `stop_listening` halts delivery and a restarted listener resumes;
-  dispatching across the whole `AppAction` surface produces the
-  documented updates; `FfiApp` restart after `Stop` works.
-- `reticulum-ffi/tests/ffi_app.rs` (pre-existing) covers the lifecycle.
-
-## 8. Benchmarks / CI ✅
-
-- `reticulum-actor/benches/actor.rs` (criterion): dispatch throughput,
-  state snapshot, audio bridge read/write latency.
-- `reticulum-actor/tests/perf_floor.rs`: machine-stable absolute floors
-  (dispatch ≥ 10k ops/s, audio callback round-trip < 1 ms) that fail CI
-  on order-of-magnitude regressions.
-- `.github/workflows/ci.yml`: a `benchmarks` job runs the floors in
-  release mode (fails on regression) and the criterion benches.
-- `Makefile`: `make mobile-smoke` builds the FFI library across the
-  mobile feature matrix (host, cargo-ndk Android targets, Apple targets;
-  missing toolchains are skipped with a warning).
+- `rnir` and `rnpkg` are attach-only stubs in both trees: Python's
+  `RNS/Utilities/rnir.py` and `rnpkg.py` instantiate `RNS.Reticulum`
+  and exit; `reticulum-utils/src/rnir.rs` and `rnpkg.rs` do the same.
+- `Resolver.resolve_identity` is an empty stub in `RNS/Resolver.py`;
+  there is no Rust resolver implementing it either.

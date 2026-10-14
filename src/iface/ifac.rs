@@ -42,7 +42,13 @@ pub const IFAC_MAX_SIZE: usize = 64;
 
 /// Default IFAC size in bytes when none is configured
 /// (Python `Interface.DEFAULT_IFAC_SIZE`).
-pub const DEFAULT_IFAC_SIZE: usize = 2;
+pub const DEFAULT_IFAC_SIZE: usize = 16;
+
+/// Default IFAC size in bytes for the serial family when none is
+/// configured (Python `DEFAULT_IFAC_SIZE` on `SerialInterface`,
+/// `KISSInterface`, `AX25KISSInterface`, `RNodeInterface`,
+/// `RNodeMultiInterface`, and `PipeInterface`).
+pub const SERIAL_FAMILY_IFAC_SIZE: usize = 8;
 
 /// HKDF-SHA256 with an empty context (Python `RNS.Cryptography.hkdf`
 /// with `context=None`).
@@ -201,9 +207,46 @@ pub fn encode(raw: &[u8], ifac: Option<&IfacKey>) -> Vec<u8> {
 /// configured (worker receive helper). Returns `None` when the packet
 /// must be dropped.
 pub fn decode(raw: &[u8], ifac: Option<&IfacKey>) -> Option<Vec<u8>> {
+    decode_inbound(raw, ifac, None)
+}
+
+/// [`decode`] that counts a bad access code or a truncated frame on
+/// `stats` (Python `Interface.ifac_violation` / `protocol_violation`).
+///
+/// `None` stats keeps the historical two-argument behaviour so existing
+/// callers stay source-compatible.
+pub fn decode_inbound(
+    raw: &[u8],
+    ifac: Option<&IfacKey>,
+    stats: Option<&crate::iface::InterfaceCounters>,
+) -> Option<Vec<u8>> {
+    if raw.len() <= 2 {
+        if let Some(stats) = stats {
+            stats.count_protocol_violation();
+            return None;
+        }
+    }
+
     match ifac {
-        Some(ifac) => ifac.strip(raw),
-        None => Some(raw.to_vec()),
+        Some(ifac) => match ifac.strip(raw) {
+            Some(plain) => Some(plain),
+            None => {
+                if let Some(stats) = stats {
+                    stats.count_ifac_violation();
+                }
+                None
+            }
+        },
+        None => {
+            // IFAC flag set on an interface that has no access code.
+            if stats.is_some() && raw.first().is_some_and(|byte| byte & 0x80 == 0x80) {
+                if let Some(stats) = stats {
+                    stats.count_ifac_violation();
+                }
+                return None;
+            }
+            Some(raw.to_vec())
+        }
     }
 }
 
@@ -256,6 +299,26 @@ mod tests {
         // Default minimum size applies.
         let small = IfacKey::derive(Some("net"), None, 0).expect("valid IFAC");
         assert_eq!(small.size, IFAC_MIN_SIZE);
+    }
+
+    #[test]
+    fn defaults_match_python() {
+        assert_eq!(IFAC_MIN_SIZE, 1);
+        // Omitted `ifac_size` is 16 bytes on the base interface.
+        assert_eq!(DEFAULT_IFAC_SIZE, 16);
+        // Serial, KISS, AX.25, RNode, RNodeMulti, and Pipe omit to 8 bytes.
+        assert_eq!(SERIAL_FAMILY_IFAC_SIZE, 8);
+
+        let base = IfacKey::derive(Some("net"), None, DEFAULT_IFAC_SIZE).expect("valid IFAC");
+        assert_eq!(base.size, 16);
+        let serial =
+            IfacKey::derive(Some("net"), None, SERIAL_FAMILY_IFAC_SIZE).expect("valid IFAC");
+        assert_eq!(serial.size, 8);
+
+        let raw = [1u8, 2, 3, 4];
+        let wrapped = base.apply(&raw);
+        assert_eq!(wrapped.len(), raw.len() + DEFAULT_IFAC_SIZE);
+        assert_eq!(base.strip(&wrapped).as_deref(), Some(raw.as_slice()));
     }
 
     #[test]

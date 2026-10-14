@@ -2,17 +2,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use alloc::sync::Arc;
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use reticulum_core::identity::Signer;
 use tokio::sync::{broadcast, Mutex, MutexGuard};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
+use crate::buffer::{InputBuffer, OutputBuffer};
 #[cfg(not(test))]
 use crate::channel::{self, Channel};
 use crate::destination::link::{
     Link, LinkEventData, LinkEventSink, LinkExt, LinkExtHandlePacket, LinkHandleResult, LinkId,
-    LinkPayload, LinkPayloadSink, LinkStatus,
+    LinkPayload, LinkPayloadSink, LinkStatus, KEEPALIVE, STALE_GRACE, STALE_TIME,
 };
 use crate::destination::{
     DestinationAnnounce, DestinationDesc, DestinationHandleStatus, DestinationName,
@@ -21,7 +22,7 @@ use crate::destination::{
 };
 use crate::error::RnsError;
 use crate::hash::{AddressHash, Hash};
-use crate::identity::PrivateIdentity;
+use crate::identity::{Identity, PrivateIdentity};
 use crate::iface::{
     InterfaceManager, InterfaceMode, InterfaceRxReceiver, RxMessage, TxMessage, TxMessageType,
 };
@@ -32,12 +33,18 @@ use crate::packet::{
 use crate::resource::{
     self,
     manager::{
-        pack_request, pack_response, request_id as make_request_id, RequestContext as RequestCtx,
-        RequestEvent, RequestEventData, ResourceManager, ResourceStrategy,
+        msgpack_bin, pack_request, pack_request_element, pack_response, packet_response_size,
+        request_id as make_request_id, PendingRequest, RequestContext as RequestCtx,
+        RequestEvent, RequestEventData, RequestHandlerConfig, RequestOptions, RequestResponse,
+        ResourceManager, ResourceStrategy,
     },
     ResourceEvent, ResourceOptions, ResourceTx,
 };
-use crate::storage::{KnownDestinations, KnownRatchets, Storage};
+use crate::serde::Serialize;
+use crate::storage::{
+    KnownDestinations, KnownRatchets, Storage, DESTINATION_TABLE_FILE, PACKET_HASHLIST_FILE,
+    TUNNELS_FILE,
+};
 
 mod announce_limits;
 mod announce_table;
@@ -112,13 +119,15 @@ impl Default for TimerConfig {
     fn default() -> Self {
         Self {
             link_check: Duration::from_secs(1),
-            in_link_stale: Duration::from_secs(10),
-            in_link_close: Duration::from_secs(5),
+            // Unknown-RTT defaults. Once RTT is known the link replaces
+            // these with `clamp(rtt * (360/1.75), 5, 360)` and `2 * keepalive`.
+            in_link_stale: STALE_TIME,
+            in_link_close: STALE_GRACE,
             out_link_restart: Duration::from_secs(60),
-            out_link_stale: Duration::from_secs(10),
-            out_link_close: Duration::from_secs(5),
+            out_link_stale: STALE_TIME,
+            out_link_close: STALE_GRACE,
             out_link_repeat: Duration::from_secs(6),
-            out_link_keep: Duration::from_secs(5),
+            out_link_keep: KEEPALIVE,
             iface_cleanup: Duration::from_secs(10),
             announces_retransmit: Duration::from_secs(1),
             old_announces_retransmit: Duration::from_secs(60),
@@ -169,6 +178,10 @@ pub struct TransportConfig {
     /// explicit proofs (packet hash + signature). Defaults to `true`,
     /// matching Python `use_implicit_proof`.
     use_implicit_proof: bool,
+
+    /// Rewrite hops-0 packets onto the wider network
+    /// (Python `local_hops_delta`, default off). The sampled value is in `2..=7`.
+    local_hops_delta: bool,
 
     timer_config: TimerConfig,
 }
@@ -237,6 +250,23 @@ pub struct ReceiptEvent {
     pub packet_hash: Hash,
 }
 
+/// Packet receipt status (Python `PacketReceipt.FAILED/SENT/DELIVERED/CULLED`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptStatus {
+    Failed = 0x00,
+    Sent = 0x01,
+    Delivered = 0x02,
+    Culled = 0xFF,
+}
+
+/// Observable receipt state. `timeout == None` is Python `timeout = -1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketReceiptInfo {
+    pub status: ReceiptStatus,
+    pub timeout: Option<Duration>,
+    pub rtt: Option<Duration>,
+}
+
 /// A pending packet receipt (Python `PacketReceipt`).
 #[derive(Clone)]
 struct PacketReceipt {
@@ -244,7 +274,71 @@ struct PacketReceipt {
     packet_hash: Hash,
     /// Identity of the destination, used to validate the proof signature.
     identity: crate::identity::Identity,
-    created_at: time::Instant,
+    sent_at: time::Instant,
+    /// `None` is Python `timeout = -1` (culled on the next check).
+    timeout: Option<Duration>,
+    status: ReceiptStatus,
+    concluded_at: Option<time::Instant>,
+}
+
+/// Reverse-table entry (Python `IDX_RT_RCVD_IF`, `IDX_RT_OUTB_IF`, `IDX_RT_TIMESTAMP`).
+struct ReverseEntry {
+    received: AddressHash,
+    outbound: AddressHash,
+    at: time::Instant,
+}
+
+/// Reverse entries are removed after 8 minutes (Python `REVERSE_TIMEOUT`).
+const REVERSE_TIMEOUT: Duration = Duration::from_secs(8 * 60);
+/// Python `Transport.MAX_RECEIPTS`.
+const MAX_RECEIPTS: usize = 1024;
+/// Python `Packet.TIMEOUT_PER_HOP` / `DEFAULT_PER_HOP_TIMEOUT`.
+const TIMEOUT_PER_HOP: Duration = Duration::from_secs(6);
+/// Python `Transport.LOCAL_CLIENT_CACHE_MAXSIZE`.
+const PHY_CACHE_MAX: usize = 512;
+
+/// Per-packet radio stats for the local-client RPC cache.
+struct PhyCache {
+    rssi: std::collections::VecDeque<(Hash, f64)>,
+    snr: std::collections::VecDeque<(Hash, f64)>,
+    q: std::collections::VecDeque<(Hash, f64)>,
+}
+
+impl PhyCache {
+    fn new() -> Self {
+        Self {
+            rssi: std::collections::VecDeque::new(),
+            snr: std::collections::VecDeque::new(),
+            q: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, hash: Hash, rssi: Option<i16>, snr: Option<f32>, quality: Option<f32>) {
+        if let Some(rssi) = rssi {
+            push_phy(&mut self.rssi, hash, f64::from(rssi));
+        }
+        if let Some(snr) = snr {
+            push_phy(&mut self.snr, hash, f64::from(snr));
+        }
+        if let Some(quality) = quality {
+            push_phy(&mut self.q, hash, f64::from(quality));
+        }
+    }
+
+    fn lookup(cache: &std::collections::VecDeque<(Hash, f64)>, hash: &Hash) -> Option<f64> {
+        cache
+            .iter()
+            .rev()
+            .find(|(key, _)| key == hash)
+            .map(|(_, value)| *value)
+    }
+}
+
+fn push_phy(cache: &mut std::collections::VecDeque<(Hash, f64)>, hash: Hash, value: f64) {
+    cache.push_back((hash, value));
+    while cache.len() > PHY_CACHE_MAX {
+        cache.pop_front();
+    }
 }
 
 pub(crate) struct TransportHandler {
@@ -264,6 +358,7 @@ pub(crate) struct TransportHandler {
     group_in_destinations: HashMap<AddressHash, Arc<Mutex<GroupInputDestination>>>,
 
     announce_limits: AnnounceLimits,
+    phy: PhyCache,
 
     out_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
     in_links: HashMap<AddressHash, Arc<Mutex<Link>>>,
@@ -317,6 +412,20 @@ pub(crate) struct TransportHandler {
     /// (Python `Transport.inbound_queues`).
     inbound_queues: std::sync::Arc<std::sync::Mutex<InboundQueues>>,
     cancel: CancellationToken,
+
+    /// Return path for proofs (Python `Transport.reverse_table`).
+    reverse_table: HashMap<AddressHash, ReverseEntry>,
+    /// Previous online state of the shared-instance initiator link.
+    shared_was_online: Option<bool>,
+    /// Spawned local-client interfaces seen on the previous tick.
+    seen_local_clients: Vec<AddressHash>,
+    persisted_loaded: bool,
+    shutdown_persisted: bool,
+    /// Saved paths whose stable interface was not live yet.
+    /// `None` means the destination table has not been read.
+    unresolved_paths: Option<Vec<PersistedPath>>,
+    /// Hashlist and tunnel table have been read for this load attempt.
+    persisted_aux_loaded: bool,
 }
 
 #[derive(Clone)]
@@ -349,6 +458,7 @@ impl TransportConfig {
             inbound_queue_lengths: INBOUND_QUEUE_LENGTHS,
             storage: None,
             use_implicit_proof: true,
+            local_hops_delta: false,
             timer_config: TimerConfig::default(),
         }
     }
@@ -364,6 +474,13 @@ impl TransportConfig {
     /// (Python config `use_implicit_proof`).
     pub fn set_implicit_proof(mut self, implicit: bool) -> Self {
         self.use_implicit_proof = implicit;
+        self
+    }
+
+    /// Rewrite hops on egress from this instance onto the wider network
+    /// (Python config `local_hops_delta`). The sampled value is in `2..=7`.
+    pub fn set_local_hops_delta(mut self, enabled: bool) -> Self {
+        self.local_hops_delta = enabled;
         self
     }
 
@@ -452,6 +569,7 @@ impl Default for TransportConfig {
             inbound_queue_lengths: INBOUND_QUEUE_LENGTHS,
             storage: None,
             use_implicit_proof: true,
+            local_hops_delta: false,
             timer_config: Default::default(),
         }
     }
@@ -465,7 +583,16 @@ impl Transport {
         let (received_data_tx, _) = tokio::sync::broadcast::channel(16);
         let (iface_messages_tx, _) = tokio::sync::broadcast::channel(16);
 
+        let local_hops_delta = if config.local_hops_delta {
+            (OsRng.next_u32() as u8 % 6) + 2
+        } else {
+            0
+        };
         let iface_manager = InterfaceManager::new(16);
+        if local_hops_delta != 0 {
+            iface_manager
+                .set_local_hops_delta(local_hops_delta, Some(*config.identity.address_hash()));
+        }
 
         let rx_receiver = iface_manager.receiver();
 
@@ -491,6 +618,7 @@ impl Transport {
             config.inbound_queue_lengths,
         )));
         let storage = config.storage.clone();
+        let persisted_loaded = storage.is_none();
         let identity = config.identity.clone();
         let blackholes = std::sync::Arc::new(tokio::sync::RwLock::new(
             blackholes::Blackholes::new(blackhole_publish),
@@ -507,6 +635,7 @@ impl Transport {
             plain_in_destinations: HashMap::new(),
             group_in_destinations: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
+            phy: PhyCache::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
             in_link_ifaces: HashMap::new(),
@@ -533,6 +662,13 @@ impl Transport {
             received_data_tx: received_data_tx.clone(),
             fixed_dest_path_requests: path_request_dest,
             cancel: cancel.clone(),
+            reverse_table: HashMap::new(),
+            shared_was_online: None,
+            seen_local_clients: Vec::new(),
+            persisted_loaded,
+            shutdown_persisted: false,
+            unresolved_paths: None,
+            persisted_aux_loaded: false,
         }));
 
         {
@@ -768,6 +904,16 @@ impl Transport {
         self.handler.lock().await.path_table.drop_path(destination)
     }
 
+    /// Backdate a path so the next cull removes it
+    /// (Python `Transport.expire_path`). The row stays until that cull.
+    pub async fn expire_path(&self, destination: &AddressHash) -> bool {
+        self.handler
+            .lock()
+            .await
+            .path_table
+            .expire_path(destination)
+    }
+
     /// Forget all paths learned over an interface (Python `drop_all_via`).
     pub async fn drop_all_via(&self, iface: &AddressHash) -> usize {
         self.handler.lock().await.path_table.drop_all_via(iface)
@@ -920,11 +1066,11 @@ impl Transport {
     pub async fn send_to_all_out_links(&self, payload: &[u8]) {
         let handler = self.handler.lock().await;
         for link in handler.out_links.values() {
-            let link = link.lock().await;
+            let mut link = link.lock().await;
             if link.status() == LinkStatus::Active {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
-                    handler.send_packet(packet).await;
+                    handler.send_from_link(&mut link, packet).await;
                 }
             }
         }
@@ -940,9 +1086,9 @@ impl Transport {
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
-                    handler.send_packet(packet).await;
-                    link.touch();
-                    sent_packets.push(packet.hash());
+                    let hash = packet.hash();
+                    handler.send_from_link(&mut link, packet).await;
+                    sent_packets.push(hash);
                 }
             }
         }
@@ -969,8 +1115,7 @@ impl Transport {
             {
                 let packet = link.data_packet(payload);
                 if let Ok(packet) = packet {
-                    handler.send_packet(packet).await;
-                    link.touch();
+                    handler.send_from_link(&mut link, packet).await;
                     count += 1;
                 }
             }
@@ -988,6 +1133,12 @@ impl Transport {
     /// Inbound queue pressure snapshot: total queued items, per-class
     /// heights and per-class drop counters
     /// (Python `Transport.inbound_queues.snapshot()`).
+    /// Configured inbound queue lengths per traffic class. A length of 0
+    /// in config is left as the class default ([`INBOUND_QUEUE_LENGTHS`]).
+    pub async fn inbound_queue_lengths(&self) -> [usize; 4] {
+        self.handler.lock().await.config.inbound_queue_lengths
+    }
+
     pub async fn inbound_queue_snapshot(&self) -> (usize, [usize; 4], [u64; 4]) {
         self.handler
             .lock()
@@ -1331,6 +1482,26 @@ impl Transport {
             .register_request_handler(*destination, path, Arc::new(handler));
     }
 
+    /// Register a request handler with Python's `allow`, `allowed_list` and
+    /// `auto_compress` arguments. The handler may return a msgpack element
+    /// or a file. [`Transport::register_request_handler`] stays allow-all
+    /// and element-only so existing callers keep working.
+    pub async fn register_request_handler_with_config<F>(
+        &self,
+        destination: &AddressHash,
+        path: &str,
+        config: RequestHandlerConfig,
+        handler: F,
+    ) where
+        F: Fn(RequestCtx) -> Option<RequestResponse> + Send + Sync + 'static,
+    {
+        self.handler
+            .lock()
+            .await
+            .resources
+            .register_request_handler_with_config(*destination, path, config, Arc::new(handler));
+    }
+
     /// Register an async request handler for a path on one of our inbound
     /// destinations. Async handlers keep the transport responsive for
     /// long-running work (e.g. remote command execution).
@@ -1385,43 +1556,80 @@ impl Transport {
         data: Vec<u8>,
         options: ResourceOptions,
     ) -> Result<crate::hash::Hash, RnsError> {
+        let staged = crate::resource::outbound::OutgoingResource::stage_bytes(data, &options)?;
+        self.enqueue_staged(link, staged, options).await
+    }
+
+    /// Send a file as a resource. Only the first segment is read before
+    /// the advertisement; later segments are read as the transfer advances.
+    pub async fn send_resource_from_path(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &std::path::Path,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError> {
+        let staged = crate::resource::outbound::OutgoingResource::stage_path(path, &options)?;
+        self.enqueue_staged(link, staged, options).await
+    }
+
+    /// Send a seekable stream as a resource. Seeking to discover the length
+    /// does not read the body, and only the first segment is read before
+    /// the advertisement. The reader does not need to be `Sync`.
+    pub async fn send_resource_from_reader<R>(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        reader: R,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError>
+    where
+        R: std::io::Read + std::io::Seek + Send + 'static,
+    {
+        let staged = crate::resource::outbound::OutgoingResource::stage_reader(reader, &options)?;
+        self.enqueue_staged(link, staged, options).await
+    }
+
+    /// Spool a non-seekable stream to a temporary file and send that, so
+    /// the bytes are not held as a single buffer. Spooling finishes before
+    /// the transport handler lock is taken.
+    pub async fn send_resource_from_read<R>(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        reader: R,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError>
+    where
+        R: std::io::Read + Send + 'static,
+    {
+        let staged = crate::resource::outbound::OutgoingResource::stage_read(reader, &options)?;
+        self.enqueue_staged(link, staged, options).await
+    }
+
+    /// Encrypt a staged resource, then lock the handler only to confirm the
+    /// link is still active and to enqueue. The first-segment read already
+    /// happened, so a slow source cannot stall packet ingress.
+    async fn enqueue_staged(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        staged: crate::resource::outbound::StagedSource,
+        options: ResourceOptions,
+    ) -> Result<crate::hash::Hash, RnsError> {
+        let resource = {
+            let link_guard = link.lock().await;
+            if link_guard.status() != LinkStatus::Active {
+                return Err(RnsError::LinkNotReady);
+            }
+            crate::resource::outbound::OutgoingResource::finish_staged(
+                staged,
+                &link_guard,
+                options,
+            )?
+        };
         let mut handler = self.handler.lock().await;
-        let link_guard = link.lock().await;
+        let mut link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
             return Err(RnsError::LinkNotReady);
         }
-
-        // reserve a slot and build the resource under the link lock
-        let mut resource =
-            crate::resource::outbound::OutgoingResource::new(data, &link_guard, options)?;
-
-        let mut tx = crate::resource::ResourceTx::default();
-        let active = handler
-            .resources
-            .out
-            .get(link_guard.id())
-            .map(|list| list.iter().any(|r| !r.status.is_concluded()))
-            .unwrap_or(false);
-
-        let hash = resource.hash;
-        if active {
-            resource.status = crate::resource::ResourceStatus::Queued;
-        } else {
-            resource.advertise(&link_guard, &mut tx)?;
-        }
-
-        for packet in tx.packets {
-            handler.send_packet(packet).await;
-        }
-
-        handler
-            .resources
-            .out
-            .entry(*link_guard.id())
-            .or_default()
-            .push(resource);
-
-        Ok(hash)
+        enqueue_resource(&mut handler, &mut link_guard, resource).await
     }
 
     /// Cancel an outbound resource transfer on a link (Python
@@ -1469,52 +1677,107 @@ impl Transport {
         path: &str,
         data: &[u8],
     ) -> Result<AddressHash, RnsError> {
-        let mut handler = self.handler.lock().await;
+        let binned = msgpack_bin(data);
+        self.request_element(link, path, Some(&binned)).await
+    }
+
+    /// [`Transport::request`] plus Python's per-request `timeout` and
+    /// `max_response_size`. A timeout is armed when the request is
+    /// delivered (immediately for a packet, after the request resource is
+    /// proven otherwise) and fails the request on the resource watchdog.
+    pub async fn request_with_options(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &str,
+        data: &[u8],
+        options: RequestOptions,
+    ) -> Result<AddressHash, RnsError> {
+        self.dispatch_packed_request(link, pack_request(path, data), options)
+            .await
+    }
+
+    /// [`request`](Self::request), but `element` is spliced as the third
+    /// msgpack value instead of being wrapped in a bin. `None` is nil.
+    pub async fn request_element(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        path: &str,
+        element: Option<&[u8]>,
+    ) -> Result<AddressHash, RnsError> {
+        self.dispatch_packed_request(
+            link,
+            pack_request_element(path, element),
+            RequestOptions::default(),
+        )
+        .await
+    }
+
+    async fn dispatch_packed_request(
+        &self,
+        link: &Arc<Mutex<Link>>,
+        packed: Vec<u8>,
+        options: RequestOptions,
+    ) -> Result<AddressHash, RnsError> {
+        let now = crate::resource::unix_time();
+
+        // Build the request before taking the handler lock. A resource
+        // request reads and encrypts its first segment here; the handler
+        // lock is only held to send or enqueue.
         let link_guard = link.lock().await;
         if link_guard.status() != LinkStatus::Active {
             return Err(RnsError::LinkNotReady);
         }
+        let link_id = *link_guard.id();
 
-        let packed = pack_request(path, data);
-
-        let rid = if packed.len() <= link_guard.mdu() {
+        if packed.len() <= link_guard.mdu() {
             let packet = link_guard.context_packet(&packed, PacketContext::Request)?;
-            handler.send_packet(packet).await;
+            drop(link_guard);
             // A packet-carried request is tracked by its packet hashable
             // part (Python `PacketReceipt.truncated_hash`), which is the
-            // id a responder echoes back.
-            request_id_from_packet(&packet)
-        } else {
-            // A resource-carried request keeps the packed-payload id
-            // (Python `Link.request` sets `request_id =
-            // truncated_hash(packed_request)`).
-            let rid = make_request_id(&packed);
-            let opts = ResourceOptions {
-                request_id: Some(rid),
-                is_response: false,
-                ..Default::default()
-            };
-            // Build + advertise directly (single outstanding request is fine)
-            let mut resource =
-                crate::resource::outbound::OutgoingResource::new(packed, &link_guard, opts)?;
-            let mut tx = crate::resource::ResourceTx::default();
-            resource.advertise(&link_guard, &mut tx)?;
-            for p in tx.packets {
-                handler.send_packet(p).await;
-            }
-            handler
-                .resources
-                .out
-                .entry(*link_guard.id())
-                .or_default()
-                .push(resource);
-            rid
-        };
+            // id a responder echoes back. The response timer starts now.
+            let rid = request_id_from_packet(&packet);
+            let mut handler = self.handler.lock().await;
+            handler.send_packet(packet).await;
+            handler.resources.track_request(
+                rid,
+                PendingRequest {
+                    link_id,
+                    deadline: options.timeout.map(|timeout| now + timeout),
+                    timeout: options.timeout,
+                    max_response_size: options.max_response_size,
+                },
+            );
+            return Ok(rid);
+        }
 
-        handler
-            .resources
-            .pending_requests
-            .insert(rid, *link_guard.id());
+        // A resource-carried request keeps the packed-payload id
+        // (Python `Link.request` sets `request_id =
+        // truncated_hash(packed_request)`). The response timer starts
+        // when that resource is proven.
+        let rid = make_request_id(&packed);
+        let opts = ResourceOptions {
+            request_id: Some(rid),
+            is_response: false,
+            timeout: options.timeout,
+            ..Default::default()
+        };
+        let resource = crate::resource::outbound::OutgoingResource::new(packed, &link_guard, opts)?;
+        drop(link_guard);
+        let mut handler = self.handler.lock().await;
+        let mut link_guard = link.lock().await;
+        if link_guard.status() != LinkStatus::Active {
+            return Err(RnsError::LinkNotReady);
+        }
+        enqueue_resource(&mut handler, &mut link_guard, resource).await?;
+        handler.resources.track_request(
+            rid,
+            PendingRequest {
+                link_id,
+                deadline: None,
+                timeout: options.timeout,
+                max_response_size: options.max_response_size,
+            },
+        );
         Ok(rid)
     }
 
@@ -1794,15 +2057,38 @@ impl Transport {
         let packet_hash = packet.hash();
 
         // Python creates a `PacketReceipt` for every outbound DATA packet.
+        // Unknown paths use PATHFINDER_M hops, matching `Transport.hops_to`.
+        let hops = handler
+            .path_table
+            .get(destination_hash)
+            .map(|entry| entry.hops)
+            .unwrap_or(PATHFINDER_M as u8);
+        let bitrate = match handler
+            .path_table
+            .get(destination_hash)
+            .map(|entry| entry.iface)
+        {
+            Some(iface) => handler
+                .iface_manager
+                .lock()
+                .await
+                .with_control(&iface, |control| control.bitrate)
+                .unwrap_or(0),
+            None => 0,
+        };
         handler.receipts.insert(
             AddressHash::new_from_hash(&packet_hash),
             PacketReceipt {
                 destination: *destination_hash,
                 packet_hash,
                 identity,
-                created_at: time::Instant::now(),
+                sent_at: time::Instant::now(),
+                timeout: Some(first_hop_timeout(bitrate) + TIMEOUT_PER_HOP * u32::from(hops)),
+                status: ReceiptStatus::Sent,
+                concluded_at: None,
             },
         );
+        cull_receipts(&mut handler.receipts);
 
         let (packet, iface) = handler.path_table.handle_packet(&packet);
         if let Some(iface) = iface {
@@ -1876,6 +2162,26 @@ impl Transport {
             .unretain(destination_hash, unix_time_now());
         persist_known_destinations(&mut handler);
         unretained
+    }
+
+    /// Mark destination data as recently used
+    /// (Python `Identity._used_destination_data`).
+    pub async fn used_destination_data(&self, destination_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let used = handler
+            .known_destinations
+            .mark_used(destination_hash, unix_time_now());
+        persist_known_destinations(&mut handler);
+        used
+    }
+
+    /// Retain every known destination belonging to an identity
+    /// (Python `Identity._retain_identity`).
+    pub async fn retain_identity(&self, identity_hash: &AddressHash) -> bool {
+        let mut handler = self.handler.lock().await;
+        let retained = handler.known_destinations.retain_identity(identity_hash);
+        persist_known_destinations(&mut handler);
+        retained
     }
 
     /// Number of known destinations (Python
@@ -2081,6 +2387,57 @@ impl Transport {
         self.handler.lock().await.knows_destination(address)
     }
 
+    /// Observable receipt for an outbound packet hash.
+    /// `timeout == None` is Python `timeout = -1`. `rtt` is set once the
+    /// receipt has concluded (delivered, failed, or culled).
+    pub async fn receipt(&self, packet_hash: &Hash) -> Option<PacketReceiptInfo> {
+        let handler = self.handler.lock().await;
+        handler
+            .receipts
+            .get(&AddressHash::new_from_hash(packet_hash))
+            .map(receipt_info)
+    }
+
+    /// Set the receipt timeout. `None` is Python `set_timeout` of -1,
+    /// which the next check concludes as culled.
+    pub async fn set_receipt_timeout(&self, packet_hash: &Hash, timeout: Option<Duration>) -> bool {
+        let mut handler = self.handler.lock().await;
+        let Some(receipt) = handler
+            .receipts
+            .get_mut(&AddressHash::new_from_hash(packet_hash))
+        else {
+            return false;
+        };
+        receipt.timeout = timeout;
+        true
+    }
+
+    /// Drop queued announces on every interface
+    /// (Python `Transport.drop_announce_queues`).
+    pub async fn drop_announce_queues(&self) {
+        self.iface_manager.lock().await.drop_announce_queues();
+    }
+
+    /// Write the path table, tunnel table, and (when transport is
+    /// enabled) the packet hashlist (Python `Transport.persist_data`).
+    /// Skipped while connected to a shared instance.
+    pub async fn persist_data(&self) {
+        let mut handler = self.handler.lock().await;
+        persist_handler(&mut handler).await;
+    }
+
+    /// Load persisted transport tables once interfaces are attached
+    /// (Python loads them at startup, after interfaces exist).
+    /// Paths whose interface is not up yet stay pending and are tried
+    /// again when that interface is added.
+    pub async fn load_persisted_state(&self) {
+        let mut handler = self.handler.lock().await;
+        handler.persisted_loaded = false;
+        handler.unresolved_paths = None;
+        handler.persisted_aux_loaded = false;
+        load_persisted_state(&mut handler).await;
+    }
+
     pub(crate) fn get_handler(&self) -> Arc<Mutex<TransportHandler>> {
         self.handler.clone()
     }
@@ -2129,6 +2486,11 @@ impl Transport {
 
 impl Drop for Transport {
     fn drop(&mut self) {
+        if let Ok(mut handler) = self.handler.try_lock() {
+            if !handler.shutdown_persisted && try_persist_handler(&mut handler) {
+                handler.shutdown_persisted = true;
+            }
+        }
         self.cancel.cancel();
     }
 }
@@ -2143,6 +2505,48 @@ impl TransportHandler {
         self.send(message).await;
     }
 
+    /// Send a packet that originated on `link`. Stamps `last_outbound`
+    /// (and `last_keepalive` for keepalive context) before the bytes go
+    /// out. Callers that already hold the link lock must use this: `send`
+    /// only try-locks, and a held guard makes that miss.
+    async fn send_from_link(&self, link: &mut Link, packet: Packet) {
+        link.mark_outbound(packet.context == PacketContext::KeepAlive);
+        self.send_packet(packet).await;
+    }
+
+    /// Python `Packet.send` sets `last_outbound` when the destination is a
+    /// link. Link requests are addressed to a destination, so Python calls
+    /// `had_outbound` explicitly; the same stamp is applied here when the
+    /// link lock is free.
+    fn note_unlocked_link_outbound(&self, packet: &Packet) {
+        let is_keepalive = packet.context == PacketContext::KeepAlive;
+        if packet.header.destination_type == DestinationType::Link {
+            if let Some(link) = self.in_links.get(&packet.destination) {
+                if let Ok(mut link) = link.try_lock() {
+                    link.mark_outbound(is_keepalive);
+                }
+                return;
+            }
+            for link in self.out_links.values() {
+                let Ok(mut link) = link.try_lock() else {
+                    continue;
+                };
+                if link.id() == &packet.destination {
+                    link.mark_outbound(is_keepalive);
+                    return;
+                }
+            }
+            return;
+        }
+        if packet.header.packet_type == PacketType::LinkRequest {
+            if let Some(link) = self.out_links.get(&packet.destination) {
+                if let Ok(mut link) = link.try_lock() {
+                    link.mark_outbound(false);
+                }
+            }
+        }
+    }
+
     async fn send(&self, message: TxMessage) {
         // Early rejection of excessive hop counts
         // (Python `Transport._outbound`:
@@ -2155,6 +2559,7 @@ impl TransportHandler {
             );
             return;
         }
+        self.note_unlocked_link_outbound(&message.packet);
         self.packet_cache.lock().await.update(&message.packet);
         self.iface_manager.lock().await.send(message).await;
     }
@@ -2278,12 +2683,11 @@ fn create_single_destination_proof(
     proof_strategy: ProofStrategy,
     sign_key: &crate::identity::SigningKey,
 ) -> Option<Packet> {
-    // Python proves SINGLE-destination data unconditionally for PROVE_ALL;
-    // PROVE_APP consults the proof-requested callback which is not wired
-    // here, so app-data packets (context NONE) are proved.
+    // PROVE_APP is decided by `Destination::should_prove` at the call
+    // site. This builder only emits a proof once that decision is All.
     let should_prove = match proof_strategy {
-        ProofStrategy::None => false,
-        ProofStrategy::App | ProofStrategy::All => true,
+        ProofStrategy::None | ProofStrategy::App => false,
+        ProofStrategy::All => true,
     };
 
     if !should_prove {
@@ -2355,7 +2759,10 @@ fn validate_single_destination_proof(handler: &mut TransportHandler, packet: &Pa
     };
 
     if valid {
-        handler.receipts.remove(&packet.destination);
+        if let Some(stored) = handler.receipts.get_mut(&packet.destination) {
+            stored.status = ReceiptStatus::Delivered;
+            stored.concluded_at = Some(time::Instant::now());
+        }
         let _ = handler.receipt_tx.send(ReceiptEvent {
             destination: receipt.destination,
             packet_hash: receipt.packet_hash,
@@ -2391,13 +2798,16 @@ async fn handle_proof<'a>(
         }
         let link = link.or_else(|| handler.in_links.get(&packet.destination).cloned());
         if let Some(link) = link {
-            let link_guard = link.lock().await;
+            let mut link_guard = link.lock().await;
+            // Resource proofs return before link data handling. Refresh
+            // inbound silence for an established link first.
+            note_established_inbound(&mut link_guard, packet, false);
             let mut tx = ResourceTx::default();
             handler
                 .resources
                 .handle_proof(&link_guard, packet.data.as_slice(), &mut tx);
-            for packet in tx.packets {
-                handler.send_packet(packet).await;
+            for reply in tx.packets {
+                handler.send_from_link(&mut link_guard, reply).await;
             }
             drop(link_guard);
             handler.resources.cleanup();
@@ -2407,6 +2817,8 @@ async fn handle_proof<'a>(
         // No local link owns this proof: fall through to the link-table
         // relay below (Python routes every non-LRPROOF link packet).
     }
+
+    relay_reverse_proof(packet, ingress_iface, &mut handler).await;
 
     // Proofs for our own outbound SINGLE-destination packets are addressed
     // to the truncated packet hash of the proved packet.
@@ -2446,7 +2858,7 @@ async fn handle_proof<'a>(
             rebalanced_path = Some((link.destination().address_hash, observed));
 
             let rtt_packet = link.create_rtt();
-            handler.send_packet(rtt_packet).await;
+            handler.send_from_link(&mut link, rtt_packet).await;
         }
     }
 
@@ -2542,10 +2954,27 @@ async fn send_to_next_hop<'a>(
     packet: &Packet,
     handler: &mut MutexGuard<'a, TransportHandler>,
     lookup: Option<AddressHash>,
+    ingress: Option<AddressHash>,
 ) -> bool {
+    let truncated = AddressHash::new_from_hash(&packet.hash());
+    let is_link_request = packet.header.packet_type == PacketType::LinkRequest;
     let (mut packet, maybe_iface) = handler.path_table.handle_inbound_packet(packet, lookup);
 
     if let Some(iface) = maybe_iface {
+        // Return path for a later proof (Python `reverse_table`). Link
+        // requests are tracked in the link table instead.
+        if !is_link_request {
+            if let Some(received) = ingress {
+                handler.reverse_table.insert(
+                    truncated,
+                    ReverseEntry {
+                        received,
+                        outbound: iface,
+                        at: time::Instant::now(),
+                    },
+                );
+            }
+        }
         // Python clamps or removes the link-request MTU signalling
         // bytes when relaying onto interfaces that cannot negotiate a
         // path MTU (no AUTOCONFIGURE_MTU/FIXED_MTU, e.g. UDP, serial,
@@ -2558,9 +2987,10 @@ async fn send_to_next_hop<'a>(
                 .iface_kind(&iface)
                 .map(|kind| {
                     // Python AUTOCONFIGURE_MTU/FIXED_MTU interfaces:
-                    // TCP, Backbone, local shared-instance links and
-                    // AutoInterface. Everything else (UDP, serial, KISS,
-                    // RNode, I2P, AX.25, pipes) disables the upgrade.
+                    // TCP, Backbone, local shared-instance links,
+                    // AutoInterface and Weave. Everything else (UDP,
+                    // serial, KISS, RNode, I2P, AX.25, pipes) disables
+                    // the upgrade.
                     matches!(
                         kind.as_str(),
                         "TcpClient"
@@ -2570,6 +3000,8 @@ async fn send_to_next_hop<'a>(
                             | "AutoInterface"
                             | "LocalServer"
                             | "LocalClient"
+                            | "WeaveInterface"
+                            | "WeaveInterfacePeer"
                     )
                 })
                 .unwrap_or(false);
@@ -2629,7 +3061,7 @@ async fn handle_resource_packet<'a>(
 ) -> bool {
     use crate::packet::PacketContext as Ctx;
 
-    let link = link_arc.lock().await;
+    let mut link = link_arc.lock().await;
     let handled = match packet.context {
         Ctx::ResourceAdvertisement => {
             let mut buffer = [0u8; PACKET_MDU];
@@ -2639,7 +3071,7 @@ async fn handle_resource_packet<'a>(
                         .resources
                         .handle_advertisement(&link, packet, plaintext);
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     // an accepted request resource may need dispatch once done
                     true
@@ -2653,7 +3085,7 @@ async fn handle_resource_packet<'a>(
                 Ok(plaintext) => {
                     let tx = handler.resources.handle_request_data(&link, plaintext);
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     true
                 }
@@ -2666,7 +3098,7 @@ async fn handle_resource_packet<'a>(
                 Ok(plaintext) => {
                     let tx = handler.resources.handle_hashmap_update(&link, plaintext);
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     true
                 }
@@ -2676,13 +3108,13 @@ async fn handle_resource_packet<'a>(
         Ctx::Resource => {
             let (part_tx, completed) = handler.resources.handle_part(&link, packet);
             for p in part_tx.packets {
-                handler.send_packet(p).await;
+                handler.send_from_link(&mut link, p).await;
             }
             if completed {
                 let mut tx = crate::resource::ResourceTx::default();
                 if let Some((_hash, data)) = handler.resources.assemble_completed(&link, &mut tx) {
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                     // Dispatch an inbound request resource to handlers
                     let request_data = data;
@@ -2705,7 +3137,7 @@ async fn handle_resource_packet<'a>(
                     }
                 } else {
                     for p in tx.packets {
-                        handler.send_packet(p).await;
+                        handler.send_from_link(&mut link, p).await;
                     }
                 }
             }
@@ -2716,8 +3148,8 @@ async fn handle_resource_packet<'a>(
             handler
                 .resources
                 .handle_proof(&link, packet.data.as_slice(), &mut tx);
-            for packet in tx.packets {
-                handler.send_packet(packet).await;
+            for reply in tx.packets {
+                handler.send_from_link(&mut link, reply).await;
             }
             handler.resources.cleanup();
             true
@@ -2741,33 +3173,82 @@ async fn handle_resource_packet<'a>(
     handled
 }
 
+/// Queue `resource` behind any transfer already running on the link, or
+/// advertise it immediately. Callers already hold the handler and link locks.
+async fn enqueue_resource(
+    handler: &mut TransportHandler,
+    link: &mut Link,
+    mut resource: crate::resource::OutgoingResource,
+) -> Result<Hash, RnsError> {
+    let active = handler
+        .resources
+        .out
+        .get(link.id())
+        .is_some_and(|list| list.iter().any(|r| !r.status.is_concluded()));
+    let mut tx = ResourceTx::default();
+    if active {
+        resource.status = crate::resource::ResourceStatus::Queued;
+    } else {
+        resource.advertise(link, &mut tx)?;
+    }
+    let hash = resource.hash;
+    handler
+        .resources
+        .out
+        .entry(*link.id())
+        .or_default()
+        .push(resource);
+    for packet in tx.packets {
+        handler.send_from_link(link, packet).await;
+    }
+    Ok(hash)
+}
+
 /// Send a request response as a packet or resource
 /// (shared by the sync and async handler paths).
+///
+/// A msgpack element is wrapped as `[request_id, element]`. A file is
+/// Python's `(BufferedReader, metadata)` return: the bytes go out as a
+/// resource with no msgpack wrapper, using the handler's auto_compress.
 async fn send_response<'a>(
-    link: &Link,
+    link: &mut Link,
     rid: &AddressHash,
-    response: &[u8],
+    response: &RequestResponse,
+    auto_compress: bool,
+    auto_compress_limit: Option<usize>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
-    let packed = pack_response(rid, response);
-    if packed.len() <= link.mdu() {
-        if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
-            handler.send_packet(packet).await;
-        }
-    } else {
-        let opts = ResourceOptions {
-            request_id: Some(*rid),
-            is_response: true,
-            ..Default::default()
-        };
-        match handler.resources.send_resource(link, packed, opts) {
-            Ok(tx) => {
-                for p in tx.packets {
-                    handler.send_packet(p).await;
+    let opts = ResourceOptions {
+        request_id: Some(*rid),
+        is_response: true,
+        auto_compress,
+        auto_compress_limit,
+        ..Default::default()
+    };
+    let resource = match response {
+        RequestResponse::Element(element) => {
+            let packed = pack_response(rid, element);
+            if packed.len() <= link.mdu() {
+                if let Ok(packet) = link.context_packet(&packed, PacketContext::Response) {
+                    handler.send_from_link(link, packet).await;
                 }
+                return;
             }
-            Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
+            crate::resource::OutgoingResource::new(packed, link, opts)
         }
+        RequestResponse::File { path, metadata } => {
+            let mut opts = opts;
+            opts.metadata = metadata.clone();
+            crate::resource::OutgoingResource::from_path(path, link, opts)
+        }
+    };
+    match resource {
+        Ok(resource) => {
+            if let Err(err) = enqueue_resource(handler, link, resource).await {
+                log::debug!("tp: could not send response resource: {err:?}");
+            }
+        }
+        Err(err) => log::debug!("tp: could not send response resource: {err:?}"),
     }
 }
 
@@ -2780,7 +3261,7 @@ async fn handle_incoming_request<'a>(
     transport_handler: &Arc<Mutex<TransportHandler>>,
     handler: &mut MutexGuard<'a, TransportHandler>,
 ) {
-    let link = link_arc.lock().await;
+    let mut link = link_arc.lock().await;
     let destination = link.destination().address_hash;
     let remote_identity = link.remote_identity();
 
@@ -2794,8 +3275,9 @@ async fn handle_incoming_request<'a>(
         .resources
         .async_request_handler(&destination, &path_hash)
     {
+        // Async handlers have no allow policy. They send with the default
+        // compress values; the sync config path is what restricts peers.
         let link_id = *link.id();
-        let _mdu = link.mdu();
         drop(link);
 
         // Async handlers run on the runtime WITHOUT the transport lock:
@@ -2818,25 +3300,33 @@ async fn handle_incoming_request<'a>(
 
             if let Some(response) = response {
                 let mut handler = transport_handler.lock().await;
-                let link = link_arc.lock().await;
-                send_response(&link, &rid, &response, &mut handler).await;
+                let mut link = link_arc.lock().await;
+                send_response(
+                    &mut link,
+                    &rid,
+                    &RequestResponse::Element(response),
+                    true,
+                    None,
+                    &mut handler,
+                )
+                .await;
             }
         });
         return;
     }
 
-    let handler_fn = handler
-        .resources
-        .request_handlers
-        .get(&destination)
-        .and_then(|handlers| handlers.get(&path_hash).cloned());
-
-    let Some(handler_fn) = handler_fn else {
+    let Some(registered) = handler.resources.request_handler(&destination, &path_hash) else {
         log::trace!("tp: no handler for request path {path_hash}");
         return;
     };
+    if !registered.allows(&remote_identity) {
+        log::debug!("tp: request from peer not allowed");
+        return;
+    }
+    let auto_compress = registered.config.auto_compress;
+    let auto_compress_limit = registered.config.auto_compress_limit;
 
-    let response = handler_fn(RequestCtx {
+    let response = registered.call(RequestCtx {
         path_hash,
         data: request_data,
         request_id: rid,
@@ -2846,7 +3336,15 @@ async fn handle_incoming_request<'a>(
     });
 
     if let Some(response) = response {
-        send_response(&link, &rid, &response, handler).await;
+        send_response(
+            &mut link,
+            &rid,
+            &response,
+            auto_compress,
+            auto_compress_limit,
+            handler,
+        )
+        .await;
     }
 }
 
@@ -2908,6 +3406,18 @@ async fn handle_request_or_response_packet<'a>(
             let Some((rid, response)) = crate::resource::manager::unpack_response(plaintext) else {
                 return false;
             };
+            // Python `handle_response` only accepts a response while the
+            // request receipt is still pending. A late packet after a
+            // timeout (the receipt was already removed) is ignored.
+            if !handler.resources.pending_requests.contains_key(&rid) {
+                return true;
+            }
+            // `len(umsgpack.packb(response_data)) - 2`.
+            let size = packet_response_size(plaintext).unwrap_or(response.len());
+            if !handler.resources.response_size_allowed(&rid, size) {
+                handler.resources.fail_request(rid);
+                return true;
+            }
             // Retain the completed response so an `await_request_response`
             // call that has not subscribed yet still observes it.
             handler
@@ -2973,6 +3483,21 @@ async fn handle_cache_request<'a>(
     }
 }
 
+/// Python `Link.__receive` sets `last_inbound` before dispatch, for every
+/// packet on an open link except an initiator's own `0xFF`.
+fn note_established_inbound(link: &mut Link, packet: &Packet, out_link: bool) {
+    if !matches!(link.status(), LinkStatus::Active | LinkStatus::Stale) {
+        return;
+    }
+    if out_link
+        && packet.context == PacketContext::KeepAlive
+        && packet.data.as_slice().first() == Some(&KEEP_ALIVE_REQUEST)
+    {
+        return;
+    }
+    link.touch();
+}
+
 async fn handle_data<'a>(
     packet: &Packet,
     ingress_iface: AddressHash,
@@ -3000,6 +3525,12 @@ async fn handle_data<'a>(
             // link-table routing must not also try to forward it
             // (Python delivers endpoint link data to the local link).
             local_out_link_handled = true;
+            // Refresh inbound silence before resource/request/cache
+            // handlers return. Pending links are left alone.
+            {
+                let mut established = link.lock().await;
+                note_established_inbound(&mut established, packet, false);
+            }
             if handle_resource_packet(packet, &link, transport_handler, &mut handler).await {
                 return;
             }
@@ -3024,7 +3555,7 @@ async fn handle_data<'a>(
                     .get_cached_announce(&request_hash);
                 if let Some(cached) = cached {
                     if let Ok(response) = link.data_packet(cached.data.as_slice()) {
-                        handler.send_packet(response).await;
+                        handler.send_from_link(&mut link, response).await;
                         return;
                     }
                 }
@@ -3032,40 +3563,49 @@ async fn handle_data<'a>(
 
             let channel_tx = handler.channel_table.get(link.id());
 
-            // Proof strategy of the destination owning this link gates
-            // message proofs (Python `Link.receive`: PROVE_NONE never
-            // proves, PROVE_ALL always proves, PROVE_APP only proves
-            // application data packets).
+            // Python `Link.receive` calls `proof_requested` only for
+            // context NONE. CHANNEL is proved with no callback. Every
+            // other link context ignores the callback. PROVE_ALL still
+            // proves NONE without asking the callback.
             let proof_strategy = handler
                 .single_in_destinations
                 .get(&link.destination().address_hash)
                 .and_then(|destination| destination.try_lock().ok())
-                .map(|destination| destination.proof_strategy());
+                .map(|destination| {
+                    let strategy = destination.proof_strategy();
+                    let app_prove = packet.context == PacketContext::None
+                        && strategy == ProofStrategy::App
+                        && destination.should_prove(packet);
+                    (strategy, app_prove)
+                });
 
             let result = link.handle_packet(&handler.link_in_event_tx, channel_tx, packet, false);
 
             match result {
-                LinkHandleResult::KeepAlive => {
+                LinkHandleResult::KeepAlive
+                    if link.keepalive_reply_due(handler.config.timer_config.out_link_keep) =>
+                {
+                    // Python answers 0xFF only when outbound has been idle
+                    // for a keepalive interval.
                     let packet = link.keep_alive_packet(KEEP_ALIVE_RESPONSE);
-                    handler.send_packet(packet).await;
+                    handler.send_from_link(&mut link, packet).await;
                 }
                 LinkHandleResult::MessageReceived(proof) => {
-                    let strategy = proof_strategy.unwrap_or_default();
-                    // Python `Link.receive`: CHANNEL-context packets are
-                    // proved unconditionally (channel reliability),
-                    // independent of the destination's proof strategy.
-                    let should_prove = match strategy {
-                        ProofStrategy::None => packet.context == PacketContext::Channel,
-                        ProofStrategy::App => {
-                            packet.context == PacketContext::None
-                                || packet.context == PacketContext::Channel
-                        }
-                        ProofStrategy::All => true,
+                    let (strategy, app_prove) =
+                        proof_strategy.unwrap_or((ProofStrategy::None, false));
+                    let should_prove = match packet.context {
+                        PacketContext::Channel => true,
+                        PacketContext::None => match strategy {
+                            ProofStrategy::None => false,
+                            ProofStrategy::App => app_prove,
+                            ProofStrategy::All => true,
+                        },
+                        _ => false,
                     };
 
                     if should_prove {
                         if let Some(proof) = proof {
-                            handler.send_packet(proof).await;
+                            handler.send_from_link(&mut link, proof).await;
                         }
                     }
                 }
@@ -3085,6 +3625,10 @@ async fn handle_data<'a>(
             let link_id = *link.lock().await.id();
 
             if link_id == packet.destination {
+                {
+                    let mut established = link.lock().await;
+                    note_established_inbound(&mut established, packet, true);
+                }
                 if handle_resource_packet(packet, &link, transport_handler, &mut handler).await {
                     local_out_link_handled = true;
                     data_handled = true;
@@ -3108,7 +3652,7 @@ async fn handle_data<'a>(
                 );
 
                 if let LinkHandleResult::MessageReceived(Some(proof)) = result {
-                    handler.send_packet(proof).await;
+                    handler.send_from_link(&mut link, proof).await;
                 }
 
                 local_out_link_handled = true;
@@ -3232,14 +3776,19 @@ async fn handle_data<'a>(
                         })
                         .ok();
 
-                    // Python `Transport`/`Link` prove incoming packets
-                    // according to the destination's proof strategy.
-                    let proof_strategy = destination.proof_strategy();
+                    // Ordinary data proofs follow `Destination::should_prove`
+                    // (PROVE_ALL always, PROVE_APP only when the callback
+                    // asks, PROVE_NONE never). Link proofs stay outside this.
                     let sign_key = destination.sign_key().clone();
-                    if let Some(proof) =
-                        create_single_destination_proof(&handler, packet, proof_strategy, &sign_key)
-                    {
-                        handler.send_packet(proof).await;
+                    if destination.should_prove(packet) {
+                        if let Some(proof) = create_single_destination_proof(
+                            &handler,
+                            packet,
+                            ProofStrategy::All,
+                            &sign_key,
+                        ) {
+                            handler.send_packet(proof).await;
+                        }
                     }
                 }
                 Err(error) => {
@@ -3253,7 +3802,7 @@ async fn handle_data<'a>(
         } else if packet.transport == Some(*handler.config.identity.address_hash()) {
             // Path forwarding only applies to packets addressed to this
             // instance (Python `transport_id == Transport.identity.hash`).
-            data_handled = send_to_next_hop(packet, &mut handler, None).await;
+            data_handled = send_to_next_hop(packet, &mut handler, None, Some(ingress_iface)).await;
         }
     }
 
@@ -3278,24 +3827,11 @@ async fn handle_announce<'a>(
         return;
     }
 
-    // Drop announces whose announced identity is blackholed
-    // (Python checks the identity hash inside `validate_announce`).
-    {
-        let blackholes = handler.blackholes.read().await;
-        if blackholes.is_blackholed(&packet.destination) {
-            log::debug!(
-                "tp({}): dropping announce from blackholed {}",
-                handler.config.name,
-                packet.destination
-            );
-            return;
-        }
-    }
-
     // Ingress control (Python `Transport.inbound` announce path):
     // sample the announce, and hold it if the interface is currently
-    // ingress limiting. Announces for destinations with waiting path
-    // requests are never limited.
+    // ingress limiting. Waiting path requests and discovery requests
+    // exempt the announce for the life of that deadline. KISS, serial
+    // and RNode interfaces are never ingress-limited.
     {
         handler
             .iface_manager
@@ -3305,8 +3841,15 @@ async fn handle_announce<'a>(
 
         let known_path = handler.path_table.get(&packet.destination).is_some();
         let pending_request = handler.path_requests.has_pending(&packet.destination);
+        let discovery_waiting = handler.path_requests.discovery_pending(&packet.destination);
+        let exempt = {
+            let manager = handler.iface_manager.lock().await;
+            manager
+                .iface_kind(&iface)
+                .is_some_and(|kind| ingress_exempt_kind(&kind))
+        };
 
-        if !known_path && !pending_request {
+        if !known_path && !pending_request && !discovery_waiting && !exempt {
             let limited = {
                 let manager = handler.iface_manager.lock().await;
                 manager
@@ -3333,33 +3876,72 @@ async fn handle_announce<'a>(
         }
     }
 
-    if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
+    let interface_rate = {
+        let manager = handler.iface_manager.lock().await;
+        manager.with_control(&iface, |control| {
+            control
+                .announce_rate_target
+                .map(|target| announce_limits::AnnounceRateLimit {
+                    target,
+                    grace: control.announce_rate_grace.unwrap_or(0),
+                    penalty: control.announce_rate_penalty,
+                })
+        })
+    };
+    let blocked_until = match interface_rate.flatten() {
+        Some(limit) => handler
+            .announce_limits
+            .check_limited(&packet.destination, limit),
+        None => handler.announce_limits.check(&packet.destination),
+    };
+    // A rate hit suppresses rebroadcast only. The path is still installed.
+    let rate_blocked = blocked_until.is_some();
+    if let Some(blocked_until) = blocked_until {
         log::info!(
-            "tp({}): too many announces from {}, blocked for {} seconds",
+            "tp({}): blocking rebroadcast of announce from {} for {} seconds",
             handler.config.name,
             packet.destination,
             blocked_until.as_secs(),
         );
+    }
+
+    // Blackhole check uses the announced identity hash and runs before
+    // the signature check (Python `Identity.validate_announce` returns
+    // "blackholed" without verifying). An invalid signature is a
+    // protocol violation; a blackholed identity is not.
+    let Some(identity_hash) = announced_identity_hash(packet) else {
+        handler
+            .iface_manager
+            .lock()
+            .await
+            .count_protocol_violation(&iface);
+        return;
+    };
+    if handler
+        .blackholes
+        .read()
+        .await
+        .is_blackholed(&identity_hash)
+    {
+        log::debug!(
+            "tp({}): dropping announce from blackholed identity {}",
+            handler.config.name,
+            identity_hash
+        );
         return;
     }
 
-    if let Ok((destination, announce)) = DestinationAnnounce::validate(packet) {
+    let Ok((destination, announce)) = DestinationAnnounce::validate(packet) else {
+        handler
+            .iface_manager
+            .lock()
+            .await
+            .count_protocol_violation(&iface);
+        return;
+    };
+    {
         let dest_hash = destination.identity.address_hash;
         let public_key = destination.identity.to_bytes();
-
-        // Drop announces whose announced identity is blackholed
-        // (Python checks inside `validate_announce`).
-        {
-            let blackholes = handler.blackholes.read().await;
-            if blackholes.is_blackholed(&dest_hash) {
-                log::debug!(
-                    "tp({}): dropping announce from blackholed identity {}",
-                    handler.config.name,
-                    dest_hash
-                );
-                return;
-            }
-        }
 
         let destination = Arc::new(Mutex::new(destination));
 
@@ -3416,9 +3998,11 @@ async fn handle_announce<'a>(
         // (Python `Transport.cache(force_cache=True, packet_type="announce")`).
         handler.packet_cache.lock().await.cache_announce(packet);
 
-        handler
-            .announce_table
-            .add(packet, packet.destination, dest_hash);
+        if !rate_blocked {
+            handler
+                .announce_table
+                .add(packet, packet.destination, dest_hash);
+        }
 
         // If we have a waiting discovery path request for this destination,
         // answer it immediately with a path response announce on the
@@ -3448,9 +4032,21 @@ async fn handle_announce<'a>(
             );
         }
 
-        handler
-            .path_table
-            .handle_announce(packet, packet.transport, iface);
+        let (mode, gravity) = {
+            let manager = handler.iface_manager.lock().await;
+            let mode = manager.iface_mode(&iface);
+            let gravity = manager
+                .with_control(&iface, |control| control.gravity)
+                .unwrap_or(0);
+            (mode, gravity)
+        };
+        handler.path_table.handle_announce_with_mode(
+            packet,
+            packet.transport,
+            iface,
+            mode,
+            Some(gravity),
+        );
 
         // If the receiving interface is a tunnel, associate the path with
         // the tunnel for later restore
@@ -3474,7 +4070,7 @@ async fn handle_announce<'a>(
             );
         }
 
-        let retransmit = handler.config.retransmit;
+        let retransmit = handler.config.retransmit && !rate_blocked;
         if retransmit {
             let transport_id = *handler.config.identity.address_hash();
             // Keyed by the announced destination hash (identity hash is
@@ -3636,20 +4232,21 @@ async fn handle_path_request<'a>(
         manager.is_local_client_iface(&iface)
     };
 
-    // One discovery request at a time per destination.
-    let discovery_pending = handler
-        .path_requests
-        .discovery_pending(&request.destination);
-
-    if from_local_client && !discovery_pending {
+    if from_local_client {
         log::trace!(
             "tp({}): forwarding path request from local client for {} to all other interfaces",
             handler.config.name,
             request.destination
         );
-        handler
-            .path_requests
-            .register_discovery(&request.destination, Some(iface));
+        // Local clients still forward when a discovery is already in
+        // flight; the helper only lengthens the deadline and records
+        // this requestor.
+        let timeout = medium_discovery_timeout(handler).await;
+        handler.path_requests.register_discovery_with_timeout(
+            &request.destination,
+            Some(iface),
+            timeout,
+        );
 
         let interfaces = handler.iface_manager.lock().await.live_iface_addresses();
         for (other, online) in interfaces {
@@ -3699,13 +4296,18 @@ async fn handle_path_request<'a>(
     if let Some(search_modes) = search {
         // Abort recursive path request if the receiving interface has a
         // path-request burst active (Python `should_ingress_limit_pr`).
+        // KISS, serial and RNode are exempt inside transport.
         let ingress_limited = {
             let manager = handler.iface_manager.lock().await;
-            manager
-                .with_control(&iface, |control| {
-                    control.should_ingress_limit_pr(time::Instant::now())
-                })
-                .unwrap_or(false)
+            let exempt = manager
+                .iface_kind(&iface)
+                .is_some_and(|kind| ingress_exempt_kind(&kind));
+            !exempt
+                && manager
+                    .with_control(&iface, |control| {
+                        control.should_ingress_limit_pr(time::Instant::now())
+                    })
+                    .unwrap_or(false)
         };
         if ingress_limited {
             log::trace!(
@@ -3715,7 +4317,13 @@ async fn handle_path_request<'a>(
             return;
         }
 
-        if discovery_pending {
+        let timeout = medium_discovery_timeout(handler).await;
+        let started = handler.path_requests.register_discovery_with_timeout(
+            &request.destination,
+            Some(iface),
+            timeout,
+        );
+        if !started {
             log::trace!(
                 "tp({}): there is already a waiting path request for {}",
                 handler.config.name,
@@ -3723,10 +4331,6 @@ async fn handle_path_request<'a>(
             );
             return;
         }
-
-        handler
-            .path_requests
-            .register_discovery(&request.destination, Some(iface));
 
         log::trace!(
             "tp({}): attempting to discover unknown path to {} on behalf of path request",
@@ -3863,7 +4467,8 @@ async fn handle_tunnel_synthesize<'a>(
             let should_restore = match handler.path_table.get(&destination) {
                 None => true,
                 Some(entry) => {
-                    let expired = now.saturating_sub(entry.timestamp) >= path_table::PATHFINDER_E;
+                    let expired =
+                        path_table::path_age(now, entry.timestamp) >= path_table::PATHFINDER_E;
                     expired || path.hops <= entry.hops
                 }
             };
@@ -3938,9 +4543,8 @@ async fn handle_link_request_as_destination<'a>(
                     // follow the destination's proof strategy.
                     link.prove_messages(proof_strategy != ProofStrategy::None);
 
-                    handler
-                        .send_packet(link.prove(&handler.link_in_event_tx))
-                        .await;
+                    let proof = link.prove(&handler.link_in_event_tx);
+                    handler.send_from_link(&mut link, proof).await;
 
                     log::debug!(
                         "tp({}): save input link {} for destination {}",
@@ -3968,6 +4572,12 @@ async fn handle_link_request_as_intermediate<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
+    let next_hop_bitrate = handler
+        .iface_manager
+        .lock()
+        .await
+        .with_control(&next_hop_iface, |control| control.bitrate)
+        .unwrap_or(0);
     handler.link_table.add(
         packet,
         packet.destination,
@@ -3975,9 +4585,10 @@ async fn handle_link_request_as_intermediate<'a>(
         next_hop,
         next_hop_iface,
         remaining_hops,
+        next_hop_bitrate,
     );
 
-    send_to_next_hop(packet, &mut handler, None).await;
+    send_to_next_hop(packet, &mut handler, None, None).await;
 }
 
 async fn handle_link_request<'a>(
@@ -4046,16 +4657,19 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     let mut links_to_remove: Vec<AddressHash> = Vec::new();
     let timer_config = handler.config.timer_config;
 
-    // Clean up input links
+    // Clean up input links. Inbound silence is per link: 720s until RTT
+    // is known, then `2 * keepalive(rtt)`. Close follows `close_grace`
+    // (the watchdog cap of 5s).
     for link_entry in &handler.in_links {
         let mut link = link_entry.1.lock().await;
+        let stale_after = link.effective_stale(timer_config.in_link_stale);
+        let close_after =
+            stale_after.saturating_add(timer_config.in_link_close.min(link.close_grace()));
         match link.status() {
-            LinkStatus::Active if link.elapsed() > timer_config.in_link_stale => {
+            LinkStatus::Active if link.elapsed() >= stale_after => {
                 link.stale();
             }
-            LinkStatus::Stale
-                if link.elapsed() > timer_config.in_link_stale + timer_config.in_link_close =>
-            {
+            LinkStatus::Stale if link.elapsed() >= close_after => {
                 if let Some(packet) =
                     link.teardown(&handler.link_in_event_tx)
                         .unwrap_or_else(|err| {
@@ -4066,7 +4680,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                             None
                         })
                 {
-                    handler.send_packet(packet).await
+                    handler.send_from_link(&mut link, packet).await
                 }
                 links_to_remove.push(*link_entry.0);
             }
@@ -4081,13 +4695,25 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
 
     links_to_remove.clear();
 
-    let mut expired_links: Vec<(AddressHash, bool)> = Vec::new();
+    let mut expired_links: Vec<AddressHash> = Vec::new();
 
     for link_entry in &handler.out_links {
         let mut link = link_entry.1.lock().await;
 
+        // Only the initiator emits keepalive 0xFF. Send it before the
+        // stale check so the final probe still goes out (Python watchdog
+        // order). The send does not count as inbound activity.
+        if link.keepalive_due(timer_config.out_link_keep) {
+            let packet = link.keep_alive_packet(KEEP_ALIVE_REQUEST);
+            handler.send_from_link(&mut link, packet).await;
+        }
+
+        let stale_after = link.effective_stale(timer_config.out_link_stale);
+        let close_after =
+            stale_after.saturating_add(timer_config.out_link_close.min(link.close_grace()));
+
         match link.status() {
-            LinkStatus::Active if link.elapsed() > timer_config.out_link_stale => {
+            LinkStatus::Active if link.elapsed() >= stale_after => {
                 link.stale();
             }
             LinkStatus::Stale => {
@@ -4095,8 +4721,7 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                     if link.elapsed() > timer_config.out_link_restart {
                         link.restart();
                     }
-                } else if link.elapsed() > timer_config.out_link_stale + timer_config.out_link_close
-                {
+                } else if link.elapsed() >= close_after {
                     if let Some(packet) =
                         link.teardown(&handler.link_out_event_tx)
                             .unwrap_or_else(|err| {
@@ -4107,44 +4732,38 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                                 None
                             })
                     {
-                        handler.send_packet(packet).await
+                        handler.send_from_link(&mut link, packet).await
                     }
                     links_to_remove.push(*link_entry.0);
                 }
             }
             LinkStatus::Pending if link.elapsed() > timer_config.out_link_repeat => {
-                // Establishment timeout (Python closes the pending link
-                // after `establishment_timeout` = per-hop timeout * hops,
-                // expires the failed path on client instances and queues
-                // a new path request for rediscovery).
+                // Python `Link.__init__` waits `get_first_hop_timeout`
+                // (one MTU of airtime plus 6s) plus
+                // `ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, hops)`.
+                // That first-hop timeout already includes one MTU; this
+                // deadline does not add a second one.
                 let link_destination = link.destination().address_hash;
                 let hops = handler
                     .path_table
                     .get(&link_destination)
                     .map(|entry| entry.hops)
                     .unwrap_or(1);
-                let mut establishment_timeout = timer_config.out_link_repeat * hops.max(1) as u32
-                    + timer_config.out_link_repeat;
-                // Extra link-proof time on slow interfaces
-                // (Python `Transport.extra_link_proof_timeout`:
-                // `((1/bitrate)*8)*MTU` for the next-hop interface).
-                if let Some(iface) = handler
+                let next_iface = handler
                     .path_table
                     .get(&link_destination)
-                    .map(|entry| entry.iface)
-                {
-                    if let Some(bitrate) = handler
+                    .map(|entry| entry.iface);
+                let bitrate = match next_iface {
+                    Some(iface) => handler
                         .iface_manager
-                        .try_lock()
-                        .ok()
-                        .and_then(|manager| manager.with_control(&iface, |control| control.bitrate))
-                        .filter(|bitrate| *bitrate > 0)
-                    {
-                        establishment_timeout += Duration::from_secs_f64(
-                            (1.0 / bitrate as f64) * 8.0 * crate::packet::PROTOCOL_MTU as f64,
-                        );
-                    }
-                }
+                        .lock()
+                        .await
+                        .with_control(&iface, |control| control.bitrate)
+                        .unwrap_or(0),
+                    None => 0,
+                };
+                let establishment_timeout =
+                    first_hop_timeout(bitrate) + TIMEOUT_PER_HOP * u32::from(hops.max(1));
 
                 if link.elapsed() > establishment_timeout {
                     log::warn!(
@@ -4152,11 +4771,10 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         handler.config.name,
                         link.id()
                     );
-                    let rediscover = !handler.config.retransmit;
                     if let Some(packet) = link.teardown(&handler.link_out_event_tx).ok().flatten() {
-                        handler.send_packet(packet).await;
+                        handler.send_from_link(&mut link, packet).await;
                     }
-                    expired_links.push((link_destination, rediscover));
+                    expired_links.push(link_destination);
                     links_to_remove.push(*link_entry.0);
                 } else {
                     log::warn!(
@@ -4164,7 +4782,10 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
                         handler.config.name,
                         link.id()
                     );
-                    handler.send_packet(link.request()).await;
+                    // `request` resets the establishment clock. The packet
+                    // is not link-addressed, so stamp outbound here.
+                    let packet = link.request();
+                    handler.send_from_link(&mut link, packet).await;
                 }
             }
             LinkStatus::Closed => {
@@ -4179,29 +4800,31 @@ async fn handle_check_links<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         handler.out_links.remove(addr);
     }
 
-    for (destination, rediscover) in expired_links {
-        if rediscover {
-            handler.path_table.expire_path(&destination);
-            let packet = handler.path_requests.generate(&destination, None);
-            handler
-                .send(TxMessage {
-                    tx_type: TxMessageType::Broadcast(None),
-                    packet,
-                })
-                .await;
+    // Python closes a pending link that never activated and, when this
+    // instance is not a transport, expires the path and rediscovers it.
+    // The request is sent only when `PATH_REQUEST_MI` allows it and this
+    // instance is not attached to a shared instance. The path is not
+    // marked unresponsive here.
+    for destination in expired_links {
+        let shared = handler
+            .iface_manager
+            .lock()
+            .await
+            .connected_to_shared_instance();
+        if handler.config.retransmit
+            || shared
+            || !handler.path_requests.request_allowed(&destination)
+        {
+            continue;
         }
-    }
-}
-
-async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
-    for link in handler.out_links.values() {
-        let link = link.lock().await;
-
-        if link.status() == LinkStatus::Active {
-            handler
-                .send_packet(link.keep_alive_packet(KEEP_ALIVE_REQUEST))
-                .await;
-        }
+        handler.path_table.expire_path(&destination);
+        let packet = handler.path_requests.generate(&destination, None);
+        handler
+            .send(TxMessage {
+                tx_type: TxMessageType::Broadcast(None),
+                packet,
+            })
+            .await;
     }
 }
 
@@ -4217,11 +4840,8 @@ async fn handle_cleanup<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
         );
     }
 
-    // Cull timed-out packet receipts (Python `Transport.clean`).
-    let receipt_timeout = handler.config.timer_config.keep_packet_cached;
-    handler
-        .receipts
-        .retain(|_, receipt| receipt.created_at.elapsed() < receipt_timeout);
+    // Receipt lifetimes are the receipt timeout, not the packet-cache
+    // window. The link-check loop concludes them.
 }
 
 async fn retransmit_announces<'a>(
@@ -4255,8 +4875,9 @@ pub enum TrafficClass {
 }
 
 /// Default inbound queue lengths
-/// (Python `INBOUND_*_QUEUE_LENGTH`).
-pub const INBOUND_QUEUE_LENGTHS: [usize; 4] = [4096, 256, 256, 128];
+/// (Python `INBOUND_DA/AN/PR/IL_QUEUE_LENGTH`). A configured length of 0
+/// means that class is unset and uses this default.
+pub const INBOUND_QUEUE_LENGTHS: [usize; 4] = [1024, 128, 128, 8];
 
 /// The prioritized inbound queue backend
 /// (Python `Transport.InboundQueues`): one bounded deque per traffic
@@ -4277,6 +4898,12 @@ impl Default for InboundQueues {
 
 impl InboundQueues {
     pub fn new(sizes: [usize; 4]) -> Self {
+        let mut sizes = sizes;
+        for (index, size) in sizes.iter_mut().enumerate() {
+            if *size == 0 {
+                *size = INBOUND_QUEUE_LENGTHS[index];
+            }
+        }
         Self {
             queues: Default::default(),
             sizes,
@@ -4319,11 +4946,8 @@ impl InboundQueues {
         (heights.iter().sum(), heights, self.dropped)
     }
 
-    /// Enqueue `incoming` and drain everything queued so far, in class
-    /// order. The single-drainer structure matches Python's inbound
-    /// worker thread.
     pub fn enqueue_and_drain(&mut self, incoming: RxMessage) -> Vec<RxMessage> {
-        let class = Self::classify(&incoming.packet);
+        let class = Self::classify(&incoming.packet, &AddressHash::new([0; 16]), false);
         self.put(class, incoming);
         let mut out = Vec::new();
         while let Some(item) = self.get() {
@@ -4334,15 +4958,23 @@ impl InboundQueues {
 
     /// Classify an inbound packet
     /// (Python `Transport.preprocess_inbound` traffic class selection).
-    fn classify(packet: &Packet) -> TrafficClass {
+    ///
+    /// Path requests are DATA addressed to `path_request_dest`. An
+    /// ingress-limited path request uses [`TrafficClass::IngressLimited`].
+    /// Cache requests stay in the data class.
+    pub fn classify(
+        packet: &Packet,
+        path_request_dest: &AddressHash,
+        ingress_limited: bool,
+    ) -> TrafficClass {
         if packet.header.packet_type == PacketType::Announce {
             return TrafficClass::Announce;
         }
-        // Path requests are DATA packets aimed at the fixed plain
-        // path-request destination (Python `pr_destination_hash`).
-        if packet.header.packet_type == PacketType::Data
-            && packet.context == PacketContext::CacheRequest
+        if packet.header.packet_type == PacketType::Data && packet.destination == *path_request_dest
         {
+            if ingress_limited {
+                return TrafficClass::IngressLimited;
+            }
             return TrafficClass::PathRequest;
         }
         TrafficClass::Data
@@ -4384,6 +5016,836 @@ fn packet_filter(packet: &Packet) -> bool {
     packet_filter_violation(packet).is_none()
 }
 
+/// KISS (including AX.25), serial and RNode interfaces do not ingress-limit.
+fn ingress_exempt_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "KissInterface" | "SerialInterface" | "RnodeInterface" | "RnodeMultiInterface"
+    )
+}
+
+fn announced_identity_hash(packet: &Packet) -> Option<AddressHash> {
+    let data = packet.data.as_slice();
+    if data.len() < 64 {
+        return None;
+    }
+    let identity = Identity::new_from_slices(&data[..32], &data[32..64]);
+    Some(identity.address_hash)
+}
+
+/// Python `Transport.first_hop_timeout`: MTU airtime plus 6s, or 6s when
+/// the next-hop bitrate is unknown.
+fn first_hop_timeout(bitrate: u64) -> Duration {
+    if bitrate == 0 {
+        return Duration::from_secs(6);
+    }
+    Duration::from_secs_f64(crate::packet::PROTOCOL_MTU as f64 * (8.0 / bitrate as f64) + 6.0)
+}
+
+async fn medium_discovery_timeout(handler: &TransportHandler) -> Duration {
+    const MINIMUM_BITRATE: f64 = 5.0;
+    match handler
+        .iface_manager
+        .lock()
+        .await
+        .lowest_interface_bitrate()
+    {
+        Some(bitrate) if bitrate > 0 => {
+            let mtu = crate::packet::PROTOCOL_MTU as f64;
+            Duration::from_secs_f64(2.0 * (mtu * 8.0 / (bitrate as f64).max(MINIMUM_BITRATE)) + 6.0)
+        }
+        _ => Duration::ZERO,
+    }
+}
+
+async fn ingress_limited_path_request(handler: &TransportHandler, message: &RxMessage) -> bool {
+    let packet = &message.packet;
+    if packet.header.packet_type != PacketType::Data
+        || packet.destination != handler.fixed_dest_path_requests
+    {
+        return false;
+    }
+    let manager = handler.iface_manager.lock().await;
+    if manager
+        .iface_kind(&message.address)
+        .is_some_and(|kind| ingress_exempt_kind(&kind))
+    {
+        return false;
+    }
+    manager
+        .with_control(&message.address, |control| {
+            control.should_ingress_limit_pr(time::Instant::now())
+        })
+        .unwrap_or(false)
+}
+
+fn receipt_info(receipt: &PacketReceipt) -> PacketReceiptInfo {
+    PacketReceiptInfo {
+        status: receipt.status,
+        timeout: receipt.timeout,
+        rtt: receipt
+            .concluded_at
+            .and_then(|at| at.checked_duration_since(receipt.sent_at)),
+    }
+}
+
+/// How long a concluded receipt stays readable by `receipt()`.
+/// Link checks run every second; callers poll for a few seconds.
+const RECEIPT_CONCLUDED_GRACE: Duration = Duration::from_secs(5);
+
+fn check_receipts(receipts: &mut HashMap<AddressHash, PacketReceipt>) {
+    let now = time::Instant::now();
+    for receipt in receipts.values_mut() {
+        if receipt.status != ReceiptStatus::Sent {
+            continue;
+        }
+        let timed_out = match receipt.timeout {
+            None => true,
+            Some(timeout) => receipt.sent_at.elapsed() >= timeout,
+        };
+        if timed_out {
+            receipt.status = if receipt.timeout.is_none() {
+                ReceiptStatus::Culled
+            } else {
+                ReceiptStatus::Failed
+            };
+            receipt.concluded_at = Some(now);
+        }
+    }
+    cull_receipts(receipts);
+}
+
+/// Drop concluded receipts after [`RECEIPT_CONCLUDED_GRACE`]. While the
+/// map is over [`MAX_RECEIPTS`], drop the oldest in-flight receipts until
+/// it fits. `SENT` receipts under the cap stay until their timeout.
+fn cull_receipts(receipts: &mut HashMap<AddressHash, PacketReceipt>) {
+    let now = time::Instant::now();
+    receipts.retain(|_, receipt| match receipt.status {
+        ReceiptStatus::Sent => true,
+        _ => match receipt.concluded_at {
+            Some(at) => now.saturating_duration_since(at) < RECEIPT_CONCLUDED_GRACE,
+            None => false,
+        },
+    });
+    while receipts.len() > MAX_RECEIPTS {
+        let oldest_inflight = receipts
+            .iter()
+            .filter(|(_, receipt)| receipt.status == ReceiptStatus::Sent)
+            .min_by_key(|(_, receipt)| receipt.sent_at)
+            .map(|(key, _)| *key);
+        let Some(key) = oldest_inflight.or_else(|| {
+            receipts
+                .iter()
+                .min_by_key(|(_, receipt)| receipt.concluded_at.unwrap_or(receipt.sent_at))
+                .map(|(key, _)| *key)
+        }) else {
+            break;
+        };
+        receipts.remove(&key);
+    }
+}
+
+async fn relay_reverse_proof(
+    packet: &Packet,
+    ingress: AddressHash,
+    handler: &mut TransportHandler,
+) {
+    if packet.context == PacketContext::ResourceProof
+        || packet.context == PacketContext::LinkRequestProof
+    {
+        return;
+    }
+    let Some((received, outbound)) = handler
+        .reverse_table
+        .get(&packet.destination)
+        .map(|entry| (entry.received, entry.outbound))
+    else {
+        return;
+    };
+    let (from_local, proof_for_local, hops_delta) = {
+        let manager = handler.iface_manager.lock().await;
+        (
+            manager.is_local_client_iface(&ingress),
+            manager.is_local_client_iface(&received),
+            manager
+                .local_hops_delta
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    if !(handler.config.retransmit || from_local || proof_for_local) {
+        return;
+    }
+    handler.reverse_table.remove(&packet.destination);
+    if ingress == outbound {
+        let mut outbound_packet = *packet;
+        // Python writes `local_hops_delta` when the proof came from a
+        // local client toward the wider network. `send` only rewrites
+        // hops 0, so the sampled value has to be applied here.
+        outbound_packet.header.hops = if from_local && !proof_for_local && hops_delta != 0 {
+            hops_delta
+        } else {
+            packet.header.hops.saturating_add(1)
+        };
+        handler
+            .send(TxMessage {
+                tx_type: TxMessageType::Direct(received),
+                packet: outbound_packet,
+            })
+            .await;
+    }
+}
+
+async fn note_shared_instance(handler: &mut TransportHandler) {
+    let (online, clients) = {
+        let manager = handler.iface_manager.lock().await;
+        (
+            manager.connected_to_shared_instance(),
+            manager.local_client_iface_addresses(),
+        )
+    };
+    match handler.shared_was_online {
+        None => {
+            handler.shared_was_online = Some(online);
+            handler.seen_local_clients = clients;
+        }
+        Some(was) => {
+            if was && !online {
+                shared_connection_disappeared(handler).await;
+            } else if !was && online {
+                shared_connection_reappeared(handler).await;
+            }
+            handler.shared_was_online = Some(online);
+            let gone: Vec<AddressHash> = handler
+                .seen_local_clients
+                .iter()
+                .copied()
+                .filter(|iface| !clients.contains(iface))
+                .collect();
+            for iface in gone {
+                drop_local_client(handler, &iface).await;
+            }
+            handler.seen_local_clients = clients;
+        }
+    }
+}
+
+async fn shared_connection_disappeared(handler: &mut TransportHandler) {
+    let inbound: Vec<_> = handler.in_links.values().cloned().collect();
+    for link in inbound {
+        let mut link = link.lock().await;
+        if let Ok(Some(packet)) = link.teardown(&handler.link_in_event_tx) {
+            handler.send_from_link(&mut link, packet).await;
+        }
+    }
+    let outbound: Vec<_> = handler.out_links.values().cloned().collect();
+    for link in outbound {
+        let mut link = link.lock().await;
+        if let Ok(Some(packet)) = link.teardown(&handler.link_out_event_tx) {
+            handler.send_from_link(&mut link, packet).await;
+        }
+    }
+    handler.in_links.clear();
+    handler.out_links.clear();
+    handler.in_link_ifaces.clear();
+    handler.announce_table.clear();
+    handler.path_table.clear();
+    handler.reverse_table.clear();
+    handler.link_table.clear();
+    handler.tunnels.clear();
+}
+
+async fn shared_connection_reappeared(handler: &mut TransportHandler) {
+    if !handler
+        .iface_manager
+        .lock()
+        .await
+        .connected_to_shared_instance()
+    {
+        return;
+    }
+    let destinations: Vec<_> = handler.single_in_destinations.values().cloned().collect();
+    for destination in destinations {
+        if let Ok(packet) = destination.lock().await.path_response(OsRng, None) {
+            handler.send_packet(packet).await;
+        }
+    }
+}
+
+async fn drop_local_client(handler: &mut TransportHandler, iface: &AddressHash) {
+    handler.path_table.drop_all_via(iface);
+    handler.announce_table.drop_responses_to(iface);
+    handler.link_table.drop_iface(iface);
+    handler.tunnels.drop_iface(iface);
+    handler
+        .reverse_table
+        .retain(|_, entry| entry.received != *iface && entry.outbound != *iface);
+    let dead: Vec<_> = handler
+        .in_link_ifaces
+        .iter()
+        .filter(|(_, bound)| *bound == iface)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in dead {
+        if let Some(link) = handler.in_links.remove(&id) {
+            let mut link = link.lock().await;
+            if let Ok(Some(packet)) = link.teardown(&handler.link_in_event_tx) {
+                handler.send_from_link(&mut link, packet).await;
+            }
+        }
+        handler.in_link_ifaces.remove(&id);
+    }
+}
+
+fn serialize_packet(packet: &Packet) -> Option<Vec<u8>> {
+    let mut scratch = [0u8; 2048];
+    let mut output = OutputBuffer::new(&mut scratch);
+    packet.serialize(&mut output).ok()?;
+    Some(output.as_slice().to_vec())
+}
+
+fn value_bin(value: &rmpv::Value) -> Option<&[u8]> {
+    match value {
+        rmpv::Value::Binary(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    }
+}
+
+fn value_addr(value: &rmpv::Value) -> Option<AddressHash> {
+    let bytes = value_bin(value)?;
+    let array: [u8; 16] = bytes.try_into().ok()?;
+    Some(AddressHash::new(array))
+}
+
+fn value_hash(value: &rmpv::Value) -> Option<Hash> {
+    let bytes = value_bin(value)?;
+    let array: [u8; 32] = bytes.try_into().ok()?;
+    Some(Hash::new(array))
+}
+
+fn value_f64(value: &rmpv::Value) -> Option<f64> {
+    if let Some(number) = value.as_f64() {
+        return Some(number);
+    }
+    if let Some(number) = value.as_i64() {
+        return Some(number as f64);
+    }
+    value.as_u64().map(|number| number as f64)
+}
+
+fn write_hashlist(storage: &dyn Storage, hashes: &[Hash]) -> bool {
+    let mut raw = Vec::with_capacity(hashes.len() * 32);
+    for hash in hashes {
+        raw.extend_from_slice(hash.as_slice());
+    }
+    match storage.write(PACKET_HASHLIST_FILE, &raw) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("failed to write {PACKET_HASHLIST_FILE}: {err:?}");
+            false
+        }
+    }
+}
+
+/// One destination-table row. Live paths and paths still waiting for an
+/// interface share this field list.
+// Python-parity parameter set; grouping would churn the stacked diff.
+#[allow(clippy::too_many_arguments)]
+fn destination_table_row(
+    destination: &[u8],
+    stable_iface: &[u8],
+    hops: u64,
+    learned_unix: u64,
+    mode: u64,
+    gravity: Option<i64>,
+    unresponsive: bool,
+    blobs: Vec<rmpv::Value>,
+    announce: Option<Vec<u8>>,
+    received_from: &[u8],
+    packet_hash: &[u8],
+    expires_unix: Option<f64>,
+) -> rmpv::Value {
+    let mut fields = vec![
+        rmpv::Value::Binary(destination.to_vec()),
+        rmpv::Value::Binary(stable_iface.to_vec()),
+        rmpv::Value::from(hops),
+        rmpv::Value::from(learned_unix),
+        rmpv::Value::from(mode),
+        match gravity {
+            Some(gravity) => rmpv::Value::from(gravity),
+            None => rmpv::Value::Nil,
+        },
+        rmpv::Value::Boolean(unresponsive),
+        rmpv::Value::Array(blobs),
+        match announce {
+            Some(bytes) => rmpv::Value::Binary(bytes),
+            None => rmpv::Value::Nil,
+        },
+        rmpv::Value::Binary(received_from.to_vec()),
+        rmpv::Value::Binary(packet_hash.to_vec()),
+    ];
+    // Absolute expiry, separate from the sliding learn time. Rows written
+    // before this field omit it and are restored from the learn time.
+    if let Some(expires_unix) = expires_unix {
+        fields.push(rmpv::Value::from(expires_unix));
+    }
+    rmpv::Value::Array(fields)
+}
+
+fn write_path_table(
+    handler: &TransportHandler,
+    cache: &PacketCache,
+    storage: &dyn Storage,
+    iface_ids: &HashMap<AddressHash, AddressHash>,
+) -> bool {
+    let now = crate::time::now();
+    let unix_now = crate::time::unix_time_as_secs();
+    let mut entries = Vec::new();
+    for (destination, entry) in handler.path_table.iter() {
+        let Some(iface) = iface_ids.get(&entry.iface).copied() else {
+            continue;
+        };
+        let age = path_table::path_age(now, entry.timestamp).as_secs();
+        let learned_unix = unix_now.saturating_sub(age);
+        let announce = cache
+            .get_cached_announce(&entry.packet_hash)
+            .and_then(|packet| serialize_packet(&packet));
+        let blobs = entry.random_blobs[entry.random_blobs.len().saturating_sub(32)..]
+            .iter()
+            .map(|blob| rmpv::Value::Binary(blob.to_vec()))
+            .collect();
+        entries.push(destination_table_row(
+            destination.as_slice(),
+            iface.as_slice(),
+            u64::from(entry.hops),
+            learned_unix,
+            entry.mode as u64,
+            entry.gravity,
+            entry.unresponsive,
+            blobs,
+            announce,
+            entry.received_from.as_slice(),
+            entry.packet_hash.as_slice(),
+            Some(entry.expires_unix),
+        ));
+    }
+    // Paths whose interface was not live at load time are not in the
+    // table yet. Writing the table without them would drop them for good.
+    if let Some(pending) = &handler.unresolved_paths {
+        for path in pending {
+            if handler.path_table.get(&path.destination).is_some() {
+                continue;
+            }
+            let blobs = path
+                .blobs
+                .iter()
+                .map(|blob| rmpv::Value::Binary(blob.to_vec()))
+                .collect();
+            entries.push(destination_table_row(
+                path.destination.as_slice(),
+                path.stable_iface.as_slice(),
+                u64::from(path.hops),
+                path.stored_unix,
+                u64::from(path.mode),
+                path.gravity,
+                path.unresponsive,
+                blobs,
+                Some(path.announce.clone()),
+                path.received_from.as_slice(),
+                path.packet_hash.as_slice(),
+                path.expires_unix,
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    if rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(entries)).is_err() {
+        return false;
+    }
+    match storage.write(DESTINATION_TABLE_FILE, &buf) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("failed to write {DESTINATION_TABLE_FILE}: {err:?}");
+            false
+        }
+    }
+}
+
+fn write_tunnel_table(
+    handler: &TransportHandler,
+    storage: &dyn Storage,
+    iface_ids: &HashMap<AddressHash, AddressHash>,
+) -> bool {
+    let now_instant = time::Instant::now();
+    let now = crate::time::now();
+    let mut tunnels = Vec::new();
+    for (tunnel_id, entry) in handler.tunnels.iter() {
+        let remaining = entry
+            .expires
+            .saturating_duration_since(now_instant)
+            .as_secs();
+        let mut paths = Vec::new();
+        for (destination, path) in &entry.paths {
+            paths.push(rmpv::Value::Array(vec![
+                rmpv::Value::Binary(destination.as_slice().to_vec()),
+                rmpv::Value::Binary(path.received_from.as_slice().to_vec()),
+                rmpv::Value::from(u64::from(path.hops)),
+                rmpv::Value::from(path.expires.saturating_sub(now).as_secs()),
+                rmpv::Value::Binary(path.packet_hash.as_slice().to_vec()),
+            ]));
+        }
+        let stable_iface = entry.iface.and_then(|iface| iface_ids.get(&iface).copied());
+        tunnels.push(rmpv::Value::Array(vec![
+            rmpv::Value::Binary(tunnel_id.as_slice().to_vec()),
+            match stable_iface {
+                Some(iface) => rmpv::Value::Binary(iface.as_slice().to_vec()),
+                None => rmpv::Value::Nil,
+            },
+            rmpv::Value::from(remaining),
+            rmpv::Value::Array(paths),
+        ]));
+    }
+    let mut buf = Vec::new();
+    if rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(tunnels)).is_err() {
+        return false;
+    }
+    match storage.write(TUNNELS_FILE, &buf) {
+        Ok(()) => true,
+        Err(err) => {
+            log::error!("failed to write {TUNNELS_FILE}: {err:?}");
+            false
+        }
+    }
+}
+
+async fn persist_handler(handler: &mut TransportHandler) -> bool {
+    let Some(storage) = handler.storage.clone() else {
+        return true;
+    };
+    let iface_ids = {
+        let manager = handler.iface_manager.lock().await;
+        if manager.connected_to_shared_instance() {
+            return true;
+        }
+        manager.stable_iface_map()
+    };
+    let cache = handler.packet_cache.lock().await;
+    let hash_ok = if handler.config.retransmit {
+        write_hashlist(&*storage, &cache.hashes())
+    } else {
+        true
+    };
+    let path_ok = write_path_table(handler, &cache, &*storage, &iface_ids);
+    drop(cache);
+    hash_ok && path_ok && write_tunnel_table(handler, &*storage, &iface_ids)
+}
+
+fn try_persist_handler(handler: &mut TransportHandler) -> bool {
+    let Some(storage) = handler.storage.clone() else {
+        return true;
+    };
+    let Ok(manager) = handler.iface_manager.try_lock() else {
+        return false;
+    };
+    if manager.connected_to_shared_instance() {
+        return true;
+    }
+    let iface_ids = manager.stable_iface_map();
+    drop(manager);
+    let Ok(cache) = handler.packet_cache.try_lock() else {
+        return false;
+    };
+    let hash_ok = if handler.config.retransmit {
+        write_hashlist(&*storage, &cache.hashes())
+    } else {
+        true
+    };
+    let path_ok = write_path_table(handler, &cache, &*storage, &iface_ids);
+    drop(cache);
+    hash_ok && path_ok && write_tunnel_table(handler, &*storage, &iface_ids)
+}
+
+async fn shutdown_persist(handler: &Arc<Mutex<TransportHandler>>) {
+    let mut handler = handler.lock().await;
+    if handler.shutdown_persisted {
+        return;
+    }
+    if persist_handler(&mut handler).await {
+        handler.shutdown_persisted = true;
+    }
+}
+
+/// One path-table row read from storage, not yet bound to a live interface.
+struct PersistedPath {
+    destination: AddressHash,
+    stable_iface: AddressHash,
+    hops: u8,
+    /// Unix time the path was learned. Zero means the field was missing.
+    stored_unix: u64,
+    mode: u8,
+    gravity: Option<i64>,
+    unresponsive: bool,
+    blobs: Vec<[u8; 10]>,
+    announce: Vec<u8>,
+    received_from: AddressHash,
+    packet_hash: Hash,
+    /// Absolute expiry. `None` is a row written before this element existed.
+    expires_unix: Option<f64>,
+}
+
+fn parse_persisted_paths(bytes: &[u8]) -> Vec<PersistedPath> {
+    let Ok(value) = rmpv::decode::read_value(&mut &bytes[..]) else {
+        return Vec::new();
+    };
+    let Some(entries) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let Some(fields) = entry.as_array() else {
+            continue;
+        };
+        if fields.len() < 11 {
+            continue;
+        }
+        let (Some(destination), Some(stable_iface)) =
+            (value_addr(&fields[0]), value_addr(&fields[1]))
+        else {
+            continue;
+        };
+        let Some(announce) = value_bin(&fields[8]) else {
+            continue;
+        };
+        let Some(received_from) = value_addr(&fields[9]) else {
+            continue;
+        };
+        let Some(packet_hash) = value_hash(&fields[10]) else {
+            continue;
+        };
+        let blobs = fields[7]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let bytes = value_bin(item)?;
+                        if bytes.len() != 10 {
+                            return None;
+                        }
+                        let mut blob = [0u8; 10];
+                        blob.copy_from_slice(bytes);
+                        Some(blob)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        paths.push(PersistedPath {
+            destination,
+            stable_iface,
+            hops: fields[2].as_u64().unwrap_or(0) as u8,
+            stored_unix: fields[3].as_u64().unwrap_or(0),
+            mode: fields[4].as_u64().unwrap_or(1) as u8,
+            gravity: fields[5].as_i64(),
+            unresponsive: fields[6].as_bool().unwrap_or(false),
+            blobs,
+            announce: announce.to_vec(),
+            received_from,
+            packet_hash,
+            expires_unix: fields.get(11).and_then(value_f64),
+        });
+    }
+    paths
+}
+
+async fn restore_persisted_path(
+    handler: &mut TransportHandler,
+    path: &PersistedPath,
+    iface: AddressHash,
+) {
+    let mut input = InputBuffer::new(&path.announce);
+    let Ok(packet) = Packet::deserialize(&mut input) else {
+        return;
+    };
+    if let Some(identity) = announced_identity_hash(&packet) {
+        if handler.blackholes.read().await.is_blackholed(&identity) {
+            return;
+        }
+    }
+    // The path-table hop count is already the in-memory view. Cache the
+    // announce bytes unchanged so a later save does not add another hop.
+    handler.packet_cache.lock().await.cache_announce(&packet);
+    let unix_now = crate::time::unix_time_as_secs();
+    let now_ns = path_table::monotonic_ns(crate::time::now());
+    let stored_unix = if path.stored_unix == 0 {
+        unix_now
+    } else {
+        path.stored_unix
+    };
+    let age_secs = unix_now.saturating_sub(stored_unix);
+    let age_ns = (age_secs as u128)
+        .saturating_mul(1_000_000_000)
+        .min(i64::MAX as u128) as i64;
+    let mode = InterfaceMode::from_u8(path.mode).unwrap_or(InterfaceMode::Full);
+    let lifetime = path_table::path_lifetime(mode).as_secs_f64();
+    // A stored expiry is restored as written. Only rows that predate the
+    // field are rebuilt from the learn time plus the mode lifetime.
+    let expires_unix = match path.expires_unix {
+        Some(expires) => expires,
+        None => {
+            let base = if path.stored_unix == 0 {
+                unix_now
+            } else {
+                path.stored_unix
+            };
+            base as f64 + lifetime
+        }
+    };
+    handler.path_table.restore(
+        path.destination,
+        path_table::PathEntry {
+            received_from: path.received_from,
+            hops: path.hops,
+            iface,
+            timestamp: now_ns.saturating_sub(age_ns),
+            unresponsive: path.unresponsive,
+            packet_hash: path.packet_hash,
+            mode,
+            expires_unix,
+            random_blobs: path.blobs.clone(),
+            gravity: path.gravity,
+        },
+    );
+}
+
+async fn load_persisted_state(handler: &mut TransportHandler) {
+    if handler.persisted_loaded {
+        return;
+    }
+    let Some(storage) = handler.storage.clone() else {
+        handler.persisted_loaded = true;
+        return;
+    };
+    let (stable_to_live, ambiguous) = {
+        let manager = handler.iface_manager.lock().await;
+        if manager.connected_to_shared_instance() {
+            handler.persisted_loaded = true;
+            return;
+        }
+        manager.classify_stable_ids()
+    };
+    // No interface yet. An empty map must retry; do not commit.
+    if stable_to_live.is_empty() && ambiguous.is_empty() {
+        return;
+    }
+    if !handler.config.retransmit {
+        handler.persisted_loaded = true;
+        return;
+    }
+    if !handler.persisted_aux_loaded {
+        if let Some(raw) = storage.read(PACKET_HASHLIST_FILE) {
+            let mut cache = handler.packet_cache.lock().await;
+            for chunk in raw.as_chunks::<32>().0 {
+                cache.remember_hash(Hash::new(*chunk));
+            }
+        }
+    }
+    if handler.unresolved_paths.is_none() {
+        let paths = match storage.read(DESTINATION_TABLE_FILE) {
+            Some(bytes) => parse_persisted_paths(&bytes),
+            None => Vec::new(),
+        };
+        handler.unresolved_paths = Some(paths);
+    }
+    let pending = handler.unresolved_paths.take().unwrap_or_default();
+    let mut waiting = Vec::new();
+    for path in pending {
+        if ambiguous.contains(&path.stable_iface) {
+            // Several live interfaces share this id. Skip the path rather
+            // than attaching it to whichever interface was registered last.
+            continue;
+        }
+        let Some(iface) = stable_to_live.get(&path.stable_iface).copied() else {
+            waiting.push(path);
+            continue;
+        };
+        restore_persisted_path(handler, &path, iface).await;
+    }
+    // Keep entries whose interface is not up yet and try them again when
+    // one is added. `persisted_loaded` stays false until every saved path
+    // has been restored or skipped, so the first interface cannot drop the
+    // rest. An empty interface map already returned above.
+    if waiting.is_empty() {
+        handler.unresolved_paths = None;
+        handler.persisted_loaded = true;
+    } else {
+        handler.unresolved_paths = Some(waiting);
+    }
+    if !handler.persisted_aux_loaded {
+        if let Some(bytes) = storage.read(TUNNELS_FILE) {
+            if let Ok(value) = rmpv::decode::read_value(&mut bytes.as_slice()) {
+                if let Some(tunnels) = value.as_array() {
+                    let now = crate::time::now();
+                    let now_instant = time::Instant::now();
+                    for tunnel in tunnels {
+                        let Some(fields) = tunnel.as_array() else {
+                            continue;
+                        };
+                        if fields.len() < 4 {
+                            continue;
+                        }
+                        let Some(tunnel_id) = value_addr(&fields[0]) else {
+                            continue;
+                        };
+                        let remaining = fields[2].as_u64().unwrap_or(0);
+                        let mut paths = std::collections::BTreeMap::new();
+                        if let Some(items) = fields[3].as_array() {
+                            for item in items {
+                                let Some(path_fields) = item.as_array() else {
+                                    continue;
+                                };
+                                if path_fields.len() < 5 {
+                                    continue;
+                                }
+                                let (Some(destination), Some(received_from), Some(packet_hash)) = (
+                                    value_addr(&path_fields[0]),
+                                    value_addr(&path_fields[1]),
+                                    value_hash(&path_fields[4]),
+                                ) else {
+                                    continue;
+                                };
+                                paths.insert(
+                                    destination,
+                                    TunnelPath {
+                                        received_from,
+                                        hops: path_fields[2].as_u64().unwrap_or(0) as u8,
+                                        expires: now
+                                            + Duration::from_secs(
+                                                path_fields[3].as_u64().unwrap_or(0),
+                                            ),
+                                        packet_hash,
+                                    },
+                                );
+                            }
+                        }
+                        if paths.is_empty() {
+                            continue;
+                        }
+                        // The stored interface is not bound until a live
+                        // synthesis packet arrives (Python stores `None`).
+                        handler.tunnels.insert(
+                            tunnel_id,
+                            tunnels::TunnelEntry {
+                                iface: None,
+                                paths,
+                                expires: now_instant + Duration::from_secs(remaining),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        handler.persisted_aux_loaded = true;
+    }
+}
+
 async fn manage_transport(
     handler: Arc<Mutex<TransportHandler>>,
     rx_receiver: Arc<Mutex<InterfaceRxReceiver>>,
@@ -4416,22 +5878,49 @@ async fn manage_transport(
                 let mut rx_receiver = rx_receiver.lock().await;
 
                 if cancel.is_cancelled() {
+                    shutdown_persist(&handler_arc).await;
                     break;
                 }
 
                 tokio::select! {
                     _ = cancel.cancelled() => {
+                        shutdown_persist(&handler_arc).await;
                         break;
                     },
                     Some(message) = rx_receiver.recv() => {
-                        // Prioritized inbound processing: classify and
-                        // enqueue, then drain in class order
-                        // (Python `InboundQueues.put`/`get`).
+                        // Pull the rest of the burst, then drain in class
+                        // order so a data packet is not stuck behind an
+                        // announce that arrived in the same batch
+                        // (Python `InboundQueues.get`).
+                        let mut batch = vec![message];
+                        while let Ok(next) = rx_receiver.try_recv() {
+                            batch.push(next);
+                        }
                         let drained = {
+                            let handler_guard = handler.lock().await;
+                            let path_request_dest = handler_guard.fixed_dest_path_requests;
+                            let mut classified = Vec::with_capacity(batch.len());
+                            for message in batch {
+                                let limited = ingress_limited_path_request(&handler_guard, &message).await;
+                                let class = InboundQueues::classify(
+                                    &message.packet,
+                                    &path_request_dest,
+                                    limited,
+                                );
+                                classified.push((class, message));
+                            }
+                            drop(handler_guard);
                             let mut queues = inbound_queues
                                 .lock()
                                 .expect("inbound queue lock");
-                            queues.enqueue_and_drain(message)
+                            for (class, message) in classified {
+                                queues.put(class, message);
+                            }
+                            let mut out = Vec::new();
+                            while let Some(item) = queues.get() {
+                                out.push(item);
+                            }
+                            out
                         };
                         for message in drained {
                         let _ = iface_messages_tx.send(message);
@@ -4444,15 +5933,30 @@ async fn manage_transport(
                             log::debug!("tp: << rx({}) = {} {}", message.address, packet, packet.hash());
                         }
 
+                        {
+                            let manager = handler.iface_manager.lock().await;
+                            if let Some(stat) = manager
+                                .stats()
+                                .into_iter()
+                                .find(|stat| stat.address == message.address)
+                            {
+                                let rssi = stat.rssi;
+                                let snr = stat.snr;
+                                let quality = stat.quality;
+                                drop(manager);
+                                if rssi.is_some() || snr.is_some() || quality.is_some() {
+                                    handler.phy.record(packet.hash(), rssi, snr, quality);
+                                }
+                            }
+                        }
+
                         // Early packet filter with protocol-violation
                         // accounting (Python 1.5.0 `Transport.packet_filter`
                         // + `Interface.protocol_violation`).
                         if !packet_filter(&packet) {
-                            handler
-                                .iface_manager
-                                .lock()
-                                .await
-                                .count_packet_filter_hit(&message.address);
+                            let manager = handler.iface_manager.lock().await;
+                            manager.count_packet_filter_hit(&message.address);
+                            manager.count_protocol_violation(&message.address);
                             continue;
                         }
 
@@ -4583,6 +6087,9 @@ async fn manage_transport(
                     _ = time::sleep(Duration::from_millis(100)) => {
                         let mut handler = handler.lock().await;
 
+                        load_persisted_state(&mut handler).await;
+                        note_shared_instance(&mut handler).await;
+
                         let released = {
                             let manager = handler.iface_manager.lock().await;
                             manager.release_held_announces()
@@ -4596,13 +6103,10 @@ async fn manage_transport(
                             handle_announce(&packet, &mut handler, iface).await;
                         }
 
-                        let messages = {
-                            let manager = handler.iface_manager.lock().await;
-                            manager.process_announce_queues()
-                        };
-                        for message in messages {
-                            handler.send(message).await;
-                        }
+                        // Drained announces transmit directly on their
+                        // interface; they must not re-enter the outbound
+                        // announce-cap gate.
+                        handler.iface_manager.lock().await.process_announce_queues().await;
 
                         // Interfaces that came up (I2P peers, backbone
                         // clients, RNodeMulti transports) request tunnel
@@ -4671,30 +6175,13 @@ async fn manage_transport(
                     _ = cancel.cancelled() => {
                         break;
                     },
-                    _ = time::sleep(timer_config.link_check) => {
-                        handle_check_links(handler.lock().await).await;
-                    }
-                }
-            }
-        });
-    }
-
-    {
-        let handler = handler.clone();
-        let cancel = cancel.clone();
-
-        tokio::spawn(async move {
-            loop {
-                if cancel.is_cancelled() {
-                    break;
-                }
-
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        break;
-                    },
-                    _ = time::sleep(timer_config.out_link_keep) => {
-                        handle_keep_links(handler.lock().await).await;
+                    // Python caps each watchdog sleep at WATCHDOG_MAX_SLEEP.
+                    // link_check is already 1s; the min keeps a longer
+                    // configured check from missing a 5s keepalive.
+                    _ = time::sleep(timer_config.link_check.min(crate::destination::link::WATCHDOG_MAX_SLEEP)) => {
+                        let mut handler = handler.lock().await;
+                        check_receipts(&mut handler.receipts);
+                        handle_check_links(handler).await;
                     }
                 }
             }
@@ -4744,7 +6231,57 @@ async fn manage_transport(
                     _ = time::sleep(Duration::from_secs(5)) => {
                         let mut handler = handler.lock().await;
 
-                        handler.link_table.remove_stale();
+                        let live = {
+                            let manager = handler.iface_manager.lock().await;
+                            manager
+                                .live_iface_addresses()
+                                .into_iter()
+                                .map(|(address, _)| address)
+                                .collect::<Vec<_>>()
+                        };
+                        handler.reverse_table.retain(|_, entry| {
+                            entry.at.elapsed() < REVERSE_TIMEOUT
+                                && live.contains(&entry.received)
+                                && live.contains(&entry.outbound)
+                        });
+                        handler.path_table.drop_ifaces_not_in(&live);
+
+                        let stale_links = handler.link_table.remove_stale();
+                        let retransmit = handler.config.retransmit;
+                        for entry in stale_links {
+                            let destination = entry.original_destination;
+                            let has_path = handler.path_table.contains(&destination);
+                            let hops = handler.path_table.get(&destination).map(|path| path.hops);
+                            let allowed = handler.path_requests.request_allowed(&destination);
+                            let mut rediscover = false;
+                            let mut exclude: Option<AddressHash> = None;
+                            if !has_path || (allowed && entry.taken_hops == 0) {
+                                rediscover = true;
+                            } else if allowed && (hops == Some(1) || entry.taken_hops == 1) {
+                                rediscover = true;
+                                exclude = Some(entry.receiving_iface);
+                                let mode = handler
+                                    .iface_manager
+                                    .lock()
+                                    .await
+                                    .iface_mode(&entry.receiving_iface);
+                                if retransmit && mode != InterfaceMode::Boundary {
+                                    handler.path_table.mark_path_unresponsive(&destination);
+                                }
+                            }
+                            if rediscover {
+                                if !retransmit {
+                                    handler.path_table.expire_path(&destination);
+                                }
+                                let packet = handler.path_requests.generate(&destination, None);
+                                handler
+                                    .send(TxMessage {
+                                        tx_type: TxMessageType::Broadcast(exclude),
+                                        packet,
+                                    })
+                                    .await;
+                            }
+                        }
 
                         // Expire stale paths (Python `Transport.expire_paths`).
                         let expired = handler.path_table.expire_paths();
@@ -4905,13 +6442,54 @@ mod queue_tests {
 
     #[test]
     fn announce_classifies_higher_than_data() {
+        let path_requests = create_path_request_destination().desc.address_hash;
         assert_eq!(
-            InboundQueues::classify(&test_packet(PacketType::Announce)),
+            InboundQueues::classify(&test_packet(PacketType::Announce), &path_requests, false),
             TrafficClass::Announce
         );
         assert_eq!(
-            InboundQueues::classify(&test_packet(PacketType::Data)),
+            InboundQueues::classify(&test_packet(PacketType::Data), &path_requests, false),
             TrafficClass::Data
+        );
+        let mut request = test_packet(PacketType::Data);
+        request.destination = path_requests;
+        assert_eq!(
+            InboundQueues::classify(&request, &path_requests, false),
+            TrafficClass::PathRequest
+        );
+        assert_eq!(
+            InboundQueues::classify(&request, &path_requests, true),
+            TrafficClass::IngressLimited
+        );
+        let mut cache = test_packet(PacketType::Data);
+        cache.context = PacketContext::CacheRequest;
+        assert_eq!(
+            InboundQueues::classify(&cache, &path_requests, true),
+            TrafficClass::Data
+        );
+    }
+
+    #[test]
+    fn zero_length_uses_python_defaults() {
+        let queues = InboundQueues::new([0, 0, 0, 0]);
+        assert_eq!(queues.sizes, [1024, 128, 128, 8]);
+    }
+
+    #[test]
+    fn data_drains_before_announce() {
+        let mut queues = InboundQueues::new([2, 2, 2, 2]);
+        queues.put(
+            TrafficClass::Announce,
+            test_rx_message(PacketType::Announce),
+        );
+        queues.put(TrafficClass::Data, test_rx_message(PacketType::Data));
+        assert_eq!(
+            queues.get().unwrap().packet.header.packet_type,
+            PacketType::Data
+        );
+        assert_eq!(
+            queues.get().unwrap().packet.header.packet_type,
+            PacketType::Announce
         );
     }
 
@@ -4944,6 +6522,51 @@ mod tests {
     use crate::destination::link::LinkEvent;
     use crate::packet::HeaderType;
     use rand_core::OsRng;
+
+    #[test]
+    fn persisted_expires_is_independent_of_learn_time() {
+        let fresh = destination_table_row(
+            &[1u8; 16],
+            &[2u8; 16],
+            3,
+            1_700_000_000,
+            1,
+            None,
+            false,
+            Vec::new(),
+            Some(vec![9, 9]),
+            &[3u8; 16],
+            &[4u8; 32],
+            Some(1_800_000_000.5),
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(vec![fresh])).unwrap();
+        let paths = parse_persisted_paths(&buf);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].stored_unix, 1_700_000_000);
+        assert_eq!(paths[0].expires_unix, Some(1_800_000_000.5));
+
+        let old = destination_table_row(
+            &[1u8; 16],
+            &[2u8; 16],
+            3,
+            1_700_000_000,
+            1,
+            None,
+            false,
+            Vec::new(),
+            Some(vec![9, 9]),
+            &[3u8; 16],
+            &[4u8; 32],
+            None,
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(vec![old])).unwrap();
+        let paths = parse_persisted_paths(&buf);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].stored_unix, 1_700_000_000);
+        assert!(paths[0].expires_unix.is_none());
+    }
 
     #[tokio::test]
     async fn synchronous_accessors_are_safe_inside_a_runtime() {
@@ -5040,7 +6663,10 @@ mod tests {
             destination,
             packet_hash,
             identity: *identity.as_identity(),
-            created_at: time::Instant::now(),
+            sent_at: time::Instant::now(),
+            timeout: Some(Duration::from_secs(6)),
+            status: ReceiptStatus::Sent,
+            concluded_at: None,
         };
         let handler = transport.get_handler();
 
@@ -5263,7 +6889,7 @@ pub struct TunnelTableSnapshotEntry {
     pub paths: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PathTableSnapshotEntry {
     /// Destination hash the path leads to.
     pub destination: AddressHash,
@@ -5282,6 +6908,20 @@ pub struct PathTableSnapshotEntry {
     pub age_secs: u64,
     /// Hash of the announce packet that created/refreshed the path.
     pub announce_hash: crate::hash::Hash,
+    /// Unix expiry recorded when the path was inserted.
+    pub expires_unix: f64,
+}
+
+/// One announce-rate entry (Python `Reticulum.get_rate_table`).
+/// `blocked_for` and `since_last` are durations from now. `timestamps` is
+/// the announce window as unix times, oldest first, at most 16.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateTableEntry {
+    pub destination: AddressHash,
+    pub violations: u32,
+    pub blocked_for: Option<std::time::Duration>,
+    pub since_last: std::time::Duration,
+    pub timestamps: Vec<f64>,
 }
 
 /// Link table counters (Python `get_link_count` and the separate count of
@@ -5334,10 +6974,55 @@ impl Transport {
                 via: entry.received_from,
                 iface: entry.iface,
                 unresponsive: entry.unresponsive,
-                age_secs: now.saturating_sub(entry.timestamp).as_secs(),
+                age_secs: path_table::path_age(now, entry.timestamp).as_secs(),
                 announce_hash: entry.packet_hash,
+                expires_unix: entry.expires_unix,
             })
             .collect()
+    }
+
+    /// Announce rate-limit table (Python `Reticulum.get_rate_table`).
+    /// Empty only when nothing has been rate-limited.
+    pub async fn rate_table_snapshot(&self) -> Vec<RateTableEntry> {
+        let handler = self.handler.lock().await;
+        handler
+            .announce_limits
+            .snapshot()
+            .into_iter()
+            .map(
+                |(destination, violations, blocked_for, since_last, timestamps)| RateTableEntry {
+                    destination,
+                    violations,
+                    blocked_for,
+                    since_last,
+                    timestamps,
+                },
+            )
+            .collect()
+    }
+
+    /// Validated rows in the transport link table
+    /// (Python `Transport.active_link_count`).
+    pub async fn active_link_count(&self) -> usize {
+        self.handler.lock().await.link_table.validated_len()
+    }
+
+    /// Cached radio RSSI for `hash`, or `None` on a miss.
+    pub async fn packet_rssi(&self, hash: &Hash) -> Option<f64> {
+        let handler = self.handler.lock().await;
+        PhyCache::lookup(&handler.phy.rssi, hash)
+    }
+
+    /// Cached radio SNR for `hash`, or `None` on a miss.
+    pub async fn packet_snr(&self, hash: &Hash) -> Option<f64> {
+        let handler = self.handler.lock().await;
+        PhyCache::lookup(&handler.phy.snr, hash)
+    }
+
+    /// Cached radio quality for `hash`, or `None` on a miss.
+    pub async fn packet_q(&self, hash: &Hash) -> Option<f64> {
+        let handler = self.handler.lock().await;
+        PhyCache::lookup(&handler.phy.q, hash)
     }
 
     /// Link table / link counters (Python `get_link_count` plus
@@ -5499,7 +7184,31 @@ impl Transport {
         tokio::spawn(async move {
             loop {
                 let handler = handler.lock().await;
-                let stats = handler.iface_manager.lock().await.stats();
+                let (stats, iface_extra) = {
+                    let manager = handler.iface_manager.lock().await;
+                    let stats = manager.stats();
+                    let iface_extra = stats
+                        .iter()
+                        .map(|stat| {
+                            let (mode, bitrate) = manager
+                                .with_control(&stat.address, |control| {
+                                    (control.mode as u8, control.bitrate)
+                                })
+                                .unwrap_or((0x01, 62_500));
+                            let radio = manager.radio_telemetry(&stat.address);
+                            management::IfaceStatusExtra {
+                                mode,
+                                bitrate,
+                                mtu: manager.iface_hw_mtu(&stat.address).map(|mtu| mtu as u64),
+                                airtime_short: radio.airtime_short,
+                                airtime_long: radio.airtime_long,
+                                channel_load_short: radio.channel_load_short,
+                                channel_load_long: radio.channel_load_long,
+                            }
+                        })
+                        .collect();
+                    (stats, iface_extra)
+                };
                 let paths = handler
                     .path_table
                     .iter()
@@ -5509,14 +7218,17 @@ impl Transport {
                         via: entry.received_from,
                         iface: entry.iface,
                         unresponsive: entry.unresponsive,
-                        age_secs: crate::time::now().saturating_sub(entry.timestamp).as_secs(),
+                        age_secs: path_table::path_age(crate::time::now(), entry.timestamp)
+                            .as_secs(),
                         announce_hash: entry.packet_hash,
+                        expires_unix: entry.expires_unix,
                     })
                     .collect();
                 let blackholes = handler.blackholes.read().await.pack_table();
 
                 *snapshot.write().unwrap() = management::ManagementSnapshot {
                     stats,
+                    iface_extra,
                     paths,
                     link_counts: (
                         handler.link_table.len(),
@@ -5617,6 +7329,15 @@ impl Transport {
         );
 
         destination
+    }
+
+    /// Enable or disable announce retransmission after the instance exists.
+    ///
+    /// Shared-instance tools stay at the configured flag until the local
+    /// client is online, then clear it. A failed attach restores the flag
+    /// before configured interfaces are opened.
+    pub async fn set_retransmit(&self, retransmit: bool) {
+        self.handler.lock().await.config.retransmit = retransmit;
     }
 
     /// Hash of the identity this transport instance runs with

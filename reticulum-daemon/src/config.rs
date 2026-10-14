@@ -1,9 +1,61 @@
 use std::ffi::OsStr;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Mutex, OnceLock};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// In-process constructor for a configured interface type.
+///
+/// Python loads `interfaces/{Type}.py`. This registry does not exec a file.
+pub type InterfaceFactory = std::sync::Arc<
+    dyn Fn(
+            NamedInterface,
+            std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+fn interface_factories() -> &'static Mutex<Vec<(String, InterfaceFactory)>> {
+    static REGISTRY: OnceLock<Mutex<Vec<(String, InterfaceFactory)>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register `type_name` so startup can spawn it without a new match arm.
+pub fn register_interface_factory<F, Fut>(type_name: impl Into<String>, factory: F)
+where
+    F: Fn(
+            NamedInterface,
+            std::sync::Arc<tokio::sync::Mutex<reticulum::iface::InterfaceManager>>,
+        ) -> Fut
+        + Send
+        + Sync
+        + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let factory: InterfaceFactory =
+        std::sync::Arc::new(move |iface, manager| Box::pin(factory(iface, manager)));
+    interface_factories()
+        .lock()
+        .expect("interface factory registry")
+        .push((type_name.into(), factory));
+}
+
+/// The most recently registered factory for `type_name`.
+pub fn interface_factory(type_name: &str) -> Option<InterfaceFactory> {
+    let factories = interface_factories()
+        .lock()
+        .expect("interface factory registry");
+    factories
+        .iter()
+        .rev()
+        .find(|(name, _)| name == type_name)
+        .map(|(_, factory)| std::sync::Arc::clone(factory))
+}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -33,8 +85,84 @@ pub struct Config {
     pub reticulum: ReticulumConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_interfaces")]
     pub interfaces: Vec<NamedInterface>,
+}
+
+fn deserialize_interfaces<'de, D>(deserializer: D) -> Result<Vec<NamedInterface>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::<toml::Value>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| named_interface_from_value(value).map_err(serde::de::Error::custom))
+        .collect()
+}
+
+fn configured_enabled_flag(table: Option<&toml::map::Map<String, toml::Value>>) -> bool {
+    let flag = |key: &str| {
+        table
+            .and_then(|table| table.get(key))
+            .and_then(toml::Value::as_bool)
+    };
+    match (flag("enabled"), flag("interface_enabled")) {
+        (None, None) => true,
+        (Some(enabled), None) | (None, Some(enabled)) => enabled,
+        (Some(enabled), Some(alias)) => enabled || alias,
+    }
+}
+
+/// Unknown types can carry keys the `Unsupported` variant does not accept.
+fn reduce_unknown_interface(value: &toml::Value) -> toml::Value {
+    let Some(table) = value.as_table() else {
+        return value.clone();
+    };
+    let mut reduced = toml::map::Map::new();
+    for key in ["name", "type", "enabled", "interface_enabled"] {
+        if let Some(item) = table.get(key) {
+            reduced.insert(key.to_string(), item.clone());
+        }
+    }
+    toml::Value::Table(reduced)
+}
+
+fn named_interface_from_value(mut value: toml::Value) -> Result<NamedInterface, String> {
+    let configured_type = value
+        .get("type")
+        .and_then(toml::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let configured_enabled = configured_enabled_flag(value.as_table());
+    let supported = SUPPORTED_INTERFACE_TYPES.contains(&configured_type.as_str());
+    let raw_config = if supported { None } else { Some(value.clone()) };
+    // Serde treats `interface_enabled` as an alias of `enabled`, so both keys
+    // are a duplicate field. Collapse them to the same OR Python uses.
+    if let Some(table) = value.as_table_mut()
+        && table.contains_key("enabled")
+        && table.contains_key("interface_enabled")
+    {
+        table.insert(
+            "enabled".to_string(),
+            toml::Value::Boolean(configured_enabled),
+        );
+        table.remove("interface_enabled");
+    }
+    let mut iface: NamedInterface = if let Ok(iface) = value.clone().try_into() {
+        iface
+    } else if !supported {
+        reduce_unknown_interface(&value)
+            .try_into()
+            .map_err(|err: toml::de::Error| err.to_string())?
+    } else {
+        return value
+            .try_into()
+            .map_err(|err: toml::de::Error| err.to_string());
+    };
+    iface.configured_type = configured_type;
+    iface.configured_enabled = configured_enabled;
+    iface.raw_config = raw_config;
+    Ok(iface)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -88,20 +216,111 @@ pub struct ReticulumConfig {
     pub shared_instance_type: String,
     #[serde(default = "default_control_port")]
     pub instance_control_port: u16,
+    /// Hex authkey for the shared-instance control listener (Python `rpc_key`).
+    /// Invalid hex falls back to the SHA-256 of the persisted identity bytes.
+    #[serde(default)]
+    pub rpc_key: Option<String>,
+    /// When false, attach, detach, and reload return false
+    /// (Python `enable_interface_management`, default true).
+    #[serde(default = "default_true")]
+    pub enable_interface_management: bool,
     #[serde(default)]
     pub panic_on_interface_error: bool,
     #[serde(default)]
     pub instance_name: Option<String>,
+    /// Python `use_implicit_proof` (default enabled).
+    #[serde(default = "default_true")]
+    pub use_implicit_proof: bool,
+    /// Path of the network identity (Python `network_identity`).
+    #[serde(default)]
+    pub network_identity: Option<String>,
+    /// Keep the persisted transport identity when transport is off
+    /// (Python `static_transport_identity`).
+    #[serde(default)]
+    pub static_transport_identity: bool,
+    /// Python `local_hops_delta`.
+    #[serde(default)]
+    pub local_hops_delta: bool,
+    /// Minutes between blackhole list pulls. Minimum 2; default 60.
+    #[serde(default)]
+    pub blackhole_update_interval: Option<f64>,
+    #[serde(default)]
+    pub default_gravity: Option<i64>,
+    #[serde(default)]
+    pub discover_interfaces: bool,
+    #[serde(default)]
+    pub required_discovery_value: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
+    pub interface_discovery_sources: Vec<String>,
+    /// Maximum auto-connected discovered peers. `0` disables autoconnect
+    /// (Python `autoconnect_discovered_interfaces`).
+    #[serde(default)]
+    pub autoconnect_discovered_interfaces: u32,
+    #[serde(default)]
+    pub autoconnect_unverified_implementations: bool,
+    #[serde(default)]
+    pub autoconnect_interface_mode: Option<String>,
+    #[serde(default)]
+    pub autoconnect_interface_gravity: Option<i64>,
+    #[serde(default)]
+    pub autoconnect_announces_to_internal: bool,
+    #[serde(default)]
+    pub default_ar_target: Option<i64>,
+    #[serde(default)]
+    pub default_ar_penalty: Option<i64>,
+    #[serde(default)]
+    pub default_ar_grace: Option<i64>,
+    #[serde(default)]
+    pub ic_max_held_announces: Option<i64>,
+    #[serde(default)]
+    pub ic_burst_hold: Option<f64>,
+    #[serde(default)]
+    pub ic_burst_freq_new: Option<f64>,
+    #[serde(default)]
+    pub ic_burst_freq: Option<f64>,
+    #[serde(default)]
+    pub ic_pr_burst_freq_new: Option<f64>,
+    #[serde(default)]
+    pub ic_pr_burst_freq: Option<f64>,
+    #[serde(default)]
+    pub ec_pr_freq: Option<f64>,
+    #[serde(default)]
+    pub egress_control: Option<bool>,
+    #[serde(default)]
+    pub ic_new_time: Option<f64>,
+    #[serde(default)]
+    pub ic_burst_penalty: Option<f64>,
+    #[serde(default)]
+    pub ic_held_release_interval: Option<f64>,
+    #[serde(default)]
+    pub force_shared_instance_bitrate: Option<u64>,
+}
+
+impl ReticulumConfig {
+    /// Blackhole pull interval. Configured minutes, minimum 2, default 1 hour
+    /// (Python `blackhole_update_interval`).
+    pub fn blackhole_update_every(&self) -> std::time::Duration {
+        let minutes = self.blackhole_update_interval.unwrap_or(60.0);
+        let minutes = if minutes.is_finite() {
+            minutes.max(2.0)
+        } else {
+            60.0
+        };
+        std::time::Duration::from_secs_f64(minutes * 60.0)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_loglevel")]
     pub loglevel: log::LevelFilter,
+    /// Python `logtimestamps` (default enabled).
+    #[serde(default = "default_true")]
+    pub logtimestamps: bool,
 }
 
 /// One RNodeMulti virtual port (Python `[[subinterfaces]]` entry).
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RnodeSubinterface {
     /// Virtual port index.
     pub vport: u8,
@@ -110,20 +329,22 @@ pub struct RnodeSubinterface {
     pub txpower: u8,
     pub spreadingfactor: u8,
     pub codingrate: u8,
-    #[serde(default)]
+    #[serde(default, alias = "airtime_limit_short")]
     pub st_alock: Option<f32>,
-    #[serde(default)]
+    #[serde(default, alias = "airtime_limit_long")]
     pub lt_alock: Option<f32>,
+    /// Transmit on this virtual port (Python `outgoing`, default true).
+    #[serde(default = "default_true")]
+    pub outgoing: bool,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct NamedInterface {
     pub name: String,
     #[serde(flatten)]
     pub config: InterfaceConfig,
-    /// Interface mode (Python `mode`: full/access_point/roaming/boundary/
-    /// gateway/point_to_point/internal).
-    #[serde(default)]
+    /// Interface mode (Python `mode` / `interface_mode`).
+    #[serde(default, alias = "interface_mode")]
     pub mode: Option<String>,
     /// Nominal bitrate in bits per second (Python `configured_bitrate`).
     #[serde(default, alias = "configured_bitrate")]
@@ -160,9 +381,104 @@ pub struct NamedInterface {
     /// (Python `reachable_on`).
     #[serde(default)]
     pub reachable_on: Option<String>,
+    /// Percent of airtime announces may occupy (Python `announce_cap`, 1–100).
+    #[serde(default)]
+    pub announce_cap: Option<f64>,
+    #[serde(default)]
+    pub announce_rate_target: Option<i64>,
+    #[serde(default)]
+    pub announce_rate_grace: Option<i64>,
+    #[serde(default)]
+    pub announce_rate_penalty: Option<i64>,
+    #[serde(default)]
+    pub ingress_control: Option<bool>,
+    #[serde(default)]
+    pub egress_control: Option<bool>,
+    #[serde(default)]
+    pub ic_max_held_announces: Option<i64>,
+    #[serde(default)]
+    pub ic_burst_hold: Option<f64>,
+    #[serde(default)]
+    pub ic_burst_freq_new: Option<f64>,
+    #[serde(default)]
+    pub ic_burst_freq: Option<f64>,
+    #[serde(default)]
+    pub ic_pr_burst_freq_new: Option<f64>,
+    #[serde(default)]
+    pub ic_pr_burst_freq: Option<f64>,
+    #[serde(default)]
+    pub ec_pr_freq: Option<f64>,
+    #[serde(default)]
+    pub ic_new_time: Option<f64>,
+    #[serde(default)]
+    pub ic_burst_penalty: Option<f64>,
+    #[serde(default)]
+    pub ic_held_release_interval: Option<f64>,
+    #[serde(default)]
+    pub gravity: Option<i64>,
+    #[serde(default)]
+    pub kiss_framing: bool,
+    #[serde(default)]
+    pub prefer_ipv6: bool,
+    #[serde(default)]
+    pub device: Option<String>,
+    #[serde(default)]
+    pub fixed_mtu: Option<usize>,
+    #[serde(default)]
+    pub max_reconnect_tries: Option<u32>,
+    #[serde(default)]
+    pub connect_timeout: Option<u64>,
+    #[serde(default)]
+    pub id_interval: Option<u64>,
+    #[serde(default)]
+    pub id_callsign: Option<String>,
+    #[serde(default)]
+    pub discovery_frequency: Option<u64>,
+    #[serde(default)]
+    pub discovery_bandwidth: Option<u64>,
+    #[serde(default)]
+    pub discovery_modulation: Option<String>,
+    #[serde(default)]
+    pub publish_ifac: bool,
+    #[serde(default)]
+    pub discovery_encrypt: bool,
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+    #[serde(default)]
+    pub recursive_prs: bool,
+    /// `None` keeps the interface default (Python `True`).
+    #[serde(default)]
+    pub announces_from_internal: Option<bool>,
+    #[serde(default)]
+    pub announces_to_internal: Option<bool>,
+    #[serde(default)]
+    pub ignore_config_warnings: bool,
+    /// `serde(other)` drops the tag, so startup errors can still name the type.
+    #[serde(skip)]
+    pub configured_type: String,
+    #[serde(skip)]
+    pub configured_enabled: bool,
+    /// Original table for a type this daemon does not parse itself.
+    #[serde(skip)]
+    pub raw_config: Option<toml::Value>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+impl NamedInterface {
+    /// Python stores `announce_cap / 100`, and uses `ANNOUNCE_CAP/100`
+    /// when the key is missing or outside `(0, 100]`.
+    pub fn announce_cap_fraction(&self) -> f64 {
+        match self.announce_cap {
+            Some(cap) if cap > 0.0 && cap <= 100.0 => cap / 100.0,
+            _ => reticulum::iface::control::ANNOUNCE_CAP / 100.0,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 #[serde(tag = "type")]
 pub enum InterfaceConfig {
     TCPServerInterface {
@@ -183,9 +499,16 @@ pub enum InterfaceConfig {
         #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
         listen_ip: String,
-        listen_port: u16,
+        /// `None` when only the `port` shorthand is set.
+        #[serde(default)]
+        listen_port: Option<u16>,
         forward_ip: String,
-        forward_port: u16,
+        #[serde(default)]
+        forward_port: Option<u16>,
+        /// Sets both listen and forward ports when those are omitted
+        /// (Python `port`).
+        #[serde(default)]
+        port: Option<u16>,
     },
     I2PInterface {
         #[serde(default = "default_true", alias = "interface_enabled")]
@@ -203,8 +526,9 @@ pub enum InterfaceConfig {
     BackboneInterface {
         #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
+        #[serde(alias = "listen_on")]
         listen_ip: String,
-        #[serde(alias = "listen_port")]
+        #[serde(alias = "listen_port", alias = "port")]
         bind_port: u16,
         /// Block fast-flapping remote connections
         /// (Python `block_fast_flapping`).
@@ -223,8 +547,9 @@ pub enum InterfaceConfig {
     BackboneClientInterface {
         #[serde(default = "default_true", alias = "interface_enabled")]
         enabled: bool,
-        #[serde(alias = "target_host")]
+        #[serde(alias = "target_host", alias = "remote")]
         target_ip: String,
+        #[serde(alias = "port")]
         target_port: u16,
     },
     AutoInterface {
@@ -267,11 +592,11 @@ pub enum InterfaceConfig {
         spreadingfactor: u8,
         codingrate: u8,
         /// Short-term airtime lock in percent
-        /// (Python `airtime_limit_short_term`).
-        #[serde(default)]
+        /// (Python `airtime_limit_short`).
+        #[serde(default, alias = "airtime_limit_short")]
         st_alock: Option<f32>,
-        /// Long-term airtime lock (Python `airtime_limit_long_term`).
-        #[serde(default)]
+        /// Long-term airtime lock (Python `airtime_limit_long`).
+        #[serde(default, alias = "airtime_limit_long")]
         lt_alock: Option<f32>,
         #[serde(default)]
         flow_control: bool,
@@ -374,7 +699,13 @@ pub enum InterfaceConfig {
         #[serde(default = "default_shared_port")]
         listen_port: u16,
     },
+    WeaveInterface {
+        #[serde(default = "default_true", alias = "interface_enabled")]
+        enabled: bool,
+        port: String,
+    },
     #[serde(other)]
+    #[default]
     Unsupported,
 }
 
@@ -617,6 +948,16 @@ fn convert_config(content: &str) -> String {
                 "devices",
                 "ignored_devices",
                 "remote_management_allowed",
+                "mode",
+                "interface_mode",
+                "device",
+                "id_callsign",
+                "discovery_modulation",
+                "discovery_name",
+                "network_identity",
+                "autoconnect_interface_mode",
+                "shared_instance_type",
+                "rpc_key",
             ] {
                 converted = quote_if_needed(&converted, key);
             }
@@ -641,12 +982,43 @@ impl Default for ReticulumConfig {
             probe_destination: false,
             remote_management_allowed: Vec::new(),
             enable_transport: false,
-            share_instance: false,
+            share_instance: true,
             shared_instance_port: 37428,
             shared_instance_type: default_shared_instance_type(),
             instance_control_port: 37429,
+            rpc_key: None,
+            enable_interface_management: true,
             panic_on_interface_error: false,
             instance_name: None,
+            use_implicit_proof: true,
+            network_identity: None,
+            static_transport_identity: false,
+            local_hops_delta: false,
+            blackhole_update_interval: None,
+            default_gravity: None,
+            discover_interfaces: false,
+            required_discovery_value: None,
+            interface_discovery_sources: Vec::new(),
+            autoconnect_discovered_interfaces: 0,
+            autoconnect_unverified_implementations: false,
+            autoconnect_interface_mode: None,
+            autoconnect_interface_gravity: None,
+            autoconnect_announces_to_internal: false,
+            default_ar_target: None,
+            default_ar_penalty: None,
+            default_ar_grace: None,
+            ic_max_held_announces: None,
+            ic_burst_hold: None,
+            ic_burst_freq_new: None,
+            ic_burst_freq: None,
+            ic_pr_burst_freq_new: None,
+            ic_pr_burst_freq: None,
+            ec_pr_freq: None,
+            egress_control: None,
+            ic_new_time: None,
+            ic_burst_penalty: None,
+            ic_held_release_interval: None,
+            force_shared_instance_bitrate: None,
         }
     }
 }
@@ -655,6 +1027,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             loglevel: default_loglevel(),
+            logtimestamps: true,
         }
     }
 }
@@ -810,22 +1183,12 @@ impl Config {
             logging: LoggingConfig::default(),
             interfaces: vec![NamedInterface {
                 name: "Default TCP Server Interface".to_string(),
-                mode: None,
-                bitrate: None,
-                ifac_size: None,
-                networkname: None,
-                passphrase: None,
-                discoverable: false,
-                discovery_announce_interval_minutes: None,
-                discovery_stamp_value: None,
-                discovery_lxmf_address: None,
-                discovery_name: None,
-                reachable_on: None,
                 config: InterfaceConfig::TCPServerInterface {
                     enabled: true,
                     bind_host: "127.0.0.1".to_string(),
                     bind_port: 4242,
                 },
+                ..NamedInterface::default()
             }],
         }
     }
@@ -862,53 +1225,181 @@ pub const KNOWN_RETICULUM_KEYS: &[&str] = &[
     "panic_on_interface_error",
     "network_identity",
     "static_transport_identity",
+    "local_hops_delta",
     "storagepath",
     "require_if_time_sync",
     "link_mtu_discovery",
     "remote_management",
     "enable_remote_management",
+    "enable_interface_management",
+    "remote_management_allowed",
     "probe_destination",
     "enable_remote_probe",
+    "respond_to_probes",
     "enable_stranded_announce_rebroadcast",
+    "use_implicit_proof",
+    "rpc_key",
+    "force_shared_instance_bitrate",
+    "default_gravity",
+    "discover_interfaces",
+    "required_discovery_value",
+    "publish_blackhole",
+    "blackhole_sources",
+    "blackhole_update_interval",
+    "interface_discovery_sources",
+    "autoconnect_discovered_interfaces",
+    "autoconnect_unverified_implementations",
+    "autoconnect_interface_mode",
+    "autoconnect_interface_gravity",
+    "autoconnect_announces_to_internal",
+    "default_ar_target",
+    "default_ar_penalty",
+    "default_ar_grace",
+    "ic_max_held_announces",
+    "ic_burst_hold",
+    "ic_burst_freq_new",
+    "ic_burst_freq",
+    "ic_pr_burst_freq_new",
+    "ic_pr_burst_freq",
+    "ec_pr_freq",
+    "egress_control",
+    "ic_new_time",
+    "ic_burst_penalty",
+    "ic_held_release_interval",
+    "qlen_in_data",
+    "qlen_in_announce",
+    "qlen_in_pr",
+    "qlen_in_il",
 ];
 
-/// `[reticulum]` keys that are recognized but currently ignored by the Rust
-/// daemon.
-pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] = &[
-    "network_identity",
-    "static_transport_identity",
-    "storagepath",
-    "require_if_time_sync",
-    "link_mtu_discovery",
-    "enable_stranded_announce_rebroadcast",
-];
+/// `[reticulum]` keys Python applies and this daemon still ignores.
+/// `storagepath`, `require_if_time_sync` and
+/// `enable_stranded_announce_rebroadcast` are absent: Python
+/// `__apply_config` does not read them either.
+pub const KNOWN_BUT_UNAPPLIED_RETICULUM_KEYS: &[&str] = &["panic_on_interface_error"];
 
 /// Keys of the `[logging]` section the daemon understands.
-pub const KNOWN_LOGGING_KEYS: &[&str] = &["loglevel", "logdest", "logfile"];
+pub const KNOWN_LOGGING_KEYS: &[&str] = &["loglevel", "logdest", "logfile", "logtimestamps"];
 
-/// Keys understood inside `[[interfaces]]` entries, independent of type.
+/// Keys understood inside `[[interfaces]]` entries.
 pub const KNOWN_INTERFACE_KEYS: &[&str] = &[
     "name",
     "type",
     "enabled",
     "interface_enabled",
     "mode",
+    "interface_mode",
+    "bitrate",
     "configured_bitrate",
     "ifac_size",
-    "ifac_key",
-    "ifac_netname",
+    "networkname",
+    "network_name",
+    "passphrase",
+    "pass_phrase",
+    "announce_cap",
     "announce_rate_target",
     "announce_rate_penalty",
     "announce_rate_grace",
-    "announce_rate_min_squeeze",
-    "ingress_controlled",
+    "ingress_control",
+    "egress_control",
+    "ic_max_held_announces",
+    "ic_burst_hold",
+    "ic_burst_freq_new",
+    "ic_burst_freq",
+    "ic_pr_burst_freq_new",
+    "ic_pr_burst_freq",
+    "ec_pr_freq",
+    "ic_new_time",
+    "ic_burst_penalty",
+    "ic_held_release_interval",
+    "gravity",
     "discoverable",
     "announce_interval",
     "discovery_stamp_value",
     "discovery_name",
     "discovery_lxmf_address",
+    "discovery_encrypt",
     "reachable_on",
+    "publish_ifac",
+    "latitude",
+    "longitude",
+    "height",
+    "discovery_frequency",
+    "discovery_bandwidth",
+    "discovery_modulation",
+    "recursive_prs",
+    "announces_from_internal",
+    "announces_to_internal",
+    "ignore_config_warnings",
+    "kiss_framing",
+    "prefer_ipv6",
+    "device",
+    "fixed_mtu",
+    "max_reconnect_tries",
+    "connect_timeout",
+    "id_interval",
+    "id_callsign",
+    "bind_host",
+    "bind_port",
+    "listen_ip",
+    "listen_port",
+    "listen_on",
+    "target_host",
+    "target_port",
+    "target_ip",
+    "forward_ip",
+    "forward_port",
+    "port",
+    "remote",
+    "peers",
+    "connectable",
+    "sam_address",
+    "block_fast_flapping",
+    "fast_flapping_threshold",
+    "fast_flapping_grace",
+    "fast_flapping_block_time",
+    "group_id",
+    "discovery_port",
+    "data_port",
+    "discovery_scope",
+    "multicast_address_type",
+    "devices",
+    "ignored_devices",
+    "target",
+    "tcp",
+    "speed",
+    "frequency",
+    "bandwidth",
+    "txpower",
+    "spreadingfactor",
+    "codingrate",
+    "st_alock",
+    "lt_alock",
+    "airtime_limit_short",
+    "airtime_limit_long",
+    "flow_control",
+    "subinterfaces",
+    "enable_peripheral",
+    "enable_central",
+    "callsign",
+    "ssid",
+    "databits",
+    "parity",
+    "stopbits",
+    "preamble",
+    "txtail",
+    "persistence",
+    "slottime",
+    "command",
+    "respawn_delay",
+    "bootstrap_only",
+    "outgoing",
+    "location_cmd",
 ];
+
+/// Interface keys Python applies and this daemon still ignores.
+pub const KNOWN_BUT_UNAPPLIED_INTERFACE_KEYS: &[&str] =
+    &["bootstrap_only", "outgoing", "location_cmd"];
 
 /// Warn (never fail) about configuration keys the daemon does not know or
 /// does not apply — mirroring Python's `__apply_config` warnings.
@@ -945,7 +1436,11 @@ pub fn warn_about_unknown_keys(value: &toml::Value) {
                             );
                         }
                         for key in entry_table.keys() {
-                            if !KNOWN_INTERFACE_KEYS.contains(&key.as_str()) {
+                            if KNOWN_BUT_UNAPPLIED_INTERFACE_KEYS.contains(&key.as_str()) {
+                                log::warn!(
+                                    "Interface '{iface_name}' key '{key}' is recognized but not yet applied by the Rust daemon"
+                                );
+                            } else if !KNOWN_INTERFACE_KEYS.contains(&key.as_str()) {
                                 log::warn!(
                                     "Unknown key '{key}' in interface '{iface_name}' (type '{iface_type}')"
                                 );
@@ -981,6 +1476,8 @@ pub const SUPPORTED_INTERFACE_TYPES: &[&str] = &[
     "TCPServerInterface",
     "TCPClientInterface",
     "UDPInterface",
+    "BackboneInterface",
+    "BackboneClientInterface",
     "SerialInterface",
     "PipeInterface",
     "KISSInterface",
@@ -991,6 +1488,7 @@ pub const SUPPORTED_INTERFACE_TYPES: &[&str] = &[
     "I2PInterface",
     "BLEInterface",
     "LocalInterface",
+    "WeaveInterface",
 ];
 
 #[cfg(test)]
@@ -1001,7 +1499,7 @@ mod tests {
     fn shared_instance_defaults_match_python() {
         let config: Config = toml::from_str("").unwrap();
 
-        assert!(!config.reticulum.share_instance);
+        assert!(config.reticulum.share_instance);
         assert_eq!(config.reticulum.shared_instance_port, 37428);
         assert_eq!(
             config.reticulum.shared_instance_type, "domain",

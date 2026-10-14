@@ -49,6 +49,7 @@ async fn rnx_remote_execution_roundtrip() {
         config_dir: client_dir.clone(),
         timeout: Duration::from_secs(20),
         udp_loopback: Some((5004, 5003)),
+        ..Default::default()
     };
 
     // Derive the destination hash from the identity file.
@@ -120,4 +121,152 @@ async fn rnsh_session_command_roundtrip() {
     assert_eq!(outcome.stdout, b"shell-output");
 
     listener.abort();
+}
+
+
+/// Local PTY only: the child sees a tty, and the test applies `TIOCSWINSZ` on the local PTY.
+#[tokio::test]
+async fn rnsh_pty_resize_without_network() {
+    let script = r#"
+import os, sys, fcntl, struct, termios, time
+fd = sys.stdout.fileno()
+print("tty" if os.isatty(fd) else "notty", flush=True)
+print(os.ttyname(fd), flush=True)
+def winsz():
+    return struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0"*8))
+print("%d %d %d %d" % winsz(), flush=True)
+initial = winsz()
+for _ in range(100):
+    time.sleep(0.05)
+    now = winsz()
+    if now != initial:
+        print("%d %d %d %d" % now, flush=True)
+        sys.exit(0)
+print("unchanged", flush=True)
+sys.exit(1)
+"#;
+    let argv = vec!["python3".to_string(), "-c".to_string(), script.to_string()];
+    let mut proc = reticulum_utils::rnsh::spawn_session_process(
+        &argv,
+        false,
+        false,
+        false,
+        Some("xterm"),
+        None,
+        None,
+    )
+    .expect("spawn pty");
+    let mut stdout = proc.take_stdout().expect("pty stdout");
+
+    let first = read_pty_text(&mut stdout, 3).await;
+    let lines: Vec<&str> = first
+        .split(['\n', '\r'])
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert!(
+        lines.first().is_some_and(|line| *line == "tty"),
+        "child stdout should be a tty, got {first:?}"
+    );
+    assert!(
+        lines.get(1).is_some_and(|line| line.starts_with("/dev/")),
+        "expected a pty path, got {first:?}"
+    );
+    let initial = lines
+        .get(2)
+        .and_then(|line| parse_winsz(line))
+        .unwrap_or_else(|| panic!("initial winsize missing in {first:?}"));
+
+    let (rows, cols, hpix, vpix) = if initial.0 == 48 {
+        (50, 130, 11, 22)
+    } else {
+        (48, 123, 640, 480)
+    };
+    proc.set_window_size(Some(rows), Some(cols), Some(hpix), Some(vpix))
+        .expect("TIOCSWINSZ");
+
+    let rest = read_pty_text(&mut stdout, 1).await;
+    let updated = rest
+        .split(['\n', '\r'])
+        .filter(|line| !line.is_empty())
+        .find_map(parse_winsz)
+        .unwrap_or_else(|| panic!("resize did not change winsize, output {rest:?}"));
+    assert_eq!(updated, (rows, cols, hpix, vpix));
+
+    drop(stdout);
+    drop(proc);
+}
+
+fn parse_winsz(line: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut parts = line.split_whitespace();
+    let rows = parts.next()?.parse().ok()?;
+    let cols = parts.next()?.parse().ok()?;
+    let hpix = parts.next()?.parse().ok()?;
+    let vpix = parts.next()?.parse().ok()?;
+    Some((rows, cols, hpix, vpix))
+}
+
+async fn read_pty_text(
+    reader: &mut reticulum_utils::rnsh::SessionReader,
+    min_lines: usize,
+) -> String {
+    let mut out = Vec::new();
+    let mut buf = [0u8; 256];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let lines = out.iter().filter(|b| **b == b'\n').count();
+        if lines >= min_lines {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(200), reader.read(&mut buf))
+            .await
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            Err(_) if lines >= min_lines => break,
+            Err(_) => {}
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[tokio::test]
+async fn rnx_propagates_nonzero_remote_status_from_exit_message() {
+    let request = reticulum_utils::rnx::encode_request("exit 7", 5.0, Some(64), Some(64), None);
+    let response = reticulum_utils::rnx::execute_request(&request).await;
+    let decoded = reticulum_utils::rnx::decode_exec_response(&response).expect("exit message");
+    assert!(decoded.executed, "command must have run");
+    assert_eq!(reticulum_utils::rnx::remote_exit_code(&decoded), 7);
+
+    let capped = reticulum_utils::rnx::encode_request(
+        "printf stdout-data; printf stderr-data >&2",
+        5.0,
+        Some(6),
+        Some(3),
+        None,
+    );
+    let capped = reticulum_utils::rnx::decode_exec_response(
+        &reticulum_utils::rnx::execute_request(&capped).await,
+    )
+    .expect("capped output");
+    assert_eq!(capped.stdout, b"stdout");
+    assert_eq!(capped.stderr, b"std");
+    assert!(capped.stdout_len > capped.stdout.len() as u64);
+    assert!(capped.stderr_len > capped.stderr.len() as u64);
+
+    let dir = std::env::temp_dir().join(format!("rn-rnx-stdin-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let stdin_file = dir.join("stdin.txt");
+    std::fs::write(&stdin_file, b"hello-stdin").unwrap();
+    let stdin = reticulum_utils::rnx::stdin_payload(None, Some(&stdin_file))
+        .expect("stdin file")
+        .expect("bytes");
+    let echoed = reticulum_utils::rnx::encode_request("cat", 5.0, Some(4), Some(0), Some(&stdin));
+    let echoed = reticulum_utils::rnx::decode_exec_response(
+        &reticulum_utils::rnx::execute_request(&echoed).await,
+    )
+    .expect("stdin echo");
+    assert_eq!(echoed.stdout, b"hell");
+    assert_eq!(echoed.stdout_len, b"hello-stdin".len() as u64);
+    assert!(echoed.stderr.is_empty());
 }

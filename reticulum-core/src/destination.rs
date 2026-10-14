@@ -13,7 +13,7 @@ use crate::{
     hash::{AddressHash, Hash},
     identity::{
         EmptyIdentity, HashIdentity, Identity, PUBLIC_KEY_LENGTH, PrivateIdentity,
-        RATCHET_KEY_LENGTH, generate_ratchet, ratchet_public_from_private,
+        RATCHET_ID_LENGTH, RATCHET_KEY_LENGTH, generate_ratchet, ratchet_public_from_private,
     },
     packet::{
         self, DestinationType, Header, HeaderType, IfacFlag, Packet, PacketContext,
@@ -284,6 +284,15 @@ pub struct Destination<I: HashIdentity, D: Direction, T: Type> {
     /// Number of ratchet keys to retain
     /// (Python `Destination.retained_ratchets`).
     pub retained_ratchets: usize,
+    /// Called for [`ProofStrategy::App`] instead of sending a proof
+    /// automatically (Python `callbacks.proof_requested`).
+    proof_requested: Option<fn(&Packet) -> bool>,
+    /// Bytes included in announces when the caller does not pass app data
+    /// (Python `Destination.default_app_data`).
+    default_app_data: Option<Vec<u8>>,
+    /// Reject packets encrypted to the static identity key
+    /// (Python `Destination.__enforce_ratchets`).
+    ratchets_enforced: bool,
     pub desc: DestinationDesc,
 }
 
@@ -320,8 +329,8 @@ pub enum ProofStrategy {
     /// Never prove packets.
     #[default]
     None,
-    /// Prove packets that carry application data (proof requested via
-    /// callback in Python; approximated here by proving non-empty data).
+    /// Ask [`Destination::set_proof_requested_callback`]. Does not prove
+    /// unless that callback returns true.
     App,
     /// Prove all packets.
     All,
@@ -346,6 +355,31 @@ impl Destination<PrivateIdentity, Input, Single> {
         self.proof_strategy
     }
 
+    /// Register the callback consulted by [`ProofStrategy::App`]
+    /// (Python `Destination.set_proof_requested_callback`).
+    ///
+    /// The callback receives the packet and returns whether a proof should
+    /// be sent. [`ProofStrategy::All`] does not call it.
+    pub fn set_proof_requested_callback(&mut self, callback: fn(&Packet) -> bool) {
+        self.proof_requested = Some(callback);
+    }
+
+    /// Whether a proof should be sent for `packet`.
+    ///
+    /// [`ProofStrategy::All`] proves on its own. [`ProofStrategy::App`] does
+    /// not: it raises the proof-requested callback and proves only when that
+    /// returns true. [`ProofStrategy::None`] never proves.
+    pub fn should_prove(&self, packet: &Packet) -> bool {
+        match self.proof_strategy {
+            ProofStrategy::All => true,
+            ProofStrategy::None => false,
+            ProofStrategy::App => self
+                .proof_requested
+                .map(|callback| callback(packet))
+                .unwrap_or(false),
+        }
+    }
+
     /// Enable ratchets on this destination (Python `Destination.enable_ratchets`).
     ///
     /// `ratchets` are the retained *private* ratchet keys (newest first,
@@ -360,6 +394,31 @@ impl Destination<PrivateIdentity, Input, Single> {
     /// Disable ratchets on this destination again.
     pub fn disable_ratchets(&mut self) {
         self.ratchets = None;
+        self.ratchets_enforced = false;
+    }
+
+    /// Reject packets that use the base identity key
+    /// (Python `Destination.enforce_ratchets`).
+    ///
+    /// Returns false when ratchets are not enabled.
+    pub fn enforce_ratchets(&mut self) -> bool {
+        if self.ratchets.is_some() {
+            self.ratchets_enforced = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Default app data included in announces that do not pass their own
+    /// (Python `Destination.set_default_app_data`). `None` clears it.
+    pub fn set_default_app_data(&mut self, app_data: Option<&[u8]>) {
+        self.default_app_data = app_data.map(|data| data.to_vec());
+    }
+
+    /// Clear default app data (Python `Destination.clear_default_app_data`).
+    pub fn clear_default_app_data(&mut self) {
+        self.set_default_app_data(None);
     }
 
     pub fn ratchets_enabled(&self) -> bool {
@@ -423,11 +482,27 @@ impl Destination<PrivateIdentity, Input, Single> {
         }
     }
 
-    /// Decrypt a SINGLE-destination data packet (Python `Destination.decrypt`):
-    /// try the retained ratchet keys first, then the static identity key.
+    /// Decrypt a SINGLE-destination data packet (Python `Destination.decrypt`).
+    ///
+    /// Retained ratchet keys are tried first. The static identity key is
+    /// used only when ratchet enforcement is off.
     pub fn decrypt<'a>(&self, data: &[u8], out_buf: &'a mut [u8]) -> Result<&'a [u8], RnsError> {
+        self.decrypt_ratchet(data, out_buf)
+            .map(|(plaintext, _ratchet_id)| plaintext)
+    }
+
+    /// Decrypt and report the ratchet id that opened the packet.
+    ///
+    /// The id is `None` when the static identity key was used. Enforcement
+    /// rejects that fallback (Python `enforce_ratchets`).
+    pub fn decrypt_ratchet<'a>(
+        &self,
+        data: &[u8],
+        out_buf: &'a mut [u8],
+    ) -> Result<(&'a [u8], Option<[u8; RATCHET_ID_LENGTH]>), RnsError> {
         let ratchets = self.ratchets.as_deref().unwrap_or(&[]);
-        self.identity.decrypt(data, ratchets, out_buf)
+        self.identity
+            .decrypt_ratchet(data, ratchets, self.ratchets_enforced, out_buf)
     }
 
     /// Control whether this destination accepts incoming link requests
@@ -455,6 +530,9 @@ impl Destination<PrivateIdentity, Input, Single> {
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
+            proof_requested: None,
+            default_app_data: None,
+            ratchets_enforced: false,
             desc: DestinationDesc {
                 identity: pub_identity,
                 name,
@@ -483,6 +561,14 @@ impl Destination<PrivateIdentity, Input, Single> {
         app_data: Option<&[u8]>,
         now_secs: u64,
     ) -> Result<Packet, RnsError> {
+        // Python `Destination.announce`: an omitted app_data falls back to
+        // the destination default, which may itself be absent.
+        let default_app_data = self.default_app_data.clone();
+        let app_data = match app_data {
+            Some(data) => Some(data),
+            None => default_app_data.as_deref(),
+        };
+
         // Python `Destination.announce`: rotate ratchets (respecting the
         // rotation interval) and announce the newest public key.
         let ratchet = self
@@ -604,7 +690,8 @@ impl Destination<PrivateIdentity, Input, Single> {
         }
 
         if packet.header.packet_type == PacketType::LinkRequest {
-            // TODO: check prove strategy
+            // Link-request proofs are not gated by the proof strategy
+            // (Python `Destination.incoming_link_request`).
             return DestinationHandleStatus::LinkProof;
         }
 
@@ -630,6 +717,9 @@ impl Destination<Identity, Output, Single> {
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
+            proof_requested: None,
+            default_app_data: None,
+            ratchets_enforced: false,
             desc: DestinationDesc {
                 identity,
                 name,
@@ -653,6 +743,9 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
+            proof_requested: None,
+            default_app_data: None,
+            ratchets_enforced: false,
             desc: DestinationDesc {
                 identity: Default::default(),
                 name,
@@ -663,12 +756,11 @@ impl<D: Direction> Destination<EmptyIdentity, D, Plain> {
 }
 
 /// Symmetric group key (Python `RNS.Cryptography.Token`): the raw key is
-/// split into an HMAC signing key and an AES-CBC encryption key. The
-/// default build uses AES-256 (64-byte keys, Python
-/// `Token.generate_key()` default `AES_256_CBC`); with the
-/// `fernet-aes128` feature 32-byte keys (Python `AES_128_CBC`) are used
-/// instead. Token format `iv || ciphertext || hmac` is byte-compatible
-/// with the reference `Destination.prv`.
+/// split into an HMAC signing key and an AES-CBC encryption key. A 64-byte
+/// key is AES-256 (Python `Token.generate_key()` default) and a 32-byte
+/// key is AES-128. The `fernet-aes128` feature still selects the size of
+/// keys this type generates. Token format `iv || ciphertext || hmac` is
+/// byte-compatible with the reference `Destination.prv`.
 pub struct GroupKey {
     /// Decrypt/verify view of the token keys (no entropy consumed).
     fernet: crate::crypt::fernet::Fernet<crate::crypt::fernet::ZeroRng>,
@@ -784,6 +876,9 @@ impl<D: Direction> Destination<EmptyIdentity, D, Group> {
             latest_ratchet_time: 0,
             ratchet_interval: RATCHET_INTERVAL_SECS,
             retained_ratchets: RATCHET_COUNT,
+            proof_requested: None,
+            default_app_data: None,
+            ratchets_enforced: false,
             desc: DestinationDesc {
                 identity: Default::default(),
                 name,
@@ -900,6 +995,138 @@ mod tests {
         assert_eq!(destination.proof_strategy(), ProofStrategy::None);
         destination.set_proof_strategy(ProofStrategy::All);
         assert_eq!(destination.proof_strategy(), ProofStrategy::All);
+    }
+
+    #[test]
+    fn app_strategy_does_not_auto_prove() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::packet::Packet;
+
+        static PROOF_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+        fn on_proof(_packet: &Packet) -> bool {
+            PROOF_REQUESTED.store(true, Ordering::SeqCst);
+            false
+        }
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let mut destination =
+            SingleInputDestination::new(identity, DestinationName::new("test", "proof.app"));
+        destination.set_proof_strategy(ProofStrategy::App);
+
+        let packet = Packet::default();
+        PROOF_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(!destination.should_prove(&packet));
+        assert!(!PROOF_REQUESTED.load(Ordering::SeqCst));
+
+        destination.set_proof_requested_callback(on_proof);
+        assert!(!destination.should_prove(&packet));
+        assert!(PROOF_REQUESTED.load(Ordering::SeqCst));
+
+        destination.set_proof_strategy(ProofStrategy::All);
+        PROOF_REQUESTED.store(false, Ordering::SeqCst);
+        assert!(destination.should_prove(&packet));
+        assert!(!PROOF_REQUESTED.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn enforced_ratchets_reject_static_ciphertext() {
+        use crate::identity::{
+            RATCHET_ID_LENGTH, generate_ratchet, ratchet_id, ratchet_public_from_private,
+        };
+        use x25519_dalek::PublicKey;
+
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let public = *identity.as_identity();
+        let mut destination =
+            SingleInputDestination::new(identity, DestinationName::new("test", "ratchet.enforce"));
+
+        assert!(!destination.enforce_ratchets());
+        let ratchet = generate_ratchet(OsRng);
+        destination.enable_ratchets(alloc::vec![ratchet]);
+        assert!(destination.enforce_ratchets());
+
+        let plaintext = b"static key packet";
+        let mut token_buf = [0u8; 512];
+        let static_token = public
+            .encrypt(OsRng, plaintext, None, &mut token_buf)
+            .expect("static encrypt")
+            .to_vec();
+
+        let mut out = [0u8; 512];
+        assert!(destination.decrypt(&static_token, &mut out).is_err());
+
+        let ratchet_public = ratchet_public_from_private(&ratchet);
+        let mut ratchet_buf = [0u8; 512];
+        let ratchet_token = public
+            .encrypt(
+                OsRng,
+                plaintext,
+                Some(&PublicKey::from(ratchet_public)),
+                &mut ratchet_buf,
+            )
+            .expect("ratchet encrypt")
+            .to_vec();
+
+        let (decrypted, id) = destination
+            .decrypt_ratchet(&ratchet_token, &mut out)
+            .expect("ratchet decrypt");
+        assert_eq!(decrypted, plaintext);
+        let hash = ratchet_id(&ratchet_public);
+        let mut expected = [0u8; RATCHET_ID_LENGTH];
+        expected.copy_from_slice(&hash.as_slice()[..RATCHET_ID_LENGTH]);
+        assert_eq!(id, Some(expected));
+    }
+
+    #[test]
+    fn default_app_data_is_announced_when_omitted() {
+        let identity = PrivateIdentity::new_from_name("default-app-data");
+        let mut destination =
+            SingleInputDestination::new(identity, DestinationName::new("test", "app.data"));
+        destination.set_default_app_data(Some(b"default-bytes"));
+        destination.set_ratchet_interval(u64::MAX);
+
+        let announce = destination
+            .announce_at(OsRng, None, 1_700_000_000)
+            .expect("announce");
+        assert!(
+            announce
+                .data
+                .as_slice()
+                .windows(13)
+                .any(|window| window == b"default-bytes")
+        );
+
+        let explicit = destination
+            .announce_at(OsRng, Some(b"explicit"), 1_700_000_000)
+            .expect("announce");
+        assert!(
+            explicit
+                .data
+                .as_slice()
+                .windows(8)
+                .any(|window| window == b"explicit")
+        );
+        assert!(
+            !explicit
+                .data
+                .as_slice()
+                .windows(13)
+                .any(|window| window == b"default-bytes")
+        );
+
+        destination.clear_default_app_data();
+        let cleared = destination
+            .announce_at(OsRng, None, 1_700_000_000)
+            .expect("announce");
+        assert!(
+            !cleared
+                .data
+                .as_slice()
+                .windows(13)
+                .any(|window| window == b"default-bytes")
+        );
     }
 
     #[test]

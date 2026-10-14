@@ -14,8 +14,9 @@ pub mod outbound;
 pub use advertisement::ResourceAdvertisement;
 pub use inbound::IncomingResource;
 pub use manager::{
-    msgpack_bin, pack_request, pack_response, request_id, unpack_request, unpack_response,
-    RequestContext, ResourceAcceptCallback, ResourceStartedCallback, ResourceStrategy,
+    msgpack_bin, pack_request, pack_request_element, pack_response, request_id, unpack_request,
+    unpack_response, RequestAllow, RequestContext, RequestHandlerConfig, RequestOptions,
+    RequestResponse, ResourceAcceptCallback, ResourceStartedCallback, ResourceStrategy,
 };
 pub use outbound::OutgoingResource;
 
@@ -154,6 +155,10 @@ impl ResourceTx {
 #[derive(Clone)]
 pub struct ResourceOptions {
     pub auto_compress: bool,
+    /// Python `auto_compress=<int>`: compress only when the original input
+    /// (file or buffer, not including metadata) is at most this many bytes.
+    /// `None` uses [`AUTO_COMPRESS_MAX_SIZE`].
+    pub auto_compress_limit: Option<usize>,
     pub metadata: Option<Vec<u8>>,
     pub timeout: Option<f64>,
     pub request_id: Option<AddressHash>,
@@ -164,12 +169,25 @@ impl Default for ResourceOptions {
     fn default() -> Self {
         Self {
             auto_compress: true,
+            auto_compress_limit: None,
             metadata: None,
             timeout: None,
             request_id: None,
             is_response: false,
         }
     }
+}
+
+/// Whether this input should be bz2-compressed, matching Python
+/// `Resource.__init__`: a bool enables compression up to
+/// `AUTO_COMPRESS_MAX_SIZE`, and an int limit replaces that cap. The
+/// original input length is what is compared, not the segment length.
+pub fn should_auto_compress(opts: &ResourceOptions, original_len: usize) -> bool {
+    if !opts.auto_compress {
+        return false;
+    }
+    let limit = opts.auto_compress_limit.unwrap_or(AUTO_COMPRESS_MAX_SIZE);
+    original_len <= limit
 }
 
 pub(crate) fn unix_time() -> f64 {
@@ -245,4 +263,25 @@ pub fn map_hash(data: &[u8], random_hash: &[u8; RANDOM_HASH_SIZE]) -> [u8; MAPHA
         .chain_update(random_hash)
         .finalize();
     [digest[0], digest[1], digest[2], digest[3]]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_compress_limit_uses_the_original_length() {
+        let mut opts = ResourceOptions::default();
+        assert!(should_auto_compress(&opts, 1));
+        assert!(should_auto_compress(&opts, AUTO_COMPRESS_MAX_SIZE));
+        assert!(!should_auto_compress(&opts, AUTO_COMPRESS_MAX_SIZE + 1));
+
+        opts.auto_compress = false;
+        assert!(!should_auto_compress(&opts, 1));
+
+        opts.auto_compress = true;
+        opts.auto_compress_limit = Some(1000);
+        assert!(should_auto_compress(&opts, 1000));
+        assert!(!should_auto_compress(&opts, 1001));
+    }
 }

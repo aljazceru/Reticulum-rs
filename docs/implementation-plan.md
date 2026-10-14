@@ -1,7 +1,7 @@
 # Reticulum-rs — Feature-Parity Implementation Plan
 
 Target: bring `Reticulum-rs` (workspace v0.1.0) to functional parity with Python
-`Reticulum` v1.4.2 (`b48b96e6`, `RNS/` ≈ 13.2k lines).
+`Reticulum` 1.5.5 (`1.5.5`, `RNS/` ≈ 13.2k lines).
 
 This document inventories every gap identified by comparing the two codebases,
 and turns it into a phased, dependency-ordered work plan. Every work item lists
@@ -44,7 +44,7 @@ constrain all later designs.
 
 Every protocol-visible feature (announces, path requests, links, channel
 envelopes, resources, requests, IFAC, shared-instance frames, tunnel packets)
-must byte-match what Python Reticulum 1.4.2 puts on the wire. Verification is
+must byte-match what Python Reticulum 1.5.5 puts on the wire. Verification is
 done by extending the existing Python-interop harness (`tests/python.rs`,
 feature `python-tests`, `RETICULUM_TEST_PYTHON_DIR`) — see [Phase 9](#12-phase-9--testing-ci--documentation).
 

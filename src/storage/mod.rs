@@ -34,6 +34,21 @@ use reticulum_core::identity::{
 /// (Python `RNS.Reticulum.storagepath + "/known_destinations"`).
 pub const KNOWN_DESTINATIONS_FILE: &str = "known_destinations";
 
+/// Duplicate-filter snapshot (Python `packet_hashlist.raw`).
+pub const PACKET_HASHLIST_FILE: &str = "packet_hashlist.raw";
+
+/// Persisted path table. The file name matches Python's `destination_table`,
+/// but each msgpack record is a reticulum-rs path entry (destination, stable
+/// interface id, hops, unix learned-at, mode, gravity, unresponsive flag,
+/// random blobs, announce bytes, received-from, packet hash). This is not
+/// Python's on-disk schema and is not read as one.
+pub const DESTINATION_TABLE_FILE: &str = "destination_table";
+
+/// Persisted tunnel table. The file name matches Python's `tunnels`, but
+/// the msgpack records are reticulum-rs tunnel entries. This is not a
+/// Python schema reader.
+pub const TUNNELS_FILE: &str = "tunnels";
+
 /// Directory of remembered remote ratchets
 /// (Python `RNS.Reticulum.storagepath + "/ratchets"`).
 pub const RATCHETS_DIR: &str = "ratchets";
